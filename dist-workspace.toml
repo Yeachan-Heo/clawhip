@@ -17,3 +17,5 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# Allow manually edited CI files
+allow-dirty = ["ci"]
