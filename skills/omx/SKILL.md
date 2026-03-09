@@ -4,6 +4,7 @@ Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with au
 
 ## What you get
 
+- Native `agent.started`, `agent.finished`, and `agent.failed` lifecycle events via `clawhip emit`
 - Session keyword alerts (error, PR created, complete, etc.)
 - Stale session detection (no output for N minutes)
 - All notifications routed to the correct Discord channel
@@ -30,6 +31,8 @@ Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with au
 ./create.sh issue-123 ~/my-project/worktrees/issue-123 1234567890 "<@user-id>"
 ```
 
+`create.sh` now emits lifecycle notifications directly from the OMX shell session, so you no longer need a separate lifecycle watcher command.
+
 ### Send a prompt
 
 ```bash
@@ -52,6 +55,7 @@ Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with au
 | `CLAWHIP_OMX_STALE_MIN` | `30` | Minutes before stale alert |
 | `CLAWHIP_OMX_FLAGS` | `--madmax` | Extra flags passed to `omx` |
 | `CLAWHIP_OMX_ENV` | *(empty)* | Extra env vars prepended to omx command (e.g. `FOO=1 BAR=2`) |
+| `CLAWHIP_OMX_PROJECT` | detected from the git common dir (fallback: worktree name) | Override the project name sent in lifecycle events |
 
 ### Config defaults
 

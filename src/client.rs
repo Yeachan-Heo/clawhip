@@ -22,7 +22,7 @@ impl DaemonClient {
     }
 
     pub async fn send_event(&self, event: &IncomingEvent) -> Result<()> {
-        self.post_json("/api/event", event).await.map(|_| ())
+        self.post_json("/event", event).await.map(|_| ())
     }
 
     pub async fn register_tmux(&self, registration: &RegisteredTmuxSession) -> Result<()> {

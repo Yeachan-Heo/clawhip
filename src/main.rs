@@ -47,6 +47,11 @@ async fn real_main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&health)?);
             Ok(())
         }
+        Commands::Emit(args) => {
+            let client = DaemonClient::from_config(config.as_ref());
+            let event = args.into_event()?;
+            client.send_event(&event).await
+        }
         Commands::Send { channel, message } => {
             let client = DaemonClient::from_config(config.as_ref());
             client

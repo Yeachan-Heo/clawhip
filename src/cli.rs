@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde_json::Value;
+
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use crate::events::MessageFormat;
@@ -44,6 +46,8 @@ pub enum Commands {
         #[arg(long)]
         message: String,
     },
+    /// Emit an arbitrary event to the local daemon.
+    Emit(EmitArgs),
     /// Send git-related events to the local daemon.
     Git {
         #[command(subcommand)]
@@ -86,6 +90,78 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<ConfigCommand>,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct EmitArgs {
+    pub event_type: String,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub fields: Vec<String>,
+}
+
+impl EmitArgs {
+    pub fn into_event(self) -> crate::Result<crate::events::IncomingEvent> {
+        let mut channel = None;
+        let mut mention = None;
+        let mut format = None;
+        let mut template = None;
+        let mut payload = None;
+        let mut payload_map = serde_json::Map::new();
+
+        if !self.fields.len().is_multiple_of(2) {
+            return Err("emit fields must be provided as --key value pairs".into());
+        }
+
+        for pair in self.fields.chunks_exact(2) {
+            let key = pair[0]
+                .strip_prefix("--")
+                .ok_or_else(|| format!("emit field names must start with --, got {}", pair[0]))?;
+            let key = normalize_emit_key(key);
+            let raw_value = pair[1].clone();
+            match key {
+                "channel" => channel = Some(raw_value),
+                "mention" => mention = Some(raw_value),
+                "format" => format = Some(MessageFormat::from_label(&raw_value)?),
+                "template" => template = Some(raw_value),
+                "payload" => payload = Some(serde_json::from_str::<Value>(&raw_value)?),
+                _ => {
+                    payload_map.insert(key.to_string(), parse_emit_value(&raw_value));
+                }
+            }
+        }
+
+        let payload = match payload {
+            Some(Value::Object(mut object)) => {
+                object.extend(payload_map);
+                Value::Object(object)
+            }
+            Some(other) => other,
+            None => Value::Object(payload_map),
+        };
+
+        Ok(crate::events::IncomingEvent {
+            kind: self.event_type,
+            channel,
+            mention,
+            format,
+            template,
+            payload,
+        })
+    }
+}
+
+fn normalize_emit_key(key: &str) -> &str {
+    match key {
+        "agent" => "agent_name",
+        "session" => "session_id",
+        "elapsed" => "elapsed_secs",
+        "error" => "error_message",
+        other => other,
+    }
+}
+
+fn parse_emit_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 #[derive(Debug, Subcommand)]
@@ -280,6 +356,84 @@ pub enum ConfigCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_emit_subcommand_with_top_level_fields() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "emit",
+            "agent.started",
+            "--channel",
+            "alerts",
+            "--mention",
+            "<@123>",
+            "--format",
+            "alert",
+            "--template",
+            "agent {agent_name}",
+            "--agent",
+            "omc",
+            "--elapsed",
+            "17",
+        ]);
+
+        let Commands::Emit(args) = cli.command.expect("emit command") else {
+            panic!("expected emit command");
+        };
+
+        let event = args.into_event().expect("event");
+        assert_eq!(event.kind, "agent.started");
+        assert_eq!(event.channel.as_deref(), Some("alerts"));
+        assert_eq!(event.mention.as_deref(), Some("<@123>"));
+        assert!(matches!(event.format, Some(MessageFormat::Alert)));
+        assert_eq!(event.template.as_deref(), Some("agent {agent_name}"));
+        assert_eq!(event.payload["agent_name"], Value::String("omc".into()));
+        assert_eq!(event.payload["elapsed_secs"], Value::from(17));
+    }
+
+    #[test]
+    fn emit_args_merge_payload_json_with_extra_fields() {
+        let args = EmitArgs {
+            event_type: "agent.failed".into(),
+            fields: vec![
+                "--payload".into(),
+                r#"{"session":"sess-1","ok":true}"#.into(),
+                "--error".into(),
+                "boom".into(),
+            ],
+        };
+
+        let event = args.into_event().expect("event");
+        assert_eq!(event.payload["session"], Value::String("sess-1".into()));
+        assert_eq!(event.payload["ok"], Value::Bool(true));
+        assert_eq!(event.payload["error_message"], Value::String("boom".into()));
+    }
+
+    #[test]
+    fn emit_args_reject_invalid_format() {
+        let args = EmitArgs {
+            event_type: "agent.started".into(),
+            fields: vec!["--format".into(), "loud".into()],
+        };
+
+        let error = args.into_event().expect_err("invalid format should fail");
+        assert!(error.to_string().contains("unsupported message format"));
+    }
+
+    #[test]
+    fn emit_args_reject_invalid_field_shape() {
+        let args = EmitArgs {
+            event_type: "agent.started".into(),
+            fields: vec!["agent".into(), "omc".into(), "--session".into()],
+        };
+
+        let error = args.into_event().expect_err("invalid fields should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("emit fields must be provided as --key value pairs")
+        );
+    }
 
     #[test]
     fn parses_agent_finished_subcommand() {

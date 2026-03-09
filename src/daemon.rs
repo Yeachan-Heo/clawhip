@@ -45,6 +45,7 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     let app = AxumRouter::new()
         .route("/health", get(health))
         .route("/api/status", get(status))
+        .route("/event", post(post_event))
         .route("/api/event", post(post_event))
         .route("/events", post(post_event))
         .route("/api/tmux/register", post(register_tmux))
