@@ -227,10 +227,34 @@ event = "tmux.keyword"
 webhook = "https://discord.com/api/webhooks/..."
 ```
 
+## Slack webhook setup
+
+Slack webhook routes work without a bot token.
+
+1. In Slack, open the app settings for your workspace and enable **Incoming Webhooks**
+2. Add a new webhook to the channel you want clawhip to notify
+3. Copy the generated `https://hooks.slack.com/services/...` URL into a route
+
+Route examples:
+
+```toml
+[[routes]]
+event = "git.commit"
+filter = { repo = "my-app" }
+slack_webhook = "https://hooks.slack.com/services/T.../B.../xxx"
+format = "compact"
+
+[[routes]]
+event = "tmux.keyword"
+sink = "slack"
+webhook = "https://hooks.slack.com/services/T.../B.../yyy"
+format = "alert"
+```
+
 ## System model
 
 ```text
-[input] -> [clawhip daemon :25294] -> [route/filter/preset render] -> [Discord REST delivery]
+[input] -> [clawhip daemon :25294] -> [route/filter/preset render] -> [Discord/Slack sink delivery]
 ```
 
 Input sources:
@@ -510,7 +534,7 @@ allow_dynamic_tokens = false
 Resolution rules:
 1. event family match
 2. payload filter match
-3. route channel / format / template / mention applied
+3. route sink / target / format / template / mention applied
 4. default fallback used if route fields absent
 
 ## Dynamic token contract

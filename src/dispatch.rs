@@ -6,7 +6,7 @@ use crate::Result;
 use crate::events::IncomingEvent;
 use crate::render::Renderer;
 use crate::router::Router;
-use crate::sink::Sink;
+use crate::sink::{Sink, SinkMessage};
 
 pub struct Dispatcher {
     rx: mpsc::Receiver<IncomingEvent>,
@@ -69,7 +69,13 @@ impl Dispatcher {
                     }
                 };
 
-                if let Err(error) = sink.send(&delivery.target, &content).await {
+                let message = SinkMessage {
+                    event_kind: event.canonical_kind().to_string(),
+                    format: delivery.format.clone(),
+                    content,
+                };
+
+                if let Err(error) = sink.send(&delivery.target, &message).await {
                     eprintln!(
                         "clawhip dispatcher delivery failed to {}/ {:?}: {error}",
                         delivery.sink, delivery.target
@@ -90,7 +96,7 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, RouteRule};
     use crate::render::DefaultRenderer;
-    use crate::sink::DiscordSink;
+    use crate::sink::{DiscordSink, SlackSink};
 
     fn test_dispatcher(rx: mpsc::Receiver<IncomingEvent>, router: Router) -> Dispatcher {
         let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
@@ -98,6 +104,7 @@ mod tests {
             "discord".into(),
             Box::new(DiscordSink::from_config(Arc::new(AppConfig::default())).unwrap()),
         );
+        sinks.insert("slack".into(), Box::new(SlackSink::default()));
         Dispatcher::new(rx, router, Box::new(DefaultRenderer), sinks)
     }
 
@@ -143,6 +150,7 @@ mod tests {
                     filter: Default::default(),
                     channel: None,
                     webhook: Some(failing_webhook),
+                    slack_webhook: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -154,6 +162,7 @@ mod tests {
                     filter: Default::default(),
                     channel: None,
                     webhook: Some(successful_webhook),
+                    slack_webhook: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -188,5 +197,57 @@ mod tests {
             .unwrap();
         assert!(failing_request.contains("\"content\":\"first\""));
         assert!(successful_request.contains("\"content\":\"second\""));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_sends_to_slack_webhook() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+            stream.write_all(response.as_bytes()).await.unwrap();
+            req
+        });
+
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                slack_webhook: Some(format!("http://{addr}/webhook")),
+                format: Some(crate::events::MessageFormat::Alert),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let router = Router::new(Arc::new(config));
+        let mut dispatcher = test_dispatcher(rx, router);
+        let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
+
+        tx.send(IncomingEvent::tmux_keyword(
+            "issue-28".into(),
+            "error".into(),
+            "boom".into(),
+            None,
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        task.await.unwrap();
+        let request = timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            request.contains("\"text\":\"🚨 tmux session issue-28 hit keyword 'error': boom\"")
+        );
+        assert!(request.contains("\"blocks\""));
     }
 }

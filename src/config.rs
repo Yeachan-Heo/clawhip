@@ -29,6 +29,8 @@ pub struct AppConfig {
 pub struct ProvidersConfig {
     #[serde(default)]
     pub discord: DiscordConfig,
+    #[serde(default)]
+    pub slack: SlackConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -38,6 +40,9 @@ pub struct DiscordConfig {
     #[serde(alias = "default_channel")]
     pub legacy_default_channel: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SlackConfig {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -57,7 +62,7 @@ impl DiscordConfig {
 
 impl ProvidersConfig {
     fn is_empty(&self) -> bool {
-        self.discord.is_empty()
+        self.discord.is_empty() && self.slack.is_empty()
     }
 }
 
@@ -96,6 +101,7 @@ pub struct RouteRule {
     pub sink: String,
     pub channel: Option<String>,
     pub webhook: Option<String>,
+    pub slack_webhook: Option<String>,
     pub mention: Option<String>,
     #[serde(default)]
     pub allow_dynamic_tokens: bool,
@@ -111,11 +117,47 @@ impl Default for RouteRule {
             sink: default_sink_name(),
             channel: None,
             webhook: None,
+            slack_webhook: None,
             mention: None,
             allow_dynamic_tokens: false,
             format: None,
             template: None,
         }
+    }
+}
+
+impl SlackConfig {
+    fn is_empty(&self) -> bool {
+        true
+    }
+}
+
+impl RouteRule {
+    pub fn effective_sink(&self) -> &str {
+        let sink = self.sink.trim();
+        if self.slack_webhook_target().is_some() && (sink.is_empty() || sink == "discord") {
+            "slack"
+        } else if sink.is_empty() {
+            "discord"
+        } else {
+            sink
+        }
+    }
+
+    pub fn discord_webhook_target(&self) -> Option<&str> {
+        (self.effective_sink() == "discord")
+            .then(|| non_empty_trimmed(self.webhook.as_deref()))
+            .flatten()
+    }
+
+    pub fn slack_webhook_target(&self) -> Option<&str> {
+        non_empty_trimmed(self.slack_webhook.as_deref()).or_else(|| {
+            (self.sink.trim() == "slack").then(|| non_empty_trimmed(self.webhook.as_deref()))?
+        })
+    }
+
+    fn has_any_webhook_target(&self) -> bool {
+        self.discord_webhook_target().is_some() || self.slack_webhook_target().is_some()
     }
 }
 
@@ -303,6 +345,13 @@ fn normalize_secret(value: Option<String>) -> Option<String> {
     })
 }
 
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
 fn discord_token_from_env_with<F>(mut get_env: F) -> Option<String>
 where
     F: FnMut(&str) -> Option<String>,
@@ -398,7 +447,7 @@ impl AppConfig {
     pub fn webhook_route_count(&self) -> usize {
         self.routes
             .iter()
-            .filter(|route| normalize_secret(route.webhook.clone()).is_some())
+            .filter(|route| route.has_any_webhook_target())
             .count()
     }
 
@@ -408,29 +457,65 @@ impl AppConfig {
 
     pub fn validate(&self) -> Result<()> {
         for (index, route) in self.routes.iter().enumerate() {
+            let sink = route.effective_sink();
             let has_channel = normalize_secret(route.channel.clone()).is_some();
-            let has_webhook = normalize_secret(route.webhook.clone()).is_some();
-            if route.sink.trim().is_empty() {
+            let has_discord_webhook = route.discord_webhook_target().is_some();
+            let has_slack_webhook = route.slack_webhook_target().is_some();
+            if route.sink.trim().is_empty() && !has_slack_webhook {
                 return Err(
                     format!("route #{} ({}) must set a sink", index + 1, route.event).into(),
                 );
             }
-            if route.sink != default_sink_name() {
+            if !matches!(sink, "discord" | "slack") {
                 return Err(format!(
                     "route #{} ({}) uses unsupported sink '{}'",
                     index + 1,
                     route.event,
-                    route.sink
+                    sink
                 )
                 .into());
             }
-            if has_channel && has_webhook {
-                return Err(format!(
-                    "route #{} ({}) cannot set both channel and webhook",
-                    index + 1,
-                    route.event
-                )
-                .into());
+
+            match sink {
+                "discord" => {
+                    if has_channel && has_discord_webhook {
+                        return Err(format!(
+                            "route #{} ({}) cannot set both channel and webhook",
+                            index + 1,
+                            route.event
+                        )
+                        .into());
+                    }
+                }
+                "slack" => {
+                    if has_channel {
+                        return Err(format!(
+                            "route #{} ({}) cannot set channel when sink = \"slack\"",
+                            index + 1,
+                            route.event
+                        )
+                        .into());
+                    }
+                    if normalize_secret(route.webhook.clone()).is_some()
+                        && normalize_secret(route.slack_webhook.clone()).is_some()
+                    {
+                        return Err(format!(
+                            "route #{} ({}) cannot set both webhook and slack_webhook for Slack delivery",
+                            index + 1,
+                            route.event
+                        )
+                        .into());
+                    }
+                    if !has_slack_webhook {
+                        return Err(format!(
+                            "route #{} ({}) must set webhook or slack_webhook when sink = \"slack\"",
+                            index + 1,
+                            route.event
+                        )
+                        .into());
+                    }
+                }
+                _ => unreachable!(),
             }
         }
 
@@ -468,6 +553,7 @@ impl AppConfig {
             sink: default_sink_name(),
             channel: None,
             webhook: Some(webhook),
+            slack_webhook: None,
             mention: None,
             allow_dynamic_tokens: false,
             format: None,
@@ -575,6 +661,7 @@ impl AppConfig {
             route.sink = normalize_text(Some(route.sink.clone())).unwrap_or_else(default_sink_name);
             route.channel = normalize_text(route.channel.clone());
             route.webhook = normalize_text(route.webhook.clone());
+            route.slack_webhook = normalize_text(route.slack_webhook.clone());
             route.mention = normalize_text(route.mention.clone());
             route.template = normalize_text(route.template.clone());
         }
@@ -595,7 +682,7 @@ impl AppConfig {
     fn routes_with_webhooks(&self) -> usize {
         self.routes
             .iter()
-            .filter(|route| normalize_text(route.webhook.clone()).is_some())
+            .filter(|route| route.has_any_webhook_target())
             .count()
     }
 }
@@ -760,6 +847,21 @@ mod tests {
     }
 
     #[test]
+    fn slack_webhook_route_satisfies_delivery_validation_without_bot_token() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                slack_webhook: Some("https://hooks.slack.com/services/T/B/abc".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.webhook_route_count(), 1);
+    }
+
+    #[test]
     fn route_cannot_set_channel_and_webhook() {
         let config = AppConfig {
             providers: ProvidersConfig {
@@ -767,12 +869,14 @@ mod tests {
                     bot_token: Some("token".into()),
                     legacy_default_channel: None,
                 },
+                slack: SlackConfig::default(),
             },
             routes: vec![RouteRule {
                 event: "tmux.keyword".into(),
                 sink: default_sink_name(),
                 channel: Some("123".into()),
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                slack_webhook: None,
                 ..RouteRule::default()
             }],
             ..AppConfig::default()
@@ -780,6 +884,39 @@ mod tests {
 
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("cannot set both channel and webhook"));
+    }
+
+    #[test]
+    fn slack_route_cannot_set_channel() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "slack".into(),
+                channel: Some("123".into()),
+                webhook: Some("https://hooks.slack.com/services/T/B/abc".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot set channel when sink = \"slack\""));
+    }
+
+    #[test]
+    fn slack_route_can_use_generic_webhook_field() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "slack".into(),
+                webhook: Some("https://hooks.slack.com/services/T/B/abc".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.webhook_route_count(), 1);
     }
 
     #[test]

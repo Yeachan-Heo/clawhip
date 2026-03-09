@@ -13,6 +13,7 @@ mod plugins;
 mod render;
 mod router;
 mod sink;
+mod slack;
 mod source;
 mod tmux_wrapper;
 

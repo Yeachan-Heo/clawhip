@@ -668,6 +668,7 @@ mod tests {
                     .collect(),
                 channel: Some("route-channel".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: Some("<@1465264645320474637>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),

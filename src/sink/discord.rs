@@ -6,7 +6,7 @@ use crate::Result;
 use crate::config::AppConfig;
 use crate::discord::DiscordClient;
 
-use super::{Sink, SinkTarget};
+use super::{Sink, SinkMessage, SinkTarget};
 
 #[derive(Clone)]
 pub struct DiscordSink {
@@ -25,7 +25,7 @@ impl DiscordSink {
 
 #[async_trait]
 impl Sink for DiscordSink {
-    async fn send(&self, target: &SinkTarget, content: &str) -> Result<()> {
-        self.client.send(target, content).await
+    async fn send(&self, target: &SinkTarget, message: &SinkMessage) -> Result<()> {
+        self.client.send(target, message).await
     }
 }

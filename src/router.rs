@@ -9,6 +9,8 @@ use crate::render::DefaultRenderer;
 use crate::render::Renderer;
 #[cfg(test)]
 use crate::sink::Sink;
+#[cfg(test)]
+use crate::sink::SinkMessage;
 use crate::sink::SinkTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +40,12 @@ impl Router {
         let renderer = DefaultRenderer;
         for delivery in self.resolve(event).await? {
             let content = self.render_delivery(event, &delivery, &renderer).await?;
-            if let Err(error) = sink.send(&delivery.target, &content).await {
+            let message = SinkMessage {
+                event_kind: event.canonical_kind().to_string(),
+                format: delivery.format.clone(),
+                content,
+            };
+            if let Err(error) = sink.send(&delivery.target, &message).await {
                 eprintln!(
                     "clawhip router delivery failed to {:?}: {error}",
                     delivery.target
@@ -81,8 +88,7 @@ impl Router {
         route: Option<&RouteRule>,
     ) -> Result<ResolvedDelivery> {
         let sink = route
-            .map(|route| route.sink.trim())
-            .filter(|sink| !sink.is_empty())
+            .map(RouteRule::effective_sink)
             .map(ToString::to_string)
             .unwrap_or_else(default_sink_name);
         let target = self.target_for(event, route, &sink)?;
@@ -143,8 +149,8 @@ impl Router {
             .await?;
         match delivery.target {
             SinkTarget::DiscordChannel(channel) => Ok((channel, delivery.format, content)),
-            SinkTarget::DiscordWebhook(_) => {
-                Err("matched route uses a Discord webhook instead of a channel".into())
+            SinkTarget::DiscordWebhook(_) | SinkTarget::SlackWebhook(_) => {
+                Err("matched route uses a webhook instead of a channel".into())
             }
         }
     }
@@ -191,30 +197,39 @@ impl Router {
         route: Option<&RouteRule>,
         sink: &str,
     ) -> Result<SinkTarget> {
-        if sink != default_sink_name() {
-            return Err(format!(
-                "unsupported sink '{sink}' for event {}",
+        match sink {
+            "discord" => {
+                if let Some(webhook) = route.and_then(RouteRule::discord_webhook_target) {
+                    return Ok(SinkTarget::DiscordWebhook(webhook.to_string()));
+                }
+
+                let channel = event
+                    .channel
+                    .clone()
+                    .or_else(|| route.and_then(|route| route.channel.clone()))
+                    .or_else(|| self.config.defaults.channel.clone())
+                    .ok_or_else(|| {
+                        format!("no channel configured for event {}", event.canonical_kind())
+                    })?;
+
+                Ok(SinkTarget::DiscordChannel(channel))
+            }
+            "slack" => route
+                .and_then(RouteRule::slack_webhook_target)
+                .map(|webhook| SinkTarget::SlackWebhook(webhook.to_string()))
+                .ok_or_else(|| {
+                    format!(
+                        "no Slack webhook configured for event {}",
+                        event.canonical_kind()
+                    )
+                    .into()
+                }),
+            other => Err(format!(
+                "unsupported sink '{other}' for event {}",
                 event.canonical_kind()
             )
-            .into());
+            .into()),
         }
-
-        if let Some(webhook) = route
-            .and_then(|route| route.webhook.as_deref())
-            .map(str::trim)
-            .filter(|webhook| !webhook.is_empty())
-        {
-            return Ok(SinkTarget::DiscordWebhook(webhook.to_string()));
-        }
-
-        let channel = event
-            .channel
-            .clone()
-            .or_else(|| route.and_then(|route| route.channel.clone()))
-            .or_else(|| self.config.defaults.channel.clone())
-            .ok_or_else(|| format!("no channel configured for event {}", event.canonical_kind()))?;
-
-        Ok(SinkTarget::DiscordChannel(channel))
     }
 }
 
@@ -274,7 +289,7 @@ mod tests {
     use super::*;
     use crate::config::{DefaultsConfig, RouteRule};
     use crate::render::DefaultRenderer;
-    use crate::sink::DiscordSink;
+    use crate::sink::{DiscordSink, SlackSink};
 
     #[tokio::test]
     async fn resolve_returns_all_matching_deliveries_in_route_order() {
@@ -290,6 +305,7 @@ mod tests {
                     filter: Default::default(),
                     channel: Some("ops".into()),
                     webhook: None,
+                    slack_webhook: None,
                     mention: Some("@ops".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -301,6 +317,7 @@ mod tests {
                     filter: Default::default(),
                     channel: Some("eng".into()),
                     webhook: None,
+                    slack_webhook: None,
                     mention: Some("@eng".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Compact),
@@ -352,6 +369,7 @@ mod tests {
                 filter: Default::default(),
                 channel: Some("github".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -412,6 +430,7 @@ mod tests {
                     filter: Default::default(),
                     channel: None,
                     webhook: Some(failing_webhook),
+                    slack_webhook: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -423,6 +442,7 @@ mod tests {
                     filter: Default::default(),
                     channel: None,
                     webhook: Some(successful_webhook),
+                    slack_webhook: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -465,6 +485,7 @@ mod tests {
                     .collect(),
                 channel: Some("route".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -498,6 +519,7 @@ mod tests {
                 filter: Default::default(),
                 channel: Some("route".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: Some("<@1465264645320474637>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -528,6 +550,7 @@ mod tests {
                         .collect(),
                     channel: Some("gh-route".into()),
                     webhook: None,
+                    slack_webhook: None,
                     mention: Some("<@botid>".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -541,6 +564,7 @@ mod tests {
                         .collect(),
                     channel: Some("tmux-route".into()),
                     webhook: None,
+                    slack_webhook: None,
                     mention: Some("<@botid>".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -577,6 +601,7 @@ mod tests {
                 filter: Default::default(),
                 channel: Some("dynamic-route".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: None,
                 allow_dynamic_tokens: true,
                 format: None,
@@ -603,6 +628,7 @@ mod tests {
                 filter: Default::default(),
                 channel: Some("dynamic-route".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: None,
                 allow_dynamic_tokens: true,
                 format: None,
@@ -631,6 +657,7 @@ mod tests {
                     .collect(),
                 channel: Some("tmux-route".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -663,6 +690,7 @@ mod tests {
                 filter: Default::default(),
                 channel: Some("tmux-route".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -695,6 +723,7 @@ mod tests {
                     .collect(),
                 channel: Some("route-channel".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -731,6 +760,7 @@ mod tests {
                     .collect(),
                 channel: Some("route-channel".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -775,6 +805,7 @@ mod tests {
                     .collect(),
                 channel: Some("agent-route".into()),
                 webhook: None,
+                slack_webhook: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -834,6 +865,7 @@ mod tests {
                         .collect(),
                     channel: Some("repo-a".into()),
                     webhook: None,
+                    slack_webhook: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -847,6 +879,7 @@ mod tests {
                         .collect(),
                     channel: Some("repo-b".into()),
                     webhook: None,
+                    slack_webhook: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -874,6 +907,7 @@ mod tests {
                 filter: Default::default(),
                 channel: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                slack_webhook: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -912,6 +946,7 @@ mod tests {
                 filter: Default::default(),
                 channel: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                slack_webhook: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -932,5 +967,107 @@ mod tests {
             delivery.target,
             SinkTarget::DiscordWebhook("https://discord.com/api/webhooks/123/abc".into())
         );
+    }
+
+    #[tokio::test]
+    async fn slack_webhook_route_is_used_as_delivery_target() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                slack_webhook: Some("https://hooks.slack.com/services/T/B/abc".into()),
+                format: Some(MessageFormat::Alert),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-28".into(), "error".into(), "boom".into(), None);
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+        assert_eq!(delivery.sink, "slack");
+        assert_eq!(
+            delivery.target,
+            SinkTarget::SlackWebhook("https://hooks.slack.com/services/T/B/abc".into())
+        );
+        assert_eq!(
+            router
+                .render_delivery(&event, &delivery, &DefaultRenderer)
+                .await
+                .unwrap(),
+            "🚨 tmux session issue-28 hit keyword 'error': boom"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_sink_route_can_use_generic_webhook_field() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "slack".into(),
+                webhook: Some("https://hooks.slack.com/services/T/B/generic".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let delivery = router
+            .preview_delivery(&IncomingEvent::custom(None, "hello".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(delivery.sink, "slack");
+        assert_eq!(
+            delivery.target,
+            SinkTarget::SlackWebhook("https://hooks.slack.com/services/T/B/generic".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_dispatch_posts_block_kit_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+            stream.write_all(response.as_bytes()).await.unwrap();
+            req
+        });
+
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                slack_webhook: Some(format!("http://{addr}/webhook")),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let slack = SlackSink::default();
+
+        router
+            .dispatch(
+                &IncomingEvent::custom(None, "hello from clawhip".into()),
+                &slack,
+            )
+            .await
+            .unwrap();
+
+        let request = timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.contains("\"text\":\"hello from clawhip\""));
+        assert!(request.contains("\"blocks\""));
     }
 }

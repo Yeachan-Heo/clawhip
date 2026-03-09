@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::Result;
 use crate::config::AppConfig;
-use crate::sink::SinkTarget;
+use crate::sink::{SinkMessage, SinkTarget};
 
 #[derive(Clone)]
 pub struct DiscordClient {
@@ -43,11 +43,16 @@ impl DiscordClient {
         })
     }
 
-    pub async fn send(&self, target: &SinkTarget, content: &str) -> Result<()> {
+    pub async fn send(&self, target: &SinkTarget, message: &SinkMessage) -> Result<()> {
         match target {
-            SinkTarget::DiscordChannel(channel_id) => self.send_message(channel_id, content).await,
+            SinkTarget::DiscordChannel(channel_id) => {
+                self.send_message(channel_id, &message.content).await
+            }
             SinkTarget::DiscordWebhook(webhook_url) => {
-                self.send_webhook(webhook_url, content).await
+                self.send_webhook(webhook_url, &message.content).await
+            }
+            SinkTarget::SlackWebhook(_) => {
+                Err("cannot send Slack webhook via Discord client".into())
             }
         }
     }
