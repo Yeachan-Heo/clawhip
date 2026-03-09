@@ -315,6 +315,55 @@ impl IncomingEvent {
         }
     }
 
+    pub fn git_commit_events(
+        repo: String,
+        branch: String,
+        commits: Vec<(String, String)>,
+        channel: Option<String>,
+    ) -> Vec<Self> {
+        let commit_count = commits.len();
+        if commit_count == 0 {
+            return Vec::new();
+        }
+
+        if commit_count == 1 {
+            let Some((commit, summary)) = commits.into_iter().next() else {
+                return Vec::new();
+            };
+            return vec![Self::git_commit(repo, branch, commit, summary, channel)];
+        }
+
+        let (first_commit, first_summary) = commits[0].clone();
+        let commits = commits
+            .into_iter()
+            .map(|(commit, summary)| {
+                let short_commit = short_sha(&commit);
+                json!({
+                    "commit": commit,
+                    "short_commit": short_commit,
+                    "summary": summary,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        vec![Self {
+            kind: "git.commit".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "repo": repo,
+                "branch": branch,
+                "commit": first_commit.clone(),
+                "short_commit": short_sha(&first_commit),
+                "summary": first_summary,
+                "commit_count": commit_count,
+                "commits": commits,
+            }),
+        }]
+    }
+
     pub fn git_branch_changed(
         repo: String,
         old_branch: String,
@@ -419,6 +468,11 @@ impl IncomingEvent {
 
     pub fn render_default(&self, format: &MessageFormat) -> Result<String> {
         let payload = &self.payload;
+        if self.canonical_kind() == "git.commit"
+            && let Some(rendered) = render_aggregated_git_commit(payload, format)?
+        {
+            return Ok(rendered);
+        }
         let text = match (self.canonical_kind(), format) {
             ("custom", MessageFormat::Compact | MessageFormat::Inline) => {
                 string_field(payload, "message")?
@@ -740,6 +794,58 @@ fn short_sha(commit: &str) -> String {
     commit.chars().take(7).collect()
 }
 
+fn render_aggregated_git_commit(payload: &Value, format: &MessageFormat) -> Result<Option<String>> {
+    let Some(commits) = payload.get("commits").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if commits.len() <= 1 {
+        return Ok(None);
+    }
+
+    let repo = string_field(payload, "repo")?;
+    let branch = string_field(payload, "branch")?;
+    let summaries = commits
+        .iter()
+        .filter_map(|commit| {
+            commit
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    let commit_count = optional_u64_field(payload, "commit_count")
+        .map(|count| count as usize)
+        .unwrap_or(summaries.len());
+
+    let mut lines = vec![match format {
+        MessageFormat::Alert => {
+            format!("🚨 git:{repo}@{branch} pushed {commit_count} commits:")
+        }
+        MessageFormat::Compact | MessageFormat::Inline => {
+            format!("git:{repo}@{branch} pushed {commit_count} commits:")
+        }
+        MessageFormat::Raw => return Ok(None),
+    }];
+
+    if summaries.len() > 5 {
+        for summary in summaries.iter().take(3) {
+            lines.push(format!("- {summary}"));
+        }
+        lines.push(format!("... and {} more", commit_count.saturating_sub(5)));
+        for summary in summaries.iter().skip(summaries.len().saturating_sub(2)) {
+            lines.push(format!("- {summary}"));
+        }
+    } else {
+        for summary in summaries {
+            lines.push(format!("- {summary}"));
+        }
+    }
+
+    Ok(Some(lines.join("\n")))
+}
+
 fn flatten_json(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
     match value {
         Value::Object(map) => {
@@ -1031,6 +1137,85 @@ mod tests {
                 "summary": "after test run",
                 "error_message": "build failed"
             })
+        );
+    }
+
+    #[test]
+    fn git_commit_events_keep_single_commit_rendering() {
+        let events = IncomingEvent::git_commit_events(
+            "repo".into(),
+            "main".into(),
+            vec![("1234567890abcdef".into(), "ship it".into())],
+            Some("alerts".into()),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].render_default(&MessageFormat::Compact).unwrap(),
+            "git:repo@main 1234567 ship it"
+        );
+        assert_eq!(
+            events[0].render_default(&MessageFormat::Alert).unwrap(),
+            "🚨 new commit in repo@main: 1234567 ship it"
+        );
+        assert_eq!(
+            events[0].render_default(&MessageFormat::Inline).unwrap(),
+            "[git] repo ship it"
+        );
+        assert_eq!(events[0].channel.as_deref(), Some("alerts"));
+    }
+
+    #[test]
+    fn git_commit_events_aggregate_multi_commit_pushes() {
+        let events = IncomingEvent::git_commit_events(
+            "repo".into(),
+            "main".into(),
+            vec![
+                ("1234567890abcdef".into(), "first".into()),
+                ("234567890abcdef1".into(), "second".into()),
+                ("34567890abcdef12".into(), "third".into()),
+            ],
+            Some("alerts".into()),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "git.commit");
+        assert_eq!(events[0].payload["summary"], json!("first"));
+        assert_eq!(events[0].payload["short_commit"], json!("1234567"));
+        assert_eq!(events[0].payload["commit_count"], json!(3));
+        assert_eq!(events[0].payload["commits"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            events[0].render_default(&MessageFormat::Compact).unwrap(),
+            "git:repo@main pushed 3 commits:\n- first\n- second\n- third"
+        );
+    }
+
+    #[test]
+    fn aggregated_git_commit_render_truncates_after_first_three_and_last_two() {
+        let event = IncomingEvent::git_commit_events(
+            "repo".into(),
+            "main".into(),
+            vec![
+                ("1111111111111111".into(), "one".into()),
+                ("2222222222222222".into(), "two".into()),
+                ("3333333333333333".into(), "three".into()),
+                ("4444444444444444".into(), "four".into()),
+                ("5555555555555555".into(), "five".into()),
+                ("6666666666666666".into(), "six".into()),
+            ],
+            None,
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+
+        assert_eq!(
+            event.render_default(&MessageFormat::Compact).unwrap(),
+            "git:repo@main pushed 6 commits:\n- one\n- two\n- three\n... and 1 more\n- five\n- six"
+        );
+        assert_eq!(
+            event.render_default(&MessageFormat::Alert).unwrap(),
+            "🚨 git:repo@main pushed 6 commits:\n- one\n- two\n- three\n... and 1 more\n- five\n- six"
         );
     }
 }

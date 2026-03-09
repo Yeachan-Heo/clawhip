@@ -141,16 +141,20 @@ async fn poll_git_repos(
                             Ok(_) | Err(_) => snapshot.commits.clone(),
                         };
 
-                        for commit in commits {
-                            let event = IncomingEvent::git_commit(
-                                snapshot.name.clone(),
-                                snapshot.branch.clone(),
-                                commit.sha,
-                                commit.summary,
-                                repo.channel.clone(),
-                            )
-                            .with_format(repo.format.clone())
-                            .with_template(repo.template.clone());
+                        let events = IncomingEvent::git_commit_events(
+                            snapshot.name.clone(),
+                            snapshot.branch.clone(),
+                            commits
+                                .into_iter()
+                                .map(|commit| (commit.sha, commit.summary))
+                                .collect(),
+                            repo.channel.clone(),
+                        );
+
+                        for event in events {
+                            let event = event
+                                .with_format(repo.format.clone())
+                                .with_template(repo.template.clone());
                             if let Err(error) = router.dispatch(&event, discord).await {
                                 eprintln!("clawhip watch git commit event failed: {error}");
                             }

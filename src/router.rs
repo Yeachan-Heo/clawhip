@@ -459,6 +459,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregated_git_commit_can_use_github_route_family_and_mention() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "github.*".into(),
+                filter: [("repo".to_string(), "clawhip".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("route-channel".into()),
+                webhook: None,
+                mention: Some("<@route>".into()),
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit_events(
+            "clawhip".into(),
+            "main".into(),
+            vec![
+                ("1234567890abcdef".into(), "ship it".into()),
+                ("234567890abcdef1".into(), "follow up".into()),
+            ],
+            None,
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+
+        let (channel, _, content) = router.preview(&event).await.unwrap();
+        assert_eq!(channel, "route-channel");
+        assert!(content.starts_with("<@route> "));
+        assert!(content.contains("pushed 2 commits"));
+        assert!(content.contains("- ship it"));
+        assert!(content.contains("- follow up"));
+    }
+
+    #[tokio::test]
     async fn agent_family_route_matches_all_agent_events() {
         let config = AppConfig {
             defaults: DefaultsConfig {

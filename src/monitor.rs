@@ -168,15 +168,17 @@ async fn poll_git(
                             .ok()
                             .filter(|entries| !entries.is_empty())
                             .unwrap_or_else(|| snapshot.commits.clone());
-                        for commit in commits {
-                            let event = IncomingEvent::git_commit(
-                                snapshot.repo_name.clone(),
-                                snapshot.branch.clone(),
-                                commit.sha,
-                                commit.summary,
-                                repo.channel.clone(),
-                            )
-                            .with_format(repo.format.clone());
+                        let events = IncomingEvent::git_commit_events(
+                            snapshot.repo_name.clone(),
+                            snapshot.branch.clone(),
+                            commits
+                                .into_iter()
+                                .map(|commit| (commit.sha, commit.summary))
+                                .collect(),
+                            repo.channel.clone(),
+                        );
+                        for event in events {
+                            let event = event.with_format(repo.format.clone());
                             if let Err(error) =
                                 dispatch_event(router, discord, &event, repo.mention.as_deref())
                                     .await
