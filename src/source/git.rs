@@ -157,13 +157,7 @@ pub(crate) async fn snapshot_git_repo(repo: &GitRepoMonitor) -> Result<GitSnapsh
     .unwrap_or_default();
 
     Ok(GitSnapshot {
-        repo_name: repo.name.clone().unwrap_or_else(|| {
-            Path::new(&repo.path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(&repo.path)
-                .to_string()
-        }),
+        repo_name: repo_display_name(repo),
         branch,
         head: head.clone(),
         commits: vec![CommitEntry { sha: head, summary }],
@@ -217,6 +211,16 @@ pub(crate) async fn run_command(binary: &str, args: &[&str]) -> Result<String> {
         )
         .into())
     }
+}
+
+pub(crate) fn repo_display_name(repo: &GitRepoMonitor) -> String {
+    repo.name.clone().unwrap_or_else(|| {
+        Path::new(&repo.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&repo.path)
+            .to_string()
+    })
 }
 
 pub(crate) fn git_bin() -> String {
