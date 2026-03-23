@@ -132,18 +132,25 @@ async fn post_event(
     Json(event): Json<IncomingEvent>,
 ) -> impl IntoResponse {
     let event = normalize_event(event);
-    if let Err(error) = from_incoming_event(&event) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"ok": false, "error": error.to_string()})),
-        )
-            .into_response();
-    }
+    let envelope = match from_incoming_event(&event) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
 
     match enqueue_event(&state.tx, event.clone()).await {
         Ok(()) => (
             StatusCode::ACCEPTED,
-            Json(json!({"ok": true, "type": event.kind})),
+            Json(json!({
+                "ok": true,
+                "type": event.kind,
+                "event_id": envelope.id.to_string(),
+            })),
         )
             .into_response(),
         Err(error) => (
@@ -291,6 +298,7 @@ async fn enqueue_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use axum::body::to_bytes;
 
     #[test]
     fn health_payload_includes_version_and_token_source() {
@@ -308,5 +316,45 @@ mod tests {
         assert_eq!(payload["configured_git_monitors"], Value::from(1));
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
+    }
+
+    #[tokio::test]
+    async fn post_event_returns_event_id_and_preserves_normalized_metadata() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let event = IncomingEvent::agent_started(
+            "worker-1".into(),
+            Some("sess-123".into()),
+            Some("my-repo".into()),
+            None,
+            Some("booted".into()),
+            None,
+            None,
+        );
+
+        let response = post_event(State(state), Json(event)).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        let event_id = response_json["event_id"].as_str().unwrap();
+        assert!(!event_id.is_empty());
+        assert_eq!(response_json["type"], Value::from("agent.started"));
+
+        let queued = rx.recv().await.unwrap();
+        assert_eq!(queued.payload["event_id"], Value::from(event_id));
+        assert_eq!(queued.payload["correlation_id"], Value::from("sess-123"));
+        assert!(
+            queued
+                .payload
+                .get("first_seen_at")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        );
     }
 }

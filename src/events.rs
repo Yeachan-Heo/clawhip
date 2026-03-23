@@ -4,6 +4,8 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 use crate::Result;
 use crate::render::{DefaultRenderer, Renderer};
@@ -650,6 +652,7 @@ fn map_native_signal(raw: &str) -> Option<&'static str> {
 }
 
 fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind: &str) {
+    let first_seen_at = now_rfc3339();
     let tool = infer_tool(payload);
     let session_name = first_string(
         payload,
@@ -745,6 +748,22 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
             .flatten()
     });
     let event_timestamp = first_string(payload, &["/event_timestamp", "/timestamp"]);
+    let event_id =
+        first_string(payload, &["/event_id"]).unwrap_or_else(|| Uuid::new_v4().to_string());
+    let correlation_id = first_string(payload, &["/correlation_id"])
+        .or_else(|| {
+            [
+                session_id.as_deref(),
+                session_name.as_deref(),
+                project.as_deref(),
+                repo_name.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| event_id.clone());
     let route_key = first_string(
         payload,
         &["/route_key", "/signal/routeKey", "/context/route_key"],
@@ -785,6 +804,9 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
         .or_insert_with(|| json!(canonical_kind));
 
     insert_string_if_missing(object, "tool", tool);
+    insert_string_if_missing(object, "event_id", Some(event_id));
+    insert_string_if_missing(object, "correlation_id", Some(correlation_id));
+    insert_string_if_missing(object, "first_seen_at", Some(first_seen_at));
     if (canonical_kind.starts_with("agent.") || canonical_kind.starts_with("session."))
         && object.get("agent_name").is_none()
         && let Some(tool) = object
@@ -814,6 +836,12 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
     insert_string_if_missing(object, "event_timestamp", event_timestamp);
     insert_string_if_missing(object, "route_key", route_key);
     insert_string_if_missing(object, "source", source);
+}
+
+fn now_rfc3339() -> String {
+    let now = OffsetDateTime::now_utc();
+    now.format(&Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string())
 }
 
 fn infer_tool(payload: &Value) -> Option<String> {
@@ -1293,6 +1321,37 @@ mod tests {
         assert_eq!(event.payload["status"], json!("finished"));
         assert_eq!(event.payload["tool"], json!("omc"));
         assert_eq!(event.payload["agent_name"], json!("omc"));
+    }
+
+    #[test]
+    fn normalize_event_adds_ingress_metadata_and_exposes_it_in_template_context() {
+        let event = normalize_event(IncomingEvent::agent_started(
+            "worker-1".into(),
+            Some("sess-123".into()),
+            Some("my-repo".into()),
+            None,
+            Some("booted".into()),
+            None,
+            None,
+        ));
+        let context = event.template_context();
+
+        let event_id = event.payload["event_id"].as_str().unwrap();
+        assert!(!event_id.is_empty());
+        assert_eq!(event.payload["correlation_id"], json!("sess-123"));
+        assert!(
+            event
+                .payload
+                .get("first_seen_at")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(context.get("event_id").map(String::as_str), Some(event_id));
+        assert_eq!(
+            context.get("correlation_id").map(String::as_str),
+            Some("sess-123")
+        );
+        assert!(context.get("first_seen_at").is_some());
     }
 
     #[test]

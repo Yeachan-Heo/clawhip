@@ -24,7 +24,7 @@ impl TryFrom<&IncomingEvent> for EventEnvelope {
         let payload = &normalized.payload;
 
         Ok(Self {
-            id: Uuid::new_v4(),
+            id: event_id_for(&normalized).unwrap_or_else(Uuid::new_v4),
             timestamp: OffsetDateTime::now_utc(),
             source: source_for_kind(kind),
             body: body_for(kind, payload)?,
@@ -283,6 +283,14 @@ fn optional_string_field(payload: &Value, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn event_id_for(event: &IncomingEvent) -> Option<Uuid> {
+    event
+        .payload
+        .get("event_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
 fn u64_field(payload: &Value, key: &str) -> Result<u64> {
     payload
         .get(key)
@@ -430,5 +438,16 @@ mod tests {
             }
             other => panic!("expected GitHubCIFailed body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reuses_normalized_event_id_when_available() {
+        let event = crate::events::normalize_event(IncomingEvent::custom(None, "hello".into()));
+        let envelope = from_incoming_event(&event).unwrap();
+
+        assert_eq!(
+            envelope.id.to_string(),
+            event.payload["event_id"].as_str().unwrap()
+        );
     }
 }
