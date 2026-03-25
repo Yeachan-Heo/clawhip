@@ -107,6 +107,7 @@ mod tests {
             event_kind: "tmux.keyword".into(),
             format: MessageFormat::Compact,
             content: "tmux:ops matched 'error' => boom".into(),
+            payload: serde_json::json!({}),
         });
 
         assert_eq!(
@@ -130,6 +131,7 @@ mod tests {
             event_kind: "github.ci-failed".into(),
             format: MessageFormat::Alert,
             content: "🚨 deploy <failed> & paging".into(),
+            payload: serde_json::json!({}),
         });
 
         let blocks = payload

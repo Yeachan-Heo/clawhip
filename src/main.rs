@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod config;
+mod core;
 mod daemon;
 mod discord;
 mod dispatch;

@@ -73,6 +73,7 @@ impl Dispatcher {
                     event_kind: event.canonical_kind().to_string(),
                     format: delivery.format.clone(),
                     content,
+                    payload: event.payload.clone(),
                 };
 
                 if let Err(error) = sink.send(&delivery.target, &message).await {

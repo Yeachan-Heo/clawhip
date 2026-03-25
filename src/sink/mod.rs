@@ -5,6 +5,7 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::events::MessageFormat;
+use serde_json::Value;
 
 pub use discord::DiscordSink;
 pub use slack::SlackSink;
@@ -21,6 +22,7 @@ pub struct SinkMessage {
     pub event_kind: String,
     pub format: MessageFormat,
     pub content: String,
+    pub payload: Value,
 }
 
 #[async_trait]
