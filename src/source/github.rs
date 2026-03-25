@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -86,6 +87,9 @@ struct GitHubCISnapshot {
     sha: String,
     url: String,
     branch: Option<String>,
+    run_id: Option<String>,
+    run_job_count: usize,
+    run_all_terminal: bool,
 }
 
 impl GitHubCISnapshot {
@@ -454,22 +458,28 @@ fn collect_ci_events(
             continue;
         }
 
-        events.push(
-            IncomingEvent::github_ci(
-                ci.event_kind(),
-                repo_name.to_string(),
-                ci.pr_number,
-                ci.workflow.clone(),
-                ci.status.clone(),
-                ci.conclusion.clone(),
-                ci.sha.clone(),
-                ci.url.clone(),
-                ci.branch.clone(),
-                repo.channel.clone(),
-            )
-            .with_mention(repo.mention.clone())
-            .with_format(repo.format.clone()),
-        );
+        let mut event = IncomingEvent::github_ci(
+            ci.event_kind(),
+            repo_name.to_string(),
+            ci.pr_number,
+            ci.workflow.clone(),
+            ci.status.clone(),
+            ci.conclusion.clone(),
+            ci.sha.clone(),
+            ci.url.clone(),
+            ci.branch.clone(),
+            repo.channel.clone(),
+        )
+        .with_mention(repo.mention.clone())
+        .with_format(repo.format.clone());
+        if let Some(payload) = event.payload.as_object_mut() {
+            if let Some(run_id) = &ci.run_id {
+                payload.insert("run_id".to_string(), json!(run_id));
+            }
+            payload.insert("run_job_count".to_string(), json!(ci.run_job_count));
+            payload.insert("run_all_terminal".to_string(), json!(ci.run_all_terminal));
+        }
+        events.push(event);
     }
 
     events.sort_by(|left, right| {
@@ -600,19 +610,52 @@ async fn fetch_check_runs(
     .await?;
 
     let runs: GitHubCheckRunsResponse = response.json().await?;
+    let run_summaries = summarize_workflow_runs(&runs.check_runs);
     Ok(runs
         .check_runs
         .into_iter()
-        .map(|check_run| GitHubCISnapshot {
-            pr_number: Some(pr_number),
-            workflow: check_run.name,
-            status: check_run.status,
-            conclusion: check_run.conclusion,
-            sha: check_run.head_sha,
-            url: check_run.details_url.unwrap_or_else(|| pr.url.clone()),
-            branch: Some(pr.head_branch.clone()),
+        .map(|check_run| {
+            let url = check_run.details_url.unwrap_or_else(|| pr.url.clone());
+            let run_id = workflow_run_id(&url);
+            let (run_job_count, run_all_terminal) = run_id
+                .as_deref()
+                .and_then(|id| run_summaries.get(id).copied())
+                .unwrap_or((1, check_run.status == "completed"));
+            GitHubCISnapshot {
+                pr_number: Some(pr_number),
+                workflow: check_run.name,
+                status: check_run.status,
+                conclusion: check_run.conclusion,
+                sha: check_run.head_sha,
+                url,
+                branch: Some(pr.head_branch.clone()),
+                run_id,
+                run_job_count,
+                run_all_terminal,
+            }
         })
         .collect())
+}
+
+fn summarize_workflow_runs(check_runs: &[GitHubCheckRun]) -> HashMap<String, (usize, bool)> {
+    let mut summaries = HashMap::new();
+    for check_run in check_runs {
+        let Some(run_id) = check_run.details_url.as_deref().and_then(workflow_run_id) else {
+            continue;
+        };
+        let entry = summaries.entry(run_id).or_insert((0, true));
+        entry.0 += 1;
+        entry.1 &= check_run.status == "completed";
+    }
+    summaries
+}
+
+fn workflow_run_id(url: &str) -> Option<String> {
+    url.split("/actions/runs/")
+        .nth(1)
+        .and_then(|tail| tail.split('/').next())
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
 }
 
 fn build_github_client(token: Option<String>) -> Result<reqwest::Client> {
@@ -811,6 +854,9 @@ mod tests {
             sha: "abcdef1234567890".into(),
             url: "https://github.com/Yeachan-Heo/clawhip/actions/runs/1".into(),
             branch: Some("feat/github-ci-events".into()),
+            run_id: Some("1".into()),
+            run_job_count: 1,
+            run_all_terminal: status == "completed",
         }
     }
 

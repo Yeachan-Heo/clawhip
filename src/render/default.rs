@@ -466,6 +466,14 @@ fn session_inline_suffix(payload: &Value) -> String {
 }
 
 fn render_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<String> {
+    if payload
+        .get("batched")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return render_batched_github_ci(payload, kind, include_url);
+    }
+
     let workflow = string_field(payload, "workflow")?;
     let state = optional_string_field(payload, "conclusion")
         .or_else(|| optional_string_field(payload, "status"))
@@ -478,6 +486,74 @@ fn render_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<St
         state,
         sha,
     ];
+
+    if include_url {
+        parts.push(string_field(payload, "url")?);
+    }
+
+    Ok(parts.join(" · "))
+}
+
+fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<String> {
+    let jobs = payload
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing batched GitHub CI jobs".to_string())?;
+    let total = optional_u64_field(payload, "total_count").unwrap_or(jobs.len() as u64);
+    let passed = optional_u64_field(payload, "passed_count").unwrap_or(0);
+    let skipped = optional_u64_field(payload, "skipped_count").unwrap_or(0);
+    let failed = optional_u64_field(payload, "failed_count").unwrap_or(0);
+    let cancelled = optional_u64_field(payload, "cancelled_count").unwrap_or(0);
+    let workflows = jobs
+        .iter()
+        .filter_map(|job| job.get("workflow").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut parts = vec![match kind {
+        "github.ci-passed" => format!(
+            "✅ CI passed · {} · {passed}/{total} passed",
+            github_ci_target(payload)?
+        ),
+        "github.ci-failed" => format!("❌ CI failed · {}", github_ci_target(payload)?),
+        "github.ci-cancelled" => format!("🟡 CI cancelled · {}", github_ci_target(payload)?),
+        _ => format!("⏳ CI running · {}", github_ci_target(payload)?),
+    }];
+
+    if !workflows.is_empty() {
+        parts.push(workflows);
+    }
+
+    if kind == "github.ci-failed" {
+        let failed_jobs = jobs
+            .iter()
+            .filter_map(|job| {
+                let workflow = job.get("workflow").and_then(Value::as_str)?;
+                let conclusion = job
+                    .get("conclusion")
+                    .and_then(Value::as_str)
+                    .or_else(|| job.get("status").and_then(Value::as_str))?;
+                if matches!(conclusion, "success" | "neutral" | "skipped") {
+                    None
+                } else {
+                    Some(format!("{workflow}:{conclusion}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        if !failed_jobs.is_empty() {
+            parts.push(failed_jobs.join(", "));
+        }
+    } else {
+        if skipped > 0 {
+            parts.push(format!("{skipped} skipped"));
+        }
+        if cancelled > 0 {
+            parts.push(format!("{cancelled} cancelled"));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
+        }
+    }
 
     if include_url {
         parts.push(string_field(payload, "url")?);

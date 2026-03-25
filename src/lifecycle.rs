@@ -341,7 +341,7 @@ mod tests {
                     String::from("api"),
                     String::from("--method"),
                     String::from("PUT"),
-                    String::from(format!("/user/starred/{GITHUB_REPO}")),
+                    format!("/user/starred/{GITHUB_REPO}"),
                     String::from("--silent"),
                 ],
             ]
@@ -375,7 +375,7 @@ mod tests {
                     String::from("api"),
                     String::from("--method"),
                     String::from("PUT"),
-                    String::from(format!("/user/starred/{GITHUB_REPO}")),
+                    format!("/user/starred/{GITHUB_REPO}"),
                     String::from("--silent"),
                 ],
             ]

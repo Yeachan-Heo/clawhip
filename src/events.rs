@@ -1382,7 +1382,7 @@ mod tests {
             context.get("correlation_id").map(String::as_str),
             Some("sess-123")
         );
-        assert!(context.get("first_seen_at").is_some());
+        assert!(context.contains_key("first_seen_at"));
     }
 
     #[test]

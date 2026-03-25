@@ -103,7 +103,7 @@ impl DiscordClient {
                     self.send_webhook(webhook_url, &message.content).await
                 }
                 SinkTarget::SlackWebhook(_) => {
-                    return Err("cannot send Slack webhook via Discord client".into())
+                    return Err("cannot send Slack webhook via Discord client".into());
                 }
             };
 
@@ -132,7 +132,11 @@ impl DiscordClient {
         Err(error.into())
     }
 
-    async fn send_message(&self, channel_id: &str, content: &str) -> std::result::Result<(), DiscordSendError> {
+    async fn send_message(
+        &self,
+        channel_id: &str,
+        content: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
         let url = format!(
             "{}/channels/{}/messages",
             self.api_base.trim_end_matches('/'),
@@ -150,7 +154,11 @@ impl DiscordClient {
         .await
     }
 
-    async fn send_webhook(&self, webhook_url: &str, content: &str) -> std::result::Result<(), DiscordSendError> {
+    async fn send_webhook(
+        &self,
+        webhook_url: &str,
+        content: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
         self.execute_request(
             self.webhook_client
                 .post(webhook_url_with_wait(webhook_url))
@@ -243,7 +251,8 @@ impl DiscordClient {
 
         eprintln!(
             "clawhip dlq bury: {}",
-            serde_json::to_string(&entry).unwrap_or_else(|_| "{\"error\":\"dlq serialize failed\"}".to_string())
+            serde_json::to_string(&entry)
+                .unwrap_or_else(|_| "{\"error\":\"dlq serialize failed\"}".to_string())
         );
 
         let mut state = self.state.lock().expect("discord state lock");
@@ -252,7 +261,12 @@ impl DiscordClient {
 
     #[cfg(test)]
     fn dlq_entries(&self) -> Vec<DlqEntry> {
-        self.state.lock().expect("discord state lock").dlq.entries().to_vec()
+        self.state
+            .lock()
+            .expect("discord state lock")
+            .dlq
+            .entries()
+            .to_vec()
     }
 }
 
