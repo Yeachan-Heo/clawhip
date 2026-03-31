@@ -40,6 +40,12 @@ pub enum EventBody {
     AgentBlocked(AgentEvent),
     AgentFinished(AgentEvent),
     AgentFailed(AgentEvent),
+    AgentRetryNeeded(AgentEvent),
+    AgentPRCreated(AgentEvent),
+    AgentTestStarted(AgentEvent),
+    AgentTestFinished(AgentEvent),
+    AgentTestFailed(AgentEvent),
+    AgentHandoffNeeded(AgentEvent),
     Custom(CustomEvent),
 }
 

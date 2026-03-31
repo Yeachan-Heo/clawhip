@@ -1,5 +1,7 @@
 # Native OMC / OMX Event Contract
 
+> Frozen contract reference: see [docs/event-contract-v1.md](event-contract-v1.md) for the stable v1 wire-format specification. This document remains the higher-level routing and migration guide.
+
 This document is the clawhip-side normalization contract for native OMC/OMX operational events.
 
 ## Goal

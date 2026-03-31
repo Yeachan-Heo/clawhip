@@ -752,6 +752,7 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
             "/summary",
             "/signal/summary",
             "/reason",
+            "/context/summary",
             "/context/contextSummary",
             "/context/reason",
             "/context/question",

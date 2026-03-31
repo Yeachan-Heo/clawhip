@@ -88,11 +88,21 @@ pub struct TmuxStaleEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEvent {
     pub agent_name: String,
+    pub session_name: Option<String>,
     pub status: String,
+    pub normalized_event: Option<String>,
     pub session_id: Option<String>,
     pub project: Option<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub issue_number: Option<u64>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    pub command: Option<String>,
+    pub tool_name: Option<String>,
     pub elapsed_secs: Option<u64>,
     pub summary: Option<String>,
+    pub error_summary: Option<String>,
     pub error_message: Option<String>,
     pub mention: Option<String>,
 }
