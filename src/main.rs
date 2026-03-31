@@ -1,3 +1,4 @@
+mod action;
 mod cli;
 mod client;
 mod config;
@@ -17,6 +18,7 @@ mod router;
 mod sink;
 mod slack;
 mod source;
+mod tmux_ops;
 mod tmux_wrapper;
 
 use std::sync::Arc;

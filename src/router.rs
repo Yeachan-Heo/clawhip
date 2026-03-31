@@ -11,6 +11,7 @@ use crate::render::Renderer;
 use crate::sink::Sink;
 #[cfg(test)]
 use crate::sink::SinkMessage;
+use crate::config::ActionSpec;
 use crate::sink::SinkTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub struct ResolvedDelivery {
     pub mention: Option<String>,
     pub template: Option<String>,
     pub allow_dynamic_tokens: bool,
+    pub action: Option<ActionSpec>,
 }
 
 pub struct Router {
@@ -111,6 +113,7 @@ impl Router {
                 .clone()
                 .or_else(|| route.and_then(|route| route.template.clone())),
             allow_dynamic_tokens: self.allow_dynamic_tokens_for(event, route),
+            action: route.and_then(|route| route.action.clone()),
         })
     }
 
@@ -324,6 +327,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
                     template: None,
+                    action: None,
                 },
                 RouteRule {
                     event: "tmux.*".into(),
@@ -336,6 +340,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Compact),
                     template: Some("duplicate: {line}".into()),
+                    action: None,
                 },
             ],
             ..AppConfig::default()
@@ -388,6 +393,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -449,6 +455,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: Some("first".into()),
+                    action: None,
                 },
                 RouteRule {
                     event: "tmux.keyword".into(),
@@ -461,6 +468,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: Some("second".into()),
+                    action: None,
                 },
             ],
             ..AppConfig::default()
@@ -504,6 +512,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -538,6 +547,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -569,6 +579,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
                     template: None,
+                    action: None,
                 },
                 RouteRule {
                     event: "tmux.*".into(),
@@ -583,6 +594,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
                     template: None,
+                    action: None,
                 },
             ],
             ..AppConfig::default()
@@ -620,6 +632,7 @@ mod tests {
                 allow_dynamic_tokens: true,
                 format: None,
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -647,6 +660,7 @@ mod tests {
                 allow_dynamic_tokens: true,
                 format: None,
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -676,6 +690,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -709,6 +724,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -742,6 +758,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -779,6 +796,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -824,6 +842,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -886,6 +905,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -931,6 +951,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -988,6 +1009,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -1035,6 +1057,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: None,
+                    action: None,
                 },
                 RouteRule {
                     event: "github.*".into(),
@@ -1049,6 +1072,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: None,
+                    action: None,
                 },
             ],
             ..AppConfig::default()
@@ -1077,6 +1101,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
@@ -1116,6 +1141,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };
