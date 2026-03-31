@@ -14,6 +14,9 @@ impl Renderer for DefaultRenderer {
         if event.canonical_kind().starts_with("session.") {
             return render_session_event(event.canonical_kind(), payload, format);
         }
+        if event.canonical_kind().starts_with("workspace.") {
+            return render_workspace_event(event.canonical_kind(), payload, format);
+        }
         if event.canonical_kind() == "git.commit"
             && let Some(rendered) = render_aggregated_git_commit(payload, format)?
         {
@@ -693,5 +696,63 @@ impl ValueExt for Value {
         self.get(key)
             .and_then(Value::as_u64)
             .ok_or_else(|| format!("missing integer field '{key}'").into())
+    }
+}
+
+fn render_workspace_event(kind: &str, payload: &Value, format: &MessageFormat) -> Result<String> {
+    let workspace = optional_string_field(payload, "workspace_name")
+        .or_else(|| optional_string_field(payload, "workspace_root"))
+        .unwrap_or_else(|| "workspace".to_string());
+    let state_file = string_field(payload, "state_file")?;
+    let tool = optional_string_field(payload, "tool")
+        .or_else(|| optional_string_field(payload, "state_family"))
+        .unwrap_or_else(|| "workspace".to_string());
+    let summary = optional_string_field(payload, "summary").unwrap_or_else(|| kind.to_string());
+    let session = optional_string_field(payload, "session_name")
+        .or_else(|| optional_string_field(payload, "session_id"));
+    let session_suffix = session
+        .map(|value| format!(" · session={value}"))
+        .unwrap_or_default();
+
+    match format {
+        MessageFormat::Compact => Ok(format!(
+            "{}:{} · {} · {}{}",
+            tool, workspace, state_file, summary, session_suffix
+        )),
+        MessageFormat::Alert => Ok(format!(
+            "🚨 {}:{} · {} · {}{}",
+            tool, workspace, state_file, summary, session_suffix
+        )),
+        MessageFormat::Inline => Ok(format!(
+            "[{}:{}] {}{}",
+            tool, workspace, state_file, session_suffix
+        )),
+        MessageFormat::Raw => serde_json::to_string_pretty(payload).map_err(Into::into),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn renders_workspace_skill_event_compact() {
+        let event = IncomingEvent::workspace(
+            "workspace.skill.activated".into(),
+            json!({
+                "workspace_name": "repo-a",
+                "state_file": "skill-active-state.json",
+                "skill": "ralph",
+                "summary": "workspace skill state changed"
+            }),
+            None,
+        );
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+        assert!(rendered.contains("repo-a"));
+        assert!(rendered.contains("workspace skill state changed"));
     }
 }

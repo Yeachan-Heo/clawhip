@@ -7,7 +7,7 @@ use crate::event::{
     AgentEvent, CustomEvent, EventBody, EventEnvelope, EventMetadata, EventPriority,
     GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent,
     GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent, TmuxKeywordAggregatedEvent,
-    TmuxKeywordEvent, TmuxStaleEvent,
+    TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
 use crate::events::{IncomingEvent, normalize_event};
 
@@ -129,6 +129,27 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
         "session.test-finished" => Ok(EventBody::AgentTestFinished(agent_event(payload)?)),
         "session.test-failed" => Ok(EventBody::AgentTestFailed(agent_event(payload)?)),
         "session.handoff-needed" => Ok(EventBody::AgentHandoffNeeded(agent_event(payload)?)),
+        "workspace.session.started" | "workspace.session.ended" => Ok(
+            EventBody::WorkspaceSessionStarted(workspace_event(payload)?),
+        ),
+        "workspace.turn.complete" | "workspace.agent.turn" | "workspace.mission.updated" => {
+            Ok(EventBody::WorkspaceTurnComplete(workspace_event(payload)?))
+        }
+        "workspace.skill.activated"
+        | "workspace.skill.deactivated"
+        | "workspace.skill.phase-changed" => Ok(EventBody::WorkspaceSkillActivated(
+            workspace_event(payload)?,
+        )),
+        "workspace.session.blocked"
+        | "workspace.session.checkpointed"
+        | "workspace.team.nudged"
+        | "workspace.team.updated"
+        | "workspace.tmux.injection" => Ok(EventBody::WorkspaceSessionBlocked(workspace_event(
+            payload,
+        )?)),
+        "workspace.metrics.updated" => {
+            Ok(EventBody::WorkspaceMetricsUpdate(workspace_event(payload)?))
+        }
         _ => Ok(EventBody::Custom(CustomEvent {
             kind: kind.to_string(),
             message: optional_string_field(payload, "message").unwrap_or_else(|| kind.to_string()),
@@ -313,6 +334,57 @@ fn agent_event(payload: &Value) -> Result<AgentEvent> {
     })
 }
 
+fn workspace_event(payload: &Value) -> Result<WorkspaceEvent> {
+    let source_tool = optional_string_field(payload, "tool")
+        .or_else(|| optional_string_field(payload, "state_family"))
+        .unwrap_or_else(|| "workspace".to_string());
+    let workspace_path = optional_string_field(payload, "workspace_root")
+        .or_else(|| optional_string_field(payload, "monitor_path"))
+        .or_else(|| optional_string_field(payload, "workspace_name"))
+        .ok_or_else(|| "missing workspace path".to_string())?;
+    let state_file = optional_string_field(payload, "state_file")
+        .or_else(|| optional_string_field(payload, "contract_event"))
+        .unwrap_or_else(|| "workspace-state".to_string());
+    let session_name = optional_string_field(payload, "session_name")
+        .or_else(|| optional_string_field(payload, "session_id"));
+    let diff_fields = payload
+        .as_object()
+        .map(|obj| {
+            obj.keys()
+                .filter(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "tool"
+                            | "workspace_root"
+                            | "workspace_name"
+                            | "monitor_path"
+                            | "state_family"
+                            | "state_dir"
+                            | "state_file"
+                            | "summary"
+                            | "contract_event"
+                            | "event_id"
+                            | "correlation_id"
+                            | "first_seen_at"
+                            | "source"
+                            | "route_key"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(WorkspaceEvent {
+        source_tool,
+        workspace_path,
+        state_file,
+        session_name,
+        diff_fields,
+        summary: optional_string_field(payload, "summary"),
+    })
+}
+
 fn priority_for(kind: &str, payload: &Value) -> EventPriority {
     match kind {
         "agent.failed" | "session.failed" | "session.test-failed" | "github.ci-failed" => {
@@ -322,7 +394,8 @@ fn priority_for(kind: &str, payload: &Value) -> EventPriority {
         | "session.blocked"
         | "session.retry-needed"
         | "session.handoff-needed"
-        | "tmux.stale" => EventPriority::High,
+        | "tmux.stale"
+        | "workspace.session.blocked" => EventPriority::High,
         "github.pr-status-changed"
             if optional_string_field(payload, "new_status")
                 .map(|status| status == "merged" || status == "closed")
@@ -744,5 +817,17 @@ mod tests {
             EventBody::AgentHandoffNeeded(_) => "handoff-needed",
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn workspace_blocked_events_are_high_priority() {
+        let event = IncomingEvent::workspace(
+            "workspace.session.blocked".into(),
+            json!({"workspace_name": "repo", "workspace_root": "/tmp/repo", "state_file": "notify-fallback-state.json", "summary": "waiting"}),
+            None,
+        );
+
+        let envelope = from_incoming_event(&event).unwrap();
+        assert_eq!(envelope.metadata.priority, EventPriority::High);
     }
 }

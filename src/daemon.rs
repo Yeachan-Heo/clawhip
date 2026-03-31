@@ -21,6 +21,7 @@ use crate::router::Router;
 use crate::sink::{DiscordSink, Sink, SlackSink};
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
+    WorkspaceSource,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
@@ -61,6 +62,7 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         TmuxSource::new(config.clone(), tmux_registry.clone()),
         tx.clone(),
     );
+    spawn_source(WorkspaceSource::new(config.clone()), tx.clone());
 
     let app = AxumRouter::new()
         .route("/health", get(health))
@@ -119,6 +121,7 @@ fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize
         "daemon_base_url": config.daemon.base_url,
         "configured_git_monitors": config.monitors.git.repos.len(),
         "configured_tmux_monitors": config.monitors.tmux.sessions.len(),
+        "configured_workspace_monitors": config.monitors.workspace.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
     })
 }
@@ -306,6 +309,7 @@ mod tests {
         config.providers.discord.bot_token = Some("config-token".into());
         config.monitors.git.repos.push(Default::default());
         config.monitors.tmux.sessions.push(Default::default());
+        config.monitors.workspace.push(Default::default());
 
         let payload = health_payload(&config, 25294, 3);
 
@@ -315,6 +319,7 @@ mod tests {
         assert_eq!(payload["port"], Value::from(25294));
         assert_eq!(payload["configured_git_monitors"], Value::from(1));
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
+        assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
     }
 

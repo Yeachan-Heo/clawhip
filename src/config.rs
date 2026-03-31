@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::events::MessageFormat;
+use crate::source::workspace::{default_workspace_debounce_ms, default_workspace_watch_dirs};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -172,6 +173,8 @@ pub struct MonitorConfig {
     pub git: GitMonitorConfig,
     #[serde(default)]
     pub tmux: TmuxMonitorConfig,
+    #[serde(default)]
+    pub workspace: Vec<WorkspaceMonitor>,
 }
 
 impl Default for MonitorConfig {
@@ -182,6 +185,7 @@ impl Default for MonitorConfig {
             github_api_base: default_github_api_base(),
             git: GitMonitorConfig::default(),
             tmux: TmuxMonitorConfig::default(),
+            workspace: Vec::new(),
         }
     }
 }
@@ -260,6 +264,39 @@ impl Default for TmuxSessionMonitor {
             channel: None,
             mention: None,
             format: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceMonitor {
+    pub path: String,
+    #[serde(default = "default_workspace_watch_dirs")]
+    pub watch_dirs: Vec<String>,
+    #[serde(default)]
+    pub discover_worktrees: bool,
+    pub channel: Option<String>,
+    pub mention: Option<String>,
+    pub format: Option<MessageFormat>,
+    #[serde(default)]
+    pub events: Vec<String>,
+    pub poll_interval_secs: Option<u64>,
+    #[serde(default = "default_workspace_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+impl Default for WorkspaceMonitor {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            watch_dirs: default_workspace_watch_dirs(),
+            discover_worktrees: false,
+            channel: None,
+            mention: None,
+            format: None,
+            events: Vec::new(),
+            poll_interval_secs: None,
+            debounce_ms: default_workspace_debounce_ms(),
         }
     }
 }
@@ -519,6 +556,29 @@ impl AppConfig {
             }
         }
 
+        for (index, workspace) in self.monitors.workspace.iter().enumerate() {
+            if workspace.path.trim().is_empty() {
+                return Err(format!("workspace monitor #{} must set path", index + 1).into());
+            }
+            if workspace.watch_dirs.is_empty() {
+                return Err(format!(
+                    "workspace monitor #{} must set at least one watch_dirs entry",
+                    index + 1
+                )
+                .into());
+            }
+            if workspace.channel.is_none()
+                && self.defaults.channel.is_none()
+                && !self.has_webhook_routes()
+            {
+                return Err(format!(
+                    "workspace monitor #{} has no channel and no default Discord destination",
+                    index + 1
+                )
+                .into());
+            }
+        }
+
         if self.effective_token().is_none() && !self.has_webhook_routes() {
             return Err(
                 "missing Discord delivery config: configure [providers.discord].token (or legacy [discord].token) or at least one route webhook"
@@ -631,12 +691,13 @@ impl AppConfig {
         println!("  Routes: {}", self.routes.len());
         println!("  Git monitors: {}", self.monitors.git.repos.len());
         println!("  Tmux monitors: {}", self.monitors.tmux.sessions.len());
+        println!("  Workspace monitors: {}", self.monitors.workspace.len());
     }
 
     fn print_template_hint(&self) {
         println!("Edit the config file directly for routes and monitor definitions.");
         println!(
-            "Sections: [providers.discord], [daemon], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]]"
+            "Sections: [providers.discord], [daemon], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
         );
         println!(
             "Routes may set either channel = \"...\" or webhook = \"https://discord.com/api/webhooks/...\"."
@@ -676,6 +737,27 @@ impl AppConfig {
         for session in &mut self.monitors.tmux.sessions {
             session.channel = normalize_text(session.channel.clone());
             session.mention = normalize_text(session.mention.clone());
+        }
+
+        for workspace in &mut self.monitors.workspace {
+            workspace.path = normalize_text(Some(workspace.path.clone())).unwrap_or_default();
+            workspace.channel = normalize_text(workspace.channel.clone());
+            workspace.mention = normalize_text(workspace.mention.clone());
+            workspace.watch_dirs = workspace
+                .watch_dirs
+                .iter()
+                .filter_map(|dir| normalize_text(Some(dir.clone())))
+                .collect();
+            if workspace.watch_dirs.is_empty() {
+                workspace.watch_dirs = default_workspace_watch_dirs();
+            }
+            workspace.events = workspace
+                .events
+                .iter()
+                .filter_map(|event| normalize_text(Some(event.clone())))
+                .collect();
+            workspace.debounce_ms = workspace.debounce_ms.max(1);
+            workspace.poll_interval_secs = workspace.poll_interval_secs.map(|secs| secs.max(1));
         }
     }
 
@@ -938,5 +1020,96 @@ mod tests {
     fn tmux_session_monitor_defaults_keyword_window_to_thirty_seconds() {
         let session = TmuxSessionMonitor::default();
         assert_eq!(session.keyword_window_secs, 30);
+    }
+    #[test]
+    fn workspace_monitor_defaults_are_backward_compatible() {
+        let config: AppConfig = toml::from_str(
+            "
+[providers.discord]
+token = 'discord-token'
+
+[[monitors.workspace]]
+path = '/tmp/repo'
+",
+        )
+        .unwrap();
+
+        assert_eq!(config.monitors.workspace.len(), 1);
+        let monitor = &config.monitors.workspace[0];
+        assert_eq!(monitor.watch_dirs, default_workspace_watch_dirs());
+        assert_eq!(monitor.debounce_ms, default_workspace_debounce_ms());
+        assert_eq!(monitor.poll_interval_secs, None);
+        assert!(!monitor.discover_worktrees);
+    }
+
+    #[test]
+    fn normalize_trims_workspace_monitor_fields() {
+        let mut config = AppConfig::default();
+        config.monitors.workspace.push(WorkspaceMonitor {
+            path: " /tmp/repo ".into(),
+            watch_dirs: vec![" .omx/state ".into(), "".into(), " .omc/state ".into()],
+            discover_worktrees: true,
+            channel: Some(" 123 ".into()),
+            mention: Some(" <@1> ".into()),
+            format: Some(MessageFormat::Compact),
+            events: vec!["workspace.*".into()],
+            poll_interval_secs: Some(5),
+            debounce_ms: 2000,
+        });
+
+        config.normalize();
+        let monitor = &config.monitors.workspace[0];
+        assert_eq!(monitor.path, "/tmp/repo");
+        assert_eq!(monitor.watch_dirs, vec![".omx/state", ".omc/state"]);
+        assert_eq!(monitor.channel.as_deref(), Some("123"));
+        assert_eq!(monitor.mention.as_deref(), Some("<@1>"));
+    }
+
+    #[test]
+    fn workspace_monitor_config_parses_and_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[providers.discord]
+token = "abc"
+
+[[monitors.workspace]]
+path = " {} "
+watch_dirs = [" .omx/state ", " .omc/state "]
+channel = " ops "
+mention = " <@1> "
+discover_worktrees = true
+events = [" workspace.skill.* "]
+debounce_ms = 1500
+poll_interval_secs = 9
+"#,
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+        let monitor = &config.monitors.workspace[0];
+        assert_eq!(monitor.path, dir.path().display().to_string());
+        assert_eq!(monitor.watch_dirs, vec![".omx/state", ".omc/state"]);
+        assert_eq!(monitor.channel.as_deref(), Some("ops"));
+        assert_eq!(monitor.mention.as_deref(), Some("<@1>"));
+        assert!(monitor.discover_worktrees);
+        assert_eq!(monitor.events, vec!["workspace.skill.*"]);
+        assert_eq!(monitor.debounce_ms, 1500);
+        assert_eq!(monitor.poll_interval_secs, Some(9));
+    }
+
+    #[test]
+    fn config_without_workspace_monitor_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[providers.discord]\ntoken = \"abc\"\n").unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+        assert!(config.monitors.workspace.is_empty());
+        assert!(config.validate().is_ok());
     }
 }

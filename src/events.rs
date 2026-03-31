@@ -97,6 +97,17 @@ impl<'de> Deserialize<'de> for IncomingEvent {
 }
 
 impl IncomingEvent {
+    pub fn workspace(kind: String, payload: Value, channel: Option<String>) -> Self {
+        Self {
+            kind,
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload,
+        }
+    }
+
     pub fn custom(channel: Option<String>, message: String) -> Self {
         Self {
             kind: "custom".to_string(),

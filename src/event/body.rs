@@ -107,6 +107,16 @@ pub struct AgentEvent {
     pub mention: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceEvent {
+    pub source_tool: String,
+    pub workspace_path: String,
+    pub state_file: String,
+    pub session_name: Option<String>,
+    pub diff_fields: Vec<String>,
+    pub summary: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CustomEvent {
     pub kind: String,

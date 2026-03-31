@@ -1,5 +1,0 @@
-{
-  "last_turn_at": "2026-03-08T11:13:36.745Z",
-  "turn_count": 4,
-  "last_agent_output": "Done.\n\nWhat’s implemented on `main` / `origin/main`:\n- Gateway-first architecture:\n  - CLI + HTTP we"
-}

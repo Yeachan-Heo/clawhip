@@ -1,9 +1,0 @@
-{
-  "session_id": "omx-1772965833622-69uz5f",
-  "started_at": "2026-03-08T10:30:33.735Z",
-  "cwd": "/home/bellman/Workspace/clawhip",
-  "pid": 3930202,
-  "platform": "linux",
-  "pid_start_ticks": 129059030,
-  "pid_cmdline": "node /home/bellman/.nvm/versions/node/v25.1.0/bin/omx --madmax"
-}

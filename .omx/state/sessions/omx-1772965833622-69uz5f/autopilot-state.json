@@ -1,6 +1,0 @@
-{
-  "current_phase": "execution",
-  "active": true,
-  "completed_at": "2026-03-08T11:15:00Z",
-  "task_description": "Refactor clawhip into a daemon-first architecture: CLI commands post to local daemon API, daemon owns Discord delivery and built-in git/tmux monitoring, tmux wrapper registers sessions with daemon, add status and systemd unit."
-}
