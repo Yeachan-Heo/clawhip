@@ -790,6 +790,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
                 template: None,
+                action: None,
             }],
             ..AppConfig::default()
         };

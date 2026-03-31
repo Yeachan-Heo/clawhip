@@ -49,8 +49,9 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
 
+    let actions = crate::action::default_actions();
     tokio::spawn(async move {
-        let mut dispatcher = Dispatcher::new(rx, router, renderer, sinks);
+        let mut dispatcher = Dispatcher::new(rx, router, renderer, sinks, actions);
         if let Err(error) = dispatcher.run().await {
             eprintln!("clawhip dispatcher stopped: {error}");
         }

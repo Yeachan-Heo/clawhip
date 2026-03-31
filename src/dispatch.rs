@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::Result;
+use crate::action::{Action, ActionOutcome};
 use crate::core::timer_wheel::{DelayedEntry, TimerWheel};
 use crate::events::IncomingEvent;
 use crate::render::Renderer;
@@ -20,6 +21,7 @@ pub struct Dispatcher {
     router: Router,
     renderer: Box<dyn Renderer>,
     sinks: HashMap<String, Box<dyn Sink>>,
+    actions: HashMap<String, Box<dyn Action>>,
     ci_batcher: GitHubCiBatcher,
     batch_tick: Duration,
 }
@@ -30,12 +32,14 @@ impl Dispatcher {
         router: Router,
         renderer: Box<dyn Renderer>,
         sinks: HashMap<String, Box<dyn Sink>>,
+        actions: HashMap<String, Box<dyn Action>>,
     ) -> Self {
         Self {
             rx,
             router,
             renderer,
             sinks,
+            actions,
             ci_batcher: GitHubCiBatcher::new(DEFAULT_CI_BATCH_WINDOW),
             batch_tick: DEFAULT_BATCH_TICK,
         }
@@ -108,6 +112,23 @@ impl Dispatcher {
         };
 
         for delivery in deliveries {
+            if let Some(ref action_spec) = delivery.action {
+                if let Some(action) = self.actions.get(action_spec.action_type.as_str()) {
+                    match action.execute(action_spec, &event).await {
+                        ActionOutcome::Success(msg) => {
+                            eprintln!("clawhip action ok: {msg}");
+                        }
+                        ActionOutcome::Failed(msg) => {
+                            eprintln!("clawhip action failed: {msg}");
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "clawhip dispatcher unknown action type '{}'",
+                        action_spec.action_type
+                    );
+                }
+            }
             let Some(sink) = self.sinks.get(delivery.sink.as_str()) else {
                 eprintln!(
                     "clawhip dispatcher missing sink '{}' for target {:?}",
@@ -476,7 +497,7 @@ mod tests {
             Box::new(DiscordSink::from_config(Arc::new(AppConfig::default())).unwrap()),
         );
         sinks.insert("slack".into(), Box::new(SlackSink::default()));
-        Dispatcher::new(rx, router, Box::new(DefaultRenderer), sinks)
+        Dispatcher::new(rx, router, Box::new(DefaultRenderer), sinks, HashMap::new())
     }
 
     #[tokio::test]
@@ -526,6 +547,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: Some("first".into()),
+                    action: None,
                 },
                 RouteRule {
                     event: "tmux.keyword".into(),
@@ -538,6 +560,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: Some("second".into()),
+                    action: None,
                 },
             ],
             ..AppConfig::default()

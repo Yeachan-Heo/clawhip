@@ -92,6 +92,14 @@ impl Default for DefaultsConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionSpec {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    pub target: Option<String>,
+    pub keys: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteRule {
     pub event: String,
@@ -107,6 +115,8 @@ pub struct RouteRule {
     pub allow_dynamic_tokens: bool,
     pub format: Option<MessageFormat>,
     pub template: Option<String>,
+    #[serde(default)]
+    pub action: Option<ActionSpec>,
 }
 
 impl Default for RouteRule {
@@ -122,6 +132,7 @@ impl Default for RouteRule {
             allow_dynamic_tokens: false,
             format: None,
             template: None,
+            action: None,
         }
     }
 }
@@ -517,6 +528,19 @@ impl AppConfig {
                 }
                 _ => unreachable!(),
             }
+
+            if let Some(action) = &route.action {
+                const SUPPORTED_ACTIONS: &[&str] = &["tmux.send-keys"];
+                if !SUPPORTED_ACTIONS.contains(&action.action_type.as_str()) {
+                    return Err(format!(
+                        "route #{} ({}) uses unsupported action type '{}'",
+                        index + 1,
+                        route.event,
+                        action.action_type
+                    )
+                    .into());
+                }
+            }
         }
 
         if self.effective_token().is_none() && !self.has_webhook_routes() {
@@ -558,6 +582,7 @@ impl AppConfig {
             allow_dynamic_tokens: false,
             format: None,
             template: None,
+            action: None,
         });
     }
 
@@ -938,5 +963,75 @@ mod tests {
     fn tmux_session_monitor_defaults_keyword_window_to_thirty_seconds() {
         let session = TmuxSessionMonitor::default();
         assert_eq!(session.keyword_window_secs, 30);
+    }
+
+    #[test]
+    fn route_action_parses_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[routes]]
+event = "tmux.stale"
+sink = "discord"
+webhook = "https://discord.com/api/webhooks/123/abc"
+
+[routes.action]
+type = "tmux.send-keys"
+target = "{session}"
+keys = "continue"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.routes.len(), 1);
+        let action = config.routes[0].action.as_ref().unwrap();
+        assert_eq!(action.action_type, "tmux.send-keys");
+        assert_eq!(action.target.as_deref(), Some("{session}"));
+        assert_eq!(action.keys.as_deref(), Some("continue"));
+    }
+
+    #[test]
+    fn route_action_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[routes]]
+event = "tmux.keyword"
+sink = "discord"
+webhook = "https://discord.com/api/webhooks/123/abc"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.routes.len(), 1);
+        assert!(config.routes[0].action.is_none());
+    }
+
+    #[test]
+    fn route_action_rejects_unsupported_type() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.stale".into(),
+                webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                action: Some(ActionSpec {
+                    action_type: "unsupported.type".into(),
+                    target: None,
+                    keys: None,
+                }),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("unsupported action type"));
     }
 }
