@@ -740,6 +740,7 @@ impl AppConfig {
         self.providers.discord.legacy_default_channel =
             normalize_text(self.providers.discord.legacy_default_channel.clone());
         self.defaults.channel = normalize_text(self.defaults.channel.clone());
+        self.dispatch.ci_batch_window_secs = self.dispatch.ci_batch_window_secs.max(1);
         self.monitors.github_token = normalize_secret(self.monitors.github_token.clone());
 
         for route in &mut self.routes {

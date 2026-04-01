@@ -809,6 +809,9 @@ mod tests {
             Duration::from_secs(config.dispatch.ci_batch_window_secs),
         );
 
-        assert_eq!(dispatcher.ci_batcher.window, Duration::from_secs(90));
+        assert_eq!(
+            dispatcher.ci_batcher.window,
+            Duration::from_secs(config.dispatch.ci_batch_window_secs)
+        );
     }
 }
