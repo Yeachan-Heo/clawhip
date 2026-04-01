@@ -553,6 +553,7 @@ clawhip tmux watch -s <existing-session> \
 Behavior:
 - `tmux new` creates a tmux session using the user's default shell (or `--shell` override)
 - `tmux new` sends the requested command into the session, retrying Enter for TUI apps by default with exponential backoff (`--retry-enter=false` disables it, `--retry-enter-count` / `--retry-enter-delay-ms` tune retries)
+- when `tmux new` omits `--channel`, clawhip reuses the first matching Discord route channel for the session name before falling back to `defaults.channel`
 - `tmux watch` attaches monitoring to an already-running tmux session
 - both commands register the session with the daemon
 - daemon monitors keyword/stale events

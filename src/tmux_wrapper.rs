@@ -7,13 +7,14 @@ use crate::Result;
 use crate::cli::{TmuxNewArgs, TmuxWatchArgs, TmuxWrapperFormat};
 use crate::client::DaemonClient;
 use crate::config::AppConfig;
+use crate::router::resolve_tmux_session_channel;
 use crate::source::tmux::{
     RegisteredTmuxSession, content_hash, monitor_registered_session, session_exists, tmux_bin,
 };
 
 pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
     launch_session(&args).await?;
-    let monitor_args = TmuxMonitorArgs::from(&args);
+    let monitor_args = TmuxMonitorArgs::from_new_args(&args, config);
     let monitor = register_and_start_monitor(monitor_args, config).await?;
 
     if args.attach {
@@ -56,6 +57,16 @@ impl From<&TmuxNewArgs> for TmuxMonitorArgs {
             stale_minutes: value.stale_minutes,
             format: value.format,
         }
+    }
+}
+
+impl TmuxMonitorArgs {
+    fn from_new_args(value: &TmuxNewArgs, config: &AppConfig) -> Self {
+        let mut monitor_args = Self::from(value);
+        if monitor_args.channel.is_none() {
+            monitor_args.channel = resolve_tmux_session_channel(config, &value.session);
+        }
+        monitor_args
     }
 }
 
@@ -287,6 +298,8 @@ fn default_keyword_window_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppConfig, DefaultsConfig, RouteRule};
+    use std::collections::BTreeMap;
 
     #[test]
     fn build_command_to_send_preserves_shell_arguments_when_joining() {
@@ -391,6 +404,92 @@ mod tests {
             monitor_args.format,
             Some(TmuxWrapperFormat::Inline)
         ));
+    }
+
+    #[test]
+    fn new_args_auto_resolve_channel_from_routes() {
+        let args = TmuxNewArgs {
+            session: "xeroclaw-22".into(),
+            window_name: None,
+            cwd: None,
+            channel: None,
+            mention: None,
+            keywords: Vec::new(),
+            stale_minutes: 10,
+            format: None,
+            attach: false,
+            retry_enter: true,
+            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
+            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
+            shell: None,
+            command: vec!["codex".into()],
+        };
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: crate::events::MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.*".into(),
+                filter: BTreeMap::from([("session".into(), "xeroclaw-*".into())]),
+                sink: "discord".into(),
+                channel: Some("xeroclaw-dev".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+
+        let monitor_args = TmuxMonitorArgs::from_new_args(&args, &config);
+
+        assert_eq!(monitor_args.channel.as_deref(), Some("xeroclaw-dev"));
+    }
+
+    #[test]
+    fn new_args_keep_explicit_channel_over_route_resolution() {
+        let args = TmuxNewArgs {
+            session: "xeroclaw-22".into(),
+            window_name: None,
+            cwd: None,
+            channel: Some("manual".into()),
+            mention: None,
+            keywords: Vec::new(),
+            stale_minutes: 10,
+            format: None,
+            attach: false,
+            retry_enter: true,
+            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
+            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
+            shell: None,
+            command: vec!["codex".into()],
+        };
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: crate::events::MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.*".into(),
+                filter: BTreeMap::from([("session".into(), "xeroclaw-*".into())]),
+                sink: "discord".into(),
+                channel: Some("xeroclaw-dev".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+
+        let monitor_args = TmuxMonitorArgs::from_new_args(&args, &config);
+
+        assert_eq!(monitor_args.channel.as_deref(), Some("manual"));
     }
 
     #[test]

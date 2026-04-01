@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use serde_json::json;
+
 use crate::Result;
 use crate::config::{AppConfig, RouteRule, default_sink_name};
 use crate::dynamic_tokens;
@@ -174,21 +176,10 @@ impl Router {
 
     fn routes_for<'a>(&'a self, event: &IncomingEvent) -> Vec<&'a RouteRule> {
         let context = event.template_context();
-        let candidates = route_candidates(event.canonical_kind());
         self.config
             .routes
             .iter()
-            .filter(|route| {
-                candidates
-                    .iter()
-                    .any(|candidate| glob_match(&route.event, candidate))
-                    && route.filter.iter().all(|(key, expected)| {
-                        context
-                            .get(key)
-                            .map(|actual| glob_match(expected, actual))
-                            .unwrap_or(false)
-                    })
-            })
+            .filter(|route| route_matches(route, event.canonical_kind(), &context))
             .collect()
     }
 
@@ -234,6 +225,43 @@ impl Router {
     }
 }
 
+pub(crate) fn resolve_tmux_session_channel(
+    config: &AppConfig,
+    session_name: &str,
+) -> Option<String> {
+    let tmux_event =
+        IncomingEvent::tmux_keyword(session_name.to_string(), String::new(), String::new(), None);
+    let tmux_context = tmux_event.template_context();
+    let session_event = IncomingEvent {
+        kind: "session.started".to_string(),
+        channel: None,
+        mention: None,
+        format: None,
+        template: None,
+        payload: json!({
+            "session_name": session_name,
+            "session": session_name,
+            "tool": "tmux",
+        }),
+    };
+    let session_context = session_event.template_context();
+
+    for route in &config.routes {
+        let matches_tmux = route_matches(route, tmux_event.canonical_kind(), &tmux_context);
+        let matches_session =
+            route_matches(route, session_event.canonical_kind(), &session_context);
+        if !(matches_tmux || matches_session) || route.effective_sink() != "discord" {
+            continue;
+        }
+
+        if let Some(channel) = route_channel(route) {
+            return Some(channel.to_string());
+        }
+    }
+
+    config.defaults.channel.clone()
+}
+
 fn route_candidates(kind: &str) -> Vec<&str> {
     match kind {
         "git.commit" => vec!["git.commit", "github.commit"],
@@ -254,6 +282,30 @@ fn route_candidates(kind: &str) -> Vec<&str> {
         }
         other => vec![other],
     }
+}
+
+fn route_matches(
+    route: &RouteRule,
+    canonical_kind: &str,
+    context: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    route_candidates(canonical_kind)
+        .iter()
+        .any(|candidate| glob_match(&route.event, candidate))
+        && route.filter.iter().all(|(key, expected)| {
+            context
+                .get(key)
+                .map(|actual| glob_match(expected, actual))
+                .unwrap_or(false)
+        })
+}
+
+fn route_channel(route: &RouteRule) -> Option<&str> {
+    route
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|channel| !channel.is_empty())
 }
 
 fn glob_match(pattern: &str, value: &str) -> bool {
@@ -304,6 +356,7 @@ mod tests {
     use crate::render::DefaultRenderer;
     use crate::sink::{DiscordSink, SlackSink};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn resolve_returns_all_matching_deliveries_in_route_order() {
@@ -1189,6 +1242,90 @@ mod tests {
         assert_eq!(
             delivery.target,
             SinkTarget::SlackWebhook("https://hooks.slack.com/services/T/B/generic".into())
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_session_channel_prefers_matching_tmux_route() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.*".into(),
+                filter: BTreeMap::from([("session".into(), "xeroclaw-*".into())]),
+                sink: "discord".into(),
+                channel: Some("xeroclaw-dev".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            resolve_tmux_session_channel(&config, "xeroclaw-42").as_deref(),
+            Some("xeroclaw-dev")
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_session_channel_supports_session_routes() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "session.*".into(),
+                filter: BTreeMap::from([("session_name".into(), "xeroclaw-*".into())]),
+                sink: "discord".into(),
+                channel: Some("xeroclaw-dev".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            resolve_tmux_session_channel(&config, "xeroclaw-42").as_deref(),
+            Some("xeroclaw-dev")
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_session_channel_skips_webhooks_and_falls_back_to_defaults() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.*".into(),
+                filter: BTreeMap::from([("session".into(), "xeroclaw-*".into())]),
+                sink: "discord".into(),
+                channel: None,
+                webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            resolve_tmux_session_channel(&config, "xeroclaw-42").as_deref(),
+            Some("default")
         );
     }
 
