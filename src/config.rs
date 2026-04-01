@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +91,12 @@ impl Default for DispatchConfig {
         Self {
             ci_batch_window_secs: default_ci_batch_window_secs(),
         }
+    }
+}
+
+impl DispatchConfig {
+    pub fn ci_batch_window(&self) -> Duration {
+        Duration::from_secs(self.ci_batch_window_secs.max(1))
     }
 }
 
