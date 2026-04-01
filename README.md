@@ -252,9 +252,14 @@ clawhip sends high-volume notifications (commits, PRs, tmux keyword alerts, stal
 [providers.discord]
 token = "your-dedicated-clawhip-bot-token"
 default_channel = "your-default-channel-id"
+
+[dispatch]
+ci_batch_window_secs = 300
 ```
 
 Legacy `[discord]` config is still accepted and normalized at load time.
+
+`[dispatch].ci_batch_window_secs` controls how long clawhip waits before flushing a GitHub CI batch summary. Leave it unset to keep the 30-second default, or increase it for longer workflows that finish jobs over several minutes.
 
 ## Discord webhook setup
 

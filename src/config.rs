@@ -17,6 +17,8 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "ProvidersConfig::is_empty")]
     pub providers: ProvidersConfig,
     #[serde(default)]
+    pub dispatch: DispatchConfig,
+    #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub defaults: DefaultsConfig,
@@ -73,6 +75,20 @@ impl Default for DaemonConfig {
             bind_host: default_bind_host(),
             port: default_port(),
             base_url: default_base_url(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchConfig {
+    #[serde(default = "default_ci_batch_window_secs")]
+    pub ci_batch_window_secs: u64,
+}
+
+impl Default for DispatchConfig {
+    fn default() -> Self {
+        Self {
+            ci_batch_window_secs: default_ci_batch_window_secs(),
         }
     }
 }
@@ -330,6 +346,9 @@ fn default_remote() -> String {
 fn default_stale_minutes() -> u64 {
     10
 }
+fn default_ci_batch_window_secs() -> u64 {
+    30
+}
 fn default_keyword_window_secs() -> u64 {
     30
 }
@@ -493,6 +512,10 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.dispatch.ci_batch_window_secs == 0 {
+            return Err("dispatch.ci_batch_window_secs must be at least 1".into());
+        }
+
         for (index, route) in self.routes.iter().enumerate() {
             let sink = route.effective_sink();
             let has_channel = normalize_secret(route.channel.clone()).is_some();
@@ -682,6 +705,7 @@ impl AppConfig {
             "  Bind host/port: {}:{}",
             self.daemon.bind_host, self.daemon.port
         );
+        println!("  CI batch window: {}s", self.dispatch.ci_batch_window_secs);
         println!(
             "  Default channel: {}",
             self.defaults.channel.as_deref().unwrap_or("<unset>")
@@ -697,7 +721,7 @@ impl AppConfig {
     fn print_template_hint(&self) {
         println!("Edit the config file directly for routes and monitor definitions.");
         println!(
-            "Sections: [providers.discord], [daemon], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
+            "Sections: [providers.discord], [dispatch], [daemon], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
         );
         println!(
             "Routes may set either channel = \"...\" or webhook = \"https://discord.com/api/webhooks/...\"."
@@ -1021,6 +1045,56 @@ mod tests {
         let session = TmuxSessionMonitor::default();
         assert_eq!(session.keyword_window_secs, 30);
     }
+
+    #[test]
+    fn dispatch_config_defaults_ci_batch_window_to_thirty_seconds() {
+        let config = AppConfig::default();
+        assert_eq!(config.dispatch.ci_batch_window_secs, 30);
+    }
+
+    #[test]
+    fn load_or_default_parses_dispatch_ci_batch_window_secs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[providers.discord]\ntoken = \"abc\"\n[dispatch]\nci_batch_window_secs = 90\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.dispatch.ci_batch_window_secs, 90);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn load_or_default_defaults_dispatch_ci_batch_window_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[providers.discord]\ntoken = \"abc\"\n").unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.dispatch.ci_batch_window_secs, 30);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn load_or_default_normalizes_zero_dispatch_ci_batch_window_secs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[providers.discord]\ntoken = \"abc\"\n[dispatch]\nci_batch_window_secs = 0\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+        assert_eq!(config.dispatch.ci_batch_window_secs, 1);
+        assert!(config.validate().is_ok());
+    }
+
     #[test]
     fn workspace_monitor_defaults_are_backward_compatible() {
         let config: AppConfig = toml::from_str(

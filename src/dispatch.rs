@@ -12,7 +12,6 @@ use crate::render::Renderer;
 use crate::router::Router;
 use crate::sink::{Sink, SinkMessage};
 
-const DEFAULT_CI_BATCH_WINDOW: Duration = Duration::from_secs(30);
 const DEFAULT_BATCH_TICK: Duration = Duration::from_secs(1);
 
 pub struct Dispatcher {
@@ -30,20 +29,26 @@ impl Dispatcher {
         router: Router,
         renderer: Box<dyn Renderer>,
         sinks: HashMap<String, Box<dyn Sink>>,
+        ci_batch_window: Duration,
     ) -> Self {
         Self {
             rx,
             router,
             renderer,
             sinks,
-            ci_batcher: GitHubCiBatcher::new(DEFAULT_CI_BATCH_WINDOW),
+            ci_batcher: GitHubCiBatcher::new(ci_batch_window),
             batch_tick: DEFAULT_BATCH_TICK,
         }
     }
 
     #[cfg(test)]
-    fn with_ci_batch_window(mut self, window: Duration, tick: Duration) -> Self {
+    fn with_ci_batch_window(mut self, window: Duration) -> Self {
         self.ci_batcher = GitHubCiBatcher::new(window);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_batch_tick(mut self, tick: Duration) -> Self {
         self.batch_tick = tick;
         self
     }
@@ -476,7 +481,13 @@ mod tests {
             Box::new(DiscordSink::from_config(Arc::new(AppConfig::default())).unwrap()),
         );
         sinks.insert("slack".into(), Box::new(SlackSink::default()));
-        Dispatcher::new(rx, router, Box::new(DefaultRenderer), sinks)
+        Dispatcher::new(
+            rx,
+            router,
+            Box::new(DefaultRenderer),
+            sinks,
+            Duration::from_secs(30),
+        )
     }
 
     #[tokio::test]
@@ -656,7 +667,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         let router = Router::new(Arc::new(config));
         let mut dispatcher = test_dispatcher(rx, router)
-            .with_ci_batch_window(Duration::from_millis(20), Duration::from_millis(5));
+            .with_ci_batch_window(Duration::from_millis(20))
+            .with_batch_tick(Duration::from_millis(5));
         let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
 
         for workflow in ["Build", "Test"] {
@@ -698,6 +710,21 @@ mod tests {
             "url": "https://github.com/org/repo/actions/runs/123456789/jobs/42"
         });
         assert_eq!(ci_batch_key(&payload), "clawhip:86:abc:123456789");
+    }
+
+    #[test]
+    fn dispatcher_uses_provided_ci_batch_window() {
+        let (_tx, rx) = mpsc::channel(1);
+        let router = Router::new(Arc::new(AppConfig::default()));
+        let dispatcher = Dispatcher::new(
+            rx,
+            router,
+            Box::new(DefaultRenderer),
+            HashMap::new(),
+            Duration::from_secs(90),
+        );
+
+        assert_eq!(dispatcher.ci_batcher.window, Duration::from_secs(90));
     }
 
     #[test]
@@ -754,5 +781,34 @@ mod tests {
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].canonical_kind(), "github.ci-failed");
         assert_eq!(flushed[0].payload["total_count"], json!(2));
+    }
+
+    #[test]
+    fn dispatcher_uses_configured_ci_batch_window_from_app_config() {
+        let (_tx, rx) = mpsc::channel(1);
+        let router = Router::new(Arc::new(AppConfig::default()));
+        let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
+        sinks.insert(
+            "discord".into(),
+            Box::new(DiscordSink::from_config(Arc::new(AppConfig::default())).unwrap()),
+        );
+        sinks.insert("slack".into(), Box::new(SlackSink::default()));
+
+        let config = AppConfig {
+            dispatch: crate::config::DispatchConfig {
+                ci_batch_window_secs: 90,
+            },
+            ..AppConfig::default()
+        };
+
+        let dispatcher = Dispatcher::new(
+            rx,
+            router,
+            Box::new(DefaultRenderer),
+            sinks,
+            Duration::from_secs(config.dispatch.ci_batch_window_secs),
+        );
+
+        assert_eq!(dispatcher.ci_batcher.window, Duration::from_secs(90));
     }
 }
