@@ -747,7 +747,6 @@ impl AppConfig {
         self.providers.discord.legacy_default_channel =
             normalize_text(self.providers.discord.legacy_default_channel.clone());
         self.defaults.channel = normalize_text(self.defaults.channel.clone());
-        self.dispatch.ci_batch_window_secs = self.dispatch.ci_batch_window_secs.max(1);
         self.monitors.github_token = normalize_secret(self.monitors.github_token.clone());
 
         for route in &mut self.routes {
@@ -1089,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn load_or_default_normalizes_zero_dispatch_ci_batch_window_secs() {
+    fn load_or_default_preserves_zero_dispatch_ci_batch_window_secs_until_validation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(
@@ -1099,8 +1098,9 @@ mod tests {
         .unwrap();
 
         let config = AppConfig::load_or_default(&path).unwrap();
-        assert_eq!(config.dispatch.ci_batch_window_secs, 1);
-        assert!(config.validate().is_ok());
+        assert_eq!(config.dispatch.ci_batch_window_secs, 0);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("dispatch.ci_batch_window_secs must be at least 1"));
     }
 
     #[test]
