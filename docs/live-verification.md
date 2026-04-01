@@ -67,6 +67,39 @@ Operational flow:
 4. Confirm clawhip normalizes it into the expected `session.*` route family.
 5. Post one representative OMX payload carrying `context.normalized_event` to `/event`.
 6. Confirm the rendered message stays low-noise and includes normalized metadata like repo/session/issue/PR when present.
+7. Pipe the same OMX payload through the native OMX CLI ingress and confirm acceptance:
+
+```bash
+printf '%s\n' '{
+  "schema_version": "1",
+  "event": "session-start",
+  "timestamp": "2026-04-01T22:00:00Z",
+  "context": {
+    "normalized_event": "started",
+    "agent_name": "omx",
+    "session_name": "issue-65-native-sdk",
+    "status": "started"
+  }
+}' | clawhip omx hook
+```
+
+8. Post the same OMX payload to the native OMX daemon ingress and confirm acceptance:
+
+```bash
+curl -sS -X POST http://127.0.0.1:25294/api/omx/hook \
+  -H 'content-type: application/json' \
+  -d '{
+    "schema_version": "1",
+    "event": "session-start",
+    "timestamp": "2026-04-01T22:00:00Z",
+    "context": {
+      "normalized_event": "started",
+      "agent_name": "omx",
+      "session_name": "issue-65-native-sdk",
+      "status": "started"
+    }
+  }'
+```
 
 ### tmux presets
 

@@ -755,6 +755,7 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
                 .and_then(infer_test_runner)
                 .map(ToString::to_string)
         });
+    let elapsed_secs = first_u64(payload, &["/elapsed_secs", "/context/elapsed_secs"]);
     let status = first_string(payload, &["/status", "/context/status", "/signal/phase"])
         .or_else(|| event_status_from_kind(canonical_kind).map(ToString::to_string));
     let summary = first_string(
@@ -873,6 +874,7 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
     insert_string_if_missing(object, "command", command);
     insert_string_if_missing(object, "tool_name", tool_name);
     insert_string_if_missing(object, "test_runner", test_runner);
+    insert_u64_if_missing(object, "elapsed_secs", elapsed_secs);
     insert_string_if_missing(object, "status", status);
     insert_string_if_missing(object, "summary", summary);
     insert_string_if_missing(object, "error_message", error_message);
@@ -1416,6 +1418,7 @@ mod tests {
                     "worktree_path": "/repo/clawhip-worktrees/issue-65",
                     "branch": "feat/issue-65-native-event-contract-polish",
                     "issue_number": 65,
+                    "elapsed_secs": 42,
                     "error_summary": "cargo test failed"
                 }
             }),
@@ -1429,6 +1432,7 @@ mod tests {
         );
         assert_eq!(event.payload["repo_name"], json!("clawhip"));
         assert_eq!(event.payload["issue_number"], json!(65));
+        assert_eq!(event.payload["elapsed_secs"], json!(42));
         assert_eq!(event.payload["error_message"], json!("cargo test failed"));
         assert_eq!(
             event.payload["event_timestamp"],

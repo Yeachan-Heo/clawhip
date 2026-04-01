@@ -1,11 +1,12 @@
 # clawhip × OMX (oh-my-codex)
 
-Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with automatic Discord notifications via clawhip.
+Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with native clawhip event routing and automatic Discord notifications.
 
 ## What you get
 
-- Legacy-compatible `agent.started`, `agent.finished`, and `agent.failed` wrapper emits via `clawhip emit`
+- Native lifecycle emits via `clawhip omx hook`
 - clawhip-side normalization of richer native OMC/OMX events into the canonical `session.*` routing contract
+- Native OMX hook bridge assets in `integrations/omx/` for first-class OMX plugin forwarding
 - Session keyword alerts (error, PR created, complete, etc.)
 - Stale session detection (no output for N minutes)
 - All notifications routed to the correct Discord channel
@@ -36,7 +37,9 @@ Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with au
 ./create.sh issue-123 ~/my-project/worktrees/issue-123 "Fix the bug in src/main.rs and create a PR to dev" 1234567890 "<@user-id>"
 ```
 
-`create.sh` now emits lifecycle notifications directly from the OMX shell session, so you no longer need a separate lifecycle watcher command. If you pass a prompt, the script waits 10 seconds for the TUI to initialize, then sends the prompt via `tmux send-keys -l` before pressing Enter.
+`create.sh` now emits native clawhip v1 hook envelopes directly from the OMX shell session via `clawhip omx hook`, so you no longer need a separate lifecycle watcher command. If you pass a prompt, the script waits 10 seconds for the TUI to initialize, then sends the prompt via `tmux send-keys -l` before pressing Enter.
+
+For a first-class `.omx/hooks/*.mjs` bridge, see [`integrations/omx/`](../../integrations/omx/).
 
 ### Send a prompt
 

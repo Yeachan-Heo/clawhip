@@ -48,10 +48,19 @@ Upstream OMX hook payloads must use these hyphenated `normalized_event` values:
 - `handoff-needed`
 
 > Note: underscore spellings such as `retry_needed`, `pr_created`, `test_started`, `test_finished`, `test_failed`, and `handoff_needed` appear in issue prose but are **not** the frozen wire-format contract.
+>
+> Raw OMX hook events such as `pre-tool-use` / `post-tool-use` are also **not** frozen v1 canonical events. If OMX wants clawhip routing for a tool operation, it must map that operation onto one of the supported normalized events above and carry tool details as metadata.
 
 ## OMX hook envelope format
 
 clawhip accepts OMX hook envelope JSON with `schema_version = "1"`.
+
+Recommended native daemon ingress for this envelope:
+
+- `POST /api/omx/hook`
+- `POST /omx/hook`
+
+This lets native OMX integrations forward the frozen v1 envelope directly without translating it into clawhip's generic `/event` payload shape first.
 
 ```json
 {

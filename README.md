@@ -187,6 +187,10 @@ Built-in starter plugins:
 - `plugins/codex/`
 - `plugins/claude-code/`
 
+Native OMX hook-forwarding assets are bundled separately under:
+
+- `integrations/omx/`
+
 List installed plugins with:
 
 ```bash
@@ -436,6 +440,8 @@ Accepted upstream inputs:
 - legacy wrapper emits like `agent.started` / `agent.finished` / `agent.failed`
 - OMC command/HTTP payloads with `signal.routeKey`
 - OMX hook payloads with `context.normalized_event`
+- native OMX hook-envelope CLI ingress via `clawhip omx hook`
+- native OMX hook-envelope POSTs to `POST /api/omx/hook`
 
 Canonical normalized events:
 - `session.started`
@@ -475,8 +481,12 @@ Route guidance:
 - `agent.*` remains supported for clawhip-local wrapper compatibility
 - `agent.started|blocked|finished|failed` and `session.started|blocked|finished|failed` cross-match in routing for backward compatibility
 - prefer route filters like `tool`, `repo_name`, `session_name`, `issue_number`, and `branch` over brittle message parsing
+- for OMX hook plugins, prefer forwarding the frozen v1 envelope to `POST /api/omx/hook` instead of translating it into a generic `/event` payload
+
+Native OMX bridge assets live in [`integrations/omx/`](integrations/omx/).
 
 See [`docs/native-event-contract.md`](docs/native-event-contract.md) for the full normalization/deprecation notes.
+See [`integrations/omx/README.md`](integrations/omx/README.md) for the OMX-native SDK/helper surface.
 
 ### 8. Agent lifecycle preset family
 
@@ -784,6 +794,7 @@ clawhip send ...        # thin client custom event
 clawhip github ...      # thin client GitHub event
 clawhip git ...         # thin client git event
 clawhip agent ...       # thin client agent lifecycle event
+clawhip omx hook ...    # native OMX hook-envelope thin client
 clawhip tmux ...        # thin client / wrapper surface
 clawhip plugin list     # list installed/bundled shell-hook plugins
 ```

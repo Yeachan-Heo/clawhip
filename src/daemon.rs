@@ -14,7 +14,7 @@ use crate::Result;
 use crate::VERSION;
 use crate::config::AppConfig;
 use crate::dispatch::Dispatcher;
-use crate::event::compat::from_incoming_event;
+use crate::event::compat::{from_incoming_event, incoming_event_from_omx_hook_envelope_json};
 use crate::events::{IncomingEvent, normalize_event};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
@@ -71,6 +71,8 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         .route("/event", post(post_event))
         .route("/api/event", post(post_event))
         .route("/events", post(post_event))
+        .route("/omx/hook", post(post_omx_hook))
+        .route("/api/omx/hook", post(post_omx_hook))
         .route("/api/tmux/register", post(register_tmux))
         .route("/github", post(post_github));
     let port = port_override.unwrap_or(config.daemon.port);
@@ -135,7 +137,28 @@ async fn post_event(
     State(state): State<AppState>,
     Json(event): Json<IncomingEvent>,
 ) -> impl IntoResponse {
-    let event = normalize_event(event);
+    accept_event(&state, normalize_event(event)).await
+}
+
+async fn post_omx_hook(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let event = match incoming_event_from_omx_hook_envelope_json(&payload) {
+        Ok(event) => normalize_event(event),
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    accept_event(&state, event).await
+}
+
+async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response::Response {
     let envelope = match from_incoming_event(&event) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -361,6 +384,82 @@ mod tests {
                 .get("first_seen_at")
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn post_omx_hook_accepts_native_hook_envelope_and_queues_normalized_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let payload = json!({
+            "schema_version": "1",
+            "event": "session-start",
+            "timestamp": "2026-04-01T22:00:00Z",
+            "context": {
+                "normalized_event": "started",
+                "agent_name": "omx",
+                "session_name": "issue-65-native-sdk",
+                "status": "started",
+                "repo_path": "/repo/clawhip",
+                "branch": "feat/issue-65-native-sdk"
+            }
+        });
+
+        let response = post_omx_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        let event_id = response_json["event_id"].as_str().unwrap();
+        assert!(!event_id.is_empty());
+        assert_eq!(response_json["type"], Value::from("session.started"));
+
+        let queued = rx.recv().await.unwrap();
+        assert_eq!(queued.kind, "session.started");
+        assert_eq!(queued.payload["tool"], Value::from("omx"));
+        assert_eq!(
+            queued.payload["session_name"],
+            Value::from("issue-65-native-sdk")
+        );
+        assert_eq!(queued.payload["event_id"], Value::from(event_id));
+    }
+
+    #[tokio::test]
+    async fn post_omx_hook_rejects_missing_normalized_event() {
+        let (tx, _rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let payload = json!({
+            "schema_version": "1",
+            "event": "session-start",
+            "context": {
+                "agent_name": "omx",
+                "status": "started"
+            }
+        });
+
+        let response = post_omx_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            response_json["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("context.normalized_event"))
         );
     }
 }

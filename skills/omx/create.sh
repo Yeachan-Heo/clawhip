@@ -44,34 +44,86 @@ ARGS=(
 [ -n "$CHANNEL" ] && ARGS+=(--channel "$CHANNEL")
 [ -n "$MENTION" ] && ARGS+=(--mention "$MENTION")
 
-EMIT_ARGS=()
-[ -n "$CHANNEL" ] && EMIT_ARGS+=(--channel "$CHANNEL")
-[ -n "$MENTION" ] && EMIT_ARGS+=(--mention "$MENTION")
-EMIT_SUFFIX=""
-if [ ${#EMIT_ARGS[@]} -gt 0 ]; then
-  printf -v EMIT_SUFFIX ' %q' "${EMIT_ARGS[@]}"
-fi
-
 quote() {
   printf '%q' "$1"
 }
 
-# Build the OMX command with native clawhip lifecycle emits
+# Build the OMX command with native clawhip hook-envelope lifecycle emits.
 OMX_CMD=$(cat <<EOF
 source ~/.zshrc
 START_TS=\$(date +%s)
+REPO_ROOT=\$(git -C $(quote "$WORKDIR") rev-parse --show-toplevel 2>/dev/null || printf %s $(quote "$WORKDIR"))
+BRANCH=\$(git -C $(quote "$WORKDIR") rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+emit_omx_event() {
+  local raw_event="\$1"
+  local normalized_event="\$2"
+  local status="\$3"
+  local summary="\${4:-}"
+  local error_summary="\${5:-}"
+  local elapsed="\${6:-}"
+  CLAWHIP_EVENT="\$raw_event" \\
+  CLAWHIP_NORMALIZED_EVENT="\$normalized_event" \\
+  CLAWHIP_STATUS="\$status" \\
+  CLAWHIP_SUMMARY="\$summary" \\
+  CLAWHIP_ERROR_SUMMARY="\$error_summary" \\
+  CLAWHIP_ELAPSED="\$elapsed" \\
+  CLAWHIP_SESSION=$(quote "$SESSION") \\
+  CLAWHIP_PROJECT=$(quote "$PROJECT") \\
+  CLAWHIP_REPO_PATH="\$REPO_ROOT" \\
+  CLAWHIP_WORKTREE_PATH=$(quote "$WORKDIR") \\
+  CLAWHIP_BRANCH="\$BRANCH" \\
+  CLAWHIP_CHANNEL=$(quote "$CHANNEL") \\
+  CLAWHIP_MENTION=$(quote "$MENTION") \\
+  node <<'NODE' | clawhip omx hook || true
+const clean = (value) => (typeof value === 'string' ? value.trim() : '');
+const number = (value) => {
+  const parsed = Number.parseInt(clean(value), 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+const payload = {
+  schema_version: '1',
+  event: clean(process.env.CLAWHIP_EVENT) || 'notify',
+  timestamp: new Date().toISOString(),
+  source: 'native',
+  context: {
+    normalized_event: clean(process.env.CLAWHIP_NORMALIZED_EVENT),
+    agent_name: 'omx',
+    session_name: clean(process.env.CLAWHIP_SESSION),
+    status: clean(process.env.CLAWHIP_STATUS),
+    project: clean(process.env.CLAWHIP_PROJECT),
+    repo_path: clean(process.env.CLAWHIP_REPO_PATH),
+    worktree_path: clean(process.env.CLAWHIP_WORKTREE_PATH),
+    branch: clean(process.env.CLAWHIP_BRANCH),
+  },
+  session_id: clean(process.env.CLAWHIP_SESSION),
+};
+const issueNumber = number(process.env.CLAWHIP_SESSION.match(/issue-(\\d+)/)?.[1] ?? '');
+if (issueNumber !== undefined) payload.context.issue_number = issueNumber;
+const summary = clean(process.env.CLAWHIP_SUMMARY);
+if (summary) payload.context.summary = summary;
+const errorSummary = clean(process.env.CLAWHIP_ERROR_SUMMARY);
+if (errorSummary) payload.context.error_summary = errorSummary;
+const elapsed = number(process.env.CLAWHIP_ELAPSED);
+if (elapsed !== undefined) payload.context.elapsed_secs = elapsed;
+const channel = clean(process.env.CLAWHIP_CHANNEL);
+if (channel) payload.channel = channel;
+const mention = clean(process.env.CLAWHIP_MENTION);
+if (mention) payload.mention = mention;
+process.stdout.write(JSON.stringify(payload));
+NODE
+}
 cleanup() {
   local exit_code=\$?
   local elapsed=\$(( \$(date +%s) - START_TS ))
   if [ "\$exit_code" -eq 0 ]; then
-    clawhip emit agent.finished --agent omx --session $(quote "$SESSION") --project $(quote "$PROJECT") --elapsed "\$elapsed"$EMIT_SUFFIX || true
+    emit_omx_event session-end finished finished "session finished" "" "\$elapsed"
   else
-    clawhip emit agent.failed --agent omx --session $(quote "$SESSION") --project $(quote "$PROJECT") --elapsed "\$elapsed" --error "exit \$exit_code"$EMIT_SUFFIX || true
+    emit_omx_event session-end failed failed "session failed" "exit \$exit_code" "\$elapsed"
   fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-clawhip emit agent.started --agent omx --session $(quote "$SESSION") --project $(quote "$PROJECT")$EMIT_SUFFIX || true
+emit_omx_event session-start started started "session started"
 ${OMX_ENV:+$OMX_ENV }omx $OMX_FLAGS
 EOF
 )

@@ -25,7 +25,7 @@ use clap::Parser;
 
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, GitCommands, GithubCommands, MemoryCommands,
-    PluginCommands, TmuxCommands,
+    OmxCommands, PluginCommands, TmuxCommands,
 };
 use crate::client::DaemonClient;
 use crate::config::AppConfig;
@@ -204,6 +204,15 @@ async fn real_main() -> Result<()> {
             }
             TmuxCommands::New(args) => tmux_wrapper::run(args, config.as_ref()).await,
             TmuxCommands::Watch(args) => tmux_wrapper::watch(args, config.as_ref()).await,
+        },
+        Commands::Omx { command } => match command {
+            OmxCommands::Hook(args) => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let payload = args.read_payload(&mut std::io::stdin())?;
+                let response = client.send_omx_hook(&payload).await?;
+                println!("{}", serde_json::to_string(&response)?);
+                Ok(())
+            }
         },
         Commands::Config { command } => match command.unwrap_or(ConfigCommand::Interactive) {
             ConfigCommand::Interactive => {

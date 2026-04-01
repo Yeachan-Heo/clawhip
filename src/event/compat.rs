@@ -17,6 +17,11 @@ pub fn from_incoming_event(event: &IncomingEvent) -> Result<EventEnvelope> {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn from_omx_hook_envelope_json(payload: &Value) -> Result<EventEnvelope> {
+    let incoming = incoming_event_from_omx_hook_envelope_json(payload)?;
+    from_incoming_event(&incoming)
+}
+
+pub fn incoming_event_from_omx_hook_envelope_json(payload: &Value) -> Result<IncomingEvent> {
     let schema_version = payload
         .get("schema_version")
         .and_then(Value::as_str)
@@ -55,7 +60,7 @@ pub fn from_omx_hook_envelope_json(payload: &Value) -> Result<EventEnvelope> {
         payload: payload.clone(),
     };
 
-    from_incoming_event(&incoming)
+    Ok(incoming)
 }
 
 impl TryFrom<&IncomingEvent> for EventEnvelope {
@@ -718,6 +723,32 @@ mod tests {
             }
             other => panic!("expected AgentTestFailed body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn converts_omx_hook_envelope_into_incoming_event() {
+        let event = incoming_event_from_omx_hook_envelope_json(&json!({
+            "schema_version": "1",
+            "event": "notify",
+            "channel": "alerts",
+            "mention": "@ops",
+            "context": {
+                "normalized_event": "pr-created",
+                "agent_name": "omx",
+                "status": "pr-created",
+                "session_name": "issue-65",
+                "pr_number": 91
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(event.kind, "notify");
+        assert_eq!(event.channel.as_deref(), Some("alerts"));
+        assert_eq!(event.mention.as_deref(), Some("@ops"));
+        assert_eq!(
+            event.payload["context"]["normalized_event"],
+            json!("pr-created")
+        );
     }
 
     #[test]
