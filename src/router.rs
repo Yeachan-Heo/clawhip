@@ -574,6 +574,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_matches_git_routes_on_worktree_path() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                filter: [("worktree_path".to_string(), "*/issue-115".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("worktrees".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "feat/issue-115".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        )
+        .with_repo_context(
+            Some("/repo/clawhip".into()),
+            Some("/repo/.worktrees/issue-115".into()),
+        );
+
+        let (channel, format, content) = router.preview(&event).await.unwrap();
+        assert_eq!(channel, "worktrees");
+        assert_eq!(format, MessageFormat::Compact);
+        assert_eq!(
+            content,
+            "git:clawhip[wt:issue-115]@feat/issue-115 1234567 ship it"
+        );
+    }
+
+    #[tokio::test]
     async fn route_level_mention_is_prepended_for_custom() {
         let config = AppConfig {
             defaults: DefaultsConfig {

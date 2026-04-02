@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +47,13 @@ struct GitRepoState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct MonitoredGitPath {
+    state_key: String,
+    repo_path: String,
+    worktree_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommitEntry {
     pub(crate) sha: String,
     pub(crate) summary: String,
@@ -55,6 +62,8 @@ pub(crate) struct CommitEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GitSnapshot {
     pub(crate) repo_name: String,
+    pub(crate) repo_path: String,
+    pub(crate) worktree_path: String,
     pub(crate) branch: String,
     pub(crate) head: String,
     pub(crate) commits: Vec<CommitEntry>,
@@ -66,67 +75,141 @@ async fn poll_git(
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut HashMap<String, GitRepoState>,
 ) -> Result<()> {
+    let mut active_keys = HashSet::new();
+
     for repo in &config.monitors.git.repos {
-        match snapshot_git_repo(repo).await {
-            Ok(snapshot) => {
-                if let Some(previous) = state.get(&repo.path) {
-                    if repo.emit_branch_changes && previous.branch != snapshot.branch {
-                        send_event(
-                            tx,
-                            IncomingEvent::git_branch_changed(
-                                snapshot.repo_name.clone(),
-                                previous.branch.clone(),
-                                snapshot.branch.clone(),
-                                repo.channel.clone(),
+        let monitored_paths = discover_monitored_git_paths(repo)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "clawhip source git worktree discovery failed for {}: {error}",
+                    repo.path
+                );
+                vec![MonitoredGitPath {
+                    state_key: repo.path.clone(),
+                    repo_path: repo.path.clone(),
+                    worktree_path: repo.path.clone(),
+                }]
+            });
+
+        for monitored in monitored_paths {
+            active_keys.insert(monitored.state_key.clone());
+
+            match snapshot_git_worktree(repo, &monitored).await {
+                Ok(snapshot) => {
+                    if let Some(previous) = state.get(&monitored.state_key) {
+                        if repo.emit_branch_changes && previous.branch != snapshot.branch {
+                            send_event(
+                                tx,
+                                IncomingEvent::git_branch_changed(
+                                    snapshot.repo_name.clone(),
+                                    previous.branch.clone(),
+                                    snapshot.branch.clone(),
+                                    repo.channel.clone(),
+                                )
+                                .with_repo_context(
+                                    Some(snapshot.repo_path.clone()),
+                                    Some(snapshot.worktree_path.clone()),
+                                )
+                                .with_mention(repo.mention.clone())
+                                .with_format(repo.format.clone()),
                             )
-                            .with_mention(repo.mention.clone())
-                            .with_format(repo.format.clone()),
-                        )
-                        .await?;
-                    }
-                    if repo.emit_commits && previous.head != snapshot.head {
-                        let commits = list_new_commits(repo, &previous.head, &snapshot.head)
+                            .await?;
+                        }
+                        if repo.emit_commits && previous.head != snapshot.head {
+                            let commits = list_new_commits_for_path(
+                                &snapshot.worktree_path,
+                                &previous.head,
+                                &snapshot.head,
+                            )
                             .await
                             .ok()
                             .filter(|entries| !entries.is_empty())
                             .unwrap_or_else(|| snapshot.commits.clone());
-                        let events = IncomingEvent::git_commit_events(
-                            snapshot.repo_name.clone(),
-                            snapshot.branch.clone(),
-                            commits
-                                .into_iter()
-                                .map(|commit| (commit.sha, commit.summary))
-                                .collect(),
-                            repo.channel.clone(),
-                        );
-                        for event in events {
-                            send_event(
-                                tx,
-                                event
-                                    .with_mention(repo.mention.clone())
-                                    .with_format(repo.format.clone()),
-                            )
-                            .await?;
+                            let events = IncomingEvent::git_commit_events(
+                                snapshot.repo_name.clone(),
+                                snapshot.branch.clone(),
+                                commits
+                                    .into_iter()
+                                    .map(|commit| (commit.sha, commit.summary))
+                                    .collect(),
+                                repo.channel.clone(),
+                            );
+                            for event in events {
+                                send_event(
+                                    tx,
+                                    event
+                                        .with_repo_context(
+                                            Some(snapshot.repo_path.clone()),
+                                            Some(snapshot.worktree_path.clone()),
+                                        )
+                                        .with_mention(repo.mention.clone())
+                                        .with_format(repo.format.clone()),
+                                )
+                                .await?;
+                            }
                         }
                     }
-                }
 
-                state.insert(
-                    repo.path.clone(),
-                    GitRepoState {
-                        branch: snapshot.branch,
-                        head: snapshot.head,
-                    },
-                );
+                    state.insert(
+                        monitored.state_key.clone(),
+                        GitRepoState {
+                            branch: snapshot.branch,
+                            head: snapshot.head,
+                        },
+                    );
+                }
+                Err(error) => eprintln!(
+                    "clawhip source git snapshot failed for {}: {error}",
+                    monitored.worktree_path
+                ),
             }
-            Err(error) => eprintln!(
-                "clawhip source git snapshot failed for {}: {error}",
-                repo.path
-            ),
         }
     }
 
+    state.retain(|key, _| active_keys.contains(key));
+
     Ok(())
+}
+
+async fn discover_monitored_git_paths(repo: &GitRepoMonitor) -> Result<Vec<MonitoredGitPath>> {
+    let output = run_command(
+        &git_bin(),
+        &["-C", &repo.path, "worktree", "list", "--porcelain"],
+    )
+    .await?;
+
+    let mut seen = HashSet::new();
+    let mut monitored = Vec::new();
+    for worktree_path in parse_worktree_list(&output) {
+        if seen.insert(worktree_path.clone()) {
+            monitored.push(MonitoredGitPath {
+                state_key: worktree_path.clone(),
+                repo_path: repo.path.clone(),
+                worktree_path,
+            });
+        }
+    }
+
+    if monitored.is_empty() {
+        monitored.push(MonitoredGitPath {
+            state_key: repo.path.clone(),
+            repo_path: repo.path.clone(),
+            worktree_path: repo.path.clone(),
+        });
+    }
+
+    Ok(monitored)
+}
+
+fn parse_worktree_list(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 async fn send_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -> Result<()> {
@@ -136,18 +219,47 @@ async fn send_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -> R
 }
 
 pub(crate) async fn snapshot_git_repo(repo: &GitRepoMonitor) -> Result<GitSnapshot> {
-    let head = run_command(&git_bin(), &["-C", &repo.path, "rev-parse", "HEAD"]).await?;
-    let branch = run_command(
+    snapshot_git_worktree(
+        repo,
+        &MonitoredGitPath {
+            state_key: repo.path.clone(),
+            repo_path: repo.path.clone(),
+            worktree_path: repo.path.clone(),
+        },
+    )
+    .await
+}
+
+async fn snapshot_git_worktree(
+    repo: &GitRepoMonitor,
+    monitored: &MonitoredGitPath,
+) -> Result<GitSnapshot> {
+    let head = run_command(
         &git_bin(),
-        &["-C", &repo.path, "rev-parse", "--abbrev-ref", "HEAD"],
+        &["-C", &monitored.worktree_path, "rev-parse", "HEAD"],
     )
     .await?;
-    let summary = run_command(&git_bin(), &["-C", &repo.path, "log", "-1", "--pretty=%s"]).await?;
+    let branch = run_command(
+        &git_bin(),
+        &[
+            "-C",
+            &monitored.worktree_path,
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ],
+    )
+    .await?;
+    let summary = run_command(
+        &git_bin(),
+        &["-C", &monitored.worktree_path, "log", "-1", "--pretty=%s"],
+    )
+    .await?;
     let remote_url = run_command(
         &git_bin(),
         &[
             "-C",
-            &repo.path,
+            &monitored.worktree_path,
             "config",
             "--get",
             &format!("remote.{}.url", repo.remote),
@@ -158,6 +270,8 @@ pub(crate) async fn snapshot_git_repo(repo: &GitRepoMonitor) -> Result<GitSnapsh
 
     Ok(GitSnapshot {
         repo_name: repo_display_name(repo),
+        repo_path: monitored.repo_path.clone(),
+        worktree_path: monitored.worktree_path.clone(),
         branch,
         head: head.clone(),
         commits: vec![CommitEntry { sha: head, summary }],
@@ -168,16 +282,12 @@ pub(crate) async fn snapshot_git_repo(repo: &GitRepoMonitor) -> Result<GitSnapsh
     })
 }
 
-pub(crate) async fn list_new_commits(
-    repo: &GitRepoMonitor,
-    old: &str,
-    new: &str,
-) -> Result<Vec<CommitEntry>> {
+async fn list_new_commits_for_path(path: &str, old: &str, new: &str) -> Result<Vec<CommitEntry>> {
     let output = run_command(
         &git_bin(),
         &[
             "-C",
-            &repo.path,
+            path,
             "log",
             "--reverse",
             "--pretty=%H%x1f%s",
@@ -244,6 +354,7 @@ pub(crate) fn parse_github_repo(remote: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn parses_github_repo_urls() {
@@ -255,5 +366,100 @@ mod tests {
             parse_github_repo("https://github.com/bellman/clawhip.git"),
             Some("bellman/clawhip".to_string())
         );
+    }
+
+    #[test]
+    fn parses_worktree_list_output() {
+        let output = "worktree /repo/root\nHEAD abc\nbranch refs/heads/main\n\nworktree /repo/.worktrees/issue-115\nHEAD def\nbranch refs/heads/feat/issue-115\n";
+        assert_eq!(
+            parse_worktree_list(output),
+            vec![
+                "/repo/root".to_string(),
+                "/repo/.worktrees/issue-115".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_git_emits_branch_and_commit_events_for_linked_worktree() {
+        let sandbox = TempDir::new().unwrap();
+        let root = sandbox.path().join("repo");
+        let worktree = sandbox.path().join("repo-issue-115");
+        init_repo(&root).await;
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/issue-115",
+                path_str(&worktree),
+            ],
+        )
+        .await;
+
+        let repo = GitRepoMonitor {
+            path: path_str(&root).to_string(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+        let config = AppConfig {
+            monitors: crate::config::MonitorConfig {
+                git: crate::config::GitMonitorConfig { repos: vec![repo] },
+                ..crate::config::MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = HashMap::new();
+
+        poll_git(&config, &tx, &mut state).await.unwrap();
+        assert!(rx.try_recv().is_err());
+
+        git(&worktree, &["checkout", "-b", "feat/issue-115-v2"]).await;
+        poll_git(&config, &tx, &mut state).await.unwrap();
+        let branch_event = rx.try_recv().unwrap();
+        assert_eq!(branch_event.kind, "git.branch-changed");
+        assert_eq!(branch_event.payload["repo"], "clawhip");
+        assert_eq!(branch_event.payload["repo_path"], path_str(&root));
+        assert_eq!(branch_event.payload["worktree_path"], path_str(&worktree));
+        assert_eq!(branch_event.payload["old_branch"], "feat/issue-115");
+        assert_eq!(branch_event.payload["new_branch"], "feat/issue-115-v2");
+        assert!(rx.try_recv().is_err());
+
+        std::fs::write(worktree.join("worktree.txt"), "hello from worktree\n").unwrap();
+        git(&worktree, &["add", "worktree.txt"]).await;
+        git(&worktree, &["commit", "-m", "worktree commit"]).await;
+
+        poll_git(&config, &tx, &mut state).await.unwrap();
+        let commit_event = rx.try_recv().unwrap();
+        assert_eq!(commit_event.kind, "git.commit");
+        assert_eq!(commit_event.payload["repo"], "clawhip");
+        assert_eq!(commit_event.payload["repo_path"], path_str(&root));
+        assert_eq!(commit_event.payload["worktree_path"], path_str(&worktree));
+        assert_eq!(commit_event.payload["branch"], "feat/issue-115-v2");
+        assert_eq!(commit_event.payload["summary"], "worktree commit");
+        assert!(rx.try_recv().is_err());
+    }
+
+    async fn init_repo(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        git(root, &["init"]).await;
+        git(root, &["config", "user.name", "Test User"]).await;
+        git(root, &["config", "user.email", "test@example.com"]).await;
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        git(root, &["add", "README.md"]).await;
+        git(root, &["commit", "-m", "initial commit"]).await;
+    }
+
+    async fn git(root: &Path, args: &[&str]) {
+        let mut command_args = vec!["-C", path_str(root)];
+        command_args.extend_from_slice(args);
+        run_command(&git_bin(), &command_args).await.unwrap();
+    }
+
+    fn path_str(path: &Path) -> &str {
+        path.to_str().unwrap()
     }
 }

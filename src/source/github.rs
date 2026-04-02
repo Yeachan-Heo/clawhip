@@ -131,6 +131,8 @@ async fn snapshot_github_repo(repo: &GitRepoMonitor) -> Result<GitSnapshot> {
                 );
                 Ok(GitSnapshot {
                     repo_name: repo_display_name(repo),
+                    repo_path: repo.path.clone(),
+                    worktree_path: repo.path.clone(),
                     branch: String::new(),
                     head: String::new(),
                     commits: Vec::new(),

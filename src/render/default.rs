@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde_json::Value;
 
 use crate::Result;
@@ -133,40 +135,40 @@ impl Renderer for DefaultRenderer {
 
             ("git.commit", MessageFormat::Compact) => format!(
                 "git:{}@{} {} {}",
-                string_field(payload, "repo")?,
+                git_repo_label(payload)?,
                 string_field(payload, "branch")?,
                 string_field(payload, "short_commit")?,
                 string_field(payload, "summary")?
             ),
             ("git.commit", MessageFormat::Alert) => format!(
                 "🚨 new commit in {}@{}: {} {}",
-                string_field(payload, "repo")?,
+                git_repo_label(payload)?,
                 string_field(payload, "branch")?,
                 string_field(payload, "short_commit")?,
                 string_field(payload, "summary")?
             ),
             ("git.commit", MessageFormat::Inline) => format!(
                 "[git] {} {}",
-                string_field(payload, "repo")?,
+                git_repo_label(payload)?,
                 string_field(payload, "summary")?
             ),
             ("git.commit", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
             ("git.branch-changed", MessageFormat::Compact) => format!(
                 "git:{} branch changed {} -> {}",
-                string_field(payload, "repo")?,
+                git_repo_label(payload)?,
                 string_field(payload, "old_branch")?,
                 string_field(payload, "new_branch")?
             ),
             ("git.branch-changed", MessageFormat::Alert) => format!(
                 "🚨 git repo {} branch changed {} -> {}",
-                string_field(payload, "repo")?,
+                git_repo_label(payload)?,
                 string_field(payload, "old_branch")?,
                 string_field(payload, "new_branch")?
             ),
             ("git.branch-changed", MessageFormat::Inline) => format!(
                 "[git:{}] {} -> {}",
-                string_field(payload, "repo")?,
+                git_repo_label(payload)?,
                 string_field(payload, "old_branch")?,
                 string_field(payload, "new_branch")?
             ),
@@ -587,6 +589,30 @@ fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
+fn git_repo_label(payload: &Value) -> Result<String> {
+    let repo = string_field(payload, "repo")?;
+    Ok(match worktree_display_name(payload) {
+        Some(worktree) => format!("{repo}[wt:{worktree}]"),
+        None => repo,
+    })
+}
+
+fn worktree_display_name(payload: &Value) -> Option<String> {
+    let worktree_path = optional_string_field(payload, "worktree_path")?;
+    let repo_path = optional_string_field(payload, "repo_path");
+    if repo_path.as_deref() == Some(worktree_path.as_str()) {
+        return None;
+    }
+
+    Path::new(&worktree_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or(Some(worktree_path))
+}
+
 fn render_aggregated_git_commit(payload: &Value, format: &MessageFormat) -> Result<Option<String>> {
     let Some(commits) = payload.get("commits").and_then(Value::as_array) else {
         return Ok(None);
@@ -595,7 +621,7 @@ fn render_aggregated_git_commit(payload: &Value, format: &MessageFormat) -> Resu
         return Ok(None);
     }
 
-    let repo = string_field(payload, "repo")?;
+    let repo = git_repo_label(payload)?;
     let branch = string_field(payload, "branch")?;
     let summaries = commits
         .iter()
@@ -754,5 +780,42 @@ mod tests {
             .unwrap();
         assert!(rendered.contains("repo-a"));
         assert!(rendered.contains("workspace skill state changed"));
+    }
+
+    #[test]
+    fn renders_git_commit_with_worktree_suffix_when_distinct() {
+        let event = IncomingEvent::git_commit(
+            "repo".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        )
+        .with_repo_context(
+            Some("/repo/root".into()),
+            Some("/repo/root/.worktrees/issue-115".into()),
+        );
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+        assert_eq!(rendered, "git:repo[wt:issue-115]@main 1234567 ship it");
+    }
+
+    #[test]
+    fn does_not_render_worktree_suffix_for_primary_repo_path() {
+        let event = IncomingEvent::git_commit(
+            "repo".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        )
+        .with_repo_context(Some("/repo/root".into()), Some("/repo/root".into()));
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+        assert_eq!(rendered, "git:repo@main 1234567 ship it");
     }
 }

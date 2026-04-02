@@ -560,6 +560,22 @@ impl IncomingEvent {
         self
     }
 
+    pub fn with_repo_context(
+        mut self,
+        repo_path: Option<String>,
+        worktree_path: Option<String>,
+    ) -> Self {
+        if let Some(payload) = self.payload.as_object_mut() {
+            if let Some(repo_path) = repo_path.filter(|value| !value.trim().is_empty()) {
+                payload.insert("repo_path".to_string(), json!(repo_path));
+            }
+            if let Some(worktree_path) = worktree_path.filter(|value| !value.trim().is_empty()) {
+                payload.insert("worktree_path".to_string(), json!(worktree_path));
+            }
+        }
+        self
+    }
+
     pub fn canonical_kind(&self) -> &str {
         match self.kind.as_str() {
             "issue-opened" => "github.issue-opened",
@@ -1083,6 +1099,27 @@ mod tests {
         .with_mention(Some("<@123>".into()));
 
         assert_eq!(event.mention.as_deref(), Some("<@123>"));
+    }
+
+    #[test]
+    fn with_repo_context_sets_repo_and_worktree_paths() {
+        let event = IncomingEvent::git_commit(
+            "repo".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        )
+        .with_repo_context(
+            Some("/repo/root".into()),
+            Some("/repo/root/.worktrees/issue-115".into()),
+        );
+
+        assert_eq!(event.payload["repo_path"], json!("/repo/root"));
+        assert_eq!(
+            event.payload["worktree_path"],
+            json!("/repo/root/.worktrees/issue-115")
+        );
     }
 
     #[test]
