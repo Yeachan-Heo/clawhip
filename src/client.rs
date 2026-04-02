@@ -35,6 +35,21 @@ impl DaemonClient {
             .map(|_| ())
     }
 
+    pub async fn list_tmux(&self) -> Result<Vec<RegisteredTmuxSession>> {
+        let response = self
+            .http
+            .get(format!("{}/api/tmux", self.base_url))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Err(format!("daemon tmux list failed with {status}: {body}").into())
+        }
+    }
+
     pub async fn health(&self) -> Result<Value> {
         let response = self
             .http

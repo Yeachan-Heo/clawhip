@@ -359,6 +359,8 @@ pub enum TmuxCommands {
     },
     New(TmuxNewArgs),
     Watch(TmuxWatchArgs),
+    /// List active tmux watch registrations known to the daemon.
+    List,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -704,6 +706,17 @@ mod tests {
         assert_eq!(args.stale_minutes, 15);
         assert!(args.retry_enter);
         assert!(matches!(args.format, Some(TmuxWrapperFormat::Alert)));
+    }
+
+    #[test]
+    fn parses_tmux_list_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "tmux", "list"]);
+
+        let Commands::Tmux { command } = cli.command.expect("tmux command") else {
+            panic!("expected tmux command");
+        };
+
+        assert!(matches!(command, TmuxCommands::List));
     }
 
     #[test]

@@ -57,6 +57,9 @@ clawhip tmux watch -s issue-123 \
   --channel YOUR_CHANNEL_ID \
   --mention "<@your-user-id>" \
   --keywords "error,PR created,complete"
+
+# inspect active daemon-known watches later
+clawhip tmux list
 ```
 
 See [`skills/omx/`](skills/omx/) for ready-to-use scripts.
@@ -563,6 +566,8 @@ clawhip tmux watch -s <existing-session> \
   --stale-minutes 10 \
   --format alert \
   --retry-enter true
+
+clawhip tmux list
 ```
 
 Behavior:
@@ -570,7 +575,8 @@ Behavior:
 - `tmux new` sends the requested command into the session, retrying Enter for TUI apps by default with exponential backoff (`--retry-enter=false` disables it, `--retry-enter-count` / `--retry-enter-delay-ms` tune retries)
 - when `tmux new` omits `--channel`, clawhip reuses the first matching Discord route channel for the session name before falling back to `defaults.channel`
 - `tmux watch` attaches monitoring to an already-running tmux session
-- both commands register the session with the daemon
+- both commands register the session with the daemon and emit an audit log line with launch options, timestamp, and parent-process provenance
+- `tmux list` shows active daemon-known watches with source, registration timestamp, and parent-process info
 - daemon monitors keyword/stale events
 - final delivery goes through daemon routing
 

@@ -1,3 +1,4 @@
+use std::fs;
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -9,7 +10,8 @@ use crate::client::DaemonClient;
 use crate::config::AppConfig;
 use crate::router::resolve_tmux_session_channel;
 use crate::source::tmux::{
-    RegisteredTmuxSession, content_hash, monitor_registered_session, session_exists, tmux_bin,
+    ParentProcessInfo, RegisteredTmuxSession, RegistrationSource, content_hash,
+    current_timestamp_rfc3339, monitor_registered_session, session_exists, tmux_bin,
 };
 
 pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
@@ -44,6 +46,9 @@ struct TmuxMonitorArgs {
     keyword_window_secs: u64,
     stale_minutes: u64,
     format: Option<TmuxWrapperFormat>,
+    registered_at: String,
+    registration_source: RegistrationSource,
+    parent_process: Option<ParentProcessInfo>,
 }
 
 impl From<&TmuxNewArgs> for TmuxMonitorArgs {
@@ -56,6 +61,9 @@ impl From<&TmuxNewArgs> for TmuxMonitorArgs {
             keyword_window_secs: default_keyword_window_secs(),
             stale_minutes: value.stale_minutes,
             format: value.format,
+            registered_at: current_timestamp_rfc3339(),
+            registration_source: RegistrationSource::CliNew,
+            parent_process: current_parent_process_info(),
         }
     }
 }
@@ -80,6 +88,9 @@ impl From<&TmuxWatchArgs> for TmuxMonitorArgs {
             keyword_window_secs: default_keyword_window_secs(),
             stale_minutes: value.stale_minutes,
             format: value.format,
+            registered_at: current_timestamp_rfc3339(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: current_parent_process_info(),
         }
     }
 }
@@ -94,6 +105,9 @@ impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
             keyword_window_secs: value.keyword_window_secs,
             stale_minutes: value.stale_minutes,
             format: value.format.map(Into::into),
+            registered_at: value.registered_at,
+            registration_source: value.registration_source,
+            parent_process: value.parent_process,
             active_wrapper_monitor: true,
         }
     }
@@ -105,6 +119,7 @@ async fn register_and_start_monitor(
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let client = DaemonClient::from_config(config);
     let registration: RegisteredTmuxSession = args.into();
+    eprintln!("{}", format_watch_audit_log(&registration));
     client.register_tmux(&registration).await?;
 
     let monitor_client = client.clone();
@@ -295,6 +310,56 @@ fn default_keyword_window_secs() -> u64 {
     30
 }
 
+fn current_parent_process_info() -> Option<ParentProcessInfo> {
+    let pid = std::os::unix::process::parent_id();
+    if pid == 0 {
+        return None;
+    }
+
+    let name = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    Some(ParentProcessInfo { pid, name })
+}
+
+fn format_watch_audit_log(registration: &RegisteredTmuxSession) -> String {
+    let channel = registration.channel.as_deref().unwrap_or("-");
+    let mention = registration.mention.as_deref().unwrap_or("-");
+    let keywords = if registration.keywords.is_empty() {
+        "-".to_string()
+    } else {
+        registration.keywords.join(",")
+    };
+    let format = registration
+        .format
+        .as_ref()
+        .map(|format| format.as_str())
+        .unwrap_or("-");
+    let parent_process = registration
+        .parent_process
+        .as_ref()
+        .map(|parent| match parent.name.as_deref() {
+            Some(name) => format!("{}:{name}", parent.pid),
+            None => parent.pid.to_string(),
+        })
+        .unwrap_or_else(|| "-".to_string());
+
+    format!(
+        "clawhip tmux {} start session={} channel={} keywords={} mention={} stale_minutes={} format={} registered_at={} parent_process={}",
+        registration.registration_source.as_str(),
+        registration.session,
+        channel,
+        keywords,
+        mention,
+        registration.stale_minutes,
+        format,
+        registration.registered_at,
+        parent_process
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,9 +466,70 @@ mod tests {
         assert_eq!(monitor_args.keyword_window_secs, 30);
         assert_eq!(monitor_args.stale_minutes, 15);
         assert!(matches!(
+            monitor_args.registration_source,
+            RegistrationSource::CliWatch
+        ));
+        assert!(!monitor_args.registered_at.is_empty());
+        assert!(matches!(
             monitor_args.format,
             Some(TmuxWrapperFormat::Inline)
         ));
+    }
+
+    #[test]
+    fn registered_tmux_session_from_monitor_args_keeps_audit_metadata() {
+        let registration: RegisteredTmuxSession = TmuxMonitorArgs {
+            session: "issue-105".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: Some(TmuxWrapperFormat::Alert),
+            registered_at: "2026-04-02T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliNew,
+            parent_process: Some(ParentProcessInfo {
+                pid: 99,
+                name: Some("bash".into()),
+            }),
+        }
+        .into();
+
+        assert_eq!(registration.registered_at, "2026-04-02T00:00:00Z");
+        assert!(matches!(
+            registration.registration_source,
+            RegistrationSource::CliNew
+        ));
+        assert_eq!(registration.parent_process.unwrap().pid, 99);
+    }
+
+    #[test]
+    fn format_watch_audit_log_contains_required_fields() {
+        let log = format_watch_audit_log(&RegisteredTmuxSession {
+            session: "issue-105".into(),
+            channel: Some("alerts".into()),
+            mention: Some("<@123>".into()),
+            keywords: vec!["error".into(), "complete".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 12,
+            format: Some(crate::events::MessageFormat::Alert),
+            registered_at: "2026-04-02T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: Some(ParentProcessInfo {
+                pid: 42,
+                name: Some("codex".into()),
+            }),
+            active_wrapper_monitor: true,
+        });
+
+        assert!(log.contains("session=issue-105"));
+        assert!(log.contains("channel=alerts"));
+        assert!(log.contains("keywords=error,complete"));
+        assert!(log.contains("mention=<@123>"));
+        assert!(log.contains("stale_minutes=12"));
+        assert!(log.contains("format=alert"));
+        assert!(log.contains("registered_at=2026-04-02T00:00:00Z"));
+        assert!(log.contains("parent_process=42:codex"));
     }
 
     #[test]

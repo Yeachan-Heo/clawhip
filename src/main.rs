@@ -204,6 +204,12 @@ async fn real_main() -> Result<()> {
             }
             TmuxCommands::New(args) => tmux_wrapper::run(args, config.as_ref()).await,
             TmuxCommands::Watch(args) => tmux_wrapper::watch(args, config.as_ref()).await,
+            TmuxCommands::List => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let registrations = client.list_tmux().await?;
+                render_tmux_list(&registrations);
+                Ok(())
+            }
         },
         Commands::Omx { command } => match command {
             OmxCommands::Hook(args) => {
@@ -260,4 +266,40 @@ async fn real_main() -> Result<()> {
 async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Result<()> {
     let event = prepare_event(event)?;
     client.send_event(&event).await
+}
+
+fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
+    if registrations.is_empty() {
+        println!("No active tmux watches found");
+        return;
+    }
+
+    println!("SESSION\tCHANNEL\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT");
+    for registration in registrations {
+        let keywords = if registration.keywords.is_empty() {
+            "-".to_string()
+        } else {
+            registration.keywords.join(",")
+        };
+        let parent = registration
+            .parent_process
+            .as_ref()
+            .map(|parent| match parent.name.as_deref() {
+                Some(name) => format!("{}:{name}", parent.pid),
+                None => parent.pid.to_string(),
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            registration.session,
+            registration.channel.as_deref().unwrap_or("-"),
+            keywords,
+            registration.mention.as_deref().unwrap_or("-"),
+            registration.stale_minutes,
+            registration.registration_source.as_str(),
+            registration.registered_at,
+            parent,
+        );
+    }
 }
