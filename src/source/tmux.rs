@@ -13,6 +13,7 @@ use crate::client::DaemonClient;
 use crate::config::{AppConfig, TmuxSessionMonitor};
 use crate::events::{IncomingEvent, MessageFormat};
 use crate::keyword_window::{PendingKeywordHits, collect_keyword_hits};
+use crate::router::glob_match;
 use crate::source::Source;
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
@@ -221,18 +222,23 @@ async fn poll_tmux(
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut TmuxMonitorState,
 ) -> Result<()> {
-    let mut sessions: BTreeMap<String, RegisteredTmuxSession> = config
-        .monitors
-        .tmux
-        .sessions
-        .iter()
-        .map(|session| {
-            (
-                session.session.clone(),
-                RegisteredTmuxSession::from(session),
-            )
-        })
-        .collect();
+    let available_sessions = match list_tmux_sessions().await {
+        Ok(sessions) => Some(sessions),
+        Err(error) => {
+            eprintln!("clawhip source tmux list-sessions failed: {error}");
+            None
+        }
+    };
+    let mut sessions = resolve_monitored_sessions(
+        config
+            .monitors
+            .tmux
+            .sessions
+            .iter()
+            .map(RegisteredTmuxSession::from)
+            .collect(),
+        available_sessions.as_ref(),
+    );
     for (session, registration) in registry.read().await.iter() {
         sessions.insert(session.clone(), registration.clone());
     }
@@ -366,6 +372,93 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
+}
+
+fn resolve_monitored_sessions(
+    configured_sessions: Vec<RegisteredTmuxSession>,
+    available_sessions: Option<&HashSet<String>>,
+) -> BTreeMap<String, RegisteredTmuxSession> {
+    let mut resolved: BTreeMap<String, (MonitorSpecificity, RegisteredTmuxSession)> =
+        BTreeMap::new();
+
+    for registration in configured_sessions {
+        let specificity = MonitorSpecificity::for_pattern(&registration.session);
+        let matched_sessions = available_sessions
+            .into_iter()
+            .flat_map(|sessions| sessions.iter())
+            .filter(|session| glob_match(&registration.session, session))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if matched_sessions.is_empty() {
+            if !is_session_pattern(&registration.session) {
+                insert_resolved_session(
+                    &mut resolved,
+                    registration.session.clone(),
+                    specificity,
+                    registration,
+                );
+            }
+            continue;
+        }
+
+        for session in matched_sessions {
+            let mut registration = registration.clone();
+            registration.session = session.clone();
+            insert_resolved_session(&mut resolved, session, specificity, registration);
+        }
+    }
+
+    resolved
+        .into_iter()
+        .map(|(session, (_, registration))| (session, registration))
+        .collect()
+}
+
+fn is_session_pattern(session: &str) -> bool {
+    session.contains('*')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MonitorSpecificity {
+    exact_match: bool,
+    literal_chars: usize,
+    wildcard_count: usize,
+}
+
+impl MonitorSpecificity {
+    fn for_pattern(pattern: &str) -> Self {
+        Self {
+            exact_match: !is_session_pattern(pattern),
+            literal_chars: pattern.chars().filter(|ch| *ch != '*').count(),
+            wildcard_count: pattern.chars().filter(|ch| *ch == '*').count(),
+        }
+    }
+
+    fn outranks(self, other: Self) -> bool {
+        if self.exact_match != other.exact_match {
+            return self.exact_match;
+        }
+        if self.literal_chars != other.literal_chars {
+            return self.literal_chars > other.literal_chars;
+        }
+
+        self.wildcard_count < other.wildcard_count
+    }
+}
+
+fn insert_resolved_session(
+    resolved: &mut BTreeMap<String, (MonitorSpecificity, RegisteredTmuxSession)>,
+    session: String,
+    specificity: MonitorSpecificity,
+    registration: RegisteredTmuxSession,
+) {
+    match resolved.get(&session) {
+        Some((existing_specificity, _)) if !specificity.outranks(*existing_specificity) => {}
+        _ => {
+            resolved.insert(session, (specificity, registration));
+        }
+    }
 }
 
 fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> bool {
@@ -517,6 +610,25 @@ pub(crate) async fn session_exists(session: &str) -> Result<bool> {
         .output()
         .await?;
     Ok(output.status.success())
+}
+
+async fn list_tmux_sessions() -> Result<HashSet<String>> {
+    let output = Command::new(tmux_bin())
+        .arg("list-sessions")
+        .arg("-F")
+        .arg("#{session_name}")
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(tmux_stderr(&output.stderr).into());
+    }
+
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .map(ToString::to_string)
+        .collect())
 }
 
 async fn snapshot_tmux_session(session: &str) -> Result<Vec<TmuxPaneSnapshot>> {
@@ -940,5 +1052,208 @@ error: failed";
         let event = rx.recv().await.unwrap();
         assert_eq!(event.payload["keyword"], "error");
         assert_eq!(event.payload["line"], "error: failed");
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_expands_glob_patterns_to_actual_sessions() {
+        let available_sessions = HashSet::from([
+            "rcc-api".to_string(),
+            "rcc-web".to_string(),
+            "other".to_string(),
+        ]);
+        let resolved = resolve_monitored_sessions(
+            vec![RegisteredTmuxSession {
+                session: "rcc-*".into(),
+                channel: Some("alerts".into()),
+                mention: None,
+                keywords: vec!["panic".into()],
+                keyword_window_secs: 30,
+                stale_minutes: 10,
+                format: None,
+                active_wrapper_monitor: false,
+            }],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved["rcc-api"].session, "rcc-api");
+        assert_eq!(resolved["rcc-api"].channel.as_deref(), Some("alerts"));
+        assert_eq!(resolved["rcc-api"].keywords, vec!["panic"]);
+        assert_eq!(resolved["rcc-web"].session, "rcc-web");
+        assert_eq!(resolved["rcc-web"].channel.as_deref(), Some("alerts"));
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_keeps_keywords_isolated_per_actual_session() {
+        let available_sessions = HashSet::from(["rcc-prod".to_string(), "omx-prod".to_string()]);
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "rcc-*".into(),
+                    channel: Some("rcc-alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "omx-*".into(),
+                    channel: Some("omx-alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(resolved["rcc-prod"].keywords, vec!["panic"]);
+        assert_eq!(resolved["rcc-prod"].channel.as_deref(), Some("rcc-alerts"));
+        assert_eq!(resolved["omx-prod"].keywords, vec!["error"]);
+        assert_eq!(resolved["omx-prod"].channel.as_deref(), Some("omx-alerts"));
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_keeps_exact_sessions_when_listing_is_unavailable() {
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "exact-session".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "rcc-*".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved["exact-session"].session, "exact-session");
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_prefers_exact_match_over_glob_overlap() {
+        let available_sessions = HashSet::from(["rcc-api".to_string()]);
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "*".into(),
+                    channel: Some("default-alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "rcc-api".into(),
+                    channel: Some("rcc-alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(resolved["rcc-api"].channel.as_deref(), Some("rcc-alerts"));
+        assert_eq!(resolved["rcc-api"].keywords, vec!["panic"]);
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_prefers_more_specific_glob_over_broader_glob() {
+        let available_sessions = HashSet::from(["rcc-api".to_string(), "omx-api".to_string()]);
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "*".into(),
+                    channel: Some("default-alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "rcc-*".into(),
+                    channel: Some("rcc-alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(resolved["rcc-api"].channel.as_deref(), Some("rcc-alerts"));
+        assert_eq!(resolved["rcc-api"].keywords, vec!["panic"]);
+        assert_eq!(
+            resolved["omx-api"].channel.as_deref(),
+            Some("default-alerts")
+        );
+        assert_eq!(resolved["omx-api"].keywords, vec!["error"]);
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_breaks_same_literal_ties_with_fewer_wildcards() {
+        let available_sessions = HashSet::from(["abc-prod".to_string()]);
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "*abc*".into(),
+                    channel: Some("broad-alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "abc*".into(),
+                    channel: Some("specific-alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(
+            resolved["abc-prod"].channel.as_deref(),
+            Some("specific-alerts")
+        );
+        assert_eq!(resolved["abc-prod"].keywords, vec!["panic"]);
     }
 }

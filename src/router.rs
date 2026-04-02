@@ -308,7 +308,7 @@ fn route_channel(route: &RouteRule) -> Option<&str> {
         .filter(|channel| !channel.is_empty())
 }
 
-fn glob_match(pattern: &str, value: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     if pattern == value {
         return true;
     }
