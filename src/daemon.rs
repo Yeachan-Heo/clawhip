@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -35,7 +36,11 @@ struct AppState {
     tmux_registry: SharedTmuxRegistry,
 }
 
-pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<()> {
+pub async fn run(
+    config: Arc<AppConfig>,
+    port_override: Option<u16>,
+    cron_state_path: PathBuf,
+) -> Result<()> {
     config.validate()?;
     let token_source = config.discord_token_source();
     println!("clawhip v{VERSION} starting (token_source: {token_source})");
@@ -65,7 +70,7 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         tx.clone(),
     );
     spawn_source(WorkspaceSource::new(config.clone()), tx.clone());
-    spawn_source(CronSource::new(config.clone()), tx.clone());
+    spawn_source(CronSource::new(config.clone(), cron_state_path), tx.clone());
 
     let app = AxumRouter::new()
         .route("/health", get(health))

@@ -56,9 +56,10 @@ async fn real_main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config_path();
     let config = Arc::new(AppConfig::load_or_default(&config_path)?);
+    let cron_state_path = crate::cron::default_state_path(&config_path);
 
     match cli.command.unwrap_or(Commands::Start { port: None }) {
-        Commands::Start { port } => daemon::run(config, port).await,
+        Commands::Start { port } => daemon::run(config, port, cron_state_path).await,
         Commands::Status => {
             let client = DaemonClient::from_config(config.as_ref());
             let health = client.health().await?;

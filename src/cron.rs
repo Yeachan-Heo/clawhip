@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::{OffsetDateTime, Weekday};
 use tokio::sync::mpsc;
@@ -15,11 +18,12 @@ use crate::source::Source;
 
 pub struct CronSource {
     config: Arc<AppConfig>,
+    state_path: PathBuf,
 }
 
 impl CronSource {
-    pub fn new(config: Arc<AppConfig>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<AppConfig>, state_path: PathBuf) -> Self {
+        Self { config, state_path }
     }
 }
 
@@ -34,7 +38,8 @@ impl Source for CronSource {
             return Ok(());
         }
 
-        let mut scheduler = CronScheduler::new(self.config.as_ref())?;
+        let mut scheduler =
+            CronScheduler::new_with_state_path(self.config.as_ref(), self.state_path.clone())?;
         let mut tick = interval(Duration::from_secs(
             self.config.cron.poll_interval_secs.max(1),
         ));
@@ -105,14 +110,31 @@ pub fn validate_job(job: &CronJob) -> Result<()> {
         .map_err(|error| format!("cron job '{}': {error}", job.id).into())
 }
 
+pub fn default_state_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("cron-state.json")
+}
+
 #[derive(Debug, Clone)]
 struct CronScheduler {
     jobs: Vec<ScheduledCronJob>,
     last_processed_minute: Option<i64>,
+    state_path: Option<PathBuf>,
 }
 
 impl CronScheduler {
+    #[cfg(test)]
     fn new(config: &AppConfig) -> Result<Self> {
+        Self::new_internal(config, None)
+    }
+
+    fn new_with_state_path(config: &AppConfig, state_path: PathBuf) -> Result<Self> {
+        Self::new_internal(config, Some(state_path))
+    }
+
+    fn new_internal(config: &AppConfig, state_path: Option<PathBuf>) -> Result<Self> {
         let mut jobs = Vec::new();
         for job in config.cron.jobs.iter().filter(|job| job.enabled) {
             jobs.push(ScheduledCronJob {
@@ -121,9 +143,15 @@ impl CronScheduler {
             });
         }
 
+        let last_processed_minute = match state_path.as_deref() {
+            Some(path) => load_scheduler_state(path)?.last_processed_minute,
+            None => None,
+        };
+
         Ok(Self {
             jobs,
-            last_processed_minute: None,
+            last_processed_minute,
+            state_path,
         })
     }
 
@@ -133,6 +161,7 @@ impl CronScheduler {
     {
         if self.jobs.is_empty() {
             self.last_processed_minute = Some(now.unix_timestamp().div_euclid(60));
+            self.persist_state()?;
             return Ok(Vec::new());
         }
 
@@ -154,7 +183,21 @@ impl CronScheduler {
         }
 
         self.last_processed_minute = Some(current_minute);
+        self.persist_state()?;
         Ok(executed)
+    }
+
+    fn persist_state(&self) -> Result<()> {
+        let Some(path) = self.state_path.as_deref() else {
+            return Ok(());
+        };
+
+        save_scheduler_state(
+            path,
+            &CronSchedulerState {
+                last_processed_minute: self.last_processed_minute,
+            },
+        )
     }
 }
 
@@ -372,10 +415,32 @@ fn weekday_to_cron(weekday: Weekday) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct CronSchedulerState {
+    last_processed_minute: Option<i64>,
+}
+
+fn load_scheduler_state(path: &Path) -> Result<CronSchedulerState> {
+    if !path.exists() {
+        return Ok(CronSchedulerState::default());
+    }
+
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+fn save_scheduler_state(path: &Path, state: &CronSchedulerState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(state)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use tempfile::tempdir;
     use time::{Date, Month, PrimitiveDateTime, Time};
 
     use crate::config::{CronConfig, DefaultsConfig};
@@ -398,28 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_emits_matching_custom_job_once_per_minute() {
-        let config = AppConfig {
-            defaults: DefaultsConfig {
-                channel: Some("ops".into()),
-                format: MessageFormat::Compact,
-            },
-            cron: CronConfig {
-                poll_interval_secs: 30,
-                jobs: vec![CronJob {
-                    id: "dev-followup".into(),
-                    schedule: "*/10 * * * *".into(),
-                    timezone: "UTC".into(),
-                    enabled: true,
-                    channel: Some("ops".into()),
-                    mention: Some("<@bot>".into()),
-                    format: Some(MessageFormat::Alert),
-                    kind: CronJobKind::CustomMessage {
-                        message: "check open PRs".into(),
-                    },
-                }],
-            },
-            ..AppConfig::default()
-        };
+        let config = sample_config("*/10 * * * *");
         let mut scheduler = CronScheduler::new(&config).expect("scheduler");
         let emitter = RecordingEmitter::default();
 
@@ -443,6 +487,56 @@ mod tests {
         assert_eq!(events[0].format, Some(MessageFormat::Alert));
         assert_eq!(events[0].payload["message"], json!("check open PRs"));
         assert_eq!(events[0].payload["cron_job_id"], json!("dev-followup"));
+    }
+
+    #[tokio::test]
+    async fn scheduler_restart_does_not_refire_jobs_for_same_minute() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let config = sample_config("*/10 * * * *");
+        let emitter = RecordingEmitter::default();
+
+        let mut first = CronScheduler::new_with_state_path(&config, state_path.clone())
+            .expect("first scheduler");
+        first
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 3))
+            .await
+            .expect("first emit");
+
+        let mut restarted =
+            CronScheduler::new_with_state_path(&config, state_path).expect("restarted scheduler");
+        restarted
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 45))
+            .await
+            .expect("same-minute restart");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_restart_still_emits_on_next_matching_minute() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let config = sample_config("*/10 * * * *");
+        let emitter = RecordingEmitter::default();
+
+        let mut first = CronScheduler::new_with_state_path(&config, state_path.clone())
+            .expect("first scheduler");
+        first
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 3))
+            .await
+            .expect("first emit");
+
+        let mut restarted =
+            CronScheduler::new_with_state_path(&config, state_path).expect("restarted scheduler");
+        restarted
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 1))
+            .await
+            .expect("next-minute restart");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 2);
     }
 
     #[test]
@@ -473,6 +567,31 @@ mod tests {
         assert!(schedule.matches(dt(2026, Month::April, 10, 17, 45, 0)));
         assert!(!schedule.matches(dt(2026, Month::April, 10, 17, 10, 0)));
         assert!(!schedule.matches(dt(2026, Month::April, 11, 9, 0, 0)));
+    }
+
+    fn sample_config(schedule: &str) -> AppConfig {
+        AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("ops".into()),
+                format: MessageFormat::Compact,
+            },
+            cron: CronConfig {
+                poll_interval_secs: 30,
+                jobs: vec![CronJob {
+                    id: "dev-followup".into(),
+                    schedule: schedule.into(),
+                    timezone: "UTC".into(),
+                    enabled: true,
+                    channel: Some("ops".into()),
+                    mention: Some("<@bot>".into()),
+                    format: Some(MessageFormat::Alert),
+                    kind: CronJobKind::CustomMessage {
+                        message: "check open PRs".into(),
+                    },
+                }],
+            },
+            ..AppConfig::default()
+        }
     }
 
     fn dt(year: i32, month: Month, day: u8, hour: u8, minute: u8, second: u8) -> OffsetDateTime {
