@@ -269,12 +269,17 @@ async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Res
 }
 
 fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
+    print!("{}", format_tmux_list(registrations));
+}
+
+fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> String {
     if registrations.is_empty() {
-        println!("No active tmux watches found");
-        return;
+        return "No active tmux watches found\n".to_string();
     }
 
-    println!("SESSION\tCHANNEL\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT");
+    let mut output =
+        "SESSION\tCHANNEL\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT\n"
+            .to_string();
     for registration in registrations {
         let keywords = if registration.keywords.is_empty() {
             "-".to_string()
@@ -290,8 +295,8 @@ fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
             })
             .unwrap_or_else(|| "-".to_string());
 
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             registration.session,
             registration.channel.as_deref().unwrap_or("-"),
             keywords,
@@ -300,6 +305,46 @@ fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
             registration.registration_source.as_str(),
             registration.registered_at,
             parent,
-        );
+        ));
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_tmux_list;
+    use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
+
+    #[test]
+    fn format_tmux_list_renders_metadata_columns() {
+        let output = format_tmux_list(&[RegisteredTmuxSession {
+            session: "issue-105".into(),
+            channel: Some("alerts".into()),
+            mention: Some("<@123>".into()),
+            keywords: vec!["error".into(), "complete".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-04-02T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: Some(ParentProcessInfo {
+                pid: 4242,
+                name: Some("codex".into()),
+            }),
+            active_wrapper_monitor: true,
+        }]);
+
+        assert!(output.contains(
+            "SESSION\tCHANNEL\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT"
+        ));
+        assert!(output.contains(
+            "issue-105\talerts\terror,complete\t<@123>\t10\tcli-watch\t2026-04-02T00:00:00Z\t4242:codex"
+        ));
+    }
+
+    #[test]
+    fn format_tmux_list_handles_empty_registry() {
+        assert_eq!(format_tmux_list(&[]), "No active tmux watches found\n");
     }
 }

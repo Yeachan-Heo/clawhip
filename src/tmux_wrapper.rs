@@ -337,17 +337,19 @@ fn format_watch_audit_log(registration: &RegisteredTmuxSession) -> String {
         .as_ref()
         .map(|format| format.as_str())
         .unwrap_or("-");
-    let parent_process = registration
+    let (parent_pid, parent_name) = registration
         .parent_process
         .as_ref()
-        .map(|parent| match parent.name.as_deref() {
-            Some(name) => format!("{}:{name}", parent.pid),
-            None => parent.pid.to_string(),
+        .map(|parent| {
+            (
+                parent.pid.to_string(),
+                parent.name.as_deref().unwrap_or("-").to_string(),
+            )
         })
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
 
     format!(
-        "clawhip tmux {} start session={} channel={} keywords={} mention={} stale_minutes={} format={} registered_at={} parent_process={}",
+        "clawhip tmux {} start session={} channel={} keywords={} mention={} stale_minutes={} format={} registered_at={} parent_pid={} parent_name={}",
         registration.registration_source.as_str(),
         registration.session,
         channel,
@@ -356,7 +358,8 @@ fn format_watch_audit_log(registration: &RegisteredTmuxSession) -> String {
         registration.stale_minutes,
         format,
         registration.registered_at,
-        parent_process
+        parent_pid,
+        parent_name
     )
 }
 
@@ -529,7 +532,8 @@ mod tests {
         assert!(log.contains("stale_minutes=12"));
         assert!(log.contains("format=alert"));
         assert!(log.contains("registered_at=2026-04-02T00:00:00Z"));
-        assert!(log.contains("parent_process=42:codex"));
+        assert!(log.contains("parent_pid=42"));
+        assert!(log.contains("parent_name=codex"));
     }
 
     #[test]

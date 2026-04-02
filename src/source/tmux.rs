@@ -255,31 +255,17 @@ pub async fn list_active_tmux_registrations(
     config: &AppConfig,
     registry: &SharedTmuxRegistry,
 ) -> Result<Vec<RegisteredTmuxSession>> {
-    let available_sessions = list_tmux_sessions().await.unwrap_or_default();
-    let mut sessions: BTreeMap<String, RegisteredTmuxSession> = BTreeMap::new();
-
-    for registration in config
-        .monitors
-        .tmux
-        .sessions
-        .iter()
-        .map(RegisteredTmuxSession::from)
-    {
-        for session in available_sessions
-            .iter()
-            .filter(|session| glob_match(&registration.session, session))
-        {
-            let mut concrete = registration.clone();
-            concrete.session = session.clone();
-            sessions.insert(session.clone(), concrete);
+    match list_tmux_sessions().await {
+        Ok(available_sessions) => {
+            sync_active_config_registrations(config, registry, &available_sessions).await;
+        }
+        Err(error) => {
+            eprintln!("clawhip source tmux list-sessions failed: {error}");
         }
     }
 
-    for (session, registration) in registry.read().await.iter() {
-        sessions.insert(session.clone(), registration.clone());
-    }
-
-    Ok(sessions.into_values().collect())
+    let snapshot = registry.read().await;
+    Ok(sorted_registry_snapshot(&snapshot))
 }
 
 async fn poll_tmux(
@@ -295,6 +281,9 @@ async fn poll_tmux(
             None
         }
     };
+    if let Some(available_sessions) = available_sessions.as_ref() {
+        sync_active_config_registrations(config, registry, available_sessions).await;
+    }
     let mut sessions = resolve_monitored_sessions(
         config
             .monitors
@@ -438,6 +427,76 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
+}
+
+async fn sync_active_config_registrations(
+    config: &AppConfig,
+    registry: &SharedTmuxRegistry,
+    available_sessions: &HashSet<String>,
+) {
+    let existing_registry = registry.read().await.clone();
+    let resolved = resolve_monitored_sessions(
+        config
+            .monitors
+            .tmux
+            .sessions
+            .iter()
+            .map(RegisteredTmuxSession::from)
+            .collect(),
+        Some(available_sessions),
+    );
+    let active_config = resolved
+        .into_iter()
+        .filter(|(session, _)| available_sessions.contains(session))
+        .map(|(session, mut registration)| {
+            if let Some(existing) = existing_registry.get(&session).filter(|existing| {
+                !existing.active_wrapper_monitor
+                    && existing.registration_source == RegistrationSource::ConfigMonitor
+            }) {
+                registration.registered_at = existing.registered_at.clone();
+                registration.parent_process = existing.parent_process.clone();
+            }
+            (session, registration)
+        })
+        .collect();
+
+    let mut write = registry.write().await;
+    merge_active_config_registrations(&mut write, active_config);
+}
+
+fn merge_active_config_registrations(
+    registry: &mut HashMap<String, RegisteredTmuxSession>,
+    active_config: BTreeMap<String, RegisteredTmuxSession>,
+) {
+    let active_sessions: HashSet<String> = active_config.keys().cloned().collect();
+    registry.retain(|session, registration| {
+        registration.active_wrapper_monitor
+            || registration.registration_source != RegistrationSource::ConfigMonitor
+            || active_sessions.contains(session)
+    });
+
+    for (session, mut registration) in active_config {
+        if let Some(existing) = registry.get(&session) {
+            if existing.active_wrapper_monitor {
+                continue;
+            }
+            if existing.registration_source == RegistrationSource::ConfigMonitor {
+                registration.registered_at = existing.registered_at.clone();
+                registration.parent_process = existing.parent_process.clone();
+            }
+        }
+        registry.insert(session, registration);
+    }
+}
+
+fn sorted_registry_snapshot(
+    registry: &HashMap<String, RegisteredTmuxSession>,
+) -> Vec<RegisteredTmuxSession> {
+    let mut sessions: BTreeMap<String, RegisteredTmuxSession> = BTreeMap::new();
+    for (session, registration) in registry {
+        sessions.insert(session.clone(), registration.clone());
+    }
+    sessions.into_values().collect()
 }
 
 fn resolve_monitored_sessions(
@@ -898,6 +957,89 @@ PR created #7",
         ));
         assert!(!registration.registered_at.is_empty());
         assert!(registration.parent_process.is_none());
+    }
+
+    #[test]
+    fn merge_active_config_registrations_preserves_existing_timestamps_and_prunes_inactive_ones() {
+        let mut registry = HashMap::from([
+            (
+                "issue-105".into(),
+                RegisteredTmuxSession {
+                    session: "issue-105".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ),
+            (
+                "wrapper".into(),
+                RegisteredTmuxSession {
+                    session: "wrapper".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T01:00:00Z".into(),
+                    registration_source: RegistrationSource::CliWatch,
+                    parent_process: Some(ParentProcessInfo {
+                        pid: 42,
+                        name: Some("codex".into()),
+                    }),
+                    active_wrapper_monitor: true,
+                },
+            ),
+            (
+                "stale-config".into(),
+                RegisteredTmuxSession {
+                    session: "stale-config".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T02:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ),
+        ]);
+
+        merge_active_config_registrations(
+            &mut registry,
+            BTreeMap::from([(
+                "issue-105".into(),
+                RegisteredTmuxSession {
+                    session: "issue-105".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into(), "complete".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T09:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            )]),
+        );
+
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry["issue-105"].registered_at, "2026-04-02T00:00:00Z");
+        assert_eq!(registry["issue-105"].keywords, vec!["error", "complete"]);
+        assert!(registry.contains_key("wrapper"));
+        assert!(!registry.contains_key("stale-config"));
     }
 
     #[test]
