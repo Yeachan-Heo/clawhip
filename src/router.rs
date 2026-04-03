@@ -204,10 +204,9 @@ impl Router {
                     return Ok(SinkTarget::DiscordWebhook(webhook.to_string()));
                 }
 
-                let channel = event
-                    .channel
-                    .clone()
-                    .or_else(|| route.and_then(|route| route.channel.clone()))
+                let channel = route
+                    .and_then(|route| route.channel.clone())
+                    .or_else(|| event.channel.clone())
                     .or_else(|| self.config.defaults.channel.clone())
                     .ok_or_else(|| {
                         format!("no channel configured for event {}", event.canonical_kind())
@@ -1238,6 +1237,78 @@ mod tests {
         assert_eq!(
             delivery.target,
             SinkTarget::DiscordWebhook("https://discord.com/api/webhooks/123/abc".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn route_channel_takes_precedence_over_event_channel() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: Some("route-channel".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::tmux_keyword(
+            "issue-25".into(),
+            "error".into(),
+            "boom".into(),
+            Some("launcher-channel".into()),
+        );
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("route-channel".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn event_channel_is_used_when_matching_route_has_no_channel() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: Some("<@route>".into()),
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::tmux_keyword(
+            "issue-25".into(),
+            "error".into(),
+            "boom".into(),
+            Some("monitor-channel".into()),
+        );
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("monitor-channel".into())
         );
     }
 

@@ -751,7 +751,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn new_issue_events_match_repo_filter_and_route_mention() {
+    async fn new_issue_events_apply_route_channel_and_mention_over_repo_monitor_channel() {
         let repo = GitRepoMonitor {
             path: "/tmp/clawhip".into(),
             name: Some("clawhip".into()),
@@ -797,7 +797,7 @@ mod tests {
         };
         let router = Router::new(Arc::new(config));
         let (channel, _, content) = router.preview(&events[0]).await.unwrap();
-        assert_eq!(channel, "dev-channel");
+        assert_eq!(channel, "route-channel");
         assert!(content.starts_with("<@1465264645320474637> "));
         assert!(content.contains("live issue"));
     }
