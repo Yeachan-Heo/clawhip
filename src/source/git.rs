@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -41,9 +41,44 @@ impl Source for GitSource {
     }
 }
 
+#[derive(Debug)]
 struct GitRepoState {
     branch: String,
     head: String,
+}
+
+#[derive(Debug, Default)]
+struct GitMonitorState {
+    repo: Option<GitRepoState>,
+    failure: Option<GitMonitorFailureState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitMonitorFailureState {
+    classification: GitMonitorFailureClass,
+    message: String,
+    attempts: u32,
+    suppressed_polls: u32,
+    next_retry_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitMonitorFailureClass {
+    Missing,
+    NotGit,
+    GitdirBroken,
+    Unknown,
+}
+
+impl GitMonitorFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::NotGit => "not-git",
+            Self::GitdirBroken => "gitdir-broken",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,31 +108,64 @@ pub(crate) struct GitSnapshot {
 async fn poll_git(
     config: &AppConfig,
     tx: &mpsc::Sender<IncomingEvent>,
-    state: &mut HashMap<String, GitRepoState>,
+    state: &mut HashMap<String, GitMonitorState>,
+) -> Result<()> {
+    poll_git_at(config, tx, state, Instant::now()).await
+}
+
+async fn poll_git_at(
+    config: &AppConfig,
+    tx: &mpsc::Sender<IncomingEvent>,
+    state: &mut HashMap<String, GitMonitorState>,
+    now: Instant,
 ) -> Result<()> {
     let mut active_keys = HashSet::new();
+    let poll_interval = Duration::from_secs(config.monitors.poll_interval_secs.max(1));
 
     for repo in &config.monitors.git.repos {
-        let monitored_paths = discover_monitored_git_paths(repo)
-            .await
-            .unwrap_or_else(|error| {
-                eprintln!(
-                    "clawhip source git worktree discovery failed for {}: {error}",
-                    repo.path
+        let discovery_key = discovery_state_key(repo);
+        active_keys.insert(discovery_key.clone());
+
+        if let Some(discovery_state) = state.get_mut(&discovery_key)
+            && should_skip_failed_monitor(discovery_state, now)
+        {
+            preserve_repo_monitor_keys(state, &mut active_keys, repo);
+            continue;
+        }
+
+        let monitored_paths = match discover_monitored_git_paths(repo).await {
+            Ok(monitored_paths) => {
+                if let Some(discovery_state) = state.get_mut(&discovery_key) {
+                    clear_monitor_failure(discovery_state, &repo.path, "worktree discovery");
+                }
+                monitored_paths
+            }
+            Err(error) => {
+                record_monitor_failure(
+                    state.entry(discovery_key).or_default(),
+                    &repo.path,
+                    "worktree discovery",
+                    error.to_string(),
+                    now,
+                    poll_interval,
                 );
-                vec![MonitoredGitPath {
-                    state_key: repo.path.clone(),
-                    repo_path: repo.path.clone(),
-                    worktree_path: repo.path.clone(),
-                }]
-            });
+                preserve_repo_monitor_keys(state, &mut active_keys, repo);
+                continue;
+            }
+        };
 
         for monitored in monitored_paths {
             active_keys.insert(monitored.state_key.clone());
+            let monitor_state = state.entry(monitored.state_key.clone()).or_default();
+
+            if should_skip_failed_monitor(monitor_state, now) {
+                continue;
+            }
 
             match snapshot_git_worktree(repo, &monitored).await {
                 Ok(snapshot) => {
-                    if let Some(previous) = state.get(&monitored.state_key) {
+                    clear_monitor_failure(monitor_state, &monitored.worktree_path, "snapshot");
+                    if let Some(previous) = monitor_state.repo.as_ref() {
                         if repo.emit_branch_changes && previous.branch != snapshot.branch {
                             send_event(
                                 tx,
@@ -151,17 +219,18 @@ async fn poll_git(
                         }
                     }
 
-                    state.insert(
-                        monitored.state_key.clone(),
-                        GitRepoState {
-                            branch: snapshot.branch,
-                            head: snapshot.head,
-                        },
-                    );
+                    monitor_state.repo = Some(GitRepoState {
+                        branch: snapshot.branch,
+                        head: snapshot.head,
+                    });
                 }
-                Err(error) => eprintln!(
-                    "clawhip source git snapshot failed for {}: {error}",
-                    monitored.worktree_path
+                Err(error) => record_monitor_failure(
+                    monitor_state,
+                    &monitored.worktree_path,
+                    "snapshot",
+                    error.to_string(),
+                    now,
+                    poll_interval,
                 ),
             }
         }
@@ -184,7 +253,7 @@ async fn discover_monitored_git_paths(repo: &GitRepoMonitor) -> Result<Vec<Monit
     for worktree_path in parse_worktree_list(&output) {
         if seen.insert(worktree_path.clone()) {
             monitored.push(MonitoredGitPath {
-                state_key: worktree_path.clone(),
+                state_key: monitored_state_key(repo, &worktree_path),
                 repo_path: repo.path.clone(),
                 worktree_path,
             });
@@ -193,7 +262,7 @@ async fn discover_monitored_git_paths(repo: &GitRepoMonitor) -> Result<Vec<Monit
 
     if monitored.is_empty() {
         monitored.push(MonitoredGitPath {
-            state_key: repo.path.clone(),
+            state_key: monitored_state_key(repo, &repo.path),
             repo_path: repo.path.clone(),
             worktree_path: repo.path.clone(),
         });
@@ -337,6 +406,113 @@ pub(crate) fn git_bin() -> String {
     std::env::var("CLAWHIP_GIT_BIN").unwrap_or_else(|_| "git".to_string())
 }
 
+fn discovery_state_key(repo: &GitRepoMonitor) -> String {
+    format!("discovery::{}", repo.path)
+}
+
+fn monitored_state_key(repo: &GitRepoMonitor, worktree_path: &str) -> String {
+    format!("path::{}::{worktree_path}", repo.path)
+}
+
+fn repo_state_prefix(repo: &GitRepoMonitor) -> String {
+    format!("path::{}::", repo.path)
+}
+
+fn preserve_repo_monitor_keys(
+    state: &HashMap<String, GitMonitorState>,
+    active_keys: &mut HashSet<String>,
+    repo: &GitRepoMonitor,
+) {
+    let prefix = repo_state_prefix(repo);
+    for key in state.keys() {
+        if key.starts_with(&prefix) {
+            active_keys.insert(key.clone());
+        }
+    }
+}
+
+fn should_skip_failed_monitor(state: &mut GitMonitorState, now: Instant) -> bool {
+    let Some(failure) = state.failure.as_mut() else {
+        return false;
+    };
+    if now < failure.next_retry_at {
+        failure.suppressed_polls += 1;
+        return true;
+    }
+    false
+}
+
+fn clear_monitor_failure(state: &mut GitMonitorState, path: &str, context: &str) {
+    let Some(previous) = state.failure.take() else {
+        return;
+    };
+    eprintln!(
+        "clawhip source git {context} recovered for {path} after {} failure(s) and {} suppressed poll(s)",
+        previous.attempts, previous.suppressed_polls
+    );
+}
+
+fn record_monitor_failure(
+    state: &mut GitMonitorState,
+    path: &str,
+    context: &str,
+    message: String,
+    now: Instant,
+    poll_interval: Duration,
+) {
+    let classification = classify_git_monitor_failure(&message);
+    let (attempts, suppressed_polls) = match state.failure.take() {
+        Some(previous)
+            if previous.classification == classification && previous.message == message =>
+        {
+            (
+                previous.attempts.saturating_add(1),
+                previous.suppressed_polls,
+            )
+        }
+        _ => (1, 0),
+    };
+    let backoff = git_monitor_backoff(attempts, poll_interval);
+    eprintln!(
+        "clawhip source git {context} degraded for {path}: class={}, attempts={}, suppressed={}, next_retry_secs={}, error={message}",
+        classification.as_str(),
+        attempts,
+        suppressed_polls,
+        backoff.as_secs()
+    );
+    state.failure = Some(GitMonitorFailureState {
+        classification,
+        message,
+        attempts,
+        suppressed_polls: 0,
+        next_retry_at: now + backoff,
+    });
+}
+
+fn git_monitor_backoff(attempts: u32, poll_interval: Duration) -> Duration {
+    let multiplier = 2u32.saturating_pow(attempts.min(6));
+    let capped = poll_interval
+        .as_secs()
+        .saturating_mul(multiplier.into())
+        .min(300);
+    Duration::from_secs(capped.max(1))
+}
+
+fn classify_git_monitor_failure(message: &str) -> GitMonitorFailureClass {
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("no such file or directory") || lowered.contains("cannot change to") {
+        GitMonitorFailureClass::Missing
+    } else if lowered.contains("not a git repository")
+        && (lowered.contains(".git/worktrees") || lowered.contains("gitdir"))
+    {
+        GitMonitorFailureClass::GitdirBroken
+    } else if lowered.contains("not a git repository") {
+        GitMonitorFailureClass::NotGit
+    } else {
+        GitMonitorFailureClass::Unknown
+    }
+}
+
 pub(crate) fn parse_github_repo(remote: &str) -> Option<String> {
     let trimmed = remote.trim().trim_end_matches(".git");
     if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
@@ -355,6 +531,53 @@ pub(crate) fn parse_github_repo(remote: &str) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn classifies_common_invalid_monitor_failures() {
+        assert_eq!(
+            classify_git_monitor_failure(
+                "fatal: cannot change to '/tmp/missing': No such file or directory"
+            ),
+            GitMonitorFailureClass::Missing
+        );
+        assert_eq!(
+            classify_git_monitor_failure(
+                "fatal: not a git repository (or any of the parent directories): .git"
+            ),
+            GitMonitorFailureClass::NotGit
+        );
+        assert_eq!(
+            classify_git_monitor_failure(
+                "fatal: not a git repository: /tmp/repo/.git/worktrees/issue-129"
+            ),
+            GitMonitorFailureClass::GitdirBroken
+        );
+    }
+
+    #[test]
+    fn git_monitor_backoff_grows_and_caps() {
+        let poll_interval = Duration::from_secs(3);
+        assert_eq!(
+            git_monitor_backoff(1, poll_interval),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            git_monitor_backoff(2, poll_interval),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            git_monitor_backoff(6, poll_interval),
+            Duration::from_secs(192)
+        );
+        assert_eq!(
+            git_monitor_backoff(7, poll_interval),
+            Duration::from_secs(192)
+        );
+        assert_eq!(
+            git_monitor_backoff(6, Duration::from_secs(30)),
+            Duration::from_secs(300)
+        );
+    }
 
     #[test]
     fn parses_github_repo_urls() {
@@ -441,6 +664,62 @@ mod tests {
         assert_eq!(commit_event.payload["branch"], "feat/issue-115-v2");
         assert_eq!(commit_event.payload["summary"], "worktree commit");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn poll_git_backs_off_invalid_repo_discovery_failures() {
+        let sandbox = TempDir::new().unwrap();
+        let missing = sandbox.path().join("missing-repo");
+        let repo = GitRepoMonitor {
+            path: path_str(&missing).to_string(),
+            ..GitRepoMonitor::default()
+        };
+        let config = AppConfig {
+            monitors: crate::config::MonitorConfig {
+                poll_interval_secs: 1,
+                git: crate::config::GitMonitorConfig {
+                    repos: vec![repo.clone()],
+                },
+                ..crate::config::MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = HashMap::new();
+        let start = Instant::now();
+
+        poll_git_at(&config, &tx, &mut state, start).await.unwrap();
+        assert!(rx.try_recv().is_err());
+
+        let key = discovery_state_key(&repo);
+        let failure = state
+            .get(&key)
+            .and_then(|entry| entry.failure.as_ref())
+            .expect("failure state recorded");
+        assert_eq!(failure.classification, GitMonitorFailureClass::Missing);
+        assert_eq!(failure.attempts, 1);
+        let next_retry = failure.next_retry_at;
+
+        poll_git_at(&config, &tx, &mut state, start + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let failure = state
+            .get(&key)
+            .and_then(|entry| entry.failure.as_ref())
+            .expect("failure state retained during cooldown");
+        assert_eq!(failure.attempts, 1);
+        assert_eq!(failure.suppressed_polls, 1);
+
+        poll_git_at(&config, &tx, &mut state, next_retry)
+            .await
+            .unwrap();
+        let failure = state
+            .get(&key)
+            .and_then(|entry| entry.failure.as_ref())
+            .expect("failure state updated after retry");
+        assert_eq!(failure.attempts, 2);
+        assert_eq!(failure.suppressed_polls, 0);
     }
 
     async fn init_repo(root: &Path) {
