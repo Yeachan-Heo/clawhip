@@ -587,7 +587,10 @@ fn insert_resolved_session(
 }
 
 fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> bool {
-    let stale_after = Duration::from_secs(stale_minutes.max(1) * 60);
+    if stale_minutes == 0 {
+        return false;
+    }
+    let stale_after = Duration::from_secs(stale_minutes * 60);
     now.duration_since(pane.last_change) >= stale_after
         && pane
             .last_stale_notification
@@ -1549,5 +1552,33 @@ error: failed";
             Some("specific-alerts")
         );
         assert_eq!(resolved["abc-prod"].keywords, vec!["panic"]);
+    }
+
+    #[test]
+    fn stale_minutes_zero_disables_stale_detection() {
+        let pane = TmuxPaneState {
+            session: "test".into(),
+            pane_name: "0.0".into(),
+            snapshot: String::new(),
+            content_hash: 0,
+            last_change: Instant::now() - Duration::from_secs(3600),
+            last_stale_notification: None,
+        };
+        // stale_minutes=0 should never emit, even after 1 hour idle
+        assert!(!should_emit_stale(&pane, Instant::now(), 0));
+    }
+
+    #[test]
+    fn stale_minutes_nonzero_still_emits() {
+        let pane = TmuxPaneState {
+            session: "test".into(),
+            pane_name: "0.0".into(),
+            snapshot: String::new(),
+            content_hash: 0,
+            last_change: Instant::now() - Duration::from_secs(3600),
+            last_stale_notification: None,
+        };
+        // stale_minutes=1 should emit after 1 hour idle
+        assert!(should_emit_stale(&pane, Instant::now(), 1));
     }
 }
