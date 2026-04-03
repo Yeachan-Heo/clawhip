@@ -17,7 +17,7 @@ use crate::config::AppConfig;
 use crate::cron::CronSource;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::{from_incoming_event, incoming_event_from_omx_hook_envelope_json};
-use crate::events::{IncomingEvent, normalize_event};
+use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, Sink, SlackSink};
@@ -113,12 +113,38 @@ fn spawn_source<S>(source: S, tx: mpsc::Sender<IncomingEvent>)
 where
     S: Source + Send + Sync + 'static,
 {
+    let source_name = source.name().to_string();
     tokio::spawn(async move {
-        println!("clawhip source '{}' starting", source.name());
-        if let Err(error) = source.run(tx).await {
-            eprintln!("clawhip source '{}' stopped: {error}", source.name());
+        println!("clawhip source '{}' starting", source_name);
+        if let Err(error) = source.run(tx.clone()).await {
+            eprintln!("clawhip source '{}' stopped: {error}", source_name);
+            if let Err(alert_error) = tx
+                .send(source_failure_alert_event(&source_name, &error.to_string()))
+                .await
+            {
+                eprintln!(
+                    "clawhip source '{}' could not enqueue degraded alert: {alert_error}",
+                    source_name
+                );
+            }
         }
     });
+}
+
+fn source_failure_alert_event(source_name: &str, error_message: &str) -> IncomingEvent {
+    let mut event = IncomingEvent::custom(
+        None,
+        format!("clawhip degraded: source '{source_name}' stopped: {error_message}"),
+    )
+    .with_format(Some(MessageFormat::Alert));
+
+    if let Some(payload) = event.payload.as_object_mut() {
+        payload.insert("source_name".to_string(), json!(source_name));
+        payload.insert("health_status".to_string(), json!("degraded"));
+        payload.insert("error_message".to_string(), json!(error_message));
+    }
+
+    event
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -353,8 +379,15 @@ async fn enqueue_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::config::{CronJob, CronJobKind};
+    use crate::events::MessageFormat;
+    use crate::router::Router;
+    use crate::sink::SinkTarget;
     use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
+    use std::fs;
+    use tempfile::tempdir;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn health_payload_includes_version_and_token_source() {
@@ -374,6 +407,88 @@ mod tests {
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
+    }
+
+    #[tokio::test]
+    async fn source_failure_alert_defaults_to_alert_format_and_default_channel_routing() {
+        let event =
+            source_failure_alert_event("cron", "EOF while parsing a value at line 1 column 0");
+
+        assert_eq!(event.kind, "custom");
+        assert_eq!(event.channel, None);
+        assert_eq!(event.format, Some(MessageFormat::Alert));
+        assert_eq!(event.payload["source_name"], Value::from("cron"));
+        assert_eq!(event.payload["health_status"], Value::from("degraded"));
+        assert!(
+            event.payload["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("source 'cron' stopped"))
+        );
+
+        let mut config = AppConfig::default();
+        config.defaults.channel = Some("default-alerts".into());
+        let router = Router::new(Arc::new(config));
+        let delivery = router.preview_delivery(&event).await.expect("delivery");
+
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("default-alerts".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_source_emits_default_channel_alert_when_cron_source_fails_to_start() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        fs::write(&state_path, "").expect("write invalid cron state");
+
+        let mut config = AppConfig::default();
+        config.defaults.channel = Some("default-alerts".into());
+        config.cron.jobs.push(CronJob {
+            id: "dev-followup".into(),
+            schedule: "* * * * *".into(),
+            timezone: "UTC".into(),
+            enabled: true,
+            channel: Some("ops".into()),
+            mention: None,
+            format: Some(MessageFormat::Alert),
+            kind: CronJobKind::CustomMessage {
+                message: "check open PRs".into(),
+            },
+        });
+
+        let (tx, mut rx) = mpsc::channel(4);
+        spawn_source(CronSource::new(Arc::new(config.clone()), state_path), tx);
+
+        let event = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for degraded alert")
+            .expect("source alert event");
+
+        assert_eq!(event.kind, "custom");
+        assert_eq!(event.channel, None);
+        assert_eq!(event.format, Some(MessageFormat::Alert));
+        assert_eq!(event.payload["source_name"], Value::from("cron"));
+        assert_eq!(event.payload["health_status"], Value::from("degraded"));
+        assert!(
+            event.payload["error_message"]
+                .as_str()
+                .is_some_and(|message| message.contains("EOF while parsing a value"))
+        );
+
+        let router = Router::new(Arc::new(config));
+        let delivery = router.preview_delivery(&event).await.expect("delivery");
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("default-alerts".into())
+        );
+
+        let rendered = router
+            .render_delivery(&event, &delivery, &crate::render::DefaultRenderer)
+            .await
+            .expect("rendered alert");
+        assert!(rendered.contains("source 'cron' stopped"));
+        assert!(rendered.contains("EOF while parsing a value"));
     }
 
     #[tokio::test]
