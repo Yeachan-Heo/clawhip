@@ -425,7 +425,26 @@ fn load_scheduler_state(path: &Path) -> Result<CronSchedulerState> {
         return Ok(CronSchedulerState::default());
     }
 
-    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+    let raw = fs::read_to_string(path)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        eprintln!(
+            "clawhip cron state '{}' is empty; starting with fresh scheduler state",
+            path.display()
+        );
+        return Ok(CronSchedulerState::default());
+    }
+
+    match serde_json::from_str(trimmed) {
+        Ok(state) => Ok(state),
+        Err(error) => {
+            eprintln!(
+                "clawhip cron state '{}' is invalid JSON ({error}); starting with fresh scheduler state",
+                path.display()
+            );
+            Ok(CronSchedulerState::default())
+        }
+    }
 }
 
 fn save_scheduler_state(path: &Path, state: &CronSchedulerState) -> Result<()> {
@@ -537,6 +556,32 @@ mod tests {
 
         let events = emitter.events.lock().expect("events lock");
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn scheduler_starts_with_empty_state_file() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let config = sample_config("*/10 * * * *");
+        fs::write(&state_path, "").expect("write empty state");
+
+        let scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler starts");
+
+        assert_eq!(scheduler.last_processed_minute, None);
+    }
+
+    #[test]
+    fn scheduler_starts_with_invalid_state_file() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let config = sample_config("*/10 * * * *");
+        fs::write(&state_path, "{not-json").expect("write invalid state");
+
+        let scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler starts");
+
+        assert_eq!(scheduler.last_processed_minute, None);
     }
 
     #[test]
