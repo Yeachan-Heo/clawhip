@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_source_emits_default_channel_alert_when_cron_source_fails_to_start() {
+    async fn spawn_source_allows_cron_source_to_start_with_empty_state_and_emit_job_event() {
         let dir = tempdir().expect("tempdir");
         let state_path = dir.path().join("cron-state.json");
         fs::write(&state_path, "").expect("write invalid cron state");
@@ -462,33 +462,24 @@ mod tests {
 
         let event = timeout(Duration::from_secs(1), rx.recv())
             .await
-            .expect("timed out waiting for degraded alert")
-            .expect("source alert event");
+            .expect("timed out waiting for cron job event")
+            .expect("cron job event");
 
         assert_eq!(event.kind, "custom");
-        assert_eq!(event.channel, None);
+        assert_eq!(event.channel, Some("ops".into()));
         assert_eq!(event.format, Some(MessageFormat::Alert));
-        assert_eq!(event.payload["source_name"], Value::from("cron"));
-        assert_eq!(event.payload["health_status"], Value::from("degraded"));
-        assert!(
-            event.payload["error_message"]
-                .as_str()
-                .is_some_and(|message| message.contains("EOF while parsing a value"))
-        );
+        assert_eq!(event.payload["cron_job_id"], Value::from("dev-followup"));
+        assert_eq!(event.payload["cron_timezone"], Value::from("UTC"));
 
         let router = Router::new(Arc::new(config));
         let delivery = router.preview_delivery(&event).await.expect("delivery");
-        assert_eq!(
-            delivery.target,
-            SinkTarget::DiscordChannel("default-alerts".into())
-        );
+        assert_eq!(delivery.target, SinkTarget::DiscordChannel("ops".into()));
 
         let rendered = router
             .render_delivery(&event, &delivery, &crate::render::DefaultRenderer)
             .await
-            .expect("rendered alert");
-        assert!(rendered.contains("source 'cron' stopped"));
-        assert!(rendered.contains("EOF while parsing a value"));
+            .expect("rendered event");
+        assert!(rendered.contains("check open PRs"));
     }
 
     #[tokio::test]

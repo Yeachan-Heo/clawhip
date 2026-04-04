@@ -1554,7 +1554,6 @@ error: failed";
         assert_eq!(resolved["abc-prod"].keywords, vec!["panic"]);
     }
 
-
     #[test]
     fn stale_minutes_zero_disables_stale_detection() {
         let pane = TmuxPaneState {
