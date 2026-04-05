@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Ensure Homebrew and Cargo bins are available (OpenClaw exec may not inherit full PATH)
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.cargo/bin:$PATH"
+
 SESSION="${1:?Usage: $0 <session-name> \"<prompt-text>\"}"
 PROMPT="${2:?Usage: $0 <session-name> \"<prompt-text>\"}"
 

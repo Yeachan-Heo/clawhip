@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Ensure Homebrew and Cargo bins are available (OpenClaw exec may not inherit full PATH)
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.cargo/bin:$PATH"
+
 SESSION="${1:?Usage: $0 <session-name> <worktree-path> [prompt] [channel-id] [mention]}"
 WORKDIR="${2:?Usage: $0 <session-name> <worktree-path> [prompt] [channel-id] [mention]}"
 PROMPT="${3:-}"
@@ -57,13 +60,13 @@ BRANCH=\$(git -C $(quote "$WORKDIR") rev-parse --abbrev-ref HEAD 2>/dev/null || 
 emit_omx_event() {
   local raw_event="\$1"
   local normalized_event="\$2"
-  local status="\$3"
+  local evt_status="\$3"
   local summary="\${4:-}"
   local error_summary="\${5:-}"
   local elapsed="\${6:-}"
   CLAWHIP_EVENT="\$raw_event" \\
   CLAWHIP_NORMALIZED_EVENT="\$normalized_event" \\
-  CLAWHIP_STATUS="\$status" \\
+  CLAWHIP_STATUS="\$evt_status" \\
   CLAWHIP_SUMMARY="\$summary" \\
   CLAWHIP_ERROR_SUMMARY="\$error_summary" \\
   CLAWHIP_ELAPSED="\$elapsed" \\
@@ -128,7 +131,13 @@ ${OMX_ENV:+$OMX_ENV }omx $OMX_FLAGS
 EOF
 )
 
-ARGS+=(-- "$OMX_CMD")
+# Write the session script to a temp file to avoid nested-heredoc quoting issues
+# when clawhip passes the command through tmux's shell
+SCRIPT_FILE="/tmp/omx-session-${SESSION}.sh"
+printf '%s\n' "$OMX_CMD" > "$SCRIPT_FILE"
+chmod +x "$SCRIPT_FILE"
+
+ARGS+=(-- zsh "$SCRIPT_FILE")
 
 # Launch
 nohup clawhip "${ARGS[@]}" &>/dev/null &
