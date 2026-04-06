@@ -117,6 +117,14 @@ When upstream provides it, clawhip normalizes these fields onto the top-level pa
 
 ## Routing guidance
 
+Project metadata should be the routing authority.
+
+- Treat `project` / normalized `repo_name` as the source of truth for project-level routing.
+- Treat `session_name` as an operator label, not the authoritative project classifier.
+- Do not encode long-term routing doctrine around session-prefix glob hacks like `clawhip-*` when the launcher already knows the real project.
+- If routing behavior depends on prefix today, that is a compatibility bug to remove, not a convention to preserve.
+- Avoid overlapping broad tmux config monitors with launcher-registered per-session watches; duplicated watch layers can cause conflicting stale windows, ghost watches, and noisy keyword alerts.
+
 Recommended route filters:
 
 ```toml

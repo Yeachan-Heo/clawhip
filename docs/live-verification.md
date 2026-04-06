@@ -109,13 +109,13 @@ curl -sS -X POST http://127.0.0.1:25294/api/omx/hook \
 
 Operational flow:
 
-1. Use a monitored tmux session name that matches the route filter.
-2. Print a configured keyword (`error`, `FAILED`, `PR created`, etc).
-3. Confirm the keyword notification in Discord.
-4. Leave the session idle beyond the stale threshold.
-5. Confirm the stale notification in Discord.
-6. Launch a session via `clawhip tmux new ...`.
-7. Confirm wrapper registration + keyword/stale delivery.
+1. Launch a native session via `clawhip omx launch ...` or `clawhip omc ...`.
+2. Verify the pane is actually alive before trusting any `agent.started` message.
+3. Confirm routed delivery in Discord.
+4. Print a configured keyword (`error`, `FAILED`, `PR created`, etc) only when intentionally testing keyword behavior.
+5. Leave the session idle beyond the stale threshold only when intentionally testing stale behavior.
+6. Inspect `clawhip tmux list` to confirm exactly which watch registrations exist.
+7. If alert text disagrees with pane reality, treat it as monitor noise and debug registration overlap / stale math before assuming session failure.
 
 ## Helper script
 

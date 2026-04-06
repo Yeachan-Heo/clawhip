@@ -43,40 +43,38 @@ clawhip pairs well with coding session tools that run in tmux:
 
 ### [OMX (oh-my-codex)](https://github.com/Yeachan-Heo/oh-my-codex)
 
-OpenAI Codex wrapper with auto-monitoring. Launch monitored coding sessions:
+OpenAI Codex wrapper with native clawhip session launch. Launch monitored coding sessions with the native launcher first:
 
 ```bash
-clawhip tmux new -s issue-123 \
-  --channel YOUR_CHANNEL_ID \
+clawhip omx launch \
+  --session clawhip-issue-123-fix-routing \
+  --workdir ~/Workspace/clawhip.worktrees/clawhip-issue-123-fix-routing \
   --mention "<@your-user-id>" \
-  --keywords "error,PR created,complete" \
-  -- 'source ~/.zshrc && omx --madmax'
-
-# or attach monitoring to an existing tmux session
-clawhip tmux watch -s issue-123 \
-  --channel YOUR_CHANNEL_ID \
-  --mention "<@your-user-id>" \
-  --keywords "error,PR created,complete"
+  --skip-hook-check \
+  "$ralph Fix issue #123 and open a PR to dev"
 
 # inspect active daemon-known watches later
 clawhip tmux list
 ```
 
+Use `clawhip tmux new` / `clawhip tmux watch` only as fallback or launcher-debugging paths.
 See [`skills/omx/`](skills/omx/) for ready-to-use scripts.
 Native OMC/OMX routing now prefers the normalized [`session.*` contract](docs/native-event-contract.md); legacy `agent.*` wrapper emits remain supported for compatibility.
 
 ### [OMC (oh-my-claudecode)](https://github.com/Yeachan-Heo/oh-my-claudecode)
 
-Claude Code wrapper with auto-monitoring. Launch monitored coding sessions:
+Claude Code wrapper with native clawhip session launch:
 
 ```bash
-clawhip tmux new -s issue-456 \
-  --channel YOUR_CHANNEL_ID \
+clawhip omc \
+  --session clawhip-issue-456-build-feature \
+  --workdir ~/Workspace/clawhip.worktrees/clawhip-issue-456-build-feature \
   --mention "<@your-user-id>" \
-  --keywords "error,PR created,complete" \
-  -- 'source ~/.zshrc && omc --openclaw --madmax'
+  --skip-hook-check \
+  "Implement issue #456 and open a PR to dev"
 ```
 
+Use `clawhip tmux new` only when manually recovering or debugging launcher behavior.
 See [`skills/omc/`](skills/omc/) for ready-to-use scripts.
 Direct Slack/Discord notifications inside OMC/OMX should be treated as deprecated; emit native events and let clawhip own routing, mention policy, and formatting.
 
@@ -546,12 +544,30 @@ Verification:
 - let real tmux session idle past threshold
 - confirm final Discord body in target channel
 
-### 11. tmux wrapper / watch preset
+### 11. Native session launch + tmux fallback
 
-Input:
+Preferred input:
+```bash
+clawhip omx launch \
+  --session <project-issue-session-name> \
+  --workdir <verified-worktree-path> \
+  --mention '<@id>' \
+  --skip-hook-check \
+  "$ralph prompt here"
+
+clawhip omc \
+  --session <project-issue-session-name> \
+  --workdir <verified-worktree-path> \
+  --mention '<@id>' \
+  --skip-hook-check \
+  "implementation prompt here"
+
+clawhip tmux list
+```
+
+Fallback/debug input:
 ```bash
 clawhip tmux new -s <session> \
-  --channel <id> \
   --mention '<@id>' \
   --keywords 'error,PR created,FAILED,complete' \
   --stale-minutes 10 \
@@ -563,30 +579,30 @@ clawhip tmux new -s <session> \
   -- command args
 
 clawhip tmux watch -s <existing-session> \
-  --channel <id> \
   --mention '<@id>' \
   --keywords 'error,PR created,FAILED,complete' \
   --stale-minutes 10 \
   --format alert \
   --retry-enter true
-
-clawhip tmux list
 ```
 
 Behavior:
-- `tmux new` creates a tmux session using the user's default shell (or `--shell` override)
-- `tmux new` sends the requested command into the session, retrying Enter for TUI apps by default with exponential backoff (`--retry-enter=false` disables it, `--retry-enter-count` / `--retry-enter-delay-ms` tune retries)
-- when `tmux new` omits `--channel`, clawhip reuses the first matching Discord route channel for the session name before falling back to `defaults.channel`
-- `tmux watch` attaches monitoring to an already-running tmux session
-- both commands register the session with the daemon and emit an audit log line with launch options, timestamp, and parent-process provenance
+- native `omx launch` / `omc` should be the normal path for coding sessions
+- native launch emits project metadata and registers tmux monitoring automatically
+- `tmux new` / `tmux watch` are fallback paths for debugging or manual recovery
 - `tmux list` shows active daemon-known watches with source, registration timestamp, and parent-process info
-- daemon monitors keyword/stale events
-- final delivery goes through daemon routing
+- final delivery still goes through daemon routing
+
+Routing note:
+- session names are labels for operators, not routing authority
+- project metadata should be the source of truth for routing
+- broad prefix monitors like `clawhip*` are dangerous because they can overlap with launcher-registered watches and create stale/keyword noise
 
 Verification:
-- run wrapper or watch an existing session
-- emit keyword in pane
-- confirm Discord message body and mention
+- launch a native OMC/OMX session
+- verify the tmux pane is actually alive
+- confirm routed delivery in Discord
+- if alert text conflicts with pane reality, trust the pane and inspect monitor registrations
 
 ### 12. install lifecycle preset
 
