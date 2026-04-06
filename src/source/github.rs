@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,6 +94,9 @@ struct GitHubCISnapshot {
 
 impl GitHubCISnapshot {
     fn dedupe_key(&self) -> String {
+        if let Some(run_id) = &self.run_id {
+            return format!("run:{run_id}:{}", self.workflow);
+        }
         format!(
             "{}:{}:{}",
             self.pr_number
@@ -329,9 +332,6 @@ async fn poll_ci_statuses(
         .filter(|(_, pr)| pr.status == "open")
         .map(|(number, pr)| (*number, pr))
         .collect::<Vec<_>>();
-    if open_prs.is_empty() {
-        return Ok(HashMap::new());
-    }
 
     match fetch_ci_statuses(
         client,
@@ -585,11 +585,27 @@ async fn fetch_ci_statuses(
         .clone()
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
     let mut check_runs = HashMap::new();
+    let mut seen_run_ids = HashSet::new();
 
     for (number, pr) in open_prs {
         for check_run in fetch_check_runs(client, api_base, &github_repo, *number, pr).await? {
+            if let Some(run_id) = &check_run.run_id {
+                seen_run_ids.insert(run_id.clone());
+            }
             check_runs.insert(check_run.dedupe_key(), check_run);
         }
+    }
+
+    for workflow_run in fetch_direct_workflow_runs(client, api_base, &github_repo, snapshot).await?
+    {
+        if workflow_run
+            .run_id
+            .as_ref()
+            .is_some_and(|run_id| seen_run_ids.contains(run_id))
+        {
+            continue;
+        }
+        check_runs.insert(workflow_run.dedupe_key(), workflow_run);
     }
 
     Ok(check_runs)
@@ -650,6 +666,51 @@ fn summarize_workflow_runs(check_runs: &[GitHubCheckRun]) -> HashMap<String, (us
         entry.1 &= check_run.status == "completed";
     }
     summaries
+}
+
+async fn fetch_direct_workflow_runs(
+    client: &reqwest::Client,
+    api_base: &str,
+    github_repo: &str,
+    snapshot: &GitSnapshot,
+) -> Result<Vec<GitHubCISnapshot>> {
+    let mut query = vec![("per_page", "100"), ("event", "push")];
+    if !snapshot.branch.is_empty() {
+        query.push(("branch", snapshot.branch.as_str()));
+    }
+
+    let response = github_get(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/actions/runs"),
+        &query,
+        &format!("workflow runs for {github_repo}"),
+    )
+    .await?;
+
+    let runs: GitHubWorkflowRunsResponse = response.json().await?;
+    Ok(runs
+        .workflow_runs
+        .into_iter()
+        .filter(|run| run.pull_requests.is_empty())
+        .map(|run| {
+            let run_all_terminal = run.status == "completed";
+            GitHubCISnapshot {
+                pr_number: None,
+                workflow: run
+                    .name
+                    .unwrap_or_else(|| format!("workflow-run-{}", run.id)),
+                status: run.status,
+                conclusion: run.conclusion,
+                sha: run.head_sha,
+                url: run.html_url,
+                branch: non_empty_string(run.head_branch),
+                run_id: Some(run.id.to_string()),
+                run_job_count: 1,
+                run_all_terminal,
+            }
+        })
+        .collect())
 }
 
 fn workflow_run_id(url: &str) -> Option<String> {
@@ -723,6 +784,29 @@ struct GitHubCheckRun {
     conclusion: Option<String>,
     details_url: Option<String>,
     head_sha: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubWorkflowRunsResponse {
+    workflow_runs: Vec<GitHubWorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct GitHubWorkflowRun {
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+    status: String,
+    conclusion: Option<String>,
+    head_branch: String,
+    head_sha: String,
+    html_url: String,
+    #[serde(default)]
+    pull_requests: Vec<serde_json::Value>,
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn classify_ci_event_kind(status: &str, conclusion: Option<&str>) -> &'static str {
@@ -860,6 +944,192 @@ mod tests {
             run_job_count: 1,
             run_all_terminal: status == "completed",
         }
+    }
+
+    #[tokio::test]
+    async fn direct_branch_workflow_run_without_open_pr_emits_ci_failed_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = json!({
+                "workflow_runs": [{
+                    "id": 24007460067_u64,
+                    "name": "Rust CI",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "head_branch": "main",
+                    "head_sha": "deadbeef",
+                    "html_url": "https://github.com/ultraworkers/claw-code/actions/runs/24007460067",
+                    "pull_requests": []
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            req
+        });
+
+        let mut config = AppConfig::default();
+        config.monitors.github_api_base = format!("http://{addr}");
+        let repo = GitRepoMonitor {
+            path: "/tmp/claw-code".into(),
+            emit_pr_status: true,
+            ..GitRepoMonitor::default()
+        };
+        let snapshot = GitSnapshot {
+            repo_name: "claw-code".into(),
+            repo_path: "/tmp/claw-code".into(),
+            worktree_path: "/tmp/claw-code".into(),
+            branch: "main".into(),
+            head: "deadbeef".into(),
+            commits: Vec::new(),
+            github_repo: Some("ultraworkers/claw-code".into()),
+        };
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let prs = HashMap::new();
+
+        let ci = poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, &tx)
+            .await
+            .unwrap();
+
+        assert_eq!(ci.len(), 1);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.canonical_kind(), "github.ci-failed");
+        assert_eq!(event.payload["repo"], json!("claw-code"));
+        assert_eq!(event.payload["workflow"], json!("Rust CI"));
+        assert_eq!(event.payload["branch"], json!("main"));
+        assert_eq!(event.payload["run_id"], json!("24007460067"));
+        assert!(event.payload.get("number").is_none());
+
+        let req = server.await.unwrap();
+        assert!(req.contains("GET /repos/ultraworkers/claw-code/actions/runs?"));
+        assert!(req.contains("branch=main"));
+        assert!(req.contains("event=push"));
+        assert!(req.contains("per_page=100"));
+    }
+
+    #[tokio::test]
+    async fn direct_workflow_runs_skip_run_ids_already_seen_from_pr_checks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let responses = [
+                json!({
+                    "check_runs": [{
+                        "name": "test",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "details_url": "https://github.com/org/repo/actions/runs/123/jobs/1",
+                        "head_sha": "prsha"
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "workflow_runs": [
+                        {
+                            "id": 123_u64,
+                            "name": "CI",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "head_branch": "feat/pr",
+                            "head_sha": "prsha",
+                            "html_url": "https://github.com/org/repo/actions/runs/123",
+                            "pull_requests": [{"number": 42}]
+                        },
+                        {
+                            "id": 456_u64,
+                            "name": "Rust CI",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "head_branch": "main",
+                            "head_sha": "mainsha",
+                            "html_url": "https://github.com/org/repo/actions/runs/456",
+                            "pull_requests": []
+                        }
+                    ]
+                })
+                .to_string(),
+            ];
+
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+
+            requests
+        });
+
+        let snapshot = GitSnapshot {
+            repo_name: "repo".into(),
+            repo_path: "/tmp/repo".into(),
+            worktree_path: "/tmp/repo".into(),
+            branch: "main".into(),
+            head: "mainsha".into(),
+            commits: Vec::new(),
+            github_repo: Some("org/repo".into()),
+        };
+        let client = build_github_client(None).unwrap();
+        let pr = PullRequestSnapshot {
+            title: "PR".into(),
+            status: "open".into(),
+            url: "https://github.com/org/repo/pull/42".into(),
+            head_branch: "feat/pr".into(),
+            head_sha: "prsha".into(),
+        };
+        let open_prs = vec![(42_u64, &pr)];
+
+        let ci = fetch_ci_statuses(
+            &client,
+            &format!("http://{addr}"),
+            &GitRepoMonitor::default(),
+            &snapshot,
+            &open_prs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ci.len(), 2);
+        assert_eq!(
+            ci.values()
+                .filter(|snapshot| snapshot.run_id.as_deref() == Some("123"))
+                .count(),
+            1
+        );
+        let direct = ci
+            .values()
+            .find(|snapshot| snapshot.run_id.as_deref() == Some("456"))
+            .unwrap();
+        assert_eq!(direct.pr_number, None);
+        assert_eq!(direct.branch.as_deref(), Some("main"));
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("GET /repos/org/repo/commits/prsha/check-runs?"));
+        assert!(requests[1].contains("GET /repos/org/repo/actions/runs?"));
+        assert!(requests[1].contains("branch=main"));
+        assert!(requests[1].contains("event=push"));
     }
 
     #[test]
