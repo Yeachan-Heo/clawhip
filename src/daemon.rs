@@ -18,6 +18,7 @@ use crate::cron::CronSource;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::{from_incoming_event, incoming_event_from_omx_hook_envelope_json};
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
+use crate::native_hooks::incoming_event_from_native_hook_json;
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, Sink, SlackSink};
@@ -86,6 +87,8 @@ pub async fn run(
         .route("/event", post(post_event))
         .route("/api/event", post(post_event))
         .route("/events", post(post_event))
+        .route("/native/hook", post(post_native_hook))
+        .route("/api/native/hook", post(post_native_hook))
         .route("/omx/hook", post(post_omx_hook))
         .route("/api/omx/hook", post(post_omx_hook))
         .route("/api/tmux/register", post(register_tmux))
@@ -181,6 +184,24 @@ async fn post_event(
     Json(event): Json<IncomingEvent>,
 ) -> impl IntoResponse {
     accept_event(&state, normalize_event(event)).await
+}
+
+async fn post_native_hook(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let event = match incoming_event_from_native_hook_json(&payload) {
+        Ok(event) => normalize_event(event),
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    accept_event(&state, event).await
 }
 
 async fn post_omx_hook(

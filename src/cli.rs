@@ -76,6 +76,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: TmuxCommands,
     },
+    /// Send native provider hook events to the local daemon.
+    Native {
+        #[command(subcommand)]
+        command: NativeCommands,
+    },
     /// Send native OMX hook-envelope events to the local daemon.
     Omx {
         #[command(subcommand)]
@@ -129,6 +134,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: HooksCommands,
     },
+    /// Enable repo-local native hook forwarding for Claude Code and Codex.
+    EnableHook(EnableHookArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -296,6 +303,66 @@ pub struct AgentFailedArgs {
 #[derive(Debug, Clone, Subcommand)]
 pub enum PluginCommands {
     List,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum NativeCommands {
+    /// Forward a provider-native hook payload to clawhip.
+    Hook(NativeHookArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct NativeHookArgs {
+    /// Provider name (for example: claude-code or codex).
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Source/tool name override. Defaults to provider when omitted.
+    #[arg(long)]
+    pub source: Option<String>,
+    /// Provide the native hook JSON inline.
+    #[arg(long)]
+    pub payload: Option<String>,
+    /// Read native hook JSON from a file. Use "-" or omit to read stdin.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+impl NativeHookArgs {
+    pub fn read_payload(&self, stdin: &mut dyn Read) -> crate::Result<serde_json::Value> {
+        match (&self.payload, &self.file) {
+            (Some(_), Some(_)) => {
+                Err("provide either --payload or --file for clawhip native hook, not both".into())
+            }
+            (Some(payload), None) => Ok(serde_json::from_str(payload)?),
+            (None, Some(path)) => {
+                if path.as_os_str() == "-" {
+                    return Self::read_payload_from_stdin(stdin);
+                }
+                Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+            }
+            (None, None) => Self::read_payload_from_stdin(stdin),
+        }
+    }
+
+    fn read_payload_from_stdin(stdin: &mut dyn Read) -> crate::Result<serde_json::Value> {
+        let mut buffer = String::new();
+        stdin.read_to_string(&mut buffer)?;
+        let trimmed = buffer.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "clawhip native hook expects a JSON payload via stdin, --payload, or --file".into(),
+            );
+        }
+        Ok(serde_json::from_str(trimmed)?)
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct EnableHookArgs {
+    /// Repo root / current project directory (defaults to current directory).
+    #[arg(long)]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

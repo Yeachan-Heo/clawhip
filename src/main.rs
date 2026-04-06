@@ -13,6 +13,7 @@ mod hooks;
 mod keyword_window;
 mod lifecycle;
 mod memory;
+mod native_hooks;
 mod omc;
 mod omx;
 mod plugins;
@@ -29,7 +30,7 @@ use clap::Parser;
 
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, GitCommands, GithubCommands,
-    HooksCommands, MemoryCommands, OmxCommands, PluginCommands, TmuxCommands,
+    HooksCommands, MemoryCommands, NativeCommands, OmxCommands, PluginCommands, TmuxCommands,
 };
 use crate::client::DaemonClient;
 use crate::config::AppConfig;
@@ -217,6 +218,27 @@ async fn real_main() -> Result<()> {
             }
         },
         Commands::Omc(args) => omc::run(args, config.as_ref()).await,
+        Commands::Native { command } => match command {
+            NativeCommands::Hook(args) => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let mut payload = args.read_payload(&mut std::io::stdin())?;
+                if let Some(provider) = args.provider.as_deref()
+                    && payload.get("provider").is_none()
+                    && let Some(object) = payload.as_object_mut()
+                {
+                    object.insert("provider".into(), serde_json::json!(provider));
+                }
+                if let Some(source) = args.source.as_deref()
+                    && payload.get("source").is_none()
+                    && let Some(object) = payload.as_object_mut()
+                {
+                    object.insert("source".into(), serde_json::json!(source));
+                }
+                let response = client.send_native_hook(&payload).await?;
+                println!("{}", serde_json::to_string(&response)?);
+                Ok(())
+            }
+        },
         Commands::Omx { command } => match command {
             OmxCommands::Hook(args) => {
                 let client = DaemonClient::from_config(config.as_ref());
@@ -277,6 +299,7 @@ async fn real_main() -> Result<()> {
         Commands::Hooks { command } => match command {
             HooksCommands::Install(args) => hooks::install(args),
         },
+        Commands::EnableHook(args) => native_hooks::enable(args),
     }
 }
 

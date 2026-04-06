@@ -25,6 +25,10 @@ impl DaemonClient {
         self.post_json("/event", event).await.map(|_| ())
     }
 
+    pub async fn send_native_hook(&self, envelope: &Value) -> Result<Value> {
+        self.post_json("/api/native/hook", envelope).await
+    }
+
     pub async fn send_omx_hook(&self, envelope: &Value) -> Result<Value> {
         self.post_json("/api/omx/hook", envelope).await
     }

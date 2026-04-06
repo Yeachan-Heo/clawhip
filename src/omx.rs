@@ -242,8 +242,11 @@ fn dir_basename(path: &Path) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// Check if clawhip hooks (OMX bridge or plugin) are installed in this workspace.
+/// Check if clawhip hooks or repo-local native hook config are installed in this workspace.
 fn hooks_installed(workdir: &Path) -> bool {
+    if crate::native_hooks::native_hooks_installed(workdir) {
+        return true;
+    }
     // Check for OMX hook bridge
     let omx_hook = workdir.join(".omx/hooks/clawhip.mjs");
     if omx_hook.is_file() {
