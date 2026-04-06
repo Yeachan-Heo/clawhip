@@ -37,6 +37,8 @@ pub struct ProvidersConfig {
     pub discord: DiscordConfig,
     #[serde(default)]
     pub slack: SlackConfig,
+    #[serde(default)]
+    pub telegram: TelegramConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -49,6 +51,17 @@ pub struct DiscordConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlackConfig {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelegramConfig {
+    pub bot_token: Option<String>,
+}
+
+impl TelegramConfig {
+    fn is_empty(&self) -> bool {
+        self.bot_token.is_none()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -68,7 +81,7 @@ impl DiscordConfig {
 
 impl ProvidersConfig {
     fn is_empty(&self) -> bool {
-        self.discord.is_empty() && self.slack.is_empty()
+        self.discord.is_empty() && self.slack.is_empty() && self.telegram.is_empty()
     }
 }
 
@@ -136,6 +149,7 @@ pub struct RouteRule {
     pub channel: Option<String>,
     pub webhook: Option<String>,
     pub slack_webhook: Option<String>,
+    pub telegram_chat: Option<String>,
     pub mention: Option<String>,
     #[serde(default)]
     pub allow_dynamic_tokens: bool,
@@ -152,6 +166,7 @@ impl Default for RouteRule {
             channel: None,
             webhook: None,
             slack_webhook: None,
+            telegram_chat: None,
             mention: None,
             allow_dynamic_tokens: false,
             format: None,
@@ -171,11 +186,21 @@ impl RouteRule {
         let sink = self.sink.trim();
         if self.slack_webhook_target().is_some() && (sink.is_empty() || sink == "discord") {
             "slack"
+        } else if non_empty_trimmed(self.telegram_chat.as_deref()).is_some()
+            && (sink.is_empty() || sink == "discord")
+        {
+            "telegram"
         } else if sink.is_empty() {
             "discord"
         } else {
             sink
         }
+    }
+
+    pub fn telegram_chat_target(&self) -> Option<&str> {
+        (self.effective_sink() == "telegram")
+            .then(|| non_empty_trimmed(self.telegram_chat.as_deref()))
+            .flatten()
     }
 
     pub fn discord_webhook_target(&self) -> Option<&str> {
@@ -191,7 +216,9 @@ impl RouteRule {
     }
 
     fn has_any_webhook_target(&self) -> bool {
-        self.discord_webhook_target().is_some() || self.slack_webhook_target().is_some()
+        self.discord_webhook_target().is_some()
+            || self.slack_webhook_target().is_some()
+            || self.telegram_chat_target().is_some()
     }
 }
 
@@ -599,7 +626,7 @@ impl AppConfig {
                     format!("route #{} ({}) must set a sink", index + 1, route.event).into(),
                 );
             }
-            if !matches!(sink, "discord" | "slack") {
+            if !matches!(sink, "discord" | "slack" | "telegram") {
                 return Err(format!(
                     "route #{} ({}) uses unsupported sink '{}'",
                     index + 1,
@@ -642,6 +669,16 @@ impl AppConfig {
                     if !has_slack_webhook {
                         return Err(format!(
                             "route #{} ({}) must set webhook or slack_webhook when sink = \"slack\"",
+                            index + 1,
+                            route.event
+                        )
+                        .into());
+                    }
+                }
+                "telegram" => {
+                    if route.telegram_chat.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                        return Err(format!(
+                            "route #{} ({}) must set telegram_chat when sink = \"telegram\"",
                             index + 1,
                             route.event
                         )
@@ -719,6 +756,7 @@ impl AppConfig {
             channel: None,
             webhook: Some(webhook),
             slack_webhook: None,
+            telegram_chat: None,
             mention: None,
             allow_dynamic_tokens: false,
             format: None,
@@ -1080,6 +1118,7 @@ mod tests {
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                telegram: TelegramConfig::default(),
             },
             routes: vec![RouteRule {
                 event: "tmux.keyword".into(),
@@ -1317,6 +1356,7 @@ message = " ping "
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                telegram: TelegramConfig::default(),
             },
             cron: CronConfig {
                 poll_interval_secs: 30,

@@ -22,6 +22,9 @@ impl SlackClient {
             SinkTarget::DiscordChannel(_) | SinkTarget::DiscordWebhook(_) => {
                 Err("cannot send Discord target via Slack client".into())
             }
+            SinkTarget::TelegramChat(_) => {
+                Err("cannot send Telegram chat via Slack client".into())
+            }
         }
     }
 

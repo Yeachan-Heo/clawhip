@@ -720,6 +720,7 @@ fn sink_target_key(target: &SinkTarget) -> String {
         SinkTarget::DiscordChannel(channel) => format!("discord-channel:{channel}"),
         SinkTarget::DiscordWebhook(webhook) => format!("discord-webhook:{webhook}"),
         SinkTarget::SlackWebhook(webhook) => format!("slack-webhook:{webhook}"),
+        SinkTarget::TelegramChat(chat_id) => format!("telegram-chat:{chat_id}"),
     }
 }
 
@@ -831,6 +832,7 @@ mod tests {
                     channel: None,
                     webhook: Some(failing_webhook),
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -843,6 +845,7 @@ mod tests {
                     channel: None,
                     webhook: Some(successful_webhook),
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,

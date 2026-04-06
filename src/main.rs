@@ -21,6 +21,7 @@ mod router;
 mod sink;
 mod slack;
 mod source;
+mod telegram;
 mod tmux_wrapper;
 
 use std::sync::Arc;

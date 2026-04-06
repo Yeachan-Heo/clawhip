@@ -161,7 +161,7 @@ impl Router {
             .await?;
         match delivery.target {
             SinkTarget::DiscordChannel(channel) => Ok((channel, delivery.format, content)),
-            SinkTarget::DiscordWebhook(_) | SinkTarget::SlackWebhook(_) => {
+            SinkTarget::DiscordWebhook(_) | SinkTarget::SlackWebhook(_) | SinkTarget::TelegramChat(_) => {
                 Err("matched route uses a webhook instead of a channel".into())
             }
         }
@@ -231,6 +231,16 @@ impl Router {
                 .ok_or_else(|| {
                     format!(
                         "no Slack webhook configured for event {}",
+                        event.canonical_kind()
+                    )
+                    .into()
+                }),
+            "telegram" => route
+                .and_then(RouteRule::telegram_chat_target)
+                .map(|chat_id| SinkTarget::TelegramChat(chat_id.to_string()))
+                .ok_or_else(|| {
+                    format!(
+                        "no Telegram chat_id configured for event {}",
                         event.canonical_kind()
                     )
                     .into()
@@ -392,6 +402,7 @@ mod tests {
                     channel: Some("ops".into()),
                     webhook: None,
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: Some("@ops".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -404,6 +415,7 @@ mod tests {
                     channel: Some("eng".into()),
                     webhook: None,
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: Some("@eng".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Compact),
@@ -456,6 +468,7 @@ mod tests {
                 channel: Some("github".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -517,6 +530,7 @@ mod tests {
                     channel: None,
                     webhook: Some(failing_webhook),
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -529,6 +543,7 @@ mod tests {
                     channel: None,
                     webhook: Some(successful_webhook),
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -572,6 +587,7 @@ mod tests {
                 channel: Some("route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -608,6 +624,7 @@ mod tests {
                 channel: Some("worktrees".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -651,6 +668,7 @@ mod tests {
                 channel: Some("route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: Some("<@1465264645320474637>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -682,6 +700,7 @@ mod tests {
                     channel: Some("gh-route".into()),
                     webhook: None,
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: Some("<@botid>".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -696,6 +715,7 @@ mod tests {
                     channel: Some("tmux-route".into()),
                     webhook: None,
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: Some("<@botid>".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -733,6 +753,7 @@ mod tests {
                 channel: Some("dynamic-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: true,
                 format: None,
@@ -760,6 +781,7 @@ mod tests {
                 channel: Some("dynamic-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: true,
                 format: None,
@@ -789,6 +811,7 @@ mod tests {
                 channel: Some("tmux-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -822,6 +845,7 @@ mod tests {
                 channel: Some("tmux-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -855,6 +879,7 @@ mod tests {
                 channel: Some("route-channel".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -892,6 +917,7 @@ mod tests {
                 channel: Some("route-channel".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -937,6 +963,7 @@ mod tests {
                 channel: Some("agent-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -999,6 +1026,7 @@ mod tests {
                 channel: Some("session-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1044,6 +1072,7 @@ mod tests {
                 channel: Some("session-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1101,6 +1130,7 @@ mod tests {
                 channel: Some("agent-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1148,6 +1178,7 @@ mod tests {
                     channel: Some("repo-a".into()),
                     webhook: None,
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -1162,6 +1193,7 @@ mod tests {
                     channel: Some("repo-b".into()),
                     webhook: None,
                     slack_webhook: None,
+                    telegram_chat: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -1192,6 +1224,7 @@ mod tests {
                 channel: Some("repo-name-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1228,6 +1261,7 @@ mod tests {
                 channel: Some("tmux-session-name".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1255,6 +1289,7 @@ mod tests {
                 channel: Some("session-alias-route".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1293,6 +1328,7 @@ mod tests {
                 channel: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1332,6 +1368,7 @@ mod tests {
                 channel: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1368,6 +1405,7 @@ mod tests {
                 channel: Some("route-channel".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1404,6 +1442,7 @@ mod tests {
                 channel: None,
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1440,6 +1479,7 @@ mod tests {
                 channel: Some("route-ch".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1473,6 +1513,7 @@ mod tests {
                 channel: Some("route-ch".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1564,6 +1605,7 @@ mod tests {
                 channel: Some("xeroclaw-dev".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1592,6 +1634,7 @@ mod tests {
                 channel: Some("xeroclaw-dev".into()),
                 webhook: None,
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1620,6 +1663,7 @@ mod tests {
                 channel: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                telegram_chat: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1676,5 +1720,69 @@ mod tests {
             .unwrap();
         assert!(request.contains("\"text\":\"hello from clawhip\""));
         assert!(request.contains("\"blocks\""));
+    }
+
+    #[tokio::test]
+    async fn telegram_route_resolves_to_telegram_chat_target() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "telegram".into(),
+                telegram_chat: Some("-100123456".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::custom(None, "hello".into());
+        let deliveries = router.resolve(&event).await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].target,
+            SinkTarget::TelegramChat("-100123456".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_route_auto_detected_from_telegram_chat_field() {
+        // No explicit sink="telegram" — should be inferred from telegram_chat presence.
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                telegram_chat: Some("-100999".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::custom(None, "auto detect".into());
+        let deliveries = router.resolve(&event).await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].target,
+            SinkTarget::TelegramChat("-100999".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_route_missing_chat_id_returns_error() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "telegram".into(),
+                telegram_chat: None,
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::custom(None, "hello".into());
+        let result = router.resolve(&event).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("telegram") || err.contains("chat_id"),
+            "error should mention telegram or chat_id: {err}"
+        );
     }
 }

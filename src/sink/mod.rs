@@ -1,5 +1,6 @@
 pub mod discord;
 pub mod slack;
+pub mod telegram;
 
 use async_trait::async_trait;
 
@@ -9,12 +10,14 @@ use serde_json::Value;
 
 pub use discord::DiscordSink;
 pub use slack::SlackSink;
+pub use telegram::TelegramSink;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SinkTarget {
     DiscordChannel(String),
     DiscordWebhook(String),
     SlackWebhook(String),
+    TelegramChat(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

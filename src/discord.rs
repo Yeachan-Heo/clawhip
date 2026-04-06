@@ -105,6 +105,9 @@ impl DiscordClient {
                 SinkTarget::SlackWebhook(_) => {
                     return Err("cannot send Slack webhook via Discord client".into());
                 }
+                SinkTarget::TelegramChat(_) => {
+                    return Err("cannot send Telegram chat via Discord client".into());
+                }
             };
 
             match result {
@@ -286,6 +289,7 @@ fn target_rate_limit_key(target: &SinkTarget) -> String {
         SinkTarget::DiscordChannel(channel_id) => format!("discord:channel:{channel_id}"),
         SinkTarget::DiscordWebhook(webhook_url) => format!("discord:webhook:{webhook_url}"),
         SinkTarget::SlackWebhook(webhook_url) => format!("slack:webhook:{webhook_url}"),
+        SinkTarget::TelegramChat(chat_id) => format!("telegram:chat:{chat_id}"),
     }
 }
 

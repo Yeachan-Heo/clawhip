@@ -20,7 +20,7 @@ use crate::event::compat::{from_incoming_event, incoming_event_from_omx_hook_env
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
-use crate::sink::{DiscordSink, Sink, SlackSink};
+use crate::sink::{DiscordSink, Sink, SlackSink, TelegramSink};
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
     WorkspaceSource, list_active_tmux_registrations,
@@ -51,6 +51,14 @@ pub async fn run(
         Box::new(DiscordSink::from_config(config.clone())?),
     );
     sinks.insert("slack".into(), Box::new(SlackSink::default()));
+    match TelegramSink::from_config(config.clone()) {
+        Ok(sink) => {
+            sinks.insert("telegram".into(), Box::new(sink));
+        }
+        Err(e) => {
+            eprintln!("clawhip: Telegram sink not available ({e}), skipping");
+        }
+    }
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
