@@ -605,6 +605,53 @@ impl IncomingEvent {
         }
     }
 
+    /// Tmux content changed — with AI-generated summary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tmux_content_changed_with_metadata(
+        session: String,
+        pane_name: String,
+        summary: String,
+        raw_truncated: String,
+        backend: String,
+        content_mode: String,
+        channel: Option<String>,
+    ) -> Self {
+        Self {
+            kind: "tmux.content_changed".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "session": session,
+                "pane": pane_name,
+                "summary": summary,
+                "raw_truncated": raw_truncated,
+                "backend": backend,
+                "content_mode": content_mode,
+            }),
+        }
+    }
+
+    /// Heartbeat — no changes detected for a given interval.
+    pub fn tmux_heartbeat(
+        session: String,
+        minutes_since_change: u64,
+        channel: Option<String>,
+    ) -> Self {
+        Self {
+            kind: "tmux.heartbeat".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "session": session,
+                "minutes_since_change": minutes_since_change,
+            }),
+        }
+    }
+
     pub fn with_mention(mut self, mention: Option<String>) -> Self {
         self.mention = mention;
         self

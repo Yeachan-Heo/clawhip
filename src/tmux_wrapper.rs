@@ -119,6 +119,7 @@ impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
             registration_source: value.registration_source,
             parent_process: value.parent_process,
             active_wrapper_monitor: true,
+            ..Default::default()
         }
     }
 }
@@ -207,8 +208,9 @@ async fn register_and_start_monitor(
     client.register_tmux(&registration).await?;
 
     let monitor_client = client.clone();
+    let providers = config.providers.clone();
     Ok(tokio::spawn(async move {
-        monitor_registered_session(registration, monitor_client).await
+        monitor_registered_session(registration, monitor_client, providers).await
     }))
 }
 
@@ -622,6 +624,7 @@ mod tests {
                 name: Some("codex".into()),
             }),
             active_wrapper_monitor: true,
+            ..Default::default()
         });
 
         assert!(log.contains("session=issue-105"));
