@@ -6,6 +6,8 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
+use crate::config::ProvidersConfig;
+
 const MAX_INPUT_CHARS: usize = 4000;
 const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
 const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-4o-mini";
@@ -103,14 +105,19 @@ pub fn parse_summarizer_spec(
 
 pub fn build_summarizer(
     summarizer: &str,
+    providers: &ProvidersConfig,
 ) -> Result<Box<dyn Summarizer>, Box<dyn Error + Send + Sync>> {
     match parse_summarizer_spec(summarizer)? {
         SummarizerSpec::Gemini { model } => Ok(Box::new(GeminiCli { model })),
-        SummarizerSpec::OpenRouter { model } => {
-            Ok(Box::new(OpenAiCompatibleSummarizer::new_openrouter(model)?))
-        }
+        SummarizerSpec::OpenRouter { model } => Ok(Box::new(
+            OpenAiCompatibleSummarizer::new_openrouter(model, providers.openrouter.api_key.as_deref())?,
+        )),
         SummarizerSpec::OpenAiCompatible { model } => Ok(Box::new(
-            OpenAiCompatibleSummarizer::new_openai_compatible(model)?,
+            OpenAiCompatibleSummarizer::new_openai_compatible(
+                model,
+                providers.openai.api_key.as_deref(),
+                providers.openai.base_url.as_deref(),
+            )?,
         )),
         SummarizerSpec::Raw => Ok(Box::new(RawPassthroughSummarizer)),
     }
@@ -130,6 +137,22 @@ pub fn truncate_for_summarizer(content: &str) -> &str {
     &content[start..]
 }
 
+fn resolve_key(
+    config_key: Option<&str>,
+    env_var: &str,
+    backend: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if let Some(key) = config_key.filter(|k| !k.trim().is_empty()) {
+        return Ok(key.to_string());
+    }
+    std::env::var(env_var).map_err(|_| {
+        format!(
+            "{env_var} is required for {backend} summarizer; set it via [providers.{backend}].api_key in config.toml or as an environment variable"
+        )
+        .into()
+    })
+}
+
 fn default_if_empty(value: &str, default: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -140,7 +163,15 @@ fn default_if_empty(value: &str, default: &str) -> String {
 }
 
 fn summarize_system_prompt() -> &'static str {
-    "You summarize tmux session output for developer monitoring. Focus on what the agent is doing, any errors encountered, and current status. Keep it concise (2-5 sentences). If the output shows the agent is waiting for input, say so explicitly. Respond in plain text."
+    "You summarize tmux session output for developer monitoring. \
+     Focus on what the agent is doing, any errors encountered, and current status. \
+     Keep it concise (2-5 sentences).\n\n\
+     IMPORTANT: If the terminal output indicates the session is waiting for user input — for example: \
+     a [Y/n] confirmation prompt, 'Press enter to continue', 'Allow, Deny, Always allow' tool approval \
+     (Claude Code style), 'continue?', 'proceed?', 'overwrite?', an interactive menu asking for a choice, \
+     or a shell/REPL prompt awaiting a command — begin your response with exactly this line:\n\
+     STATUS: WAITING_FOR_INPUT\n\n\
+     Otherwise do not include a STATUS line. Respond in plain text."
 }
 
 fn summarize_user_prompt(session: &str, content: &str) -> String {
@@ -285,28 +316,26 @@ struct OpenAiCompatibleSummarizer {
 }
 
 impl OpenAiCompatibleSummarizer {
-    fn new_openrouter(model: String) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        Self::new(
-            "openrouter",
-            OPENROUTER_BASE_URL.to_string(),
-            std::env::var("OPENROUTER_API_KEY")
-                .map_err(|_| "OPENROUTER_API_KEY is required for openrouter summarizer")?,
-            model,
-        )
+    fn new_openrouter(
+        model: String,
+        config_key: Option<&str>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let api_key = resolve_key(config_key, "OPENROUTER_API_KEY", "openrouter")?;
+        Self::new("openrouter", OPENROUTER_BASE_URL.to_string(), api_key, model)
     }
 
-    fn new_openai_compatible(model: String) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+    fn new_openai_compatible(
+        model: String,
+        config_key: Option<&str>,
+        config_base_url: Option<&str>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let base_url = config_base_url
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| std::env::var("OPENAI_BASE_URL").ok().filter(|v| !v.trim().is_empty()))
             .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
-        Self::new(
-            "openai-compatible",
-            base_url,
-            std::env::var("OPENAI_API_KEY")
-                .map_err(|_| "OPENAI_API_KEY is required for openai summarizer")?,
-            model,
-        )
+        let api_key = resolve_key(config_key, "OPENAI_API_KEY", "openai")?;
+        Self::new("openai-compatible", base_url, api_key, model)
     }
 
     fn new(
@@ -522,6 +551,18 @@ mod tests {
 
     #[test]
     fn build_summarizer_supports_raw() {
-        assert!(build_summarizer("raw").is_ok());
+        assert!(build_summarizer("raw", &ProvidersConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn system_prompt_includes_waiting_for_input_status_marker() {
+        let prompt = summarize_system_prompt();
+        assert!(
+            prompt.contains("STATUS: WAITING_FOR_INPUT"),
+            "system prompt must instruct the LLM to emit STATUS: WAITING_FOR_INPUT"
+        );
+        // Confirm it covers the key OMC/OMX trigger patterns
+        assert!(prompt.contains("[Y/n]") || prompt.contains("Allow, Deny"));
+        assert!(prompt.contains("continue?") || prompt.contains("proceed?"));
     }
 }

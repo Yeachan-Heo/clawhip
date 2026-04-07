@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::Result;
@@ -14,6 +15,16 @@ use crate::core::dlq::{Dlq, DlqEntry};
 use crate::core::rate_limit::RateLimiter;
 use crate::sink::{SinkMessage, SinkTarget};
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DashboardSlotIds {
+    pub status: Option<String>,
+    pub summary: Option<String>,
+    pub alert: Option<String>,
+    pub activity: Option<String>,
+    pub keywords: Option<String>,
+}
+
+const DASHBOARD_SEPARATOR: &str = "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}";
 const MAX_ATTEMPTS: u32 = 3;
 const JITTER_MS: u64 = 50;
 const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
@@ -34,9 +45,20 @@ struct DiscordState {
     limiter: RateLimiter,
     circuits: HashMap<String, CircuitBreaker>,
     dlq: Dlq,
-    /// Tracks the last Discord message ID sent for each heartbeat session+channel.
-    /// Key: "{channel_id}:{session}". Used to edit instead of post new messages.
+    /// Tracks the last Discord message ID for edit-in-place event types.
+    /// Key: "{channel_id}:{edit_key}".
     last_heartbeat_msg_ids: HashMap<String, String>,
+    /// Accumulated rendered content for append-only keyword messages.
+    /// Key: "{channel_id}:keywords:{session}".
+    accumulated_keyword_content: HashMap<String, String>,
+    /// Dashboard message IDs per "{channel}:{session}".
+    dashboard_ids: HashMap<String, DashboardSlotIds>,
+    /// Rolling activity log per "{channel}:{session}" -- last 5 events.
+    activity_log: HashMap<String, VecDeque<String>>,
+    /// Rolling keyword hit log per "{channel}:{session}".
+    keyword_log: HashMap<String, VecDeque<String>>,
+    /// Path to dashboard persistence file.
+    dashboard_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -72,6 +94,15 @@ impl DiscordClient {
             .unwrap_or_else(|_| "https://discord.com/api/v10".to_string());
         let webhook_client = reqwest::Client::new();
 
+        let dashboard_path = std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".clawhip").join("dashboard.json"));
+        let dashboard_ids: HashMap<String, DashboardSlotIds> = dashboard_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
         Ok(Self {
             bot_client,
             webhook_client,
@@ -81,6 +112,11 @@ impl DiscordClient {
                 circuits: HashMap::new(),
                 dlq: Dlq::default(),
                 last_heartbeat_msg_ids: HashMap::new(),
+                accumulated_keyword_content: HashMap::new(),
+                dashboard_ids,
+                activity_log: HashMap::new(),
+                keyword_log: HashMap::new(),
+                dashboard_path,
             })),
         })
     }
@@ -102,21 +138,97 @@ impl DiscordClient {
             let result = match target {
                 SinkTarget::DiscordChannel(channel_id) => {
                     let session = message.payload["session"].as_str().unwrap_or("unknown");
-                    let edit_key = match message.event_kind.as_str() {
-                        "tmux.heartbeat" => Some(format!("heartbeat:{session}")),
-                        "tmux.waiting_for_input" => Some(format!("waiting:{session}")),
-                        "tmux.content_changed"
-                            if message.payload["content_mode"].as_str() == Some("raw") =>
+                    let dashboard_slot = message.payload["dashboard_component"].as_str();
+
+                    if let Some(slot) = dashboard_slot {
+                        let ts = time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default();
+                        let dashboard_content = if slot == "keywords" {
+                            let entry = format!("`{ts}` {}", truncate_keyword_entry(&message.content));
+                            let log_text = self.push_keyword_log(channel_id, session, &entry);
+                            format!("\u{1f511} `{session}` \u{00b7} Keyword Hits\n{DASHBOARD_SEPARATOR}\n{log_text}")
+                        } else if slot == "alert"
+                            && message.payload["resolved"].as_bool().unwrap_or(false)
                         {
-                            Some(format!("raw:{session}"))
-                        }
-                        _ => None,
-                    };
-                    if let Some(key) = edit_key {
-                        self.send_or_edit_keyed(channel_id, &key, &message.content)
+                            format!("✅ `{session}` — Input received, continuing...")
+                        } else {
+                            render_dashboard_slot(
+                                slot,
+                                session,
+                                &message.event_kind,
+                                &message.content,
+                            )
+                        };
+
+                        let activity_entry =
+                            format!("`{ts}` {} -- {}", message.event_kind, truncate_activity(&message.content));
+                        let activity_text = self.push_activity(channel_id, session, &activity_entry);
+                        let activity_content = format!(
+                            "\u{1f4dc} `{session}` \u{00b7} Recent Activity\n{DASHBOARD_SEPARATOR}\n{activity_text}"
+                        );
+                        let should_pin_activity = message.payload["pin_activity"].as_bool().unwrap_or(true);
+                        let _ = self
+                            .update_dashboard_slot(channel_id, session, "activity", &activity_content, should_pin_activity)
+                            .await;
+
+                        self.update_dashboard_slot(channel_id, session, slot, &dashboard_content, true)
                             .await
                     } else {
-                        self.send_message(channel_id, &message.content).await
+                        match message.event_kind.as_str() {
+                            "tmux.session_ended" => {
+                                self.clear_session_dashboard(channel_id, session).await;
+                                return Ok(());
+                            }
+                            "tmux.heartbeat" => {
+                                self.send_or_edit_keyed(
+                                    channel_id,
+                                    &format!("heartbeat:{session}"),
+                                    &message.content,
+                                )
+                                .await
+                            }
+                            "tmux.waiting_for_input" => {
+                                let content = if message.payload["resolved"].as_bool().unwrap_or(false) {
+                                    format!("✅ `{session}` — Input received, continuing...")
+                                } else {
+                                    message.content.clone()
+                                };
+                                self.send_or_edit_keyed(
+                                    channel_id,
+                                    &format!("waiting:{session}"),
+                                    &content,
+                                )
+                                .await
+                            }
+                            "tmux.content_changed"
+                                if message.payload["content_mode"].as_str() == Some("raw") =>
+                            {
+                                self.send_or_edit_keyed(
+                                    channel_id,
+                                    &format!("raw:{session}"),
+                                    &message.content,
+                                )
+                                .await
+                            }
+                            "tmux.stale" => {
+                                self.send_or_edit_keyed(
+                                    channel_id,
+                                    &format!("stale:{session}"),
+                                    &message.content,
+                                )
+                                .await
+                            }
+                            "tmux.keyword" => {
+                                self.append_keyword_keyed(
+                                    channel_id,
+                                    &format!("keywords:{session}"),
+                                    &message.content,
+                                )
+                                .await
+                            }
+                            _ => self.send_message(channel_id, &message.content).await,
+                        }
                     }
                 }
                 SinkTarget::DiscordWebhook(webhook_url) => {
@@ -222,7 +334,7 @@ impl DiscordClient {
 
     /// For edit-in-place event types (heartbeat, raw, waiting): edit the previous
     /// message for this key if possible, otherwise post a new one and store the ID.
-    /// `edit_key` is a logical key like "heartbeat:session-name" or "raw:session-name".
+    /// `edit_key` is a logical key like "heartbeat:session-name" or "content:session-name".
     async fn send_or_edit_keyed(
         &self,
         channel_id: &str,
@@ -249,6 +361,70 @@ impl DiscordClient {
         if let Some(id) = msg_id {
             let mut state = self.state.lock().expect("discord state lock");
             state.last_heartbeat_msg_ids.insert(key, id);
+        }
+        Ok(())
+    }
+
+    /// Append new keyword hits to an existing message, or post a new one if none exists.
+    /// When appended content would exceed the Discord limit, starts a fresh message.
+    async fn append_keyword_keyed(
+        &self,
+        channel_id: &str,
+        edit_key: &str,
+        new_content: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
+        let key = format!("{channel_id}:{edit_key}");
+        let (existing_id, accumulated) = {
+            let state = self.state.lock().expect("discord state lock");
+            let id = state.last_heartbeat_msg_ids.get(&key).cloned();
+            let acc = state
+                .accumulated_keyword_content
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            (id, acc)
+        };
+
+        let updated = if accumulated.is_empty() {
+            new_content.to_string()
+        } else {
+            format!("{accumulated}\n{new_content}")
+        };
+        // If appending would overflow, start a fresh message
+        let (content_to_send, is_continuation) = if updated.len() > 1990 {
+            (new_content.to_string(), false)
+        } else {
+            (updated, true)
+        };
+        let content_to_send = truncate_discord(&content_to_send).to_string();
+
+        if is_continuation {
+            if let Some(msg_id) = existing_id {
+                match self.edit_message(channel_id, &msg_id, &content_to_send).await {
+                    Ok(()) => {
+                        let mut state = self.state.lock().expect("discord state lock");
+                        state
+                            .accumulated_keyword_content
+                            .insert(key, content_to_send);
+                        return Ok(());
+                    }
+                    Err(e)
+                        if e.message.contains("404")
+                            || e.message.contains("Unknown Message") => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        let msg_id = self
+            .send_message_returning_id(channel_id, &content_to_send)
+            .await?;
+        if let Some(id) = msg_id {
+            let mut state = self.state.lock().expect("discord state lock");
+            state.last_heartbeat_msg_ids.insert(key.clone(), id);
+            state
+                .accumulated_keyword_content
+                .insert(key, content_to_send);
         }
         Ok(())
     }
@@ -313,6 +489,183 @@ impl DiscordClient {
             message: format!("{label} failed with {status}: {body}"),
             retry_after: parse_retry_after(status, &body),
         })
+    }
+
+    /// Pin a message in a Discord channel.
+    async fn pin_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
+        let url = format!(
+            "{}/channels/{}/pins/{}",
+            self.api_base.trim_end_matches('/'),
+            channel_id,
+            message_id
+        );
+        let client = self.bot_client.as_ref().ok_or_else(|| DiscordSendError {
+            message: "missing Discord bot token for pinning".to_string(),
+            retry_after: None,
+        })?;
+        self.execute_request(client.put(url).json(&json!({})), "Discord pin request")
+            .await
+    }
+
+    async fn unpin_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
+        let url = format!(
+            "{}/channels/{}/pins/{}",
+            self.api_base.trim_end_matches('/'),
+            channel_id,
+            message_id
+        );
+        let client = self.bot_client.as_ref().ok_or_else(|| DiscordSendError {
+            message: "missing Discord bot token for unpinning".to_string(),
+            retry_after: None,
+        })?;
+        self.execute_request(client.delete(url), "Discord unpin request")
+            .await
+    }
+
+    /// Unpin all dashboard messages for a session and clear its slot IDs.
+    async fn clear_session_dashboard(&self, channel_id: &str, session: &str) {
+        let slot_key = format!("{channel_id}:{session}");
+
+        // Collect message IDs while holding the lock, then release before async calls
+        let ids_to_unpin = {
+            let state = self.state.lock().expect("discord state lock");
+            let Some(ids) = state.dashboard_ids.get(&slot_key) else {
+                return;
+            };
+            [
+                ids.status.clone(),
+                ids.summary.clone(),
+                ids.alert.clone(),
+                ids.activity.clone(),
+                ids.keywords.clone(),
+            ]
+        };
+
+        for msg_id in ids_to_unpin.into_iter().flatten() {
+            let _ = self.unpin_message(channel_id, &msg_id).await;
+        }
+
+        // Clear the IDs and persist
+        {
+            let mut state = self.state.lock().expect("discord state lock");
+            state.dashboard_ids.remove(&slot_key);
+            // Also clear in-memory keyword and activity logs for this session
+            state.keyword_log.retain(|k, _| !k.starts_with(&format!("{channel_id}:{session}")));
+            state.activity_log.retain(|k, _| !k.starts_with(&format!("{channel_id}:{session}")));
+        }
+        self.persist_dashboard();
+    }
+
+    /// Persist dashboard message IDs to disk.
+    fn persist_dashboard(&self) {
+        let state = self.state.lock().expect("discord state lock");
+        let Some(ref path) = state.dashboard_path else {
+            return;
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&state.dashboard_ids) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// Update (or create) a pinned dashboard slot message.
+    async fn update_dashboard_slot(
+        &self,
+        channel_id: &str,
+        session: &str,
+        slot: &str,
+        content: &str,
+        should_pin: bool,
+    ) -> std::result::Result<(), DiscordSendError> {
+        let slot_key = format!("{channel_id}:{session}");
+
+        let existing_id = {
+            let state = self.state.lock().expect("discord state lock");
+            state
+                .dashboard_ids
+                .get(&slot_key)
+                .and_then(|ids| match slot {
+                    "status" => ids.status.clone(),
+                    "summary" => ids.summary.clone(),
+                    "alert" => ids.alert.clone(),
+                    "activity" => ids.activity.clone(),
+                    "keywords" => ids.keywords.clone(),
+                    _ => None,
+                })
+        };
+
+        if let Some(msg_id) = existing_id {
+            match self.edit_message(channel_id, &msg_id, content).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.message.contains("404") || e.message.contains("Unknown Message") => {
+                    let mut state = self.state.lock().expect("discord state lock");
+                    if let Some(ids) = state.dashboard_ids.get_mut(&slot_key) {
+                        match slot {
+                            "status" => ids.status = None,
+                            "summary" => ids.summary = None,
+                            "alert" => ids.alert = None,
+                            "activity" => ids.activity = None,
+                            "keywords" => ids.keywords = None,
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let new_id = self.send_message_returning_id(channel_id, content).await?;
+        if let Some(id) = new_id {
+            if should_pin {
+                let _ = self.pin_message(channel_id, &id).await;
+            }
+            {
+                let mut state = self.state.lock().expect("discord state lock");
+                let ids = state.dashboard_ids.entry(slot_key).or_default();
+                match slot {
+                    "status" => ids.status = Some(id),
+                    "summary" => ids.summary = Some(id),
+                    "alert" => ids.alert = Some(id),
+                    "activity" => ids.activity = Some(id),
+                    "keywords" => ids.keywords = Some(id),
+                    _ => {}
+                }
+            }
+            self.persist_dashboard();
+        }
+        Ok(())
+    }
+
+    /// Push an entry to the rolling activity log and return the combined log text.
+    fn push_activity(&self, channel_id: &str, session: &str, entry: &str) -> String {
+        let key = format!("{channel_id}:{session}");
+        let mut state = self.state.lock().expect("discord state lock");
+        let log = state.activity_log.entry(key).or_default();
+        if log.len() >= 5 {
+            log.pop_front();
+        }
+        log.push_back(entry.to_string());
+        log.iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Push an entry to the rolling keyword log. Drops oldest entries when total chars exceed 1800.
+    fn push_keyword_log(&self, channel_id: &str, session: &str, entry: &str) -> String {
+        let key = format!("{channel_id}:{session}");
+        let mut state = self.state.lock().expect("discord state lock");
+        let log = state.keyword_log.entry(key).or_default();
+        log.push_back(entry.to_string());
+        // Drop oldest entries until total content fits within ~1800 chars
+        while log.iter().map(|e| e.len() + 1).sum::<usize>() > 1800 && log.len() > 1 {
+            log.pop_front();
+        }
+        log.iter().cloned().collect::<Vec<_>>().join("\n")
     }
 
     fn allow_request(&self, key: &str) -> bool {
@@ -442,6 +795,70 @@ fn webhook_url_with_wait(webhook_url: &str) -> String {
     }
 }
 
+/// Render dashboard-formatted content for a given slot.
+fn render_dashboard_slot(slot: &str, session: &str, event_kind: &str, content: &str) -> String {
+    match slot {
+        "status" => {
+            let status_icon = if event_kind == "tmux.stale" {
+                "\u{23f1}\u{fe0f} Stale"
+            } else {
+                "\u{1f493} Active"
+            };
+            let body = truncate_dashboard(content, 1500);
+            format!("\u{1f4ca} `{session}` \u{00b7} Status\n{DASHBOARD_SEPARATOR}\n{status_icon}\n{body}")
+        }
+        "summary" => {
+            let body = truncate_dashboard(content, 1500);
+            format!("\u{1f4cb} `{session}` \u{00b7} Latest Output\n{DASHBOARD_SEPARATOR}\n{body}")
+        }
+        "alert" => {
+            let body = truncate_dashboard(content, 1500);
+            format!("\u{1f6a8} `{session}` \u{00b7} **WAITING FOR INPUT**\n{DASHBOARD_SEPARATOR}\n{body}")
+        }
+        _ => content.to_string(),
+    }
+}
+
+/// Truncate content for dashboard slots to stay within Discord limits.
+fn truncate_dashboard(content: &str, max_len: usize) -> String {
+    if content.len() <= max_len {
+        content.to_string()
+    } else {
+        let mut end = max_len;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\u{2026}", &content[..end])
+    }
+}
+
+/// Truncate a single activity log entry to keep the rolling log compact.
+/// Truncate for keywords rolling log entries — preserves all lines (for multi-hit aggregated
+/// events), capping total entry length to 300 chars.
+fn truncate_keyword_entry(content: &str) -> String {
+    if content.len() <= 300 {
+        return content.to_string();
+    }
+    let mut end = 300;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\u{2026}", &content[..end])
+}
+
+fn truncate_activity(content: &str) -> String {
+    let first_line = content.lines().next().unwrap_or(content);
+    if first_line.len() > 120 {
+        let mut end = 120;
+        while !first_line.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\u{2026}", &first_line[..end])
+    } else {
+        first_line.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +973,31 @@ mod tests {
         assert_eq!(dlq.len(), 1);
         assert_eq!(dlq[0].payload["repo"], "clawhip");
         assert_eq!(dlq[0].retry_count, 3);
+    }
+
+    #[test]
+    fn push_keyword_log_accumulates_and_evicts_oldest() {
+        let config = Arc::new(AppConfig::default());
+        let client = DiscordClient::from_config(config).unwrap();
+
+        // Small entries accumulate
+        let r1 = client.push_keyword_log("ch1", "sess", "entry1");
+        assert_eq!(r1, "entry1");
+        let r2 = client.push_keyword_log("ch1", "sess", "entry2");
+        assert_eq!(r2, "entry1\nentry2");
+
+        // Large entry forces eviction of oldest
+        let big = "x".repeat(1000);
+        client.push_keyword_log("ch1", "sess", &big);
+        let r4 = client.push_keyword_log("ch1", "sess", &big);
+        // After adding two ~1000-char entries, total > 1800 so oldest should be evicted
+        assert!(!r4.starts_with("entry1"), "oldest entry should have been evicted");
+    }
+
+    #[test]
+    fn render_dashboard_slot_keywords_falls_through_to_content() {
+        // keywords slot content is built inline in send(), render_dashboard_slot is not used for it
+        let result = render_dashboard_slot("keywords", "test-session", "tmux.keyword", "some hits");
+        assert_eq!(result, "some hits");
     }
 }

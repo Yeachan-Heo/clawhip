@@ -915,6 +915,274 @@ Required live sign-off presets:
 - tmux watch
 - install/update/uninstall
 
+## Complete config reference
+
+Config file: `~/.clawhip/config.toml` (override with `CLAWHIP_CONFIG=/path/to/config.toml`)
+
+### Top-level structure
+
+```toml
+[providers.discord]    # Discord bot token and default channel
+[providers.gemini]     # Gemini API key (alternative to env var)
+[providers.openrouter] # OpenRouter API key (alternative to env var)
+[providers.openai]     # OpenAI API key and base URL (alternative to env vars)
+[daemon]               # Bind host, port, base URL
+[defaults]             # Fallback channel and format
+[dispatch]             # Batch window tuning
+[[routes]]             # Event routing rules (one per [[routes]] block)
+[monitors]             # Poll interval, GitHub token, git/tmux/workspace sources
+[[monitors.git.repos]] # Git repo monitors (one per block)
+[[monitors.tmux.sessions]] # Tmux session monitors (one per block)
+[[monitors.workspace]] # Workspace file-change monitors (one per block)
+[cron]                 # Cron scheduler config
+[[cron.jobs]]          # Cron jobs (one per block)
+```
+
+### `[providers.discord]`
+
+```toml
+[providers.discord]
+token = "Bot-token-here"
+default_channel = "1480171113253175356"
+```
+
+Legacy `[discord]` is accepted and merged at load time. Conflicting values between `[discord]` and `[providers.discord]` are a load error.
+
+Token resolution order: config file → `DISCORD_TOKEN` → `CLAWHIP_DISCORD_BOT_TOKEN` → `DISCORD_BOT_TOKEN`.
+
+### `[providers.gemini]`, `[providers.openrouter]`, `[providers.openai]`
+
+Store API keys in config instead of (or in addition to) environment variables:
+
+```toml
+[providers.gemini]
+api_key = "AIza..."
+
+[providers.openrouter]
+api_key = "sk-or-..."
+
+[providers.openai]
+api_key = "sk-..."
+base_url = "https://api.x.ai/v1"  # optional; override for xAI, Ollama, etc.
+```
+
+Environment variable equivalents: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`.
+
+### `[daemon]`
+
+```toml
+[daemon]
+bind_host = "0.0.0.0"        # default: 0.0.0.0
+port = 25294                  # default: 25294
+base_url = "http://127.0.0.1:25294"  # default: http://127.0.0.1:<port>
+```
+
+`base_url` is used by thin-client CLI commands to reach the daemon. Change it when running the daemon on a remote host or non-default port.
+
+### `[defaults]`
+
+```toml
+[defaults]
+channel = "1480171113253175356"  # fallback channel when no route matches
+format = "compact"               # fallback format: "compact" | "alert" | "raw" (default: compact)
+```
+
+### `[dispatch]`
+
+```toml
+[dispatch]
+routine_batch_window_secs = 5    # Discord routine burst batch window (default: 5; 0 = disable)
+ci_batch_window_secs = 30        # GitHub CI batch flush window (default: 30)
+```
+
+`routine_batch_window_secs`: groups routine deliveries (commits, keywords, agent events) into a single Discord message within the window. Set to `0` to disable batching entirely. Mentions are suppressed when 2+ items are batched together.
+
+`ci_batch_window_secs`: how long clawhip waits before flushing a GitHub CI job batch. Increase for workflows with jobs that run over several minutes.
+
+### `[[routes]]`
+
+```toml
+[[routes]]
+event = "tmux.*"               # required; glob matched against event kind
+filter = { session = "dev" }   # optional; payload key/value filters
+sink = "discord"               # "discord" (default) | "slack"
+channel = "1480171113253175356" # Discord channel ID (bot-token mode)
+webhook = "https://discord.com/api/webhooks/..."  # Discord webhook (no token needed)
+slack_webhook = "https://hooks.slack.com/services/..."  # Slack webhook
+mention = "<@1465264645320474637>"  # prepended to rendered message
+format = "compact"             # "compact" | "alert" | "raw"; overrides defaults.format
+template = "{{session}}: {{content}}"  # custom template string; overrides format
+allow_dynamic_tokens = false   # enable {sh:...}, {env:...}, {tmux_tail:...} expansion
+```
+
+Filter keys for session events: `tool`, `repo_name`, `session_name`, `issue_number`, `branch`.
+Filter keys for git/github events: `repo`, `repo_name`.
+
+Routes are evaluated in order; the first match wins. Events with no matching route fall back to `defaults.channel`.
+
+### `[monitors]`
+
+```toml
+[monitors]
+poll_interval_secs = 5           # global poll interval for all sources (default: 5)
+github_token = "ghp_..."         # GitHub API token for issue/PR polling
+github_api_base = "https://api.github.com"  # override for GitHub Enterprise
+```
+
+`github_token` is also read from the `GITHUB_TOKEN` environment variable.
+
+### `[[monitors.git.repos]]`
+
+```toml
+[[monitors.git.repos]]
+path = "/home/user/projects/myapp"  # required; local repo path
+name = "myapp"                      # optional; used in event payloads and route filters
+remote = "origin"                   # default: "origin"
+github_repo = "owner/myapp"        # optional; enables GitHub issue/PR polling
+emit_commits = true                 # emit git.commit on new commits (default: true)
+emit_branch_changes = true          # emit git.branch-changed on branch switches (default: true)
+emit_issue_opened = true            # emit github.issue-opened via polling (default: true)
+emit_pr_status = false              # emit github.pr-status-changed via polling (default: false)
+channel = "1480171113253175356"    # optional; override channel for this repo's events
+mention = "<@123>"                  # optional; mention for this repo's events
+format = "compact"                  # optional; format override
+```
+
+### `[[monitors.tmux.sessions]]`
+
+```toml
+[[monitors.tmux.sessions]]
+session = "my-session"             # required; tmux session name or glob (e.g. "rcc-*")
+channel = "1480171113253175356"    # required; Discord channel for this session's events
+mention = "<@123>"                 # optional; mention prepended to events
+format = "compact"                 # optional; "compact" | "alert" | "raw"
+
+# ── Keyword detection ─────────────────────────────────────────────────────────
+keywords = ["error", "fail", "complete"]  # keywords to watch for in pane output
+keyword_window_secs = 30          # dedup window: same (keyword, line) pair suppressed within window (default: 30)
+
+# ── Stale detection ───────────────────────────────────────────────────────────
+stale_minutes = 10                # minutes of inactivity before tmux.stale fires (default: 10; 0 = disable)
+stale_interval = 0                # alias for stale_minutes; overrides stale_minutes when set
+
+# ── Summarization ─────────────────────────────────────────────────────────────
+summarize = false                 # enable pane snapshot summarization (default: false)
+summarizer = "gemini:gemini-2.5-flash"  # backend (see table below)
+min_new_lines = 0                 # min net new lines required to trigger summarization (0 = no filter)
+summarize_interval_mins = 0       # min minutes between LLM calls (0 = no throttle)
+summary_interval = 0              # alias for summarize_interval_mins; overrides when set
+
+# ── Heartbeat ─────────────────────────────────────────────────────────────────
+heartbeat_mins = 0                # minutes of idle before tmux.heartbeat fires (0 = disable)
+heartbeat_interval = 0            # alias for heartbeat_mins; overrides when set
+
+# ── Input detection ───────────────────────────────────────────────────────────
+detect_waiting = false            # emit tmux.waiting_for_input when pane blocks on input (default: false)
+waiting_interval = 0              # cooldown minutes between waiting alerts (0 = no cooldown)
+
+# ── Mention filtering ─────────────────────────────────────────────────────────
+mention_on = []                   # restrict @mention to specific event kinds
+                                  # values: "keyword" | "waiting_for_input" | "content_changed"
+                                  #         | "stale" | "heartbeat"
+                                  # empty = mention applies to all events (default)
+
+# ── Dashboard pinning ─────────────────────────────────────────────────────────
+# Dashboard is a set of up to 5 pinned Discord messages edited in-place.
+# Enabled automatically when any pin_* = true.
+pin_status = true                 # pin status/heartbeat slot (default: true)
+pin_summary = true                # pin AI summary slot (default: true)
+pin_alerts = true                 # pin waiting-for-input alert slot (default: true)
+pin_activity = true               # pin rolling activity log slot (default: true)
+pin_keywords = false              # pin rolling keyword hits slot (default: false)
+activity_interval = 0             # cooldown minutes between activity log updates (0 = no cooldown)
+```
+
+#### Summarizer backends
+
+| Config value | Description | Requires |
+|---|---|---|
+| `raw` | Latest terminal output verbatim (no LLM) | nothing |
+| `gemini` / `gemini:<model>` | Gemini CLI subprocess | `gemini` CLI in PATH |
+| `openrouter:<model>` | OpenRouter API | `OPENROUTER_API_KEY` or `[providers.openrouter]` |
+| `openai:<model>` | OpenAI API | `OPENAI_API_KEY` or `[providers.openai]` |
+| `openai-compatible:<model>` | Any OpenAI-compatible endpoint | `OPENAI_API_KEY` + `OPENAI_BASE_URL` |
+
+Default models when no model suffix is given: Gemini → `gemini-2.5-flash`, OpenRouter → `openai/gpt-4o-mini`, OpenAI → `gpt-4o-mini`.
+
+#### Dashboard delivery behavior
+
+| Event | Discord behavior | Slot |
+|---|---|---|
+| `tmux.content_changed` (raw) | Edit in-place | summary |
+| `tmux.content_changed` (AI summary) | New message | — |
+| `tmux.heartbeat` | Edit in-place | status |
+| `tmux.waiting_for_input` | Edit in-place | alert |
+| `tmux.waiting_resolved` | Edit in-place (✅) | alert |
+| `tmux.keyword` (pin_keywords=true) | Edit in-place rolling log | keywords |
+| `tmux.keyword` (pin_keywords=false) | New message | — |
+| `tmux.stale` | New message | — |
+| `tmux.session_ended` | Unpin all slots, clear dashboard | — |
+
+Dashboard message IDs are persisted to `~/.clawhip/dashboard.json` so in-place edits survive daemon restarts.
+
+### `[[monitors.workspace]]`
+
+Watches filesystem paths for file changes and emits `workspace.*` events.
+
+```toml
+[[monitors.workspace]]
+path = "/home/user/projects/myapp"  # required; root path to watch
+watch_dirs = [".omc", ".claude"]    # subdirs to watch (default: [".omc", ".claude"])
+discover_worktrees = false           # auto-discover git worktrees under path (default: false)
+channel = "1480171113253175356"     # optional; channel override
+mention = "<@123>"                   # optional; mention override
+format = "compact"                   # optional; format override
+events = ["skill.activated"]         # optional; restrict to specific event kinds (empty = all)
+poll_interval_secs = 5               # optional; override global poll_interval_secs for this monitor
+debounce_ms = 500                    # deduplicate rapid file changes within this window (default: 500)
+```
+
+### `[[cron.jobs]]`
+
+Scheduled message delivery using cron expressions.
+
+```toml
+[cron]
+poll_interval_secs = 30  # how often clawhip checks the cron schedule (default: 30)
+
+[[cron.jobs]]
+id = "daily-standup"             # required; unique job identifier
+kind = "custom-message"          # required; currently only "custom-message" is supported
+schedule = "0 9 * * 1-5"         # required; cron expression (minute hour dom month dow)
+timezone = "UTC"                  # default: "UTC" (only UTC accepted; others rejected)
+enabled = true                   # default: true; set false to disable without removing
+message = "🌅 Morning standup reminder — check open PRs and blockers."
+channel = "1480171113253175356"  # optional; override defaults.channel for this job
+mention = "<@123>"               # optional; mention prepended to message
+format = "compact"               # optional; format override
+```
+
+Cron schedule syntax supports standard five-field expressions including lists (`1,3,5`), ranges (`1-5`), and steps (`*/15`).
+
+Job IDs must be unique within the config. Duplicate IDs are rejected at load time.
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `CLAWHIP_CONFIG` | Override config file path |
+| `DISCORD_TOKEN` | Discord bot token (highest priority env source) |
+| `CLAWHIP_DISCORD_BOT_TOKEN` | Discord bot token (second priority) |
+| `DISCORD_BOT_TOKEN` | Discord bot token (third priority) |
+| `GITHUB_TOKEN` | GitHub API token for issue/PR polling |
+| `GEMINI_API_KEY` | Gemini API key for summarization |
+| `OPENROUTER_API_KEY` | OpenRouter API key for summarization |
+| `OPENAI_API_KEY` | OpenAI API key for summarization |
+| `OPENAI_BASE_URL` | OpenAI-compatible base URL (e.g. xAI, Ollama) |
+| `CLAWHIP_SKIP_STAR_PROMPT` | Set to `1` to skip post-install GitHub star prompt |
+
+Config file values take precedence over environment variables for API keys. Discord token resolution always prefers env vars over config.
+
 ## Minimal operational commands
 
 ```bash

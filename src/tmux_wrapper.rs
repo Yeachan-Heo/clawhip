@@ -115,6 +115,17 @@ impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
             detect_waiting: false,
             min_new_lines: 0,
             summarize_interval_mins: 0,
+            mention_on: Vec::new(),
+            pin_status: true,
+            pin_summary: true,
+            pin_alerts: true,
+            pin_activity: true,
+            pin_keywords: true,
+            heartbeat_interval: 0,
+            stale_interval: 0,
+            summary_interval: 0,
+            waiting_interval: 0,
+            activity_interval: 0,
         }
     }
 }
@@ -129,8 +140,9 @@ async fn register_and_start_monitor(
     client.register_tmux(&registration).await?;
 
     let monitor_client = client.clone();
+    let providers = config.providers.clone();
     Ok(tokio::spawn(async move {
-        monitor_registered_session(registration, monitor_client).await
+        monitor_registered_session(registration, monitor_client, providers).await
     }))
 }
 
@@ -535,6 +547,17 @@ mod tests {
             detect_waiting: false,
             min_new_lines: 0,
             summarize_interval_mins: 0,
+            mention_on: Vec::new(),
+            pin_status: true,
+            pin_summary: true,
+            pin_alerts: true,
+            pin_activity: true,
+            pin_keywords: false,
+            heartbeat_interval: 0,
+            stale_interval: 0,
+            summary_interval: 0,
+            waiting_interval: 0,
+            activity_interval: 0,
         });
 
         assert!(log.contains("session=issue-105"));

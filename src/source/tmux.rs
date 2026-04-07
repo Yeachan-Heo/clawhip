@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
 use tokio::sync::{RwLock, mpsc};
@@ -76,6 +77,33 @@ pub struct RegisteredTmuxSession {
     pub min_new_lines: usize,
     #[serde(default)]
     pub summarize_interval_mins: u64,
+    /// Event kinds for which the `mention` is prepended. Empty = mention applies to all events.
+    #[serde(default)]
+    pub mention_on: Vec<String>,
+    #[serde(default = "default_true")]
+    pub pin_status: bool,
+    #[serde(default = "default_true")]
+    pub pin_summary: bool,
+    #[serde(default = "default_true")]
+    pub pin_alerts: bool,
+    #[serde(default = "default_true")]
+    pub pin_activity: bool,
+    #[serde(default)]
+    pub pin_keywords: bool,
+    #[serde(default)]
+    pub heartbeat_interval: u64,
+    #[serde(default)]
+    pub stale_interval: u64,
+    #[serde(default)]
+    pub summary_interval: u64,
+    #[serde(default)]
+    pub waiting_interval: u64,
+    #[serde(default)]
+    pub activity_interval: u64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
@@ -98,7 +126,54 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             detect_waiting: value.detect_waiting,
             min_new_lines: value.min_new_lines,
             summarize_interval_mins: value.summarize_interval_mins,
+            mention_on: value.mention_on.clone(),
+            pin_status: value.pin_status,
+            pin_summary: value.pin_summary,
+            pin_alerts: value.pin_alerts,
+            pin_activity: value.pin_activity,
+            pin_keywords: value.pin_keywords,
+            heartbeat_interval: value.heartbeat_interval,
+            stale_interval: value.stale_interval,
+            summary_interval: value.summary_interval,
+            waiting_interval: value.waiting_interval,
+            activity_interval: value.activity_interval,
         }
+    }
+}
+
+impl RegisteredTmuxSession {
+    /// Effective heartbeat interval: heartbeat_interval overrides heartbeat_mins when > 0.
+    pub fn effective_heartbeat_mins(&self) -> u64 {
+        if self.heartbeat_interval > 0 { self.heartbeat_interval } else { self.heartbeat_mins }
+    }
+
+    /// Effective stale threshold: stale_interval overrides stale_minutes when > 0.
+    pub fn effective_stale_minutes(&self) -> u64 {
+        if self.stale_interval > 0 { self.stale_interval } else { self.stale_minutes }
+    }
+
+    /// Effective summary throttle: summary_interval overrides summarize_interval_mins when > 0.
+    pub fn effective_summary_interval(&self) -> u64 {
+        if self.summary_interval > 0 { self.summary_interval } else { self.summarize_interval_mins }
+    }
+}
+
+/// Inject dashboard routing fields into an event payload.
+fn inject_dashboard_payload(event: &mut IncomingEvent, slot: &str, pin_activity: bool) {
+    event.payload["dashboard_component"] = json!(slot);
+    event.payload["pin_activity"] = json!(pin_activity);
+}
+
+/// Returns the mention string for an event kind, respecting `mention_on` filter.
+/// If `mention_on` is empty, the mention applies to all event kinds.
+fn effective_mention(registration: &RegisteredTmuxSession, event_kind: &str) -> Option<String> {
+    if registration.mention_on.is_empty() {
+        return registration.mention.clone();
+    }
+    if registration.mention_on.iter().any(|k| k == event_kind) {
+        registration.mention.clone()
+    } else {
+        None
     }
 }
 
@@ -160,6 +235,7 @@ struct TmuxPaneState {
     content_hash: u64,
     last_change: Instant,
     last_stale_notification: Option<Instant>,
+    is_waiting: bool,
 }
 
 #[derive(Default)]
@@ -180,6 +256,7 @@ struct TmuxPaneSnapshot {
 pub async fn monitor_registered_session(
     registration: RegisteredTmuxSession,
     client: DaemonClient,
+    providers: crate::config::ProvidersConfig,
 ) -> Result<()> {
     let mut panes = HashMap::new();
     let mut pending_keyword_hits = None;
@@ -234,6 +311,7 @@ pub async fn monitor_registered_session(
                             snapshot: pane.content,
                             last_change: now,
                             last_stale_notification: None,
+                            is_waiting: false,
                         },
                     );
                     last_heartbeat = Some(now);
@@ -250,7 +328,7 @@ pub async fn monitor_registered_session(
                         if registration.summarize
                             && should_summarize_now(
                                 last_summarized,
-                                registration.summarize_interval_mins,
+                                registration.effective_summary_interval(),
                                 registration.min_new_lines,
                                 &existing.snapshot,
                                 &pane.content,
@@ -263,21 +341,36 @@ pub async fn monitor_registered_session(
                                 pane.session.clone(),
                                 pane.pane_name.clone(),
                                 pane.content.clone(),
+                                providers.clone(),
                             );
                             last_summarized = Some(now);
                         }
 
-                        if registration.detect_waiting
-                            && let Some(prompt) = is_waiting_for_input(&pane.content)
-                        {
-                            client
-                                .emit(tmux_waiting_for_input_event(
-                                    &registration,
-                                    pane.session.clone(),
-                                    pane.pane_name.clone(),
-                                    prompt,
-                                ))
-                                .await?;
+                        if registration.detect_waiting {
+                            let waiting_prompt = is_waiting_for_input(&pane.content);
+                            match (existing.is_waiting, &waiting_prompt) {
+                                (false, Some(prompt)) => {
+                                    client
+                                        .emit(tmux_waiting_for_input_event(
+                                            &registration,
+                                            pane.session.clone(),
+                                            pane.pane_name.clone(),
+                                            prompt.clone(),
+                                        ))
+                                        .await?;
+                                }
+                                (true, None) => {
+                                    client
+                                        .emit(tmux_waiting_resolved_event(
+                                            &registration,
+                                            pane.session.clone(),
+                                            pane.pane_name.clone(),
+                                        ))
+                                        .await?;
+                                }
+                                _ => {}
+                            }
+                            existing.is_waiting = waiting_prompt.is_some();
                         }
 
                         existing.session = pane.session;
@@ -287,7 +380,7 @@ pub async fn monitor_registered_session(
                         existing.last_change = now;
                         existing.last_stale_notification = None;
                         last_heartbeat = Some(now);
-                    } else if should_emit_stale(existing, now, registration.stale_minutes) {
+                    } else if should_emit_stale(existing, now, registration.effective_stale_minutes()) {
                         client
                             .emit(tmux_stale_event(
                                 &registration,
@@ -388,6 +481,10 @@ async fn poll_tmux(
         match session_exists(session_name).await {
             Ok(false) => {
                 sessions_to_unregister.push(session_name.clone());
+                let _ = tx.emit(IncomingEvent::tmux_session_ended(
+                    session_name.clone(),
+                    registration.channel.clone(),
+                )).await;
                 flush_session_pending_keyword_hits(
                     &mut state.pending_keyword_hits,
                     session_name,
@@ -432,6 +529,7 @@ async fn poll_tmux(
                                     content_hash: hash,
                                     last_change: now,
                                     last_stale_notification: None,
+                                    is_waiting: false,
                                 },
                             );
                             state
@@ -450,7 +548,7 @@ async fn poll_tmux(
                                 if registration.summarize
                                     && should_summarize_now(
                                         state.session_last_summarized.get(session_name).copied(),
-                                        registration.summarize_interval_mins,
+                                        registration.effective_summary_interval(),
                                         registration.min_new_lines,
                                         &existing.snapshot,
                                         &pane.content,
@@ -463,21 +561,35 @@ async fn poll_tmux(
                                         session_name.clone(),
                                         pane.pane_name.clone(),
                                         pane.content.clone(),
+                                        config.providers.clone(),
                                     );
                                     state
                                         .session_last_summarized
                                         .insert(session_name.to_string(), now);
                                 }
-                                if registration.detect_waiting
-                                    && let Some(prompt) = is_waiting_for_input(&pane.content)
-                                {
-                                    tx.emit(tmux_waiting_for_input_event(
-                                        registration,
-                                        session_name.clone(),
-                                        pane.pane_name.clone(),
-                                        prompt,
-                                    ))
-                                    .await?;
+                                if registration.detect_waiting {
+                                    let waiting_prompt = is_waiting_for_input(&pane.content);
+                                    match (existing.is_waiting, &waiting_prompt) {
+                                        (false, Some(prompt)) => {
+                                            tx.emit(tmux_waiting_for_input_event(
+                                                registration,
+                                                session_name.clone(),
+                                                pane.pane_name.clone(),
+                                                prompt.clone(),
+                                            ))
+                                            .await?;
+                                        }
+                                        (true, None) => {
+                                            tx.emit(tmux_waiting_resolved_event(
+                                                registration,
+                                                session_name.clone(),
+                                                pane.pane_name.clone(),
+                                            ))
+                                            .await?;
+                                        }
+                                        _ => {}
+                                    }
+                                    existing.is_waiting = waiting_prompt.is_some();
                                 }
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
@@ -743,9 +855,13 @@ fn tmux_keyword_event(
         IncomingEvent::tmux_keywords(session, hits, registration.channel.clone())
     };
 
+    let mut event = event
+        .with_mention(effective_mention(registration, "keyword"))
+        .with_format(registration.format.clone());
+    if registration.pin_keywords {
+        inject_dashboard_payload(&mut event, "keywords", registration.pin_activity);
+    }
     event
-        .with_mention(registration.mention.clone())
-        .with_format(registration.format.clone())
 }
 
 fn tmux_stale_event(
@@ -754,15 +870,19 @@ fn tmux_stale_event(
     pane: String,
     last_line: String,
 ) -> IncomingEvent {
-    IncomingEvent::tmux_stale(
+    let mut event = IncomingEvent::tmux_stale(
         session,
         pane,
-        registration.stale_minutes,
+        registration.effective_stale_minutes(),
         last_line,
         registration.channel.clone(),
     )
-    .with_mention(registration.mention.clone())
-    .with_format(registration.format.clone())
+    .with_mention(effective_mention(registration, "stale"))
+    .with_format(registration.format.clone());
+    if registration.pin_status {
+        inject_dashboard_payload(&mut event, "status", registration.pin_activity);
+    }
+    event
 }
 
 fn tmux_content_changed_event(
@@ -771,7 +891,7 @@ fn tmux_content_changed_event(
     pane: String,
     content: SummarizedContent,
 ) -> IncomingEvent {
-    IncomingEvent::tmux_content_changed_with_metadata(
+    let mut event = IncomingEvent::tmux_content_changed_with_metadata(
         session,
         pane,
         content.summary,
@@ -780,8 +900,12 @@ fn tmux_content_changed_event(
         content.content_mode.as_str().to_string(),
         registration.channel.clone(),
     )
-    .with_mention(registration.mention.clone())
-    .with_format(registration.format.clone())
+    .with_mention(effective_mention(registration, "content_changed"))
+    .with_format(registration.format.clone());
+    if registration.pin_summary {
+        inject_dashboard_payload(&mut event, "summary", registration.pin_activity);
+    }
+    event
 }
 
 fn spawn_content_changed_task<E>(
@@ -790,11 +914,12 @@ fn spawn_content_changed_task<E>(
     session_name: String,
     pane_name: String,
     content: String,
+    providers: crate::config::ProvidersConfig,
 ) where
     E: EventEmitter + Clone + Send + Sync + 'static,
 {
     tokio::spawn(async move {
-        match build_summarizer(&registration.summarizer) {
+        match build_summarizer(&registration.summarizer, &providers) {
             Ok(summarizer) => match summarizer.summarize(&content, &session_name).await {
                 Ok(transformed) => {
                     let event = tmux_content_changed_event(
@@ -825,14 +950,34 @@ fn tmux_waiting_for_input_event(
     pane: String,
     prompt_snapshot: String,
 ) -> IncomingEvent {
-    IncomingEvent::tmux_waiting_for_input(
+    let mut event = IncomingEvent::tmux_waiting_for_input(
         session,
         pane,
         prompt_snapshot,
         registration.channel.clone(),
     )
-    .with_mention(registration.mention.clone())
-    .with_format(registration.format.clone())
+    .with_mention(effective_mention(registration, "waiting_for_input"))
+    .with_format(registration.format.clone());
+    if registration.pin_alerts {
+        inject_dashboard_payload(&mut event, "alert", registration.pin_activity);
+    }
+    event
+}
+
+fn tmux_waiting_resolved_event(
+    registration: &RegisteredTmuxSession,
+    session: String,
+    pane_name: String,
+) -> IncomingEvent {
+    let mut event =
+        IncomingEvent::tmux_waiting_for_input(session, pane_name, String::new(), registration.channel.clone());
+    event.payload["resolved"] = json!(true);
+    // Mirror the same dashboard routing as the waiting event so the resolved
+    // message updates the pinned alert slot (not a separate keyed message).
+    if registration.pin_alerts {
+        inject_dashboard_payload(&mut event, "alert", registration.pin_activity);
+    }
+    event.with_format(registration.format.clone())
 }
 
 fn tmux_heartbeat_event(
@@ -840,9 +985,14 @@ fn tmux_heartbeat_event(
     session: String,
     minutes_since_change: u64,
 ) -> IncomingEvent {
-    IncomingEvent::tmux_heartbeat(session, minutes_since_change, registration.channel.clone())
-        .with_mention(registration.mention.clone())
-        .with_format(registration.format.clone())
+    let mut event =
+        IncomingEvent::tmux_heartbeat(session, minutes_since_change, registration.channel.clone())
+            .with_mention(effective_mention(registration, "heartbeat"))
+            .with_format(registration.format.clone());
+    if registration.pin_status {
+        inject_dashboard_payload(&mut event, "status", registration.pin_activity);
+    }
+    event
 }
 
 fn count_new_lines(old: &str, new: &str) -> usize {
@@ -869,25 +1019,102 @@ fn should_summarize_now(
 }
 
 fn is_waiting_for_input(content: &str) -> Option<String> {
-    let patterns = [
+    // Patterns checked against the last 3 non-empty lines (case-insensitive).
+    // Covers common interactive prompts and OMC/OMX agent harness approval flows.
+    let multiline_patterns: &[&str] = &[
+        // Generic waiting phrases
         "waiting for input",
         "awaiting user input",
         "press enter",
         "hit enter",
+        "press any key",
+        // Confirmation prompts
+        "[y/n]",
+        "(y/n)",
+        "[yes/no]",
+        "(yes/no)",
+        // Common action confirmations
+        "proceed?",
+        "continue?",
+        "overwrite?",
+        "replace?",
+        "do you want to",
+        // Menu / choice prompts
+        "enter your choice",
+        "select an option",
+        // Claude Code / OMC tool approval patterns
+        "allow, deny",
+        "allow this action",
+        "always allow",
+        "approve or deny",
+        "run this tool",
+        // Generic approval keyword at line start
+        "approve:",
+        // Credential prompts (password entry blocks terminal)
+        "password:",
+        "passphrase:",
+        "enter password",
+        // Common agent/tool confirmation phrases
+        "want me to",
+        "shall i",
+        "should i proceed",
+        "should i continue",
+        // Interactive setup confirmations
+        "is this ok?",
+        "(ctrl+c to abort)",
+        // CC permission mode picker indicator
+        "bypassPermissions",
     ];
-    let last_10 = content.lines().rev().take(10).collect::<Vec<_>>();
-    let last_10_combined = last_10
-        .iter()
+
+    // Take the last 3 non-empty lines, skipping blank padding rows.
+    // capture-pane pads the visible area with blank rows; a window of 3 non-empty
+    // lines covers real interactive prompts (which always appear as one of the last
+    // 3 non-empty lines) while being small enough that a single reply line (output
+    // + new prompt = 3 lines: output, command, new-prompt) pushes the waiting
+    // prompt out of the window, triggering the resolved transition.
+    let recent: Vec<&str> = content
+        .lines()
         .rev()
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
-    for pattern in &patterns {
-        if last_10_combined.contains(pattern) {
-            return Some(last_10.iter().rev().copied().collect::<Vec<_>>().join("\n"));
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect();
+    if recent.is_empty() {
+        return None;
+    }
+
+    let snapshot: String = recent.iter().rev().copied().collect::<Vec<_>>().join("\n");
+    let snapshot_lower = snapshot.to_lowercase();
+
+    for pattern in multiline_patterns {
+        if snapshot_lower.contains(pattern) {
+            return Some(snapshot.clone());
         }
     }
+
+    // Check the last non-empty line for short interactive-prompt endings.
+    let last_nonempty = recent.first().copied().unwrap_or("");
+    let trimmed = last_nonempty.trim_end();
+    if trimmed.len() <= 40 {
+        let prompt_suffixes: &[&str] = &[
+            "❯",
+            "$ ",
+            "% ",
+            "... ",
+            "? ",
+        ];
+        for suffix in prompt_suffixes {
+            if trimmed.ends_with(suffix) || trimmed == suffix.trim() {
+                return Some(snapshot);
+            }
+        }
+    }
+
+    // ❯ at the start of a short line indicates an interactive menu selector
+    // (e.g., Claude Code permission mode picker)
+    if trimmed.starts_with('❯') && trimmed.len() <= 80 {
+        return Some(snapshot);
+    }
+
     None
 }
 
@@ -899,7 +1126,7 @@ async fn maybe_emit_session_heartbeat<E: EventEmitter>(
     now: Instant,
     session_changed: bool,
 ) -> Result<()> {
-    if registration.heartbeat_mins == 0 {
+    if registration.effective_heartbeat_mins() == 0 {
         state.session_last_heartbeat.remove(session_name);
         return Ok(());
     }
@@ -910,7 +1137,7 @@ async fn maybe_emit_session_heartbeat<E: EventEmitter>(
             .insert(session_name.to_string(), now);
     }
 
-    let interval = Duration::from_secs(registration.heartbeat_mins * 60);
+    let interval = Duration::from_secs(registration.effective_heartbeat_mins() * 60);
     let Some(last_change) = state
         .panes
         .values()
@@ -952,12 +1179,12 @@ async fn maybe_emit_registered_session_heartbeat<E: EventEmitter>(
     last_heartbeat: &mut Option<Instant>,
     now: Instant,
 ) -> Result<()> {
-    if registration.heartbeat_mins == 0 {
+    if registration.effective_heartbeat_mins() == 0 {
         *last_heartbeat = None;
         return Ok(());
     }
 
-    let interval = Duration::from_secs(registration.heartbeat_mins * 60);
+    let interval = Duration::from_secs(registration.effective_heartbeat_mins() * 60);
     let Some(last_change) = panes.values().map(|pane| pane.last_change).max() else {
         last_heartbeat.get_or_insert(now);
         return Ok(());
@@ -1001,21 +1228,11 @@ async fn flush_pending_keyword_hits<E: EventEmitter>(
     let Some(pending) = pending_keyword_hits.take() else {
         return Ok(());
     };
-    let (raw_hits, next_window) = if force {
-        (pending.into_hits(), None)
-    } else {
-        let (hits, reset) = pending.flush_and_reset(now);
-        (hits, Some(reset))
-    };
-    let hits = raw_hits
+    let hits = pending
+        .into_hits()
         .into_iter()
         .map(|hit| (hit.keyword, hit.line))
         .collect::<Vec<_>>();
-    // Restore the reset window (with seen carried forward) before emitting so
-    // new hits arriving during the await are not lost.
-    if let Some(w) = next_window {
-        *pending_keyword_hits = Some(w);
-    }
     if hits.is_empty() {
         return Ok(());
     }
@@ -1320,6 +1537,35 @@ PR created #7",
             }
             other => panic!("expected aggregated tmux keyword body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tmux_keyword_event_with_pin_keywords_sets_dashboard_payload() {
+        let mut registration = registration(vec!["error"]);
+        registration.pin_keywords = true;
+
+        let event = tmux_keyword_event(
+            &registration,
+            "issue-24".into(),
+            vec![("error".into(), "boom".into())],
+        );
+
+        assert_eq!(event.payload["dashboard_component"], "keywords");
+        assert_eq!(event.payload["pin_activity"], false);
+    }
+
+    #[test]
+    fn tmux_keyword_event_without_pin_keywords_no_dashboard_payload() {
+        let registration = registration(vec!["error"]);
+        // pin_keywords defaults to false
+
+        let event = tmux_keyword_event(
+            &registration,
+            "issue-24".into(),
+            vec![("error".into(), "boom".into())],
+        );
+
+        assert!(event.payload["dashboard_component"].is_null());
     }
 
     #[test]
@@ -1982,6 +2228,7 @@ error: failed";
             content_hash: 0,
             last_change: Instant::now() - Duration::from_secs(3600),
             last_stale_notification: None,
+            is_waiting: false,
         };
         // stale_minutes=0 should never emit, even after 1 hour idle
         assert!(!should_emit_stale(&pane, Instant::now(), 0));
@@ -1996,8 +2243,112 @@ error: failed";
             content_hash: 0,
             last_change: Instant::now() - Duration::from_secs(3600),
             last_stale_notification: None,
+            is_waiting: false,
         };
         // stale_minutes=1 should emit after 1 hour idle
         assert!(should_emit_stale(&pane, Instant::now(), 1));
+    }
+
+    // ── is_waiting_for_input tests ──────────────────────────────────────────
+
+    #[test]
+    fn waiting_detects_press_enter() {
+        assert!(is_waiting_for_input("some output\nPress enter to continue:").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_yn_bracket() {
+        assert!(is_waiting_for_input("Overwrite file? [Y/n]").is_some());
+        assert!(is_waiting_for_input("Continue? [y/N]").is_some());
+        assert!(is_waiting_for_input("Proceed? (y/n)").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_proceed_continue_overwrite() {
+        assert!(is_waiting_for_input("Do you want to proceed?").is_some());
+        assert!(is_waiting_for_input("continue?").is_some());
+        assert!(is_waiting_for_input("overwrite?").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_omc_tool_approval() {
+        // Claude Code tool approval format
+        assert!(is_waiting_for_input("Allow, Deny, Always allow (A/d/!)?").is_some());
+        assert!(is_waiting_for_input("always allow").is_some());
+        assert!(is_waiting_for_input("run this tool").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_menu_prompts() {
+        assert!(is_waiting_for_input("Enter your choice:").is_some());
+        assert!(is_waiting_for_input("Select an option").is_some());
+        assert!(is_waiting_for_input("Press any key to continue").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_do_you_want_to() {
+        assert!(is_waiting_for_input("Do you want to install these packages?").is_some());
+    }
+
+    #[test]
+    fn waiting_ignores_normal_output() {
+        assert!(is_waiting_for_input("cargo build --release\nCompiling clawhip v0.5.4\nFinished dev profile").is_none());
+        assert!(is_waiting_for_input("").is_none());
+    }
+
+    #[test]
+    fn waiting_only_checks_last_3_lines() {
+        // Trigger phrase buried beyond the 3-line window should NOT match.
+        // 4 non-empty filler lines push "press enter" out of the window.
+        let buried = "press enter\n".to_string() + &"line\n".repeat(4);
+        assert!(is_waiting_for_input(&buried).is_none());
+        // Trailing blank lines are ignored, so this still doesn't match
+        let buried_with_blanks = "press enter\n".to_string() + &"line\n".repeat(4) + &"\n".repeat(20);
+        assert!(is_waiting_for_input(&buried_with_blanks).is_none());
+        // Pattern at exactly position 3 (last of window) still matches
+        let at_edge = "line\n".repeat(2) + "press enter\n";
+        assert!(is_waiting_for_input(&at_edge).is_some());
+    }
+
+    #[test]
+    fn waiting_detects_omc_cursor_prompt() {
+        // Short last line ending with ❯ (OMC tool approval cursor)
+        assert!(is_waiting_for_input("Allow, Deny, Always allow\n❯").is_some());
+    }
+
+    // ── mention_on tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_mention_empty_mention_on_applies_to_all() {
+        let reg = RegisteredTmuxSession {
+            mention: Some("<@123>".into()),
+            mention_on: vec![],
+            ..registration(vec![])
+        };
+        assert_eq!(effective_mention(&reg, "keyword").as_deref(), Some("<@123>"));
+        assert_eq!(effective_mention(&reg, "waiting_for_input").as_deref(), Some("<@123>"));
+        assert_eq!(effective_mention(&reg, "heartbeat").as_deref(), Some("<@123>"));
+    }
+
+    #[test]
+    fn effective_mention_filters_by_event_kind() {
+        let reg = RegisteredTmuxSession {
+            mention: Some("<@123>".into()),
+            mention_on: vec!["waiting_for_input".into()],
+            ..registration(vec![])
+        };
+        assert_eq!(effective_mention(&reg, "waiting_for_input").as_deref(), Some("<@123>"));
+        assert_eq!(effective_mention(&reg, "keyword").as_deref(), None);
+        assert_eq!(effective_mention(&reg, "heartbeat").as_deref(), None);
+    }
+
+    #[test]
+    fn effective_mention_no_mention_returns_none() {
+        let reg = RegisteredTmuxSession {
+            mention: None,
+            mention_on: vec!["waiting_for_input".into()],
+            ..registration(vec![])
+        };
+        assert_eq!(effective_mention(&reg, "waiting_for_input").as_deref(), None);
     }
 }

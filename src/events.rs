@@ -464,6 +464,19 @@ impl IncomingEvent {
         }
     }
 
+    pub fn tmux_session_ended(session: String, channel: Option<String>) -> Self {
+        Self {
+            kind: "tmux.session_ended".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "session": session,
+            }),
+        }
+    }
+
     pub fn tmux_keyword(
         session: String,
         keyword: String,
@@ -1948,7 +1961,7 @@ mod tests {
         assert_eq!(event.payload["hits"].as_array().unwrap().len(), 2);
         assert_eq!(
             event.render_default(&MessageFormat::Compact).unwrap(),
-            "tmux:issue-24 matched 2 keyword hits:\n- 'error': build failed\n- 'complete': job complete"
+            "🔑 tmux:issue-24 matched 2 keyword hits:\n- 'error': build failed\n- 'complete': job complete"
         );
         assert_eq!(
             event.render_default(&MessageFormat::Alert).unwrap(),

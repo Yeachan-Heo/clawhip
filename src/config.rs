@@ -37,6 +37,28 @@ pub struct ProvidersConfig {
     pub discord: DiscordConfig,
     #[serde(default)]
     pub slack: SlackConfig,
+    #[serde(default)]
+    pub gemini: GeminiConfig,
+    #[serde(default)]
+    pub openrouter: OpenRouterConfig,
+    #[serde(default)]
+    pub openai: OpenAiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GeminiConfig {
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenRouterConfig {
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenAiConfig {
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -300,6 +322,41 @@ pub struct TmuxSessionMonitor {
     /// Minimum minutes between LLM summarization calls for this session. 0 = no throttle.
     #[serde(default)]
     pub summarize_interval_mins: u64,
+    /// Event kinds that trigger the @mention. Empty = mention applies to all events.
+    /// Valid values: "keyword", "waiting_for_input", "content_changed", "stale", "heartbeat".
+    #[serde(default)]
+    pub mention_on: Vec<String>,
+    /// Pin and update the status/heartbeat dashboard message in-place.
+    /// Dashboard is implicit: enabled when any pin_* = true.
+    #[serde(default = "default_true")]
+    pub pin_status: bool,
+    /// Pin and update the summary dashboard message in-place.
+    #[serde(default = "default_true")]
+    pub pin_summary: bool,
+    /// Pin and update the alert dashboard message in-place.
+    #[serde(default = "default_true")]
+    pub pin_alerts: bool,
+    /// Pin and update the rolling activity log message in-place.
+    #[serde(default = "default_true")]
+    pub pin_activity: bool,
+    /// Pin keyword hits as a rolling log dashboard slot. Default false (backward compat).
+    #[serde(default)]
+    pub pin_keywords: bool,
+    /// Minutes between heartbeat events. 0 = disable. Overrides heartbeat_mins when set.
+    #[serde(default)]
+    pub heartbeat_interval: u64,
+    /// Minutes before a session is considered stale. 0 = disable. Overrides stale_minutes when set.
+    #[serde(default)]
+    pub stale_interval: u64,
+    /// Minimum minutes between AI summary events. 0 = use summarize_interval_mins.
+    #[serde(default)]
+    pub summary_interval: u64,
+    /// Cooldown minutes between waiting-for-input alerts. 0 = no cooldown.
+    #[serde(default)]
+    pub waiting_interval: u64,
+    /// Cooldown minutes between activity log updates. 0 = no cooldown.
+    #[serde(default)]
+    pub activity_interval: u64,
 }
 
 impl Default for TmuxSessionMonitor {
@@ -318,6 +375,17 @@ impl Default for TmuxSessionMonitor {
             detect_waiting: false,
             min_new_lines: 0,
             summarize_interval_mins: 0,
+            mention_on: Vec::new(),
+            pin_status: true,
+            pin_summary: true,
+            pin_alerts: true,
+            pin_activity: true,
+            pin_keywords: false,
+            heartbeat_interval: 0,
+            stale_interval: 0,
+            summary_interval: 0,
+            waiting_interval: 0,
+            activity_interval: 0,
         }
     }
 }
@@ -455,7 +523,7 @@ pub fn default_sink_name() -> String {
     "discord".to_string()
 }
 
-const DISCORD_TOKEN_ENV_VARS: [&str; 2] = ["DISCORD_TOKEN", "CLAWHIP_DISCORD_BOT_TOKEN"];
+const DISCORD_TOKEN_ENV_VARS: [&str; 3] = ["DISCORD_TOKEN", "CLAWHIP_DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKEN"];
 
 fn merge_legacy_discord_field(
     field: &str,
@@ -564,9 +632,41 @@ impl AppConfig {
     }
 
     pub fn effective_token(&self) -> Option<String> {
-        self.effective_token_with(|name| env::var(name).ok())
+        self.effective_token_with(|name| {
+            env::var(name).ok().or_else(|| load_clawhip_dot_env(name))
+        })
     }
 
+}
+
+/// Parse a single KEY=VALUE line from a .env file, stripping optional quotes.
+fn parse_dot_env_key(content: &str, key: &str) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                let v = v.trim().trim_matches('"').trim_matches('\'');
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Load a key from ~/.clawhip/.env if the file exists.
+fn load_clawhip_dot_env(key: &str) -> Option<String> {
+    let home = env::var("HOME").ok()?;
+    let path = std::path::Path::new(&home).join(".clawhip").join(".env");
+    let content = fs::read_to_string(path).ok()?;
+    parse_dot_env_key(&content, key)
+}
+
+impl AppConfig {
     fn effective_token_with<F>(&self, get_env: F) -> Option<String>
     where
         F: FnMut(&str) -> Option<String>,
@@ -1017,6 +1117,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_dot_env_key_basic() {
+        let content = "DISCORD_BOT_TOKEN=abc123\nOTHER=val\n";
+        assert_eq!(
+            parse_dot_env_key(content, "DISCORD_BOT_TOKEN").as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn parse_dot_env_key_strips_quotes() {
+        assert_eq!(
+            parse_dot_env_key("K=\"quoted\"\n", "K").as_deref(),
+            Some("quoted")
+        );
+        assert_eq!(
+            parse_dot_env_key("K='single'\n", "K").as_deref(),
+            Some("single")
+        );
+    }
+
+    #[test]
+    fn parse_dot_env_key_ignores_comments_and_blanks() {
+        let content = "# comment\n\nDISCORD_BOT_TOKEN=tok\n";
+        assert_eq!(
+            parse_dot_env_key(content, "DISCORD_BOT_TOKEN").as_deref(),
+            Some("tok")
+        );
+    }
+
+    #[test]
+    fn parse_dot_env_key_missing_returns_none() {
+        assert_eq!(parse_dot_env_key("OTHER=val\n", "DISCORD_BOT_TOKEN"), None);
+    }
+
+    #[test]
+    fn effective_token_falls_back_to_dot_env_via_callback() {
+        // Simulate what effective_token does: env var missing, .env returns value
+        let config = AppConfig::default();
+        // We can't write to HOME in tests, but we can verify the env-callback path
+        // by passing a closure that simulates the .env file content.
+        let token = config.effective_token_with(|name| {
+            // Simulate: env var not set, but .env file contains the token
+            let dot_env = "DISCORD_BOT_TOKEN=dot-env-token\n";
+            parse_dot_env_key(dot_env, name)
+        });
+        assert_eq!(token.as_deref(), Some("dot-env-token"));
+    }
+
+    #[test]
     fn provider_discord_token_is_used_when_present() {
         let mut config = AppConfig::default();
         config.providers.discord.bot_token = Some("config-token".into());
@@ -1105,6 +1254,9 @@ mod tests {
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                gemini: GeminiConfig::default(),
+                openrouter: OpenRouterConfig::default(),
+                openai: OpenAiConfig::default(),
             },
             routes: vec![RouteRule {
                 event: "tmux.keyword".into(),
@@ -1342,6 +1494,9 @@ message = " ping "
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                gemini: GeminiConfig::default(),
+                openrouter: OpenRouterConfig::default(),
+                openai: OpenAiConfig::default(),
             },
             cron: CronConfig {
                 poll_interval_secs: 30,

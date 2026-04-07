@@ -39,18 +39,6 @@ impl PendingKeywordHits {
     pub fn into_hits(self) -> Vec<KeywordHit> {
         self.hits
     }
-
-    /// Consume this window's hits and return a fresh window that carries the
-    /// `seen` set forward, so already-reported (keyword, line) pairs are
-    /// never repeated in future windows.
-    pub fn flush_and_reset(self, now: Instant) -> (Vec<KeywordHit>, Self) {
-        let next = Self {
-            started_at: now,
-            hits: Vec::new(),
-            seen: self.seen,
-        };
-        (self.hits, next)
-    }
 }
 
 pub fn collect_keyword_hits(previous: &str, current: &str, keywords: &[String]) -> Vec<KeywordHit> {

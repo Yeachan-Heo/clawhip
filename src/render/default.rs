@@ -253,23 +253,20 @@ impl Renderer for DefaultRenderer {
             ("tmux.keyword", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
             ("tmux.stale", MessageFormat::Compact) => format!(
-                "tmux:{} pane {} stale for {}m (last: {})",
+                "💤 **{}**: no new output for {}m · {}",
                 string_field(payload, "session")?,
-                string_field(payload, "pane")?,
                 payload.field_u64("minutes")?,
                 string_field(payload, "last_line")?
             ),
             ("tmux.stale", MessageFormat::Alert) => format!(
-                "🚨 tmux session {} pane {} stale for {}m (last: {})",
+                "🚨 tmux:{} stale for {}m · {}",
                 string_field(payload, "session")?,
-                string_field(payload, "pane")?,
                 payload.field_u64("minutes")?,
                 string_field(payload, "last_line")?
             ),
             ("tmux.stale", MessageFormat::Inline) => format!(
-                "[tmux stale:{} {}] {}m",
+                "💤 [{}] {}m",
                 string_field(payload, "session")?,
-                string_field(payload, "pane")?,
                 payload.field_u64("minutes")?
             ),
             ("tmux.stale", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
@@ -777,7 +774,7 @@ fn render_aggregated_tmux_keyword(
                     format!("🚨 tmux session {session} hit {hit_count} keyword matches:")
                 }
                 MessageFormat::Compact => {
-                    format!("tmux:{session} matched {hit_count} keyword hits:")
+                    format!("🔑 tmux:{session} matched {hit_count} keyword hits:")
                 }
                 _ => unreachable!(),
             };
