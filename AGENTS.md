@@ -1,6 +1,6 @@
 # clawhip — AGENTS.md
 
-Daemon-first event gateway for Discord. Routes GitHub, tmux, and custom events to channels.
+Daemon-first event gateway for Discord and Slack. Routes GitHub, tmux, git, workspace, and cron events to channels. Supports LLM-powered tmux snapshot summarization and per-session dashboard pinning.
 
 ## Working agreements
 
@@ -9,6 +9,8 @@ Daemon-first event gateway for Discord. Routes GitHub, tmux, and custom events t
 - New routes/filters: add integration tests.
 - CLI subcommands: include `--help` descriptions for all flags.
 - Keep the daemon lightweight — no unnecessary allocations in the hot path.
+- Keyword dedup is within-window only; do not carry `seen` state across windows.
+- Dashboard slot edits go through `update_dashboard_slot`; do not post new messages for pinned slots.
 
 ## Review guidelines
 
@@ -18,6 +20,7 @@ Daemon-first event gateway for Discord. Routes GitHub, tmux, and custom events t
 - TOML config parsing: ensure new fields have sensible defaults (don't break existing configs).
 - Route matching: verify glob patterns are tested with edge cases.
 - tmux integration: confirm session monitoring handles missing/dead sessions gracefully.
+- Summarization: LLM calls must run as background tasks and never block the poll loop.
 - New dependencies must be justified — prefer std library where possible.
 - Daemon lifecycle: verify clean shutdown and signal handling.
 - Test coverage: flag new logic paths that lack corresponding tests.

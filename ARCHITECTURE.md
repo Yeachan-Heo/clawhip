@@ -1,118 +1,159 @@
-# clawhip Architecture — v0.4.0
+# clawhip Architecture — v0.5.x
 
-clawhip v0.4.0 ships a daemon-first event pipeline for Discord delivery, plus the clone-local install/memory surfaces that wrap it. This document describes the architecture that is present on the `release/0.4.0` branch.
+clawhip is a daemon-first event pipeline for Discord and Slack delivery. This document reflects the architecture on the current development branch.
 
 ## Release themes
 
-- typed event model
-- multi-delivery router
-- extracted event sources
+- typed event model with normalized session contract
+- multi-delivery router (Discord bot, Discord webhook, Slack webhook)
+- extracted event sources (git, GitHub, tmux, workspace, cron)
 - renderer/sink separation
-- install lifecycle polish
-- filesystem memory scaffolds
+- tmux snapshot summarization with pluggable LLM backends
+- dashboard pinning: up to 5 per-session in-place Discord messages
+- waiting-for-input detection and resolved state machine
+- batch dispatch with per-stream windows
 
 ## High-level flow
 
 ```text
-[CLI / webhook / git / GitHub / tmux]
+[CLI / webhook / git / GitHub / tmux / workspace / cron]
               -> [sources]
               -> [mpsc queue]
-              -> [dispatcher]
-              -> [router -> renderer -> discord sink]
-              -> [Discord REST delivery]
+              -> [dispatcher + batcher]
+              -> [router -> renderer -> discord/slack sink]
+              -> [Discord REST / Slack webhook delivery]
 ```
 
 ## Core components
 
 ### Typed event model (`crate::event`)
 
-The daemon accepts legacy `IncomingEvent` payloads at ingress, normalizes them, and converts them into typed internal events through `crate::event::compat`. That gives v0.4.0 a typed event model without breaking the existing CLI and HTTP surfaces.
-
-Key event families shipped in v0.4.0:
+The daemon accepts legacy `IncomingEvent` payloads at ingress and normalizes them through `crate::event::compat` into typed internal events. The canonical event families are:
 
 - custom events
-- git commit and branch-change events
-- GitHub issue opened / commented / closed events
-- GitHub pull-request status change events
-- agent lifecycle events
-- tmux keyword and stale-session events
+- git: `git.commit`, `git.branch-changed`
+- github: `github.issue-opened`, `github.issue-commented`, `github.issue-closed`, `github.pr-status-changed`, `github.ci-started`, `github.ci-passed`, `github.ci-failed`, `github.ci-cancelled`
+- agent/session: `agent.*` (legacy) and `session.*` (native contract)
+- tmux: `tmux.keyword`, `tmux.stale`, `tmux.content_changed`, `tmux.heartbeat`, `tmux.waiting_for_input`, `tmux.session_ended`
+- workspace: `workspace.skill.activated`, `workspace.session.*`, `workspace.hud.*`
+- cron: `cron.job`
 
 ### Sources (`crate::source`)
 
-Event production is split into dedicated sources behind the `Source` trait:
+Each source implements the `Source` trait and feeds a shared Tokio `mpsc` queue:
 
-- `GitSource` polls configured repositories for commit and branch changes
-- `GitHubSource` polls configured repositories for issue and PR changes
-- `TmuxSource` monitors tmux sessions for keyword hits and stale panes
-
-All sources feed a shared Tokio `mpsc` queue. This replaces the earlier tighter coupling between monitors, routing, and transport.
+- `GitSource` — polls configured repos for commit and branch changes
+- `GitHubSource` — polls GitHub API for issue and PR state changes; also polls CI run status
+- `TmuxSource` — monitors tmux sessions per poll cycle; drives keyword detection, stale detection, heartbeat, summarization, and waiting-for-input state machine
+- `WorkspaceSource` — watches filesystem paths for file changes using a debounced poll loop; supports worktree discovery
+- `CronSource` — evaluates cron schedules on each tick and emits `cron.job` events for matching jobs
 
 ### Dispatcher (`crate::dispatch`)
 
-`Dispatcher` is the queue consumer. For each incoming event it:
+`Dispatcher` is the queue consumer. For each event it:
 
-1. resolves matching deliveries with the router
-2. renders content for each delivery
-3. hands the rendered message to the configured sink
-4. continues best-effort when one delivery fails
+1. classifies the event as routine, CI, or bypass
+2. buffers routine events in a per-delivery-signature batcher (default 5s window)
+3. buffers CI events in a separate CI batcher (default 30s window)
+4. bypass events (failures, alerts, stale) skip the batcher entirely
+5. resolves deliveries through the router, renders each one, and hands it to the sink
+6. continues best-effort when one delivery fails; failed deliveries land in the DLQ
 
-This is the central coordination point for the v0.4.0 pipeline.
+Batch windows are configurable via `[dispatch].routine_batch_window_secs` and `[dispatch].ci_batch_window_secs`. Setting routine window to `0` disables batching.
 
 ### Router (`crate::router`)
 
-The router now resolves **0..N deliveries per event**. In practice that means:
-
-- multiple route rules can match the same event
-- a match no longer stops at the first rule
-- each resolved delivery keeps the destination target, format, template, and mention context
-
-This is the main behavioral change behind the v0.4.0 multi-delivery architecture.
+Resolves **0..N deliveries per event**. Multiple route rules can match the same event; all matches are collected and delivered independently. Each resolved delivery carries its destination target, format, template, mention context, and dynamic-token opt-in flag.
 
 ### Renderer (`crate::render`)
 
-Rendering is now explicit. The default renderer is responsible for formatting supported event bodies into compact, alert, inline, or raw output before transport.
+Formats event bodies into `compact`, `alert`, `raw`, or custom template output. The renderer is sink-agnostic; the Discord and Slack sinks each receive the same rendered string.
 
-That keeps message formatting out of the transport layer and makes the dispatch pipeline easier to extend and test.
+### Sink (`crate::discord`, `crate::slack`)
 
-### Sink (`crate::sink`)
+Two sinks ship:
 
-Transport is represented by the `Sink` trait. The primary shipped sink in v0.4.0 is the Discord sink, which delivers either to a Discord channel or a Discord webhook target.
+- **Discord sink** — delivers to a bot-token channel or a Discord webhook; handles 429 rate limiting with retry-after backoff; exhausted retries go to the DLQ
+- **Slack sink** — delivers to a Slack incoming webhook URL
 
-The renderer/sink split is important even with a single shipped sink because it removes transport concerns from routing and event modeling.
+## Summarization (`crate::summarize`)
 
-## Configuration model
+Triggered by `TmuxSource` when pane content changes and `summarize = true` is set. Runs as a non-blocking background task so it never stalls the poll loop.
 
-The preferred Discord configuration surface in v0.4.0 is:
+Backends:
 
-```toml
-[providers.discord]
-token = "..."
-default_channel = "1234567890"
-```
+| Spec | Implementation |
+|---|---|
+| `raw` | Returns truncated pane content verbatim |
+| `gemini:<model>` | Shells out to the `gemini` CLI subprocess |
+| `openrouter:<model>` | HTTP POST to OpenRouter chat completions API |
+| `openai:<model>` / `openai-compatible:<model>` | HTTP POST to OpenAI-compatible chat completions API |
 
-Legacy `[discord]` configuration is still accepted and normalized on load for backward compatibility.
+The summarizer produces `tmux.content_changed` events with `content_mode: "raw"` (raw passthrough) or `"summary"` (LLM result). Raw mode edits a single living Discord message per session; summary mode posts a new message each time to build a historical record.
 
-Routes continue to use the familiar event/filter model, with a `sink` field that defaults to `"discord"`:
+## Dashboard pinning (`crate::discord`)
 
-```toml
-[[routes]]
-event = "github.*"
-filter = { repo = "clawhip" }
-sink = "discord"
-channel = "1480171113253175356"
-mention = "<@1465264645320474637>"
-format = "compact"
-```
+Each monitored tmux session maintains up to 5 pinned Discord messages, edited in-place rather than posting new messages. Slot names and their event sources:
+
+| Slot | Trigger | Default |
+|---|---|---|
+| `status` | `tmux.heartbeat` | pinned (on) |
+| `summary` | `tmux.content_changed` | pinned (on) |
+| `alert` | `tmux.waiting_for_input`, `tmux.waiting_resolved` | pinned (on) |
+| `activity` | all dashboard events (rolling log) | pinned (on) |
+| `keywords` | `tmux.keyword` (rolling log) | not pinned (off) |
+
+Message IDs are persisted to `~/.clawhip/dashboard.json`. On daemon restart, existing message IDs are reused so edits land on the same messages. When a session ends (`tmux.session_ended`), all pinned messages for that session are unpinned via the Discord API and the session entry is cleared from `dashboard.json`.
+
+When a slot message does not yet exist, a new message is posted and its ID is saved. Subsequent events for the same slot edit that message in-place (PATCH).
+
+## Waiting-for-input state machine (`crate::source::tmux`)
+
+`TmuxSource` tracks a per-pane `is_waiting: bool` flag. On each poll cycle, `is_waiting_for_input()` inspects the last 3 non-empty lines of pane content (filtered from `capture-pane -S -200` output, which pads with blank rows) and matches against a list of patterns covering interactive prompts, confirmation dialogs, credential prompts, and Claude Code tool-approval flows.
+
+State transitions:
+
+- `(false, Some(prompt))` → emit `tmux.waiting_for_input`, set `is_waiting = true`
+- `(true, None)` → emit `tmux.waiting_resolved`, set `is_waiting = false`
+- `(true, Some(_))` — still waiting, suppress duplicate events
+
+The 3-line window is intentional: after one user reply (output line + echoed command + new shell prompt = 3 non-empty lines), the original waiting prompt falls out of the window, triggering the resolved transition.
+
+`tmux.waiting_for_input` and `tmux.waiting_resolved` both carry `dashboard_component = "alert"` when `pin_alerts = true`, routing them to the alert dashboard slot. Resolved events render as `✅ \`session\` — Input received, continuing...`.
+
+## Keyword windowing (`crate::keyword_window`)
+
+`PendingKeywordHits` accumulates keyword hits within a time window. Deduplication is within-window only: the same `(keyword, line)` pair is reported at most once per window. After a window is flushed, the next window starts fresh — identical pairs can fire again in subsequent windows.
+
+When `keyword_window_secs` expires, hits are emitted as a single `tmux.keyword` event. The window is per-session and per-daemon-registration.
+
+## Configuration model (`crate::config`)
+
+Top-level sections:
+
+- `[providers.discord]` / legacy `[discord]` — Discord bot token and default channel
+- `[providers.gemini]`, `[providers.openrouter]`, `[providers.openai]` — LLM API keys
+- `[daemon]` — bind host, port, base URL
+- `[defaults]` — fallback channel and format
+- `[dispatch]` — batch window tuning
+- `[[routes]]` — event routing rules
+- `[monitors]` — global poll interval, GitHub token, source configs
+- `[[monitors.git.repos]]` — git repo monitors
+- `[[monitors.tmux.sessions]]` — tmux session monitors with full dashboard/summarization config
+- `[[monitors.workspace]]` — filesystem change monitors
+- `[cron]` + `[[cron.jobs]]` — scheduled message delivery
+
+See README for the complete field-level reference.
 
 ## Delivery semantics
 
-v0.4.0 currently uses these delivery rules:
-
 - per-source FIFO through the shared queue
-- best-effort multi-delivery; one failed delivery does not stop the others
-- no built-in retry queue
-- source-level tmux keyword windowing, with dispatch remaining stateless
+- routine events are batched per delivery signature; bypass events skip the batcher
+- best-effort multi-delivery; one failed delivery does not block others
+- 429 rate-limit responses are retried with retry-after backoff
+- exhausted retries go to an in-memory DLQ for observability
+- source-level tmux keyword windowing; dispatch is otherwise stateless
 
 ## Operational verification
 
-The release branch includes a live verification runbook in [`docs/live-verification.md`](docs/live-verification.md). It covers daemon status, custom events, git events, GitHub issue/PR flows, and tmux monitoring.
+See [`docs/live-verification.md`](docs/live-verification.md) for the full runbook.
