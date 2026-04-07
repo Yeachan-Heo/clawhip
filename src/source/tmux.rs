@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
 use tokio::sync::{RwLock, mpsc};
@@ -44,7 +45,7 @@ pub struct ParentProcessInfo {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegisteredTmuxSession {
     pub session: String,
     pub channel: Option<String>,
@@ -65,6 +66,13 @@ pub struct RegisteredTmuxSession {
     pub parent_process: Option<ParentProcessInfo>,
     #[serde(default)]
     pub active_wrapper_monitor: bool,
+    #[serde(default)]
+    pub detect_waiting: bool,
+    #[serde(default)]
+    pub waiting_interval: u64,
+    /// Event kinds for which the `mention` is prepended. Empty = mention applies to all events.
+    #[serde(default)]
+    pub mention_on: Vec<String>,
 }
 
 impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
@@ -82,7 +90,23 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
             active_wrapper_monitor: false,
+            detect_waiting: value.detect_waiting,
+            waiting_interval: value.waiting_interval,
+            mention_on: value.mention_on.clone(),
         }
+    }
+}
+
+/// Returns the mention string for an event kind, respecting `mention_on` filter.
+/// If `mention_on` is empty, the mention applies to all event kinds.
+fn effective_mention(registration: &RegisteredTmuxSession, event_kind: &str) -> Option<String> {
+    if registration.mention_on.is_empty() {
+        return registration.mention.clone();
+    }
+    if registration.mention_on.iter().any(|k| k == event_kind) {
+        registration.mention.clone()
+    } else {
+        None
     }
 }
 
@@ -145,6 +169,7 @@ struct TmuxPaneState {
     last_change: Instant,
     last_stale_notification: Option<Instant>,
     pane_dead: bool,
+    is_waiting: bool,
 }
 
 #[derive(Default)]
@@ -217,6 +242,7 @@ pub async fn monitor_registered_session(
                             last_change: now,
                             last_stale_notification: None,
                             pane_dead: pane.pane_dead,
+                            is_waiting: false,
                         },
                     );
                 }
@@ -229,6 +255,33 @@ pub async fn monitor_registered_session(
                             &registration.keywords,
                         );
                         push_pending_keyword_hits(&mut pending_keyword_hits, now, hits);
+
+                        if registration.detect_waiting {
+                            let waiting_prompt = is_waiting_for_input(&pane.content);
+                            match (existing.is_waiting, &waiting_prompt) {
+                                (false, Some(prompt)) => {
+                                    client
+                                        .emit(tmux_waiting_for_input_event(
+                                            &registration,
+                                            pane.session.clone(),
+                                            pane.pane_name.clone(),
+                                            prompt.clone(),
+                                        ))
+                                        .await?;
+                                }
+                                (true, None) => {
+                                    client
+                                        .emit(tmux_waiting_resolved_event(
+                                            &registration,
+                                            pane.session.clone(),
+                                            pane.pane_name.clone(),
+                                        ))
+                                        .await?;
+                                }
+                                _ => {}
+                            }
+                            existing.is_waiting = waiting_prompt.is_some();
+                        }
 
                         existing.session = pane.session;
                         existing.pane_name = pane.pane_name;
@@ -371,6 +424,7 @@ async fn poll_tmux(
                                     last_change: now,
                                     last_stale_notification: None,
                                     pane_dead: pane.pane_dead,
+                                    is_waiting: false,
                                 },
                             );
                             None
@@ -383,6 +437,30 @@ async fn poll_tmux(
                                     &pane.content,
                                     &registration.keywords,
                                 );
+                                if registration.detect_waiting {
+                                    let waiting_prompt = is_waiting_for_input(&pane.content);
+                                    match (existing.is_waiting, &waiting_prompt) {
+                                        (false, Some(prompt)) => {
+                                            tx.emit(tmux_waiting_for_input_event(
+                                                registration,
+                                                session_name.clone(),
+                                                pane.pane_name.clone(),
+                                                prompt.clone(),
+                                            ))
+                                            .await?;
+                                        }
+                                        (true, None) => {
+                                            tx.emit(tmux_waiting_resolved_event(
+                                                registration,
+                                                session_name.clone(),
+                                                pane.pane_name.clone(),
+                                            ))
+                                            .await?;
+                                        }
+                                        _ => {}
+                                    }
+                                    existing.is_waiting = waiting_prompt.is_some();
+                                }
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
                                 existing.content_hash = hash;
@@ -630,7 +708,7 @@ fn tmux_keyword_event(
 
     event
         .with_routing_metadata(&registration.routing)
-        .with_mention(registration.mention.clone())
+        .with_mention(effective_mention(registration, "keyword"))
         .with_format(registration.format.clone())
 }
 
@@ -648,8 +726,129 @@ fn tmux_stale_event(
         registration.channel.clone(),
     )
     .with_routing_metadata(&registration.routing)
-    .with_mention(registration.mention.clone())
+    .with_mention(effective_mention(registration, "stale"))
     .with_format(registration.format.clone())
+}
+
+fn tmux_waiting_for_input_event(
+    registration: &RegisteredTmuxSession,
+    session: String,
+    pane: String,
+    prompt_snapshot: String,
+) -> IncomingEvent {
+    IncomingEvent::tmux_waiting_for_input(
+        session,
+        pane,
+        prompt_snapshot,
+        registration.channel.clone(),
+    )
+    .with_mention(effective_mention(registration, "waiting_for_input"))
+    .with_format(registration.format.clone())
+}
+
+fn tmux_waiting_resolved_event(
+    registration: &RegisteredTmuxSession,
+    session: String,
+    pane_name: String,
+) -> IncomingEvent {
+    let mut event =
+        IncomingEvent::tmux_waiting_for_input(session, pane_name, String::new(), registration.channel.clone());
+    event.payload["resolved"] = json!(true);
+    event.with_format(registration.format.clone())
+}
+
+fn is_waiting_for_input(content: &str) -> Option<String> {
+    // Patterns checked against the last 3 non-empty lines (case-insensitive).
+    // Covers common interactive prompts and OMC/OMX agent harness approval flows.
+    let multiline_patterns: &[&str] = &[
+        // Generic waiting phrases
+        "waiting for input",
+        "awaiting user input",
+        "press enter",
+        "hit enter",
+        "press any key",
+        // Confirmation prompts
+        "[y/n]",
+        "(y/n)",
+        "[yes/no]",
+        "(yes/no)",
+        // Common action confirmations
+        "proceed?",
+        "continue?",
+        "overwrite?",
+        "replace?",
+        "do you want to",
+        // Menu / choice prompts
+        "enter your choice",
+        "select an option",
+        // Claude Code / OMC tool approval patterns
+        "allow, deny",
+        "allow this action",
+        "always allow",
+        "approve or deny",
+        "run this tool",
+        // Generic approval keyword at line start
+        "approve:",
+        // Credential prompts (password entry blocks terminal)
+        "password:",
+        "passphrase:",
+        "enter password",
+        // Common agent/tool confirmation phrases
+        "want me to",
+        "shall i",
+        "should i proceed",
+        "should i continue",
+        // Interactive setup confirmations
+        "is this ok?",
+        "(ctrl+c to abort)",
+        // CC permission mode picker indicator
+        "bypassPermissions",
+    ];
+
+    // Take the last 3 non-empty lines, skipping blank padding rows.
+    let recent: Vec<&str> = content
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect();
+    if recent.is_empty() {
+        return None;
+    }
+
+    let snapshot: String = recent.iter().rev().copied().collect::<Vec<_>>().join("\n");
+    let snapshot_lower = snapshot.to_lowercase();
+
+    for pattern in multiline_patterns {
+        if snapshot_lower.contains(pattern) {
+            return Some(snapshot.clone());
+        }
+    }
+
+    // Check the last non-empty line for short interactive-prompt endings.
+    let last_nonempty = recent.first().copied().unwrap_or("");
+    let trimmed = last_nonempty.trim_end();
+    if trimmed.len() <= 40 {
+        let prompt_suffixes: &[&str] = &[
+            "❯",
+            "$ ",
+            "% ",
+            "... ",
+            "? ",
+        ];
+        for suffix in prompt_suffixes {
+            if trimmed.ends_with(suffix) || trimmed == suffix.trim() {
+                return Some(snapshot);
+            }
+        }
+    }
+
+    // ❯ at the start of a short line indicates an interactive menu selector
+    if trimmed.starts_with('❯') && trimmed.len() <= 80 {
+        return Some(snapshot);
+    }
+
+    None
 }
 
 async fn flush_pending_keyword_hits<E: EventEmitter>(
@@ -870,6 +1069,9 @@ mod tests {
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
             active_wrapper_monitor: false,
+            detect_waiting: false,
+            waiting_interval: 0,
+            mention_on: Vec::new(),
         }
     }
 
@@ -988,6 +1190,7 @@ PR created #7",
             keyword_window_secs: 30,
             stale_minutes: 10,
             format: None,
+            ..Default::default()
         };
 
         let registration = RegisteredTmuxSession::from(&monitor);
@@ -1018,6 +1221,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ),
             (
@@ -1038,6 +1242,7 @@ PR created #7",
                         name: Some("codex".into()),
                     }),
                     active_wrapper_monitor: true,
+                    ..Default::default()
                 },
             ),
             (
@@ -1055,6 +1260,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ),
         ]);
@@ -1076,6 +1282,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             )]),
         );
@@ -1386,6 +1593,7 @@ error: failed";
                 registration_source: RegistrationSource::ConfigMonitor,
                 parent_process: None,
                 active_wrapper_monitor: false,
+                ..Default::default()
             }],
             Some(&available_sessions),
         );
@@ -1416,6 +1624,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "omx-*".into(),
@@ -1430,6 +1639,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             Some(&available_sessions),
@@ -1458,6 +1668,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
@@ -1472,6 +1683,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             None,
@@ -1499,6 +1711,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "rcc-api".into(),
@@ -1513,6 +1726,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             Some(&available_sessions),
@@ -1540,6 +1754,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
@@ -1554,6 +1769,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             Some(&available_sessions),
@@ -1586,6 +1802,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "abc*".into(),
@@ -1600,6 +1817,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             Some(&available_sessions),
@@ -1622,6 +1840,7 @@ error: failed";
             last_change: Instant::now() - Duration::from_secs(3600),
             last_stale_notification: None,
             pane_dead: false,
+            is_waiting: false,
         };
         // stale_minutes=0 should never emit, even after 1 hour idle
         assert!(!should_emit_stale(&pane, Instant::now(), 0));
@@ -1637,6 +1856,7 @@ error: failed";
             last_change: Instant::now() - Duration::from_secs(3600),
             last_stale_notification: None,
             pane_dead: false,
+            is_waiting: false,
         };
         // stale_minutes=1 should emit after 1 hour idle
         assert!(should_emit_stale(&pane, Instant::now(), 1));
@@ -1652,8 +1872,112 @@ error: failed";
             last_change: Instant::now() - Duration::from_secs(3600),
             last_stale_notification: None,
             pane_dead: true,
+            is_waiting: false,
         };
         // Dead pane should never emit stale, even after 1 hour idle
         assert!(!should_emit_stale(&pane, Instant::now(), 1));
+    }
+
+    // ── is_waiting_for_input tests ──────────────────────────────────────────
+
+    #[test]
+    fn waiting_detects_press_enter() {
+        assert!(is_waiting_for_input("some output\nPress enter to continue:").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_yn_bracket() {
+        assert!(is_waiting_for_input("Overwrite file? [Y/n]").is_some());
+        assert!(is_waiting_for_input("Continue? [y/N]").is_some());
+        assert!(is_waiting_for_input("Proceed? (y/n)").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_proceed_continue_overwrite() {
+        assert!(is_waiting_for_input("Do you want to proceed?").is_some());
+        assert!(is_waiting_for_input("continue?").is_some());
+        assert!(is_waiting_for_input("overwrite?").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_omc_tool_approval() {
+        // Claude Code tool approval format
+        assert!(is_waiting_for_input("Allow, Deny, Always allow (A/d/!)?").is_some());
+        assert!(is_waiting_for_input("always allow").is_some());
+        assert!(is_waiting_for_input("run this tool").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_menu_prompts() {
+        assert!(is_waiting_for_input("Enter your choice:").is_some());
+        assert!(is_waiting_for_input("Select an option").is_some());
+        assert!(is_waiting_for_input("Press any key to continue").is_some());
+    }
+
+    #[test]
+    fn waiting_detects_do_you_want_to() {
+        assert!(is_waiting_for_input("Do you want to install these packages?").is_some());
+    }
+
+    #[test]
+    fn waiting_ignores_normal_output() {
+        assert!(is_waiting_for_input("cargo build --release\nCompiling clawhip v0.5.4\nFinished dev profile").is_none());
+        assert!(is_waiting_for_input("").is_none());
+    }
+
+    #[test]
+    fn waiting_only_checks_last_3_lines() {
+        // Trigger phrase buried beyond the 3-line window should NOT match.
+        // 4 non-empty filler lines push "press enter" out of the window.
+        let buried = "press enter\n".to_string() + &"line\n".repeat(4);
+        assert!(is_waiting_for_input(&buried).is_none());
+        // Trailing blank lines are ignored, so this still doesn't match
+        let buried_with_blanks = "press enter\n".to_string() + &"line\n".repeat(4) + &"\n".repeat(20);
+        assert!(is_waiting_for_input(&buried_with_blanks).is_none());
+        // Pattern at exactly position 3 (last of window) still matches
+        let at_edge = "line\n".repeat(2) + "press enter\n";
+        assert!(is_waiting_for_input(&at_edge).is_some());
+    }
+
+    #[test]
+    fn waiting_detects_omc_cursor_prompt() {
+        // Short last line ending with ❯ (OMC tool approval cursor)
+        assert!(is_waiting_for_input("Allow, Deny, Always allow\n❯").is_some());
+    }
+
+    // ── mention_on tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_mention_empty_mention_on_applies_to_all() {
+        let reg = RegisteredTmuxSession {
+            mention: Some("<@123>".into()),
+            mention_on: vec![],
+            ..registration(vec![])
+        };
+        assert_eq!(effective_mention(&reg, "keyword").as_deref(), Some("<@123>"));
+        assert_eq!(effective_mention(&reg, "waiting_for_input").as_deref(), Some("<@123>"));
+        assert_eq!(effective_mention(&reg, "heartbeat").as_deref(), Some("<@123>"));
+    }
+
+    #[test]
+    fn effective_mention_filters_by_event_kind() {
+        let reg = RegisteredTmuxSession {
+            mention: Some("<@123>".into()),
+            mention_on: vec!["waiting_for_input".into()],
+            ..registration(vec![])
+        };
+        assert_eq!(effective_mention(&reg, "waiting_for_input").as_deref(), Some("<@123>"));
+        assert_eq!(effective_mention(&reg, "keyword").as_deref(), None);
+        assert_eq!(effective_mention(&reg, "heartbeat").as_deref(), None);
+    }
+
+    #[test]
+    fn effective_mention_no_mention_returns_none() {
+        let reg = RegisteredTmuxSession {
+            mention: None,
+            mention_on: vec!["waiting_for_input".into()],
+            ..registration(vec![])
+        };
+        assert_eq!(effective_mention(&reg, "waiting_for_input").as_deref(), None);
     }
 }

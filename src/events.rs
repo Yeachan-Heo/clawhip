@@ -605,6 +605,27 @@ impl IncomingEvent {
         }
     }
 
+    /// Session is waiting for user input.
+    pub fn tmux_waiting_for_input(
+        session: String,
+        pane_name: String,
+        prompt_snapshot: String,
+        channel: Option<String>,
+    ) -> Self {
+        Self {
+            kind: "tmux.waiting_for_input".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "session": session,
+                "pane": pane_name,
+                "prompt_snapshot": prompt_snapshot,
+            }),
+        }
+    }
+
     pub fn with_mention(mut self, mention: Option<String>) -> Self {
         self.mention = mention;
         self

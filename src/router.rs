@@ -321,6 +321,9 @@ fn route_candidates(kind: &str) -> Vec<&str> {
         | "session.handoff-needed" => {
             vec![kind, "session.*"]
         }
+        "tmux.waiting_for_input" => {
+            vec![kind, "tmux.*"]
+        }
         other => vec![other],
     }
 }

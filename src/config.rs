@@ -287,6 +287,15 @@ pub struct TmuxSessionMonitor {
     pub channel: Option<String>,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
+    #[serde(default)]
+    pub detect_waiting: bool,
+    /// Cooldown minutes between waiting-for-input alerts. 0 = no cooldown.
+    #[serde(default)]
+    pub waiting_interval: u64,
+    /// Event kinds that trigger the @mention. Empty = mention applies to all events.
+    /// Valid values: "keyword", "waiting_for_input", "content_changed", "stale", "heartbeat".
+    #[serde(default)]
+    pub mention_on: Vec<String>,
 }
 
 impl Default for TmuxSessionMonitor {
@@ -299,6 +308,9 @@ impl Default for TmuxSessionMonitor {
             channel: None,
             mention: None,
             format: None,
+            detect_waiting: false,
+            waiting_interval: 0,
+            mention_on: Vec::new(),
         }
     }
 }

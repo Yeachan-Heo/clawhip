@@ -119,6 +119,9 @@ impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
             registration_source: value.registration_source,
             parent_process: value.parent_process,
             active_wrapper_monitor: true,
+            detect_waiting: false,
+            waiting_interval: 0,
+            mention_on: Vec::new(),
         }
     }
 }
@@ -622,6 +625,7 @@ mod tests {
                 name: Some("codex".into()),
             }),
             active_wrapper_monitor: true,
+            ..Default::default()
         });
 
         assert!(log.contains("session=issue-105"));

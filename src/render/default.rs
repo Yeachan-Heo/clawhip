@@ -303,6 +303,26 @@ impl Renderer for DefaultRenderer {
             ),
             ("tmux.stale", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
+            ("tmux.waiting_for_input", MessageFormat::Compact) => {
+                let session = string_field(payload, "session")?;
+                let prompt = optional_string_field(payload, "prompt_snapshot")
+                    .unwrap_or_else(|| "no prompt".to_string());
+                format!("⏳ **{session}**:\n```\n{prompt}\n```")
+            }
+            ("tmux.waiting_for_input", MessageFormat::Alert) => {
+                let session = string_field(payload, "session")?;
+                let prompt = optional_string_field(payload, "prompt_snapshot")
+                    .unwrap_or_else(|| "no prompt".to_string());
+                format!("⏳ **{session}**:\n```\n{prompt}\n```")
+            }
+            ("tmux.waiting_for_input", MessageFormat::Inline) => {
+                let session = string_field(payload, "session")?;
+                format!("⏳ [{session}]")
+            }
+            ("tmux.waiting_for_input", MessageFormat::Raw) => {
+                serde_json::to_string_pretty(payload)?
+            }
+
             (_, MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
             (_, _) => serde_json::to_string(payload)?,
         };
@@ -959,5 +979,27 @@ mod tests {
             .unwrap();
         assert!(rendered.starts_with("🚨"));
         assert!(rendered.contains("release published"));
+    }
+
+    #[test]
+    fn renders_tmux_waiting_for_input_formats() {
+        let renderer = DefaultRenderer;
+        let event = IncomingEvent::tmux_waiting_for_input(
+            "issue-24".into(),
+            "0.1".into(),
+            "Press enter to continue".into(),
+            None,
+        );
+
+        assert_eq!(
+            renderer.render(&event, &MessageFormat::Inline).unwrap(),
+            "⏳ [issue-24]"
+        );
+        assert!(
+            renderer
+                .render(&event, &MessageFormat::Compact)
+                .unwrap()
+                .starts_with("⏳ **issue-24**")
+        );
     }
 }
