@@ -337,6 +337,21 @@ pub struct TmuxSessionMonitor {
     /// Valid values: "keyword", "waiting_for_input", "content_changed", "stale", "heartbeat".
     #[serde(default)]
     pub mention_on: Vec<String>,
+    /// Pin and update the status/heartbeat dashboard message in-place.
+    /// Dashboard is implicit: enabled when any pin_* = true.
+    #[serde(default)]
+    pub pin_status: bool,
+    /// Pin and update the summary dashboard message in-place.
+    #[serde(default)]
+    pub pin_summary: bool,
+    /// Pin and update the alert dashboard message in-place.
+    #[serde(default)]
+    pub pin_alerts: bool,
+    #[serde(default)]
+    pub pin_activity: bool,
+    /// Pin keyword hits as a rolling log dashboard slot. Default false (backward compat).
+    #[serde(default)]
+    pub pin_keywords: bool,
 }
 
 impl Default for TmuxSessionMonitor {
@@ -359,6 +374,11 @@ impl Default for TmuxSessionMonitor {
             detect_waiting: false,
             waiting_interval: 0,
             mention_on: Vec::new(),
+            pin_status: true,
+            pin_summary: true,
+            pin_alerts: true,
+            pin_activity: true,
+            pin_keywords: false,
         }
     }
 }

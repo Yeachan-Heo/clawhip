@@ -673,6 +673,19 @@ impl IncomingEvent {
         }
     }
 
+    pub fn tmux_session_ended(session: String, channel: Option<String>) -> Self {
+        Self {
+            kind: "tmux.session_ended".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "session": session,
+            }),
+        }
+    }
+
     pub fn with_mention(mut self, mention: Option<String>) -> Self {
         self.mention = mention;
         self

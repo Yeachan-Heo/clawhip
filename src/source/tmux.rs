@@ -88,6 +88,16 @@ pub struct RegisteredTmuxSession {
     /// Event kinds for which the `mention` is prepended. Empty = mention applies to all events.
     #[serde(default)]
     pub mention_on: Vec<String>,
+    #[serde(default)]
+    pub pin_status: bool,
+    #[serde(default)]
+    pub pin_summary: bool,
+    #[serde(default)]
+    pub pin_alerts: bool,
+    #[serde(default)]
+    pub pin_activity: bool,
+    #[serde(default)]
+    pub pin_keywords: bool,
 }
 
 impl RegisteredTmuxSession {
@@ -127,6 +137,11 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             detect_waiting: value.detect_waiting,
             waiting_interval: value.waiting_interval,
             mention_on: value.mention_on.clone(),
+            pin_status: value.pin_status,
+            pin_summary: value.pin_summary,
+            pin_alerts: value.pin_alerts,
+            pin_activity: value.pin_activity,
+            pin_keywords: value.pin_keywords,
         }
     }
 }
@@ -451,6 +466,10 @@ async fn poll_tmux(
         match session_exists(session_name).await {
             Ok(false) => {
                 sessions_to_unregister.push(session_name.clone());
+                let _ = tx.emit(IncomingEvent::tmux_session_ended(
+                    session_name.clone(),
+                    registration.channel.clone(),
+                )).await;
                 flush_session_pending_keyword_hits(
                     &mut state.pending_keyword_hits,
                     session_name,
@@ -803,6 +822,12 @@ fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> 
             .unwrap_or(true)
 }
 
+/// Inject dashboard routing fields into an event payload.
+fn inject_dashboard_payload(event: &mut IncomingEvent, slot: &str, pin_activity: bool) {
+    event.payload["dashboard_component"] = json!(slot);
+    event.payload["pin_activity"] = json!(pin_activity);
+}
+
 fn tmux_keyword_event(
     registration: &RegisteredTmuxSession,
     session: String,
@@ -824,10 +849,14 @@ fn tmux_keyword_event(
         IncomingEvent::tmux_keywords(session, hits, registration.channel.clone())
     };
 
-    event
+    let mut event = event
         .with_routing_metadata(&registration.routing)
         .with_mention(effective_mention(registration, "keyword"))
-        .with_format(registration.format.clone())
+        .with_format(registration.format.clone());
+    if registration.pin_keywords {
+        inject_dashboard_payload(&mut event, "keywords", registration.pin_activity);
+    }
+    event
 }
 
 fn tmux_stale_event(
@@ -836,7 +865,7 @@ fn tmux_stale_event(
     pane: String,
     last_line: String,
 ) -> IncomingEvent {
-    IncomingEvent::tmux_stale(
+    let mut event = IncomingEvent::tmux_stale(
         session,
         pane,
         registration.stale_minutes,
@@ -845,7 +874,11 @@ fn tmux_stale_event(
     )
     .with_routing_metadata(&registration.routing)
     .with_mention(effective_mention(registration, "stale"))
-    .with_format(registration.format.clone())
+    .with_format(registration.format.clone());
+    if registration.pin_status {
+        inject_dashboard_payload(&mut event, "status", registration.pin_activity);
+    }
+    event
 }
 
 fn tmux_content_changed_event(
@@ -854,7 +887,7 @@ fn tmux_content_changed_event(
     pane: String,
     content: SummarizedContent,
 ) -> IncomingEvent {
-    IncomingEvent::tmux_content_changed_with_metadata(
+    let mut event = IncomingEvent::tmux_content_changed_with_metadata(
         session,
         pane,
         content.summary,
@@ -863,8 +896,12 @@ fn tmux_content_changed_event(
         content.content_mode.as_str().to_string(),
         registration.channel.clone(),
     )
-    .with_mention(registration.mention.clone())
-    .with_format(registration.format.clone())
+    .with_mention(effective_mention(registration, "content_changed"))
+    .with_format(registration.format.clone());
+    if registration.pin_summary {
+        inject_dashboard_payload(&mut event, "summary", registration.pin_activity);
+    }
+    event
 }
 
 fn spawn_content_changed_task<E>(
@@ -908,9 +945,14 @@ fn tmux_heartbeat_event(
     session: String,
     minutes_since_change: u64,
 ) -> IncomingEvent {
-    IncomingEvent::tmux_heartbeat(session, minutes_since_change, registration.channel.clone())
-        .with_mention(registration.mention.clone())
-        .with_format(registration.format.clone())
+    let mut event =
+        IncomingEvent::tmux_heartbeat(session, minutes_since_change, registration.channel.clone())
+            .with_mention(effective_mention(registration, "heartbeat"))
+            .with_format(registration.format.clone());
+    if registration.pin_status {
+        inject_dashboard_payload(&mut event, "status", registration.pin_activity);
+    }
+    event
 }
 
 fn count_new_lines(old: &str, new: &str) -> usize {
@@ -1032,14 +1074,18 @@ fn tmux_waiting_for_input_event(
     pane: String,
     prompt_snapshot: String,
 ) -> IncomingEvent {
-    IncomingEvent::tmux_waiting_for_input(
+    let mut event = IncomingEvent::tmux_waiting_for_input(
         session,
         pane,
         prompt_snapshot,
         registration.channel.clone(),
     )
     .with_mention(effective_mention(registration, "waiting_for_input"))
-    .with_format(registration.format.clone())
+    .with_format(registration.format.clone());
+    if registration.pin_alerts {
+        inject_dashboard_payload(&mut event, "alert", registration.pin_activity);
+    }
+    event
 }
 
 fn tmux_waiting_resolved_event(
@@ -1050,6 +1096,11 @@ fn tmux_waiting_resolved_event(
     let mut event =
         IncomingEvent::tmux_waiting_for_input(session, pane_name, String::new(), registration.channel.clone());
     event.payload["resolved"] = json!(true);
+    // Mirror the same dashboard routing as the waiting event so the resolved
+    // message updates the pinned alert slot (not a separate keyed message).
+    if registration.pin_alerts {
+        inject_dashboard_payload(&mut event, "alert", registration.pin_activity);
+    }
     event.with_format(registration.format.clone())
 }
 
@@ -2325,5 +2376,20 @@ error: failed";
             ..registration(vec![])
         };
         assert_eq!(effective_mention(&reg, "waiting_for_input").as_deref(), None);
+    }
+
+    #[test]
+    fn tmux_keyword_event_with_pin_keywords_sets_dashboard_payload() {
+        let mut registration = registration(vec!["error"]);
+        registration.pin_keywords = true;
+
+        let event = tmux_keyword_event(
+            &registration,
+            "issue-24".into(),
+            vec![("error".into(), "boom".into())],
+        );
+
+        assert_eq!(event.payload["dashboard_component"], "keywords");
+        assert_eq!(event.payload["pin_activity"], false);
     }
 }

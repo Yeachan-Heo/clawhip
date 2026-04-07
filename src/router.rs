@@ -321,7 +321,7 @@ fn route_candidates(kind: &str) -> Vec<&str> {
         | "session.handoff-needed" => {
             vec![kind, "session.*"]
         }
-        "tmux.content_changed" | "tmux.heartbeat" | "tmux.waiting_for_input" => {
+        "tmux.content_changed" | "tmux.heartbeat" | "tmux.waiting_for_input" | "tmux.session_ended" => {
             vec![kind, "tmux.*"]
         }
         other => vec![other],
