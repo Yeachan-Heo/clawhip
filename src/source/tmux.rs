@@ -816,19 +816,40 @@ fn is_waiting_for_input(content: &str) -> Option<String> {
         return None;
     }
 
+    // recent[0] is the LAST non-empty line (collected with .rev()).
+    let last_nonempty = recent.first().copied().unwrap_or("");
+    let last_trimmed = last_nonempty.trim_end();
+
+    // If the last line looks like a completed shell prompt (e.g.
+    // "user@host:~/dir$ "), the session has moved past any interactive
+    // prompt still visible in prior lines. Used to avoid false-positive
+    // detections after the user already answered a [y/n] style prompt.
+    let last_line_is_shell_prompt = {
+        let t = last_trimmed;
+        ((t.ends_with('$') || t.ends_with('#') || t.ends_with('%')) && t.contains('@'))
+            || t == "$"
+            || t == "#"
+            || t == "%"
+    };
+
     let snapshot: String = recent.iter().rev().copied().collect::<Vec<_>>().join("\n");
     let snapshot_lower = snapshot.to_lowercase();
 
     for pattern in multiline_patterns {
         if snapshot_lower.contains(pattern) {
+            // If the match is only in a prior line (not the last line) and the
+            // last line looks like a completed shell prompt, the input was
+            // already provided — skip this pattern.
+            let in_last_line = last_nonempty.to_ascii_lowercase().contains(pattern);
+            if !in_last_line && last_line_is_shell_prompt {
+                continue;
+            }
             return Some(snapshot.clone());
         }
     }
 
     // Check the last non-empty line for short interactive-prompt endings.
-    let last_nonempty = recent.first().copied().unwrap_or("");
-    let trimmed = last_nonempty.trim_end();
-    if trimmed.len() <= 40 {
+    if last_trimmed.len() <= 40 {
         let prompt_suffixes: &[&str] = &[
             "❯",
             "$ ",
@@ -837,14 +858,14 @@ fn is_waiting_for_input(content: &str) -> Option<String> {
             "? ",
         ];
         for suffix in prompt_suffixes {
-            if trimmed.ends_with(suffix) || trimmed == suffix.trim() {
+            if last_trimmed.ends_with(suffix) || last_trimmed == suffix.trim() {
                 return Some(snapshot);
             }
         }
     }
 
     // ❯ at the start of a short line indicates an interactive menu selector
-    if trimmed.starts_with('❯') && trimmed.len() <= 80 {
+    if last_trimmed.starts_with('❯') && last_trimmed.len() <= 80 {
         return Some(snapshot);
     }
 
@@ -1979,5 +2000,36 @@ error: failed";
             ..registration(vec![])
         };
         assert_eq!(effective_mention(&reg, "waiting_for_input").as_deref(), None);
+    }
+
+    #[test]
+    fn is_waiting_clears_after_yn_prompt_answered() {
+        // After the user types "y" and the prompt is in the capture history,
+        // the session should NOT be detected as waiting any more because the
+        // last non-empty line is now a shell prompt.
+        let content = "Are you sure? [y/n]: y\nsnibbor@snibbor-vm:~/projects$ ";
+        assert!(
+            is_waiting_for_input(content).is_none(),
+            "should not detect waiting after [y/n] prompt was already answered"
+        );
+    }
+
+    #[test]
+    fn is_waiting_detects_unanswered_yn_prompt() {
+        let content = "snibbor@snibbor-vm:~/projects$ some-cmd\nAre you sure? [y/n]: ";
+        assert!(
+            is_waiting_for_input(content).is_some(),
+            "should detect unanswered [y/n] prompt as the last line"
+        );
+    }
+
+    #[test]
+    fn is_waiting_clears_after_read_prompt_answered_with_hostname_shell() {
+        // Simulates: read -p "Confirm action [y/n]: " answer → user types y
+        let content = "read -p 'Confirm action [y/n]: ' answer\nConfirm action [y/n]: y\nsnibbor@snibbor-vm:~/projects$ ";
+        assert!(
+            is_waiting_for_input(content).is_none(),
+            "should not detect waiting when shell prompt follows answered read"
+        );
     }
 }
