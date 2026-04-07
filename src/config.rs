@@ -39,6 +39,28 @@ pub struct ProvidersConfig {
     pub discord: DiscordConfig,
     #[serde(default)]
     pub slack: SlackConfig,
+    #[serde(default)]
+    pub gemini: GeminiConfig,
+    #[serde(default)]
+    pub openrouter: OpenRouterConfig,
+    #[serde(default)]
+    pub openai: OpenAiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GeminiConfig {
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenRouterConfig {
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenAiConfig {
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -287,6 +309,25 @@ pub struct TmuxSessionMonitor {
     pub channel: Option<String>,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
+    // ── Optional tmux content transformation ──
+    #[serde(default)]
+    pub summarize: bool,
+    #[serde(default = "default_summarizer")]
+    pub summarizer: String,
+    #[serde(default)]
+    pub heartbeat_mins: u64,
+    /// Minimum number of new lines added before triggering summarization. 0 = no filter.
+    #[serde(default)]
+    pub min_new_lines: usize,
+    /// Minimum minutes between LLM summarization calls for this session. 0 = no throttle.
+    #[serde(default)]
+    pub summarize_interval_mins: u64,
+    /// Minutes between heartbeat events. 0 = disable. Overrides heartbeat_mins when set.
+    #[serde(default)]
+    pub heartbeat_interval: u64,
+    /// Minimum minutes between AI summary events. 0 = use summarize_interval_mins.
+    #[serde(default)]
+    pub summary_interval: u64,
 }
 
 impl Default for TmuxSessionMonitor {
@@ -299,6 +340,13 @@ impl Default for TmuxSessionMonitor {
             channel: None,
             mention: None,
             format: None,
+            summarize: false,
+            summarizer: default_summarizer(),
+            heartbeat_mins: 0,
+            min_new_lines: 0,
+            summarize_interval_mins: 0,
+            heartbeat_interval: 0,
+            summary_interval: 0,
         }
     }
 }
@@ -426,6 +474,10 @@ fn default_cron_timezone() -> String {
 }
 fn default_true() -> bool {
     true
+}
+
+fn default_summarizer() -> String {
+    "gemini:gemini-2.5-flash".to_string()
 }
 
 pub fn default_sink_name() -> String {
@@ -1082,6 +1134,7 @@ mod tests {
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                ..Default::default()
             },
             routes: vec![RouteRule {
                 event: "tmux.keyword".into(),
@@ -1319,6 +1372,7 @@ message = " ping "
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                ..Default::default()
             },
             cron: CronConfig {
                 poll_interval_secs: 30,
