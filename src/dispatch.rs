@@ -688,6 +688,7 @@ fn should_bypass_routine_batch(event: &IncomingEvent) -> bool {
     kind.ends_with(".failed")
         || kind.ends_with(".blocked")
         || kind == "tmux.stale"
+        || kind == "tmux.session_ended"
         || kind.starts_with("github.ci-")
 }
 
