@@ -81,11 +81,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: NativeCommands,
     },
-    /// Send native OMX hook-envelope events to the local daemon.
-    Omx {
-        #[command(subcommand)]
-        command: OmxCommands,
-    },
     /// Run configured cron jobs via clawhip.
     Cron {
         #[command(subcommand)]
@@ -117,8 +112,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: PluginCommands,
     },
-    /// Launch an OMC (oh-my-claudecode) session with clawhip monitoring.
-    Omc(OmcArgs),
     /// Manage configuration.
     Config {
         #[command(subcommand)]
@@ -129,13 +122,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: MemoryCommands,
     },
-    /// Install and manage native OMC/OMX hooks.
-    Hooks {
-        #[command(subcommand)]
-        command: HooksCommands,
-    },
-    /// Enable repo-local native hook forwarding for Claude Code and Codex.
-    EnableHook(EnableHookArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -309,6 +295,8 @@ pub enum PluginCommands {
 pub enum NativeCommands {
     /// Forward a provider-native hook payload to clawhip.
     Hook(NativeHookArgs),
+    /// Install provider-native Codex and/or Claude hook configuration.
+    Install(NativeInstallArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -359,18 +347,16 @@ impl NativeHookArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct EnableHookArgs {
-    /// Repo root / current project directory (defaults to current directory).
+pub struct NativeInstallArgs {
+    /// Which provider config to install.
+    #[arg(long, value_enum, default_value = "all")]
+    pub provider: crate::native_hooks::NativeProvider,
+    /// Whether to install project-local or user-global provider files.
+    #[arg(long, value_enum, default_value = "project")]
+    pub scope: crate::native_hooks::NativeInstallScope,
+    /// Project root for project-scope installs (defaults to current directory).
     #[arg(long)]
     pub root: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum OmxCommands {
-    /// Forward an OMX v1 hook envelope to clawhip.
-    Hook(OmxHookArgs),
-    /// Launch an OMX session with clawhip monitoring.
-    Launch(OmxLaunchArgs),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -380,47 +366,6 @@ pub enum CronCommands {
         /// Cron job id from [[cron.jobs]].id.
         id: String,
     },
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct OmxHookArgs {
-    /// Provide the hook-envelope JSON inline.
-    #[arg(long)]
-    pub payload: Option<String>,
-    /// Read hook-envelope JSON from a file. Use "-" or omit to read stdin.
-    #[arg(long)]
-    pub file: Option<PathBuf>,
-}
-
-#[cfg_attr(test, allow(dead_code))]
-impl OmxHookArgs {
-    pub fn read_payload(&self, stdin: &mut dyn Read) -> crate::Result<serde_json::Value> {
-        match (&self.payload, &self.file) {
-            (Some(_), Some(_)) => {
-                Err("provide either --payload or --file for clawhip omx hook, not both".into())
-            }
-            (Some(payload), None) => Ok(serde_json::from_str(payload)?),
-            (None, Some(path)) => {
-                if path.as_os_str() == "-" {
-                    return Self::read_payload_from_stdin(stdin);
-                }
-                Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
-            }
-            (None, None) => Self::read_payload_from_stdin(stdin),
-        }
-    }
-
-    fn read_payload_from_stdin(stdin: &mut dyn Read) -> crate::Result<serde_json::Value> {
-        let mut buffer = String::new();
-        stdin.read_to_string(&mut buffer)?;
-        let trimmed = buffer.trim();
-        if trimmed.is_empty() {
-            return Err(
-                "clawhip omx hook expects a JSON payload via stdin, --payload, or --file".into(),
-            );
-        }
-        Ok(serde_json::from_str(trimmed)?)
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -567,97 +512,6 @@ pub struct MemoryStatusArgs {
     /// Daily shard name to inspect under memory/daily/ (YYYY-MM-DD).
     #[arg(long)]
     pub date: Option<String>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct OmcArgs {
-    /// The prompt to send to the OMC session after initialization.
-    pub prompt: Option<String>,
-    /// Tmux session name (defaults to worktree/directory basename).
-    #[arg(short = 's', long)]
-    pub session: Option<String>,
-    /// Working directory or worktree path (defaults to git toplevel or CWD).
-    #[arg(short = 'w', long)]
-    pub workdir: Option<PathBuf>,
-    /// Discord channel override.
-    #[arg(long)]
-    pub channel: Option<String>,
-    /// Discord mention override.
-    #[arg(long)]
-    pub mention: Option<String>,
-    /// Comma-separated keywords to monitor.
-    #[arg(long, value_delimiter = ',')]
-    pub keywords: Vec<String>,
-    /// Minutes before stale alert.
-    #[arg(long)]
-    pub stale_minutes: Option<u64>,
-    /// Extra flags passed to `omc` (default: --openclaw --madmax).
-    #[arg(long)]
-    pub omc_flags: Option<String>,
-    /// Attach to the tmux session after creation.
-    #[arg(long, default_value_t = false)]
-    pub attach: bool,
-    /// Skip the hook installation check.
-    #[arg(long, default_value_t = false)]
-    pub skip_hook_check: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct OmxLaunchArgs {
-    /// The prompt to send to the OMX session after initialization.
-    pub prompt: Option<String>,
-    /// Tmux session name (defaults to worktree/directory basename).
-    #[arg(short = 's', long)]
-    pub session: Option<String>,
-    /// Working directory or worktree path (defaults to git toplevel or CWD).
-    #[arg(short = 'w', long)]
-    pub workdir: Option<PathBuf>,
-    /// Discord channel override.
-    #[arg(long)]
-    pub channel: Option<String>,
-    /// Discord mention override.
-    #[arg(long)]
-    pub mention: Option<String>,
-    /// Comma-separated keywords to monitor.
-    #[arg(long, value_delimiter = ',')]
-    pub keywords: Vec<String>,
-    /// Minutes before stale alert.
-    #[arg(long)]
-    pub stale_minutes: Option<u64>,
-    /// Extra flags passed to `omx` (default: --madmax).
-    #[arg(long)]
-    pub omx_flags: Option<String>,
-    /// Attach to the tmux session after creation.
-    #[arg(long, default_value_t = false)]
-    pub attach: bool,
-    /// Skip the hook installation check.
-    #[arg(long, default_value_t = false)]
-    pub skip_hook_check: bool,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum HooksCommands {
-    /// Install native hooks for OMC and/or OMX.
-    Install(HooksInstallArgs),
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct HooksInstallArgs {
-    /// Install OMC hooks to ~/.claude/hooks/.
-    #[arg(long, default_value_t = false)]
-    pub omc: bool,
-    /// Install OMX hooks to .omx/hooks/.
-    #[arg(long, default_value_t = false)]
-    pub omx: bool,
-    /// Install both OMC and OMX hooks.
-    #[arg(long, default_value_t = false)]
-    pub all: bool,
-    /// Override OMC hooks destination directory.
-    #[arg(long)]
-    pub omc_dir: Option<PathBuf>,
-    /// Override OMX hooks destination directory.
-    #[arg(long)]
-    pub omx_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Subcommand)]
