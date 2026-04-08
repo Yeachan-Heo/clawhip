@@ -667,6 +667,10 @@ impl IncomingEvent {
             "test-finished" => "session.test-finished",
             "test-failed" => "session.test-failed",
             "handoff-needed" => "session.handoff-needed",
+            "prompt-submitted" => "session.prompt-submitted",
+            "prompt-delivered" => "session.prompt-delivered",
+            "prompt-delivery-failed" => "session.prompt-delivery-failed",
+            "stopped" => "session.stopped",
             other => other,
         }
     }
@@ -819,6 +823,19 @@ fn map_native_signal(raw: &str) -> Option<&'static str> {
         }
         "test-failed" | "session.test-failed" | "test.failed" => Some("session.test-failed"),
         "handoff-needed" | "session.handoff-needed" => Some("session.handoff-needed"),
+        "stop" | "stopped" | "session.stopped" => Some("session.stopped"),
+        "userpromptsubmit"
+        | "user-prompt-submit"
+        | "user-prompt-submitted"
+        | "prompt-submitted"
+        | "prompt.submitted"
+        | "session.prompt-submitted" => Some("session.prompt-submitted"),
+        "prompt-delivered" | "session.prompt-delivered" | "first-prompt-delivered" => {
+            Some("session.prompt-delivered")
+        }
+        "prompt-delivery-failed"
+        | "session.prompt-delivery-failed"
+        | "first-prompt-delivery-failed" => Some("session.prompt-delivery-failed"),
         _ => None,
     }
 }
@@ -1036,7 +1053,8 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
     insert_string_if_missing(object, "tool_name", tool_name);
     insert_string_if_missing(object, "test_runner", test_runner);
     insert_u64_if_missing(object, "elapsed_secs", elapsed_secs);
-    insert_string_if_missing(object, "status", status);
+    insert_string_if_missing(object, "status", status.clone());
+    insert_string_if_missing(object, "normalized_event", status);
     insert_string_if_missing(object, "summary", summary);
     insert_string_if_missing(object, "error_message", error_message);
     insert_string_if_missing(object, "event_timestamp", event_timestamp);
@@ -1111,6 +1129,10 @@ fn event_status_from_kind(kind: &str) -> Option<&'static str> {
         "session.test-finished" => Some("test-finished"),
         "session.test-failed" => Some("test-failed"),
         "session.handoff-needed" => Some("handoff-needed"),
+        "session.prompt-submitted" => Some("prompt-submitted"),
+        "session.prompt-delivered" => Some("prompt-delivered"),
+        "session.prompt-delivery-failed" => Some("prompt-delivery-failed"),
+        "session.stopped" => Some("stopped"),
         _ => None,
     }
 }
@@ -1967,5 +1989,70 @@ mod tests {
             event.render_default(&MessageFormat::Inline).unwrap(),
             "[tmux:issue-24] 'error': build failed · 'complete': job complete"
         );
+    }
+
+    #[test]
+    fn canonical_kind_maps_prompt_lifecycle_aliases() {
+        let cases = [
+            ("prompt-submitted", "session.prompt-submitted"),
+            ("prompt-delivered", "session.prompt-delivered"),
+            ("prompt-delivery-failed", "session.prompt-delivery-failed"),
+            ("stopped", "session.stopped"),
+        ];
+
+        for (kind, expected) in cases {
+            let event = IncomingEvent {
+                kind: kind.into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({}),
+            };
+            assert_eq!(
+                event.canonical_kind(),
+                expected,
+                "unexpected canonical kind for {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_event_maps_native_prompt_and_stop_signals() {
+        let cases = [
+            (
+                "user-prompt-submit",
+                json!({}),
+                "session.prompt-submitted",
+                "prompt-submitted",
+            ),
+            (
+                "notify",
+                json!({"normalized_event": "prompt-delivered"}),
+                "session.prompt-delivered",
+                "prompt-delivered",
+            ),
+            (
+                "notify",
+                json!({"route_key": "first-prompt-delivery-failed"}),
+                "session.prompt-delivery-failed",
+                "prompt-delivery-failed",
+            ),
+            ("stop", json!({}), "session.stopped", "stopped"),
+        ];
+
+        for (kind, payload, expected_kind, expected_status) in cases {
+            let event = normalize_event(IncomingEvent {
+                kind: kind.into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload,
+            });
+            assert_eq!(event.kind, expected_kind);
+            assert_eq!(event.payload["status"], json!(expected_status));
+            assert_eq!(event.payload["normalized_event"], json!(expected_status));
+        }
     }
 }

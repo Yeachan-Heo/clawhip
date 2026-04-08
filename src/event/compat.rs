@@ -95,6 +95,12 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
         "session.test-finished" => Ok(EventBody::AgentTestFinished(agent_event(payload)?)),
         "session.test-failed" => Ok(EventBody::AgentTestFailed(agent_event(payload)?)),
         "session.handoff-needed" => Ok(EventBody::AgentHandoffNeeded(agent_event(payload)?)),
+        "session.prompt-submitted" => Ok(EventBody::AgentPromptSubmitted(agent_event(payload)?)),
+        "session.prompt-delivered" => Ok(EventBody::AgentPromptDelivered(agent_event(payload)?)),
+        "session.prompt-delivery-failed" => {
+            Ok(EventBody::AgentPromptDeliveryFailed(agent_event(payload)?))
+        }
+        "session.stopped" => Ok(EventBody::AgentStopped(agent_event(payload)?)),
         "workspace.session.started" | "workspace.session.ended" => Ok(
             EventBody::WorkspaceSessionStarted(workspace_event(payload)?),
         ),
@@ -368,13 +374,16 @@ fn workspace_event(payload: &Value) -> Result<WorkspaceEvent> {
 
 fn priority_for(kind: &str, payload: &Value) -> EventPriority {
     match kind {
-        "agent.failed" | "session.failed" | "session.test-failed" | "github.ci-failed" => {
-            EventPriority::Critical
-        }
+        "agent.failed"
+        | "session.failed"
+        | "session.test-failed"
+        | "session.prompt-delivery-failed"
+        | "github.ci-failed" => EventPriority::Critical,
         "agent.blocked"
         | "session.blocked"
         | "session.retry-needed"
         | "session.handoff-needed"
+        | "session.stopped"
         | "tmux.stale"
         | "workspace.session.blocked" => EventPriority::High,
         "github.release-published" | "github.release-prereleased" => EventPriority::High,
@@ -613,6 +622,22 @@ mod tests {
                 "session.handoff-needed",
                 EventBody::AgentHandoffNeeded(sample_agent_event("handoff-needed")),
             ),
+            (
+                "session.prompt-submitted",
+                EventBody::AgentPromptSubmitted(sample_agent_event("prompt-submitted")),
+            ),
+            (
+                "session.prompt-delivered",
+                EventBody::AgentPromptDelivered(sample_agent_event("prompt-delivered")),
+            ),
+            (
+                "session.prompt-delivery-failed",
+                EventBody::AgentPromptDeliveryFailed(sample_agent_event("prompt-delivery-failed")),
+            ),
+            (
+                "session.stopped",
+                EventBody::AgentStopped(sample_agent_event("stopped")),
+            ),
         ];
 
         for (kind, expected) in cases {
@@ -713,6 +738,10 @@ mod tests {
             EventBody::AgentTestFinished(_) => "test-finished",
             EventBody::AgentTestFailed(_) => "test-failed",
             EventBody::AgentHandoffNeeded(_) => "handoff-needed",
+            EventBody::AgentPromptSubmitted(_) => "prompt-submitted",
+            EventBody::AgentPromptDelivered(_) => "prompt-delivered",
+            EventBody::AgentPromptDeliveryFailed(_) => "prompt-delivery-failed",
+            EventBody::AgentStopped(_) => "stopped",
             _ => unreachable!(),
         }
     }

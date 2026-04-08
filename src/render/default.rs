@@ -414,13 +414,18 @@ fn session_subject(payload: &Value) -> String {
 
 fn session_status_label(kind: &str, payload: &Value) -> String {
     match kind {
-        "session.started" | "session.blocked" | "session.finished" | "session.failed" => {
-            optional_string_field(payload, "status").unwrap_or_else(|| {
-                kind.strip_prefix("session.")
-                    .unwrap_or(kind)
-                    .replace('-', " ")
-            })
-        }
+        "session.started"
+        | "session.blocked"
+        | "session.finished"
+        | "session.failed"
+        | "session.prompt-submitted"
+        | "session.prompt-delivered"
+        | "session.prompt-delivery-failed"
+        | "session.stopped" => optional_string_field(payload, "status").unwrap_or_else(|| {
+            kind.strip_prefix("session.")
+                .unwrap_or(kind)
+                .replace('-', " ")
+        }),
         _ => kind.strip_prefix("session.").unwrap_or(kind).to_string(),
     }
 }

@@ -396,7 +396,10 @@ fn map_shared_event(value: &str) -> Option<&'static str> {
         "sessionstart" | "session-start" | "session.started" | "started" => Some("session.started"),
         "pretooluse" | "pre-tool-use" => Some("tool.pre"),
         "posttooluse" | "post-tool-use" => Some("tool.post"),
-        "userpromptsubmit" | "user-prompt-submit" => Some("prompt.submitted"),
+        "userpromptsubmit"
+        | "user-prompt-submit"
+        | "prompt-submitted"
+        | "session.prompt-submitted" => Some("session.prompt-submitted"),
         "stop" | "sessionstop" | "session-stopped" => Some("session.stopped"),
         _ => None,
     }
@@ -407,7 +410,7 @@ fn normalized_event_label(kind: &str) -> &str {
         "session.started" => "started",
         "tool.pre" => "pre-tool-use",
         "tool.post" => "post-tool-use",
-        "prompt.submitted" => "user-prompt-submit",
+        "session.prompt-submitted" => "prompt-submitted",
         "session.stopped" => "stop",
         _ => kind,
     }
@@ -552,7 +555,11 @@ mod tests {
             ("SessionStart", "codex", "session.started"),
             ("PreToolUse", "codex", "tool.pre"),
             ("PostToolUse", "claude-code", "tool.post"),
-            ("UserPromptSubmit", "claude-code", "prompt.submitted"),
+            (
+                "UserPromptSubmit",
+                "claude-code",
+                "session.prompt-submitted",
+            ),
             ("Stop", "codex", "session.stopped"),
         ];
 
