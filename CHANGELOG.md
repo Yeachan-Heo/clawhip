@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.2 - 2026-04-09
+
+### Highlights
+
+- ship the patched root `SKILL.md` so repo-level setup guidance finally matches the provider-native hook model already used by Codex and Claude
+- add regression coverage to keep the root skill aligned with the real hook install targets and routing metadata expectations
+
+### Documentation and tooling
+
+- document `clawhip hooks install --all --scope global --force` directly in the root skill
+- document the canonical local install targets:
+  - `~/.clawhip/hooks/native-hook.mjs`
+  - `~/.codex/hooks.json`
+  - `~/.claude/settings.json`
+- add root-level guidance for `.clawhip/project.json`, `repo_name` / `project` route filters, and the detached-worktree metadata caveat
+
+### Upgrade notes
+
+- crate version is now `0.6.2`
+- if you use the repo root `SKILL.md` as your operator/setup guide, refresh to this release before onboarding new local installs
+- root skill examples now prefer provider-native `repo_name` / `project` routing over wrapper-era session-prefix assumptions
+
 ## 0.6.1 - 2026-04-09
 
 ### Highlights

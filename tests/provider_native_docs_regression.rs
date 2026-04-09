@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 const DOCS_WITHOUT_LEGACY_SURFACES: &[&str] = &[
+    "SKILL.md",
     "README.md",
     "docs/canonical-contract-cleanup.md",
     "docs/native-event-contract.md",
@@ -50,6 +51,7 @@ fn provider_native_docs_drop_legacy_public_surfaces() {
 #[test]
 fn provider_native_contract_docs_list_all_shared_events() {
     for relative in [
+        "SKILL.md",
         "README.md",
         "docs/native-event-contract.md",
         "docs/live-verification.md",
@@ -65,6 +67,24 @@ fn provider_native_contract_docs_list_all_shared_events() {
         assert!(
             contents.contains("clawhip native hook"),
             "{relative} should reference the generic provider-native ingress"
+        );
+    }
+}
+
+#[test]
+fn root_skill_guides_provider_native_install_and_routing() {
+    let contents = read_repo_file("SKILL.md");
+    for needle in [
+        "clawhip hooks install --all --scope global --force",
+        ".codex/hooks.json",
+        ".claude/settings.json",
+        ".clawhip/project.json",
+        "repo_name",
+        "claude-code",
+    ] {
+        assert!(
+            contents.contains(needle),
+            "SKILL.md should mention {needle}"
         );
     }
 }

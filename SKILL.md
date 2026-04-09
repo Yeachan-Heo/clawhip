@@ -31,12 +31,14 @@ Preferred operator instruction:
 Expected automation flow:
 
 1. clone repo
-2. run `./install.sh`
+2. run `./install.sh` or `cargo install --path . --force`
 3. read this `SKILL.md`
 4. attach skill
 5. scaffold `~/.clawhip/config.toml`
-6. start daemon
-7. run live verification presets
+6. install provider-native hooks with `clawhip hooks install --all --scope global --force`
+7. create or verify `.clawhip/project.json` in repos/worktrees that need stable route metadata
+8. start daemon
+9. run live verification presets
 
 ## Runtime surface
 
@@ -61,6 +63,9 @@ clawhip tmux keyword ...
 clawhip tmux stale ...
 clawhip tmux new -s <session> --channel <id> --keywords error,complete --shell /bin/zsh -- command
 clawhip tmux watch -s <existing-session> --channel <id> --mention '<@id>' --keywords error,complete
+clawhip hooks install --all --scope global --force
+clawhip native hook --provider codex --file payload.json
+clawhip native hook --provider claude-code --file payload.json
 ```
 
 ## Lifecycle surface
@@ -75,6 +80,35 @@ clawhip uninstall --remove-systemd --remove-config
 ./install.sh --systemd
 ./install.sh --skip-star-prompt
 ```
+
+## Provider-native hook installation
+
+Canonical local install targets:
+
+- `~/.clawhip/hooks/native-hook.mjs`
+- `~/.codex/hooks.json`
+- `~/.claude/settings.json`
+
+Install or refresh them with:
+
+```bash
+clawhip hooks install --all --scope global --force
+```
+
+Provider-native routing notes:
+
+- Codex and Claude own session launch plus hook registration.
+- clawhip is the normalization, routing, and delivery layer.
+- Canonical provider names in payloads/routes are `codex` and `claude-code`.
+- `claude` may appear as CLI shorthand, but route/docs examples should prefer `claude-code`.
+
+Shared provider-native events:
+
+- `SessionStart`
+- `PreToolUse`
+- `PostToolUse`
+- `UserPromptSubmit`
+- `Stop`
 
 ## Discord bot token (recommended setup)
 
@@ -98,26 +132,46 @@ Setup:
 token = "your-dedicated-clawhip-bot-token"
 ```
 
+Preferred modern config surface is `[providers.discord]`, but legacy `[discord]` remains compatible.
+
 ## Config scaffold expectations
 
 Key sections:
 - `[discord]`
+- `[providers.discord]` (preferred when present)
 - `[daemon]`
 - `[defaults]`
 - `[[routes]]`
 - `[monitors]`
 - `[[monitors.git.repos]]`
 - `[[monitors.tmux.sessions]]`
+- `.clawhip/project.json`
 
 Typical preset route:
 
 ```toml
 [[routes]]
-event = "github.*"
-filter = { repo = "clawhip" }
+event = "session.*"
+filter = { repo_name = "clawhip" }
 channel = "1480171113253175356"
 mention = "<@1465264645320474637>"
 format = "compact"
+```
+
+Routing guidance:
+
+- Prefer `repo_name` / `project` filters for provider-native `session.*` and `tool.*` events.
+- Treat tmux/session-name prefixes like `omx-*` or `clawhip-*` as operator hints, not routing authority.
+- In detached worktrees, `repo_name` can drift unless `.clawhip/project.json` is present.
+- For local misroutes, test the smallest safe filter first: a narrow `session.*` rule on `repo_name` or `project`.
+
+Example project metadata:
+
+```json
+{
+  "project": "clawhip",
+  "repo_name": "clawhip"
+}
 ```
 
 ## Dynamic template opt-in
@@ -163,6 +217,7 @@ Preset verification targets:
 - GitHub PR opened / status changed / merged
 - git commit monitor
 - tmux keyword / stale / wrapper / watch
+- provider-native Codex / Claude session hooks
 - install / update / uninstall
 
 ## Attachment summary
