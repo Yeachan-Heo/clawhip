@@ -343,10 +343,10 @@ async fn poll_ci_statuses(
     .await
     {
         Ok(ci) => {
-            let empty = HashMap::new();
-            let previous_ci = previous.map(|entry| &entry.ci).unwrap_or(&empty);
-            for event in collect_ci_events(repo, &snapshot.repo_name, previous_ci, &ci) {
-                send_event(tx, event).await?;
+            if let Some(previous) = previous {
+                for event in collect_ci_events(repo, &snapshot.repo_name, &previous.ci, &ci) {
+                    send_event(tx, event).await?;
+                }
             }
             Ok(ci)
         }
@@ -1163,6 +1163,69 @@ mod tests {
             events[0].payload["url"],
             json!("https://github.com/Yeachan-Heo/clawhip/actions/runs/1")
         );
+    }
+
+    #[tokio::test]
+    async fn poll_ci_statuses_suppresses_initial_detection_on_cold_start() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            let body = json!({
+                "workflow_runs": [{
+                    "id": 24007460067_u64,
+                    "name": "Rust CI",
+                    "status": "in_progress",
+                    "conclusion": null,
+                    "head_branch": "main",
+                    "head_sha": "deadbeef",
+                    "html_url": "https://github.com/example/repo/actions/runs/24007460067",
+                    "pull_requests": []
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.monitors.github_api_base = format!("http://{addr}");
+        let repo = GitRepoMonitor {
+            path: "/tmp/repo".into(),
+            emit_pr_status: true,
+            ..GitRepoMonitor::default()
+        };
+        let snapshot = GitSnapshot {
+            repo_name: "repo".into(),
+            repo_path: "/tmp/repo".into(),
+            worktree_path: "/tmp/repo".into(),
+            branch: "main".into(),
+            head: "deadbeef".into(),
+            commits: Vec::new(),
+            github_repo: Some("example/repo".into()),
+        };
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let prs = HashMap::new();
+
+        let ci = poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, &tx)
+            .await
+            .unwrap();
+
+        assert_eq!(ci.len(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "cold-start CI detection should not emit"
+        );
+        server.await.unwrap();
     }
 
     #[test]

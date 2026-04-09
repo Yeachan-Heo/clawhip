@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.3 - 2026-04-09
+
+### Highlights
+
+- suppress duplicate GitHub CI lifecycle emission on cold start / daemon restart by avoiding initial CI event emission from an empty previous-state snapshot
+
+### Upgrade notes
+
+- crate version is now `0.6.3`
+- this release narrows a restart replay bug in the GitHub source: in-progress workflow runs should no longer be re-announced just because the daemon restarted
+- no local route/filter migration is required for this patch
+
 ## 0.6.2 - 2026-04-09
 
 ### Highlights

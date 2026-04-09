@@ -1,6 +1,6 @@
 [package]
 name = "clawhip"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 description = "Event-to-channel notification router for Discord — bypass gateway sessions, just events in, messages out"
 license = "MIT"
