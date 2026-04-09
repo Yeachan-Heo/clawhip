@@ -57,12 +57,15 @@ Operational flow:
 ### Provider-native Codex + Claude contract
 
 - shared event set: `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`
-- generic ingestion via `clawhip native hook --provider <codex|claude>`
+- generic ingestion via `clawhip native hook --provider <codex|claude-code>` (`claude` remains an alias)
 
 Operational flow:
 
 1. Enable provider-native hooks at project or global scope in a real Codex workspace.
-2. Pipe one representative Codex payload through the generic native ingress:
+2. If you are testing from a worktree, verify `.clawhip/project.json` exists there before blaming
+   the router; missing project metadata can make `repo_name` reflect the worktree basename instead
+   of the real repo.
+3. Pipe one representative Codex payload through the generic native ingress:
 
 ```bash
 printf '%s\n' '{
@@ -72,20 +75,24 @@ printf '%s\n' '{
 }' | clawhip native hook --provider codex
 ```
 
-3. Confirm clawhip accepts it and renders a stable lifecycle message with project/repo context.
-4. Repeat with a representative Claude payload:
+4. Confirm clawhip accepts it and renders a stable lifecycle message with project/repo context.
+5. Repeat with a representative Claude payload:
 
 ```bash
 printf '%s\n' '{
   "session_id": "sess-65",
   "cwd": "/repo/clawhip",
   "event": "SessionStart"
-}' | clawhip native hook --provider claude
+}' | clawhip native hook --provider claude-code
 ```
 
-5. Confirm both providers normalize into the same shared route family.
-6. Send representative payloads for `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`.
-7. Confirm additive augmentation still preserves the base routing keys when `.clawhip/hooks/` is enabled.
+6. Confirm both providers normalize into the same shared route family (`session.*` / `tool.*`),
+   not a separate `native.*` route namespace.
+7. Send representative payloads for `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`.
+8. If delivery misses the expected channel, test a narrow metadata route such as
+   `event = "session.*"` with `filter = { repo_name = "clawhip" }` before broadening tmux/session
+   prefix filters.
+9. Confirm additive augmentation still preserves the base routing keys when `.clawhip/hooks/` is enabled.
 
 ### tmux presets
 
@@ -102,6 +109,9 @@ Operational flow:
 5. Leave the session idle beyond the stale threshold only when intentionally testing stale behavior.
 6. Inspect `clawhip tmux list` to confirm exactly which watch registrations exist.
 7. If alert text disagrees with pane reality, treat it as monitor noise and debug registration overlap / stale math before assuming session failure.
+8. If the launcher names panes like `omx-clawhip-dev-*`, remember that prefix-only
+   `session = "clawhip-*"` rules can miss provider-native session events even when the daemon is
+   routing correctly.
 
 ## Helper script
 

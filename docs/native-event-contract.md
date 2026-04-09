@@ -31,7 +31,7 @@ Use the generic provider-native thin client:
 
 ```bash
 clawhip native hook --provider codex --file payload.json
-clawhip native hook --provider claude --file payload.json
+clawhip native hook --provider claude-code --file payload.json
 cat payload.json | clawhip native hook --provider codex
 ```
 
@@ -60,6 +60,8 @@ fields for routing:
 
 - `.clawhip/project.json` is the preferred place for project identity that should survive across
   providers.
+- Detached worktrees should still carry `.clawhip/project.json`; otherwise the raw worktree
+  basename can leak into `repo_name` and break project-level routes.
 - `project` / `repo_name` should be the authority for project-level routing.
 - `directory` and `worktree_path` are base context, not optional decorations.
 - Tool-specific metadata is additive; it should not replace core routing fields.
@@ -93,13 +95,23 @@ Prefer filters on structured metadata such as:
 - `tool_name`
 
 Avoid routing on rendered message text.
+Prefer normalized event families such as `session.*` and `tool.*`; provider-native ingress does
+not route through a separate `native.*` family after normalization.
+Treat `session` / `tmux_session` prefixes as debugging hints only, because real launcher names like
+`omx-clawhip-dev-*` can differ from the project that should receive the alert.
 
 Recommended route shape:
 
 ```toml
 [[routes]]
-event = "native.*"
-filter = { provider = "codex", project = "clawhip" }
+event = "session.*"
+filter = { provider = "codex", repo_name = "clawhip" }
+channel = "1480171113253175356"
+format = "compact"
+
+[[routes]]
+event = "tool.*"
+filter = { provider = "claude-code", project = "clawhip" }
 channel = "1480171113253175356"
 format = "compact"
 ```

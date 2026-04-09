@@ -504,6 +504,7 @@ mod tests {
     use crate::sink::SinkTarget;
     use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
     use tokio::time::{Duration, timeout};
@@ -679,6 +680,137 @@ mod tests {
         assert_eq!(queued.payload["tool"], Value::from("codex"));
         assert_eq!(queued.payload["session_id"], Value::from("sess-65"));
         assert_eq!(queued.payload["event_id"], Value::from(event_id));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_routes_session_events_by_repo_metadata_over_session_prefix_filters() {
+        let repo = tempdir().expect("tempdir");
+        let clawhip_dir = repo.path().join(".clawhip");
+        fs::create_dir_all(&clawhip_dir).expect("create .clawhip");
+        fs::write(
+            clawhip_dir.join("project.json"),
+            r#"{"name":"clawhip","repo_name":"clawhip","id":"clawhip-core"}"#,
+        )
+        .expect("write project metadata");
+
+        let mut config = AppConfig::default();
+        config.routes = vec![
+            crate::config::RouteRule {
+                event: "session.*".into(),
+                sink: "discord".into(),
+                filter: BTreeMap::from([("session_name".to_string(), "clawhip-*".to_string())]),
+                channel: Some("heuristic-route".into()),
+                ..Default::default()
+            },
+            crate::config::RouteRule {
+                event: "session.*".into(),
+                sink: "discord".into(),
+                filter: BTreeMap::from([("repo_name".to_string(), "clawhip".to_string())]),
+                channel: Some("metadata-route".into()),
+                ..Default::default()
+            },
+        ];
+
+        let router = Router::new(Arc::new(config.clone()));
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(config),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+        };
+        let worktree_path = repo.path().to_string_lossy().into_owned();
+        let payload = json!({
+            "provider": "codex",
+            "event_name": "SessionStart",
+            "directory": worktree_path,
+            "cwd": worktree_path,
+            "tmux_session": "clawhip-issue-180",
+            "event_payload": {
+                "session_id": "sess-180",
+                "cwd": worktree_path
+            }
+        });
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let queued = rx.recv().await.expect("queued native hook event");
+        assert_eq!(queued.kind, "session.started");
+        assert_eq!(queued.payload["project"], Value::from("clawhip"));
+        assert_eq!(queued.payload["repo_name"], Value::from("clawhip"));
+        assert_eq!(
+            queued.payload["session_name"],
+            Value::from("clawhip-issue-180")
+        );
+
+        let delivery = router.preview_delivery(&queued).await.expect("delivery");
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("metadata-route".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_supports_repo_alias_filters_for_provider_native_sessions() {
+        let repo = tempdir().expect("tempdir");
+        let clawhip_dir = repo.path().join(".clawhip");
+        fs::create_dir_all(&clawhip_dir).expect("create .clawhip");
+        fs::write(
+            clawhip_dir.join("project.json"),
+            r#"{"name":"clawhip","repo_name":"clawhip"}"#,
+        )
+        .expect("write project metadata");
+
+        let mut config = AppConfig::default();
+        config.routes = vec![crate::config::RouteRule {
+            event: "session.*".into(),
+            sink: "discord".into(),
+            filter: BTreeMap::from([("repo".to_string(), "clawhip".to_string())]),
+            channel: Some("repo-alias-route".into()),
+            ..Default::default()
+        }];
+
+        let router = Router::new(Arc::new(config.clone()));
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(config),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+        };
+        let worktree_path = repo.path().to_string_lossy().into_owned();
+        let payload = json!({
+            "provider": "claude-code",
+            "event_name": "SessionStart",
+            "directory": worktree_path,
+            "cwd": worktree_path,
+            "tmux_session": "clawhip-issue-181",
+            "event_payload": {
+                "session_id": "sess-181",
+                "cwd": worktree_path
+            }
+        });
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let queued = rx.recv().await.expect("queued native hook event");
+        assert_eq!(queued.kind, "session.started");
+        assert_eq!(queued.payload["tool"], Value::from("claude-code"));
+        assert_eq!(queued.payload["repo_name"], Value::from("clawhip"));
+
+        let delivery = router.preview_delivery(&queued).await.expect("delivery");
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("repo-alias-route".into())
+        );
     }
 
     #[tokio::test]

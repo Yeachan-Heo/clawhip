@@ -55,7 +55,7 @@ Local ingress for sample payloads and manual verification:
 
 ```bash
 clawhip native hook --provider codex --file payload.json
-clawhip native hook --provider claude --file payload.json
+clawhip native hook --provider claude-code --file payload.json
 cat payload.json | clawhip native hook --provider codex
 ```
 
@@ -456,6 +456,10 @@ Augmentation rules:
 
 Route guidance:
 - prefer filters like `provider`, `event`, `repo_name`, `project`, and `branch`
+- remember provider-native hooks normalize into `session.*` / `tool.*` events, not `native.*`
+- treat tmux/session-name prefixes as operator hints, not routing authority
+- if you are testing from a detached worktree, make sure `.clawhip/project.json` exists so
+  `project` / `repo_name` stay stable
 - avoid route logic that depends on rendered message text
 - keep provider-specific extras out of the shared v1 route surface until explicitly adopted
 
@@ -520,7 +524,7 @@ Verification:
 Preferred input:
 ```bash
 clawhip native hook --provider codex --file payload.json
-clawhip native hook --provider claude --file payload.json
+clawhip native hook --provider claude-code --file payload.json
 clawhip tmux list
 ```
 
@@ -555,6 +559,8 @@ Behavior:
 Routing note:
 - session names are labels for operators, not routing authority
 - project metadata should be the source of truth for routing
+- the smallest safe route test is usually a narrow `session.*` rule filtered on `repo_name` or
+  `project`, not broadening a `session = "clawhip-*"` prefix rule
 - broad prefix monitors like `clawhip*` are dangerous because they can overlap with launcher-registered watches and create stale/keyword noise
 
 Verification:
