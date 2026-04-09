@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.1 - 2026-04-09
+
+### Highlights
+
+- verify that provider-native Codex and Claude hook emission works locally against the real clawhip daemon path
+- confirm the remaining local routing confusion is primarily caused by route-filter / metadata assumptions, not daemon-core native-hook routing
+- update provider-native route guidance so detached-worktree metadata, repo/project filtering, and session/tool family routing are documented together
+
+### Documentation and tooling
+
+- refresh README, native-event docs, live-verification docs, and OMC/OMX skill surfaces to match the verified provider-native flow
+- replace stale wrapper-era examples such as `tool=omx` route assumptions with provider-native routing examples using session/tool families plus provider/repo/project metadata
+- clarify canonical `claude-code` naming while noting where `claude` is only a CLI shorthand/alias
+
+### Upgrade notes
+
+- crate version is now `0.6.1`
+- if local provider-native events appear to route to the wrong Discord destination, test narrower `repo_name` / `project` filters before broad session-prefix filters like `omx-*`
+- detached worktrees can change `repo_name` assumptions unless `.clawhip/project.json` is present, so route guidance now explicitly calls that out
+
 ## 0.6.0 - 2026-04-09
 
 ### Highlights
