@@ -1870,6 +1870,49 @@ mod tests {
     }
 
     #[test]
+    fn normalize_event_preserves_tmux_pane_metadata_in_payload_and_template_context() {
+        let event = normalize_event(IncomingEvent {
+            kind: "session-start".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "tool": "codex",
+                "tmux_session": "issue-180",
+                "tmux_window": "2",
+                "tmux_pane": "%11",
+                "tmux_pane_tty": "/dev/pts/42",
+                "tmux_attached": false,
+                "tmux_client_count": 0
+            }),
+        });
+        let context = event.template_context();
+
+        assert_eq!(event.kind, "session.started");
+        assert_eq!(event.payload["session_name"], json!("issue-180"));
+        assert_eq!(event.payload["tmux_session"], json!("issue-180"));
+        assert_eq!(event.payload["tmux_window"], json!("2"));
+        assert_eq!(event.payload["tmux_pane"], json!("%11"));
+        assert_eq!(event.payload["tmux_pane_tty"], json!("/dev/pts/42"));
+        assert_eq!(event.payload["tmux_attached"], json!(false));
+        assert_eq!(event.payload["tmux_client_count"], json!(0));
+        assert_eq!(context.get("session").map(String::as_str), Some("issue-180"));
+        assert_eq!(
+            context.get("tmux_pane_tty").map(String::as_str),
+            Some("/dev/pts/42")
+        );
+        assert_eq!(
+            context.get("tmux_attached").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            context.get("tmux_client_count").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
     fn normalize_event_maps_omc_signal_route_key_into_session_event() {
         let event = normalize_event(IncomingEvent {
             kind: "post-tool-use".into(),

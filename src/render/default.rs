@@ -950,6 +950,44 @@ mod tests {
     }
 
     #[test]
+    fn renders_session_events_with_tmux_metadata() {
+        let event = IncomingEvent {
+            kind: "session.started".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "tool": "codex",
+                "session_name": "issue-180",
+                "repo_name": "clawhip",
+                "tmux_session": "issue-180",
+                "tmux_window": "2",
+                "tmux_pane": "%11",
+                "tmux_pane_tty": "/dev/pts/42",
+                "tmux_attached": false,
+                "tmux_client_count": 0
+            }),
+        };
+
+        let compact = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+        let inline = DefaultRenderer
+            .render(&event, &MessageFormat::Inline)
+            .unwrap();
+
+        assert_eq!(
+            compact,
+            "codex issue-180 started (repo=clawhip, tmux=issue-180:2:%11, pane_tty=/dev/pts/42, clients=0, detached)"
+        );
+        assert_eq!(
+            inline,
+            "[codex issue-180] started · clawhip · tmux issue-180:2:%11 · /dev/pts/42 · 0 clients · detached"
+        );
+    }
+
+    #[test]
     fn renders_release_published_compact() {
         let event = IncomingEvent::github_release(
             "published",
