@@ -6,9 +6,7 @@ use crate::Result;
 use crate::config::{AppConfig, RouteRule, default_sink_name};
 use crate::dynamic_tokens;
 use crate::events::{IncomingEvent, MessageFormat, RoutingMetadata};
-use crate::provenance::{
-    DeliveryExplanation, FilterResult, Provenance, RouteExplanation,
-};
+use crate::provenance::{DeliveryExplanation, FilterResult, Provenance, RouteExplanation};
 #[cfg(test)]
 use crate::render::DefaultRenderer;
 use crate::render::Renderer;
@@ -393,10 +391,9 @@ fn delivery_explanation(
     matched_route_index: Option<usize>,
 ) -> DeliveryExplanation {
     let (target_label, channel) = match &delivery.target {
-        SinkTarget::DiscordChannel(name) => (
-            format!("DiscordChannel({name:?})"),
-            Some(name.clone()),
-        ),
+        SinkTarget::DiscordChannel(name) => {
+            (format!("DiscordChannel({name:?})"), Some(name.clone()))
+        }
         SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
         SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
     };
@@ -2058,13 +2055,22 @@ mod tests {
             ..AppConfig::default()
         };
         let router = Router::new(Arc::new(config));
-        let event =
-            IncomingEvent::git_commit("clawhip".into(), "main".into(), "abc123".into(), "ship it".into(), None);
+        let event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "main".into(),
+            "abc123".into(),
+            "ship it".into(),
+            None,
+        );
 
         let provenance = router.explain(&event);
 
         assert_eq!(provenance.canonical_kind, "git.commit");
-        assert!(provenance.route_candidates.contains(&"git.commit".to_string()));
+        assert!(
+            provenance
+                .route_candidates
+                .contains(&"git.commit".to_string())
+        );
         assert_eq!(provenance.routes.len(), 1);
         assert!(provenance.routes[0].matched);
         assert!(provenance.routes[0].pattern_matched);
@@ -2138,12 +2144,8 @@ mod tests {
             ..AppConfig::default()
         };
         let router = Router::new(Arc::new(config));
-        let event = IncomingEvent::tmux_keyword(
-            "dev".into(),
-            "error".into(),
-            "segfault".into(),
-            None,
-        );
+        let event =
+            IncomingEvent::tmux_keyword("dev".into(), "error".into(), "segfault".into(), None);
 
         let provenance = router.explain(&event);
 
