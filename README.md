@@ -279,6 +279,49 @@ Quick start:
 clawhip setup --webhook "https://discord.com/api/webhooks/..."
 ```
 
+`clawhip setup --webhook ...` remains the fastest first-run path. The setup/config UX intentionally stays bounded to a fixed five-item preset catalog so advanced routes and monitors remain explicit manual edits instead of surprising wizard-owned state.
+
+## Setup and bounded config editing
+
+Use the built-in setup/config surfaces for these five common presets only:
+
+1. Discord webhook quickstart route
+2. Discord bot token
+3. Default channel
+4. Default message format
+5. Daemon base URL
+
+Use the non-interactive path for first-run scaffolding:
+
+```bash
+clawhip setup \
+  --webhook "https://discord.com/api/webhooks/..." \
+  --bot-token "your-dedicated-clawhip-bot-token" \
+  --default-channel "123456789012345678" \
+  --default-format compact \
+  --daemon-base-url "http://127.0.0.1:8940"
+```
+
+Use `clawhip config` to revisit the same bounded preset surface later. For anything outside those five presets—custom `[[routes]]`, Slack routes, monitors, dispatch tuning, cron jobs, or template-heavy routing—edit the TOML file directly.
+
+### Quickstart-route ownership rules
+
+The webhook quickstart helpers own exactly one canonical wildcard Discord webhook route:
+
+- `event = "*"`
+- `sink = "discord"`
+- `filter` is empty
+- `channel`, `slack_webhook`, `mention`, `template`, and `format` are unset
+- `allow_dynamic_tokens = false`
+
+That ownership rule preserves backward compatibility for `clawhip setup --webhook ...` while protecting unrelated manual routes:
+
+- if no canonical quickstart route exists, setup/config may append one
+- if exactly one canonical quickstart route exists, setup/config may update only its `webhook`
+- if multiple canonical quickstart routes exist, clean them up manually before using the bounded setup/config helpers again
+
+The manual template hint from `clawhip config` is intentional: advanced routing and monitor definitions stay manual so the editor never implies full config authoring support.
+
 Route example:
 
 ```toml
@@ -814,7 +857,7 @@ Required live sign-off presets:
 ```bash
 clawhip                 # start daemon
 clawhip status          # daemon health
-clawhip config          # config management
+clawhip config          # bounded setup-preset editor / config inspection
 clawhip send ...        # thin client custom event
 clawhip github ...      # thin client GitHub event
 clawhip git ...         # thin client git event
