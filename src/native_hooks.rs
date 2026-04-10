@@ -304,6 +304,13 @@ pub fn incoming_event_from_native_hook_json(
             .or_else(|| payload.pointer("/event_payload/augmentation")),
     );
 
+    apply_stop_context(
+        &mut normalized,
+        payload
+            .get("stop_context")
+            .or_else(|| payload.pointer("/event_payload/stop_context")),
+    );
+
     Ok(crate::events::IncomingEvent {
         kind: canonical_kind.to_string(),
         channel: None,
@@ -518,6 +525,12 @@ function collectTmuxMetadata(input, cwd) {
   return Object.keys(direct).length > 0 ? direct : null;
 }
 
+function truncate(text, maxLen = 200) {
+  if (!text || typeof text !== 'string') return '';
+  const trimmed = text.trim();
+  return trimmed.length <= maxLen ? trimmed : trimmed.slice(0, maxLen) + '…';
+}
+
 function maybeWritePromptSubmitState(repoRoot, provider, eventName, input) {
   const normalizedEvent = String(eventName || '').trim().toLowerCase();
   if (
@@ -530,6 +543,7 @@ function maybeWritePromptSubmitState(repoRoot, provider, eventName, input) {
   }
 
   try {
+    const promptText = input.prompt || input.user_prompt || input.message || '';
     const path = join(repoRoot, '.clawhip', 'state', 'prompt-submit.json');
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({
@@ -538,7 +552,27 @@ function maybeWritePromptSubmitState(repoRoot, provider, eventName, input) {
       event_name: eventName,
       session_id: input.session_id || input.sessionId || null,
       turn_id: input.turn_id || input.turnId || null,
+      prompt_summary: truncate(promptText),
     }, null, 2) + '\n');
+  } catch {}
+}
+
+function maybeEnrichStopEvent(repoRoot, payload, eventName) {
+  const normalizedEvent = String(eventName || '').trim().toLowerCase();
+  if (normalizedEvent !== 'stop' && normalizedEvent !== 'sessionstop' && normalizedEvent !== 'session-stopped') {
+    return;
+  }
+  try {
+    const path = join(repoRoot, '.clawhip', 'state', 'prompt-submit.json');
+    if (!existsSync(path)) return;
+    const raw = readFileSync(path, 'utf8');
+    const state = parseJson(raw, null);
+    if (!state) return;
+    payload.stop_context = {
+      last_prompt_at: state.observed_at || null,
+      last_prompt_summary: state.prompt_summary || null,
+      last_turn_id: state.turn_id || null,
+    };
   } catch {}
 }
 
@@ -595,6 +629,7 @@ async function main() {
   }
 
   maybeWritePromptSubmitState(repoRoot, provider, eventName, input);
+  maybeEnrichStopEvent(repoRoot, payload, eventName);
 
   spawnSync('clawhip', ['native', 'hook', '--provider', provider], {
     input: JSON.stringify(payload),
@@ -751,6 +786,47 @@ fn apply_augmentation(payload: &mut Map<String, Value>, augmentation: Option<&Va
     }
 
     payload.insert("augmentation".into(), Value::Object(augmentation.clone()));
+}
+
+/// For stop events, propagate the last-prompt context into top-level fields
+/// so templates and renderers can reference them without digging into nested
+/// objects.
+fn apply_stop_context(payload: &mut Map<String, Value>, stop_context: Option<&Value>) {
+    let Some(stop_context) = stop_context.and_then(Value::as_object) else {
+        return;
+    };
+
+    if let Some(summary) = stop_context
+        .get("last_prompt_summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !payload.contains_key("summary") {
+            payload.insert("summary".into(), json!(summary));
+        }
+        payload.insert("last_prompt_summary".into(), json!(summary));
+    }
+
+    if let Some(at) = stop_context
+        .get("last_prompt_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        payload.insert("last_prompt_at".into(), json!(at));
+    }
+
+    if let Some(turn_id) = stop_context
+        .get("last_turn_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        payload.insert("last_turn_id".into(), json!(turn_id));
+    }
+
+    payload.insert("stop_context".into(), Value::Object(stop_context.clone()));
 }
 
 fn merge_object_like(payload: &mut Map<String, Value>, key: &str, incoming: Value) {
@@ -1048,5 +1124,86 @@ mod tests {
             Some(expected),
             "infer_repo_root should return the main repo, not the worktree"
         );
+    }
+
+    #[test]
+    fn stop_event_payload_surfaces_stop_context_summary() {
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "claude-code",
+            "directory": "/repo/clawhip",
+            "event_name": "Stop",
+            "stop_context": {
+                "last_prompt_at": "2026-04-10T12:34:56Z",
+                "last_prompt_summary": "wire up event provenance for issue 188",
+                "last_turn_id": "turn-99"
+            }
+        }))
+        .expect("event");
+
+        assert_eq!(event.kind, "session.stopped");
+        assert_eq!(
+            event.payload["last_prompt_summary"],
+            json!("wire up event provenance for issue 188")
+        );
+        assert_eq!(
+            event.payload["last_prompt_at"],
+            json!("2026-04-10T12:34:56Z")
+        );
+        assert_eq!(event.payload["last_turn_id"], json!("turn-99"));
+        // summary is backfilled from last_prompt_summary when absent, so the
+        // default renderer's inline/compact mode has something meaningful to show.
+        assert_eq!(
+            event.payload["summary"],
+            json!("wire up event provenance for issue 188")
+        );
+        // The original nested stop_context is retained for callers that want it.
+        assert!(event.payload["stop_context"].is_object());
+    }
+
+    #[test]
+    fn stop_event_without_stop_context_does_not_invent_summary() {
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "claude-code",
+            "directory": "/repo/clawhip",
+            "event_name": "Stop"
+        }))
+        .expect("event");
+
+        assert_eq!(event.kind, "session.stopped");
+        assert!(event.payload.get("stop_context").is_none());
+        assert!(event.payload.get("last_prompt_summary").is_none());
+        assert!(event.payload.get("summary").is_none());
+    }
+
+    #[test]
+    fn stop_event_respects_preexisting_summary_over_stop_context() {
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "claude-code",
+            "directory": "/repo/clawhip",
+            "event_name": "Stop",
+            "stop_context": {
+                "last_prompt_summary": "older prompt"
+            },
+            "augmentation": {
+                "summary": "explicit override"
+            }
+        }))
+        .expect("event");
+
+        // augmentation ran first and set summary; stop_context must not clobber it
+        assert_eq!(event.payload["summary"], json!("explicit override"));
+        // but the raw prompt context is still exposed for renderers that want it
+        assert_eq!(event.payload["last_prompt_summary"], json!("older prompt"));
+    }
+
+    #[test]
+    fn hook_script_saves_prompt_summary_and_enriches_stop_events() {
+        // Sanity-check the embedded JS hook script text so refactors of the
+        // string constant don't silently drop the stop-context plumbing.
+        let script = super::generated_hook_script();
+        assert!(script.contains("maybeEnrichStopEvent"));
+        assert!(script.contains("prompt_summary"));
+        assert!(script.contains("stop_context"));
+        assert!(script.contains("last_prompt_summary"));
     }
 }

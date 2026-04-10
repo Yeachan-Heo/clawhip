@@ -6,6 +6,9 @@ use crate::Result;
 use crate::config::{AppConfig, RouteRule, default_sink_name};
 use crate::dynamic_tokens;
 use crate::events::{IncomingEvent, MessageFormat, RoutingMetadata};
+use crate::provenance::{
+    DeliveryExplanation, FilterResult, Provenance, RouteExplanation,
+};
 #[cfg(test)]
 use crate::render::DefaultRenderer;
 use crate::render::Renderer;
@@ -188,6 +191,88 @@ impl Router {
         matching_routes_for(&self.config.routes, event.canonical_kind(), &context)
     }
 
+    /// Produce a full provenance trace explaining how an event would be routed.
+    ///
+    /// Unlike [`resolve`](Self::resolve) this evaluates *every* configured route
+    /// and returns detailed match/mismatch reasons, so operators can answer
+    /// "what emitted this message and why".
+    pub fn explain(&self, event: &IncomingEvent) -> Provenance {
+        let canonical_kind = event.canonical_kind().to_string();
+        let context = event.template_context();
+        let candidates: Vec<String> = route_candidates(&canonical_kind)
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let mut route_explanations = Vec::with_capacity(self.config.routes.len());
+        let mut matched_indices = Vec::new();
+
+        for (index, route) in self.config.routes.iter().enumerate() {
+            let pattern_matched = candidates
+                .iter()
+                .any(|candidate| glob_match(&route.event, candidate));
+
+            let filter_results: Vec<FilterResult> = route
+                .filter
+                .iter()
+                .map(|(key, expected)| {
+                    let actual = context.get(key).cloned();
+                    let matched = actual
+                        .as_ref()
+                        .map(|a| glob_match(expected, a))
+                        .unwrap_or(false);
+                    FilterResult {
+                        key: key.clone(),
+                        pattern: expected.clone(),
+                        actual,
+                        matched,
+                    }
+                })
+                .collect();
+
+            let all_filters_match =
+                filter_results.is_empty() || filter_results.iter().all(|f| f.matched);
+            let matched = pattern_matched && all_filters_match;
+
+            if matched {
+                matched_indices.push(index);
+            }
+
+            route_explanations.push(RouteExplanation {
+                route_index: index,
+                event_pattern: route.event.clone(),
+                matched,
+                pattern_matched,
+                filter_results,
+            });
+        }
+
+        let deliveries = if matched_indices.is_empty() {
+            match self.resolve_delivery(event, None) {
+                Ok(d) => vec![delivery_explanation(&d, None)],
+                Err(_) => vec![],
+            }
+        } else {
+            matched_indices
+                .iter()
+                .filter_map(|&idx| {
+                    let route = &self.config.routes[idx];
+                    self.resolve_delivery(event, Some(route))
+                        .ok()
+                        .map(|d| delivery_explanation(&d, Some(idx)))
+                })
+                .collect()
+        };
+
+        Provenance {
+            event_kind: event.kind.clone(),
+            canonical_kind,
+            route_candidates: candidates,
+            routes: route_explanations,
+            deliveries,
+        }
+    }
+
     fn target_for(
         &self,
         event: &IncomingEvent,
@@ -301,6 +386,30 @@ pub(crate) fn resolve_tmux_session_channel_with_metadata(
     }
 
     config.defaults.channel.clone()
+}
+
+fn delivery_explanation(
+    delivery: &ResolvedDelivery,
+    matched_route_index: Option<usize>,
+) -> DeliveryExplanation {
+    let (target_label, channel) = match &delivery.target {
+        SinkTarget::DiscordChannel(name) => (
+            format!("DiscordChannel({name:?})"),
+            Some(name.clone()),
+        ),
+        SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
+        SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
+    };
+
+    DeliveryExplanation {
+        sink: delivery.sink.clone(),
+        target: target_label,
+        channel,
+        format: delivery.format.as_str().to_string(),
+        mention: delivery.mention.clone(),
+        template: delivery.template.clone(),
+        matched_route_index,
+    }
 }
 
 fn route_candidates(kind: &str) -> Vec<&str> {
@@ -1927,5 +2036,214 @@ mod tests {
             .unwrap();
         assert!(request.contains("\"text\":\"hello from clawhip\""));
         assert!(request.contains("\"blocks\""));
+    }
+
+    // ── explain / provenance ─────────────────────────────────────
+
+    #[test]
+    fn explain_shows_matched_route_with_filter_details() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                filter: BTreeMap::from([("repo_name".into(), "clawhip".into())]),
+                channel: Some("commits".into()),
+                mention: Some("@devs".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::git_commit("clawhip".into(), "main".into(), "abc123".into(), "ship it".into(), None);
+
+        let provenance = router.explain(&event);
+
+        assert_eq!(provenance.canonical_kind, "git.commit");
+        assert!(provenance.route_candidates.contains(&"git.commit".to_string()));
+        assert_eq!(provenance.routes.len(), 1);
+        assert!(provenance.routes[0].matched);
+        assert!(provenance.routes[0].pattern_matched);
+        assert_eq!(provenance.routes[0].filter_results.len(), 1);
+        assert!(provenance.routes[0].filter_results[0].matched);
+        assert_eq!(provenance.routes[0].filter_results[0].key, "repo_name");
+        assert_eq!(
+            provenance.routes[0].filter_results[0].actual.as_deref(),
+            Some("clawhip")
+        );
+        assert_eq!(provenance.deliveries.len(), 1);
+        assert_eq!(provenance.deliveries[0].matched_route_index, Some(0));
+        assert_eq!(provenance.deliveries[0].sink, "discord");
+        assert_eq!(provenance.deliveries[0].channel.as_deref(), Some("commits"));
+    }
+
+    #[test]
+    fn explain_reports_filter_mismatch() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                filter: BTreeMap::from([("branch".into(), "main".into())]),
+                channel: Some("commits".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "feature".into(),
+            "abc123".into(),
+            "wip".into(),
+            None,
+        );
+
+        let provenance = router.explain(&event);
+
+        assert_eq!(provenance.routes.len(), 1);
+        assert!(!provenance.routes[0].matched);
+        assert!(provenance.routes[0].pattern_matched);
+        assert!(!provenance.routes[0].filter_results[0].matched);
+        assert_eq!(
+            provenance.routes[0].filter_results[0].actual.as_deref(),
+            Some("feature")
+        );
+        // Falls through to default
+        assert_eq!(provenance.deliveries.len(), 1);
+        assert_eq!(provenance.deliveries[0].matched_route_index, None);
+        assert_eq!(provenance.deliveries[0].channel.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn explain_pattern_mismatch_skips_route() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("fallback".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "github.*".into(),
+                sink: "discord".into(),
+                channel: Some("github".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::tmux_keyword(
+            "dev".into(),
+            "error".into(),
+            "segfault".into(),
+            None,
+        );
+
+        let provenance = router.explain(&event);
+
+        assert_eq!(provenance.routes.len(), 1);
+        assert!(!provenance.routes[0].matched);
+        assert!(!provenance.routes[0].pattern_matched);
+        assert_eq!(provenance.deliveries[0].matched_route_index, None);
+    }
+
+    #[test]
+    fn explain_multi_route_match_produces_multiple_deliveries() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "discord".into(),
+                    channel: Some("ops".into()),
+                    mention: Some("@ops".into()),
+                    format: Some(MessageFormat::Alert),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "tmux.*".into(),
+                    sink: "discord".into(),
+                    channel: Some("eng".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-42".into(), "error".into(), "boom".into(), None);
+
+        let provenance = router.explain(&event);
+
+        assert_eq!(provenance.routes.len(), 2);
+        assert!(provenance.routes[0].matched);
+        assert!(provenance.routes[1].matched);
+        assert_eq!(provenance.deliveries.len(), 2);
+        assert_eq!(provenance.deliveries[0].matched_route_index, Some(0));
+        assert_eq!(provenance.deliveries[0].channel.as_deref(), Some("ops"));
+        assert_eq!(provenance.deliveries[1].matched_route_index, Some(1));
+        assert_eq!(provenance.deliveries[1].channel.as_deref(), Some("eng"));
+    }
+
+    #[test]
+    fn explain_no_routes_and_no_default_produces_empty_deliveries() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::custom(None, "orphan".into());
+
+        let provenance = router.explain(&event);
+
+        assert!(provenance.routes.is_empty());
+        assert!(provenance.deliveries.is_empty());
+    }
+
+    #[test]
+    fn explain_json_serialization_roundtrips() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("general".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                channel: Some("commits".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "repo".into(),
+            "main".into(),
+            "abc".into(),
+            "msg".into(),
+            None,
+        );
+
+        let provenance = router.explain(&event);
+        let json = serde_json::to_string(&provenance).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["canonical_kind"], "git.commit");
+        assert!(parsed["routes"].is_array());
+        assert!(parsed["deliveries"].is_array());
+        assert_eq!(parsed["deliveries"][0]["sink"], "discord");
     }
 }

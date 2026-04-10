@@ -137,6 +137,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: HooksCommands,
     },
+    /// Explain how an event would be routed without actually dispatching it.
+    ///
+    /// Shows which routes match, which filters pass/fail, and where the
+    /// event would be delivered — useful for debugging config.
+    Explain(ExplainArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -157,6 +162,32 @@ pub struct EmitArgs {
     pub event_type: String,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub fields: Vec<String>,
+}
+
+/// Arguments for `clawhip explain`.
+///
+/// Mirrors `EmitArgs` so operators can explain the exact same event shape
+/// they would normally emit — with `--channel`, `--format`, `--payload` JSON,
+/// and ad-hoc `--key value` fields.
+#[derive(Debug, Clone, Args)]
+pub struct ExplainArgs {
+    /// Event type (canonical or alias, same as `clawhip emit`).
+    pub event_type: String,
+    /// Emit output as JSON instead of the human-readable text report.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub fields: Vec<String>,
+}
+
+impl ExplainArgs {
+    pub fn into_event(self) -> crate::Result<crate::events::IncomingEvent> {
+        EmitArgs {
+            event_type: self.event_type,
+            fields: self.fields,
+        }
+        .into_event()
+    }
 }
 
 #[derive(Debug, Clone, Default, Args)]

@@ -15,6 +15,7 @@ mod lifecycle;
 mod memory;
 mod native_hooks;
 mod plugins;
+mod provenance;
 mod render;
 mod router;
 mod sink;
@@ -28,8 +29,9 @@ use std::sync::Arc;
 use clap::Parser;
 
 use crate::cli::{
-    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, GitCommands, GithubCommands,
-    HooksCommands, MemoryCommands, NativeCommands, PluginCommands, TmuxCommands, UpdateCommands,
+    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GitCommands,
+    GithubCommands, HooksCommands, MemoryCommands, NativeCommands, PluginCommands, TmuxCommands,
+    UpdateCommands,
 };
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, SetupEdits};
@@ -74,6 +76,7 @@ async fn real_main() -> Result<()> {
             let client = DaemonClient::from_config(config.as_ref());
             send_incoming_event(&client, args.into_event()?).await
         }
+        Commands::Explain(args) => run_explain(config.as_ref(), args),
         Commands::Setup(args) => {
             let mut editable = AppConfig::load_or_default(&config_path)?;
             editable.apply_setup_edits(SetupEdits {
@@ -337,6 +340,24 @@ async fn real_main() -> Result<()> {
 async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Result<()> {
     let event = prepare_event(event)?;
     client.send_event(&event).await
+}
+
+fn run_explain(config: &AppConfig, args: ExplainArgs) -> Result<()> {
+    let json_output = args.json;
+    // Only normalize the event (for canonical_kind / template_context), skip
+    // the strict typed-envelope validation that prepare_event does — explain
+    // must work even with partial payloads an operator types by hand.
+    let event = crate::events::normalize_event(args.into_event()?);
+    let router = router::Router::new(Arc::new(config.clone()));
+    let provenance = router.explain(&event);
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&provenance)?);
+    } else {
+        print!("{provenance}");
+    }
+
+    Ok(())
 }
 
 fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
