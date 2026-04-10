@@ -19,13 +19,19 @@ use crate::source::tmux::{
 pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
     launch_session(&args).await?;
     let monitor_args = TmuxMonitorArgs::from_new_args(&args, config);
-    let monitor = register_and_start_monitor(monitor_args, config).await?;
 
-    if args.attach {
-        attach_session(&args.session).await?;
+    if args.follow {
+        let monitor = register_and_start_monitor(monitor_args, config).await?;
+        if args.attach {
+            attach_session(&args.session).await?;
+        }
+        monitor.await??;
+    } else {
+        register_for_daemon_monitoring(monitor_args, config).await?;
+        if args.attach {
+            attach_session(&args.session).await?;
+        }
     }
-
-    monitor.await??;
     Ok(())
 }
 
@@ -104,21 +110,21 @@ impl From<&TmuxWatchArgs> for TmuxMonitorArgs {
     }
 }
 
-impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
-    fn from(value: TmuxMonitorArgs) -> Self {
-        Self {
-            session: value.session,
-            channel: value.channel,
-            mention: value.mention,
-            routing: value.routing,
-            keywords: value.keywords,
-            keyword_window_secs: value.keyword_window_secs,
-            stale_minutes: value.stale_minutes,
-            format: value.format.map(Into::into),
-            registered_at: value.registered_at,
-            registration_source: value.registration_source,
-            parent_process: value.parent_process,
-            active_wrapper_monitor: true,
+impl TmuxMonitorArgs {
+    fn into_registration(self, active_wrapper_monitor: bool) -> RegisteredTmuxSession {
+        RegisteredTmuxSession {
+            session: self.session,
+            channel: self.channel,
+            mention: self.mention,
+            routing: self.routing,
+            keywords: self.keywords,
+            keyword_window_secs: self.keyword_window_secs,
+            stale_minutes: self.stale_minutes,
+            format: self.format.map(Into::into),
+            registered_at: self.registered_at,
+            registration_source: self.registration_source,
+            parent_process: self.parent_process,
+            active_wrapper_monitor,
         }
     }
 }
@@ -132,7 +138,22 @@ fn routing_metadata_for_cwd(cwd: Option<&str>) -> RoutingMetadata {
         .unwrap_or_else(|_| workdir.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    let repo_path = git_output(workdir, &["rev-parse", "--show-toplevel"]);
+    // Use --git-common-dir to derive the main repo root even when CWD is a
+    // worktree.  --show-toplevel would return the worktree root, making
+    // repo_path identical to worktree_path (issue #182).
+    let repo_path = git_output(
+        workdir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .as_deref()
+    .and_then(|common_dir| Path::new(common_dir).parent())
+    .and_then(|root| {
+        root.canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .to_str()
+            .map(ToString::to_string)
+    })
+    .or_else(|| git_output(workdir, &["rev-parse", "--show-toplevel"]));
     let project = detect_project(workdir).or_else(|| {
         repo_path
             .as_deref()
@@ -202,7 +223,7 @@ async fn register_and_start_monitor(
     config: &AppConfig,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let client = DaemonClient::from_config(config);
-    let registration: RegisteredTmuxSession = args.into();
+    let registration = args.into_registration(true);
     eprintln!("{}", format_watch_audit_log(&registration));
     client.register_tmux(&registration).await?;
 
@@ -210,6 +231,21 @@ async fn register_and_start_monitor(
     Ok(tokio::spawn(async move {
         monitor_registered_session(registration, monitor_client).await
     }))
+}
+
+/// Register the freshly-launched tmux session so the daemon's own poll loop
+/// takes over monitoring, then return without blocking. This is the default
+/// path for `clawhip tmux new`: callers see the wrapper exit with success as
+/// soon as the session exists and is registered, instead of the wrapper
+/// staying alive for the entire session lifetime and exposing the caller to
+/// false-negative SIGKILL surfaces when the launcher/supervisor later kills
+/// it (issue #194).
+async fn register_for_daemon_monitoring(args: TmuxMonitorArgs, config: &AppConfig) -> Result<()> {
+    let client = DaemonClient::from_config(config);
+    let registration = args.into_registration(false);
+    eprintln!("{}", format_watch_audit_log(&registration));
+    client.register_tmux(&registration).await?;
+    Ok(())
 }
 
 async fn launch_session(args: &TmuxNewArgs) -> Result<()> {
@@ -478,6 +514,7 @@ mod tests {
             stale_minutes: 10,
             format: None,
             attach: false,
+            follow: false,
             retry_enter: true,
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
@@ -507,6 +544,7 @@ mod tests {
             stale_minutes: 10,
             format: None,
             attach: false,
+            follow: false,
             retry_enter: true,
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
@@ -532,6 +570,7 @@ mod tests {
             stale_minutes: 10,
             format: None,
             attach: false,
+            follow: false,
             retry_enter: true,
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
@@ -578,7 +617,7 @@ mod tests {
 
     #[test]
     fn registered_tmux_session_from_monitor_args_keeps_audit_metadata() {
-        let registration: RegisteredTmuxSession = TmuxMonitorArgs {
+        let registration = TmuxMonitorArgs {
             session: "issue-105".into(),
             channel: Some("alerts".into()),
             mention: None,
@@ -594,7 +633,7 @@ mod tests {
                 name: Some("bash".into()),
             }),
         }
-        .into();
+        .into_registration(true);
 
         assert_eq!(registration.registered_at, "2026-04-02T00:00:00Z");
         assert!(matches!(
@@ -602,6 +641,40 @@ mod tests {
             RegistrationSource::CliNew
         ));
         assert_eq!(registration.parent_process.unwrap().pid, 99);
+        assert!(
+            registration.active_wrapper_monitor,
+            "into_registration(true) should mark the session as wrapper-monitored"
+        );
+    }
+
+    #[test]
+    fn into_registration_false_lets_daemon_take_over_monitoring() {
+        // Regression for #194: when --follow is not set, clawhip tmux new
+        // exits right after launch and hands off monitoring to the daemon.
+        // The registration MUST report active_wrapper_monitor=false so the
+        // daemon's poll_tmux loop picks it up instead of skipping it as a
+        // wrapper-owned session.
+        let registration = TmuxMonitorArgs {
+            session: "issue-194".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            routing: RoutingMetadata::default(),
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-04-10T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliNew,
+            parent_process: None,
+        }
+        .into_registration(false);
+
+        assert!(
+            !registration.active_wrapper_monitor,
+            "follow=false path must register with active_wrapper_monitor=false \
+             so the daemon resumes monitoring after the wrapper exits"
+        );
+        assert_eq!(registration.session, "issue-194");
     }
 
     #[test]
@@ -647,6 +720,7 @@ mod tests {
             stale_minutes: 10,
             format: None,
             attach: false,
+            follow: false,
             retry_enter: true,
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
@@ -691,6 +765,7 @@ mod tests {
             stale_minutes: 10,
             format: None,
             attach: false,
+            follow: false,
             retry_enter: true,
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
@@ -749,6 +824,7 @@ mod tests {
             stale_minutes: 10,
             format: None,
             attach: false,
+            follow: false,
             retry_enter: true,
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
@@ -812,6 +888,68 @@ mod tests {
                 Duration::from_millis(2),
                 Duration::from_millis(4)
             ]
+        );
+    }
+
+    #[test]
+    fn routing_metadata_repo_path_returns_main_repo_for_worktree() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = StdCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&repo, &["init"]);
+        std::fs::write(repo.join("README.md"), "init\n").expect("write");
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        git(&repo, &["branch", "issue-182"]);
+
+        let wt = temp.path().join("wt-issue-182");
+        git(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "issue-182"],
+        );
+
+        let metadata = routing_metadata_for_cwd(Some(&wt.to_string_lossy()));
+        let expected_repo = repo
+            .canonicalize()
+            .expect("canonical")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(
+            metadata.repo_path.as_deref(),
+            Some(expected_repo.as_str()),
+            "repo_path should be main repo root, not worktree"
+        );
+        assert_eq!(metadata.branch.as_deref(), Some("issue-182"));
+        assert!(
+            metadata.worktree_path.as_deref() != metadata.repo_path.as_deref(),
+            "worktree_path and repo_path must differ for a worktree checkout"
         );
     }
 }

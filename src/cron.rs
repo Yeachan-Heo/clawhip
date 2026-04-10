@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -87,8 +87,13 @@ pub async fn run_configured_job(config: &AppConfig, id: &str) -> Result<()> {
         return Err(format!("cron job '{id}' is disabled").into());
     }
 
+    // Manual runs bypass zero-delta suppression: if an operator explicitly
+    // kicks a job they want the event fired regardless of backlog state. We
+    // still attach the state snapshot to the payload if configured so
+    // downstream consumers see the same context the scheduler would.
+    let state = job.state_file.as_deref().and_then(evaluate_state_file);
     let client = DaemonClient::from_config(config);
-    client.emit(build_job_event(job)).await
+    client.emit(build_job_event(job, state.as_ref())).await
 }
 
 pub fn validate_job(job: &CronJob) -> Result<()> {
@@ -121,6 +126,7 @@ pub fn default_state_path(config_path: &Path) -> PathBuf {
 struct CronScheduler {
     jobs: Vec<ScheduledCronJob>,
     last_processed_minute: Option<i64>,
+    job_fingerprints: HashMap<String, String>,
     state_path: Option<PathBuf>,
 }
 
@@ -143,14 +149,18 @@ impl CronScheduler {
             });
         }
 
-        let last_processed_minute = match state_path.as_deref() {
-            Some(path) => load_scheduler_state(path)?.last_processed_minute,
-            None => None,
+        let (last_processed_minute, job_fingerprints) = match state_path.as_deref() {
+            Some(path) => {
+                let state = load_scheduler_state(path)?;
+                (state.last_processed_minute, state.job_fingerprints)
+            }
+            None => (None, HashMap::new()),
         };
 
         Ok(Self {
             jobs,
             last_processed_minute,
+            job_fingerprints,
             state_path,
         })
     }
@@ -176,8 +186,22 @@ impl CronScheduler {
             let scheduled_for = OffsetDateTime::from_unix_timestamp(minute * 60)?;
             for job in &self.jobs {
                 if job.matches(scheduled_for)? {
-                    emitter.emit(build_job_event(&job.config)).await?;
+                    let state = job
+                        .config
+                        .state_file
+                        .as_deref()
+                        .and_then(evaluate_state_file);
+                    if should_suppress(&state, self.job_fingerprints.get(&job.config.id)) {
+                        continue;
+                    }
+                    emitter
+                        .emit(build_job_event(&job.config, state.as_ref()))
+                        .await?;
                     executed.push(job.config.id.clone());
+                    if let Some(eval) = state {
+                        self.job_fingerprints
+                            .insert(job.config.id.clone(), eval.fingerprint);
+                    }
                 }
             }
         }
@@ -196,6 +220,7 @@ impl CronScheduler {
             path,
             &CronSchedulerState {
                 last_processed_minute: self.last_processed_minute,
+                job_fingerprints: self.job_fingerprints.clone(),
             },
         )
     }
@@ -214,7 +239,7 @@ impl ScheduledCronJob {
     }
 }
 
-fn build_job_event(job: &CronJob) -> IncomingEvent {
+fn build_job_event(job: &CronJob, state: Option<&StateEvaluation>) -> IncomingEvent {
     let mut event = match &job.kind {
         CronJobKind::CustomMessage { message } => {
             IncomingEvent::custom(job.channel.clone(), message.clone())
@@ -227,9 +252,73 @@ fn build_job_event(job: &CronJob) -> IncomingEvent {
         payload.insert("cron_job_id".to_string(), json!(job.id));
         payload.insert("cron_schedule".to_string(), json!(job.schedule));
         payload.insert("cron_timezone".to_string(), json!(job.timezone));
+        if let Some(state) = state {
+            payload.insert(
+                "repo_state_fingerprint".to_string(),
+                json!(state.fingerprint),
+            );
+            payload.insert(
+                "repo_state_zero_backlog".to_string(),
+                json!(state.zero_backlog),
+            );
+        }
     }
 
     event
+}
+
+/// Snapshot derived from a cron job's `state_file`, used to decide whether to
+/// suppress an emission and to attach context to events that do fire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateEvaluation {
+    /// Canonical JSON serialization of the state file contents. Any byte-level
+    /// change in the parsed value changes the fingerprint, which breaks
+    /// suppression and causes the job to fire immediately on the next tick.
+    fingerprint: String,
+    /// True only when both `open_issues` and `open_prs` are present and zero.
+    /// Missing counters default to non-zero so jobs keep firing until the
+    /// state file explicitly advertises a zero backlog.
+    zero_backlog: bool,
+}
+
+/// Read and evaluate a cron job's `state_file`. Returns `None` when the file
+/// is missing, empty, or not valid JSON so callers fail open (i.e. emit
+/// normally rather than silently swallowing a broken config).
+fn evaluate_state_file(path: &Path) -> Option<StateEvaluation> {
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let open_issues = value
+        .get("open_issues")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let open_prs = value.get("open_prs").and_then(|v| v.as_u64()).unwrap_or(1);
+    let zero_backlog = open_issues == 0 && open_prs == 0;
+    let fingerprint = serde_json::to_string(&value).ok()?;
+    Some(StateEvaluation {
+        fingerprint,
+        zero_backlog,
+    })
+}
+
+/// A cron job should be suppressed only when its state file advertises a zero
+/// backlog *and* its canonical fingerprint matches the one stored from the
+/// previous emission. Any other case (non-zero backlog, missing state,
+/// different fingerprint, first fire) fires the job.
+fn should_suppress(state: &Option<StateEvaluation>, previous_fingerprint: Option<&String>) -> bool {
+    let Some(eval) = state else {
+        return false;
+    };
+    if !eval.zero_backlog {
+        return false;
+    }
+    match previous_fingerprint {
+        Some(prev) => prev.as_str() == eval.fingerprint.as_str(),
+        None => false,
+    }
 }
 
 fn validate_timezone(job: &CronJob) -> Result<()> {
@@ -418,6 +507,11 @@ fn weekday_to_cron(weekday: Weekday) -> u8 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct CronSchedulerState {
     last_processed_minute: Option<i64>,
+    /// Per-job canonical JSON fingerprint of the `state_file` contents at the
+    /// time of the last successful emission. Used to suppress repeated
+    /// zero-delta follow-up nudges when the repo backlog is already zero.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    job_fingerprints: HashMap<String, String>,
 }
 
 fn load_scheduler_state(path: &Path) -> Result<CronSchedulerState> {
@@ -590,6 +684,7 @@ mod tests {
             channel: Some("ops".into()),
             mention: None,
             format: None,
+            state_file: None,
             kind: CronJobKind::CustomMessage {
                 message: "wake up".into(),
             },
@@ -597,6 +692,280 @@ mod tests {
         .expect_err("unsupported timezone");
 
         assert!(error.to_string().contains("supports UTC only"));
+    }
+
+    #[tokio::test]
+    async fn suppresses_repeat_nudge_when_backlog_is_zero_and_state_unchanged() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("repo.json");
+        fs::write(
+            &repo_state,
+            r#"{"open_issues":0,"open_prs":0,"sha":"deadbeef"}"#,
+        )
+        .expect("write repo state");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state));
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 3))
+            .await
+            .expect("first tick");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 5))
+            .await
+            .expect("second tick — should suppress");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 40, 5))
+            .await
+            .expect("third tick — should also suppress");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected only the first nudge to fire while state stayed at zero backlog"
+        );
+        assert_eq!(
+            events[0].payload["repo_state_zero_backlog"],
+            json!(true),
+            "emitted event should carry the zero-backlog signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_again_when_state_file_changes_even_with_zero_backlog() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("repo.json");
+        fs::write(
+            &repo_state,
+            r#"{"open_issues":0,"open_prs":0,"sha":"aaaa"}"#,
+        )
+        .expect("write repo state v1");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state.clone()));
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 3))
+            .await
+            .expect("first tick");
+
+        // A real delta lands: sha changes even though counters stay zero. The
+        // scheduler must re-fire because "zero-delta" means the state itself
+        // has not moved; any byte-level change breaks that assumption.
+        fs::write(
+            &repo_state,
+            r#"{"open_issues":0,"open_prs":0,"sha":"bbbb"}"#,
+        )
+        .expect("write repo state v2");
+
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 5))
+            .await
+            .expect("second tick — should re-emit");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn never_suppresses_when_backlog_is_nonzero() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("repo.json");
+        // Backlog is 3 open PRs. Even if nothing else changes, we want the
+        // nudge to keep firing so operators don't lose track of active work.
+        fs::write(&repo_state, r#"{"open_issues":0,"open_prs":3}"#).expect("write repo state");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state));
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        for hour_minute in [(8u8, 20u8), (8, 30), (8, 40)] {
+            scheduler
+                .emit_due(
+                    &emitter,
+                    dt(2026, Month::April, 2, hour_minute.0, hour_minute.1, 1),
+                )
+                .await
+                .expect("tick");
+        }
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].payload["repo_state_zero_backlog"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn re_emits_immediately_when_backlog_transitions_back_from_zero() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("repo.json");
+        fs::write(&repo_state, r#"{"open_issues":0,"open_prs":0}"#)
+            .expect("write repo state v1 (zero)");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state.clone()));
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        // First tick establishes the zero-backlog baseline and fires once.
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 0))
+            .await
+            .expect("tick 1");
+        // Second tick is suppressed: same zero backlog, same fingerprint.
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 0))
+            .await
+            .expect("tick 2");
+
+        // Backlog grows: a new PR lands.
+        fs::write(&repo_state, r#"{"open_issues":0,"open_prs":1}"#)
+            .expect("write repo state v2 (nonzero)");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 40, 0))
+            .await
+            .expect("tick 3 — nonzero delta");
+
+        // Work ships; backlog drops back to zero. The scheduler should fire
+        // one more time to announce the transition, then fall silent again.
+        fs::write(&repo_state, r#"{"open_issues":0,"open_prs":0}"#)
+            .expect("write repo state v3 (back to zero)");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 50, 0))
+            .await
+            .expect("tick 4 — zero transition");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 9, 0, 0))
+            .await
+            .expect("tick 5 — suppressed again");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(
+            events.len(),
+            3,
+            "expected emissions at ticks 1, 3, 4 (ticks 2 and 5 suppressed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_state_file_fails_open_and_fires_normally() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("does-not-exist.json");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state));
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 0))
+            .await
+            .expect("tick 1");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 0))
+            .await
+            .expect("tick 2");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(
+            events.len(),
+            2,
+            "missing state file must not silently suppress a configured job"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_without_state_file_preserves_legacy_behavior() {
+        let config = sample_config("*/10 * * * *");
+        let mut scheduler = CronScheduler::new(&config).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 0))
+            .await
+            .expect("tick 1");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 0))
+            .await
+            .expect("tick 2");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0].payload.get("repo_state_fingerprint").is_none(),
+            "legacy jobs without state_file should not leak repo_state_* fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprint_persists_across_scheduler_restarts() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("repo.json");
+        fs::write(&repo_state, r#"{"open_issues":0,"open_prs":0}"#).expect("write repo state");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state));
+        let emitter = RecordingEmitter::default();
+
+        let mut first = CronScheduler::new_with_state_path(&config, state_path.clone())
+            .expect("first scheduler");
+        first
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 0))
+            .await
+            .expect("first emit");
+
+        // Restart reads the persisted fingerprint and should keep suppressing
+        // — a daemon restart shouldn't cause a spurious repeat nudge.
+        let mut restarted =
+            CronScheduler::new_with_state_path(&config, state_path).expect("restarted scheduler");
+        restarted
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 0))
+            .await
+            .expect("restarted emit");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_state_file_treats_missing_counters_as_nonzero() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("repo.json");
+        fs::write(&path, r#"{"sha":"abc"}"#).expect("write state file");
+
+        let eval = evaluate_state_file(&path).expect("evaluation");
+        assert!(
+            !eval.zero_backlog,
+            "a state file without counters must not trigger suppression"
+        );
+    }
+
+    #[test]
+    fn evaluate_state_file_normalizes_whitespace_in_fingerprint() {
+        let dir = tempdir().expect("tempdir");
+        let compact = dir.path().join("compact.json");
+        let pretty = dir.path().join("pretty.json");
+        fs::write(&compact, r#"{"open_issues":0,"open_prs":0}"#).expect("write compact");
+        fs::write(&pretty, "{\n  \"open_issues\": 0,\n  \"open_prs\": 0\n}\n")
+            .expect("write pretty");
+
+        let compact_eval = evaluate_state_file(&compact).expect("compact eval");
+        let pretty_eval = evaluate_state_file(&pretty).expect("pretty eval");
+        assert_eq!(
+            compact_eval.fingerprint, pretty_eval.fingerprint,
+            "whitespace-only formatting changes must not count as a delta"
+        );
     }
 
     #[test]
@@ -611,6 +980,10 @@ mod tests {
     }
 
     fn sample_config(schedule: &str) -> AppConfig {
+        sample_config_with_state(schedule, None)
+    }
+
+    fn sample_config_with_state(schedule: &str, state_file: Option<PathBuf>) -> AppConfig {
         AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("ops".into()),
@@ -626,6 +999,7 @@ mod tests {
                     channel: Some("ops".into()),
                     mention: Some("<@bot>".into()),
                     format: Some(MessageFormat::Alert),
+                    state_file,
                     kind: CronJobKind::CustomMessage {
                         message: "check open PRs".into(),
                     },

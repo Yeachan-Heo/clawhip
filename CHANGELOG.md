@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.6.5 - 2026-04-10
+
+### Highlights
+
+- remove the residual dispatch bypass-delivery timing flake with a deterministic test path so CI stays boring under load
+- fix `clawhip tmux new` false-negative launch failures by handing monitoring back to the daemon after successful session creation
+- add `clawhip release preflight` and gate the release workflow on version / Cargo.lock / changelog consistency
+- add `clawhip explain` plus route/delivery provenance output for operator debugging
+
+### Upgrade notes
+
+- crate version is now `0.6.5`
+- existing config remains compatible; no migration required
+
+## Unreleased
+
+### Highlights
+
+- add `clawhip release preflight` to verify `Cargo.toml` / `Cargo.lock` / `CHANGELOG.md` stay consistent with the intended release tag before pushing (#189)
+- wire the preflight into `.github/workflows/release.yml` so an inconsistent release tag is rejected before `dist plan` and `publish-crates` run
+
+### How to use
+
+- run `clawhip release preflight` locally in the repo root before tagging — omit the version to default to the current `Cargo.toml` version, or pass an explicit tag (`clawhip release preflight v0.6.5`, `clawhip release preflight refs/tags/v0.6.5`)
+- the same command runs in CI via the new `preflight` job gating the release workflow
+
+## 0.6.4 - 2026-04-10
+
+### Breaking
+
+- replace provider-specific wrapper/launcher docs with the shared provider-native Codex + Claude hook surface
+- document `clawhip native hook` as the generic ingress for shared hook payload verification
+- move public guidance to provider-native installation, `.clawhip/project.json`, and additive `.clawhip/hooks/` augmentation
+
+### Highlights
+
+- add `clawhip deliver` for prompt-submit-aware prompt recovery into existing hooked tmux-backed provider sessions
+- validate repo-local hook setup and active Codex/Claude (including OMC/OMX wrapper) panes before retrying Enter
+- record prompt-submit readiness in `.clawhip/state/prompt-submit.json` so delivery can stop once the hook actually fires
+
+### Upgrade notes
+
+- if you were using wrapper-specific launch flows, migrate to provider-owned hook registration plus `clawhip native hook` for local testing
+- the shared v1 contract now documents only `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`
+
 ## 0.6.0 - 2026-04-09
 
 ### Highlights

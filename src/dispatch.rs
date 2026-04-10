@@ -778,8 +778,15 @@ mod tests {
                     .send(String::from_utf8_lossy(&buf[..n]).to_string())
                     .await
                     .unwrap();
+                // connection: close prevents reqwest's default keep-alive
+                // from reusing the TCP stream. The collector calls accept()
+                // per request, so pooling the connection causes the 2nd
+                // request under load to hit a dead stream and the collector
+                // to hang on accept() forever (flake root-cause, see #194).
                 stream
-                    .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                    )
                     .await
                     .unwrap();
             }
@@ -1097,6 +1104,14 @@ mod tests {
     async fn dispatcher_sends_bypass_events_immediately_while_routine_delivery_waits() {
         use tokio::time::{Duration, timeout};
 
+        // Regression for #196: the prior version used an 80ms routine batch
+        // window and a 30ms negative wait. Under CI load the bypass HTTP
+        // delivery could take long enough that the 30ms "no second request"
+        // check overlapped the 80ms batch-window expiry, letting the routine
+        // event escape the batcher mid-assertion. We now use the same
+        // stable pattern as the other batching tests in this file: a 30s
+        // batch window so the batcher cannot time out during the test, and
+        // an explicit `drop(tx)` shutdown to trigger flush_all_routine_batches.
         let (webhook, mut requests, server) = spawn_webhook_collector(2).await;
         let config = AppConfig {
             routes: vec![
@@ -1118,7 +1133,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         let router = Router::new(Arc::new(config));
         let mut dispatcher = test_dispatcher(rx, router)
-            .with_routine_batch_window(Some(Duration::from_millis(80)))
+            .with_routine_batch_window(Some(Duration::from_secs(30)))
             .with_batch_tick(Duration::from_millis(5));
         let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
 
@@ -1143,24 +1158,34 @@ mod tests {
         .await
         .unwrap();
 
-        let first = timeout(Duration::from_millis(150), requests.recv())
+        // Bypass delivery (agent.failed) must arrive first, even though it
+        // was enqueued second — the routine delivery (tmux.keyword) is still
+        // held by the 30s batch window.
+        let first = timeout(Duration::from_secs(2), requests.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .expect("bypass delivery should arrive promptly")
+            .expect("webhook collector closed before bypass delivery");
         assert!(first.contains("agent codex"));
         assert!(first.contains("failed"));
 
+        // A short negative wait confirms the routine delivery is still in
+        // the batcher rather than already in-flight. With a 30s batch
+        // window this is deterministic: the batcher cannot expire during
+        // the wait, so any second request would indicate a bypass leak.
         assert!(
-            timeout(Duration::from_millis(30), requests.recv())
+            timeout(Duration::from_millis(50), requests.recv())
                 .await
-                .is_err()
+                .is_err(),
+            "routine delivery escaped batch before shutdown flush"
         );
 
+        // Shutdown (channel close) triggers flush_all_routine_batches, which
+        // releases the held tmux.keyword delivery regardless of batch window.
         drop(tx);
         let second = timeout(Duration::from_secs(2), requests.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .expect("routine delivery should flush on shutdown")
+            .expect("webhook collector closed before routine flush");
         task.await.unwrap();
         server.await.unwrap();
 

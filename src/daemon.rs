@@ -571,6 +571,7 @@ mod tests {
             channel: Some("ops".into()),
             mention: None,
             format: Some(MessageFormat::Alert),
+            state_file: None,
             kind: CronJobKind::CustomMessage {
                 message: "check open PRs".into(),
             },

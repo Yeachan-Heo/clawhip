@@ -1070,8 +1070,12 @@ mod tests {
                 let mut buf = vec![0_u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap();
                 requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                // connection: close prevents reqwest from reusing the TCP
+                // stream — the mock server calls accept() per request, so
+                // keep-alive pooling causes the 2nd request to go to a dead
+                // connection under load (flake root-cause, see #194).
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
                     body.len(),
                     body
                 );

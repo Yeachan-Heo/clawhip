@@ -45,8 +45,26 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # Fail fast if tag/Cargo.toml/Cargo.lock/CHANGELOG are out of sync.
+  preflight:
+    runs-on: "ubuntu-22.04"
+    if: ${{ !github.event.pull_request }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build clawhip (release preflight needs the binary)
+        run: cargo build --release
+      - name: Release consistency preflight
+        run: ./target/release/clawhip release preflight "${{ github.ref_name }}"
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - preflight
+    if: ${{ always() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') }}
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}

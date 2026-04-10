@@ -4,3 +4,4 @@ target/
 .omc/
 .omx/
 .claude/worktrees/
+.clawhip/state/

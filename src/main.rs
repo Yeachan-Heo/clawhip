@@ -15,6 +15,8 @@ mod lifecycle;
 mod memory;
 mod native_hooks;
 mod plugins;
+mod provenance;
+mod release_preflight;
 mod render;
 mod router;
 mod sink;
@@ -28,11 +30,12 @@ use std::sync::Arc;
 use clap::Parser;
 
 use crate::cli::{
-    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, GitCommands, GithubCommands,
-    HooksCommands, MemoryCommands, NativeCommands, PluginCommands, TmuxCommands, UpdateCommands,
+    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GitCommands,
+    GithubCommands, HooksCommands, MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands,
+    TmuxCommands, UpdateCommands,
 };
 use crate::client::DaemonClient;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SetupEdits};
 use crate::event::compat::from_incoming_event;
 use crate::events::IncomingEvent;
 
@@ -69,13 +72,21 @@ async fn real_main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&health)?);
             Ok(())
         }
+        Commands::Deliver(args) => crate::hooks::prompt_deliver::run(args).await,
         Commands::Emit(args) => {
             let client = DaemonClient::from_config(config.as_ref());
             send_incoming_event(&client, args.into_event()?).await
         }
-        Commands::Setup { webhook } => {
+        Commands::Explain(args) => run_explain(config.as_ref(), args),
+        Commands::Setup(args) => {
             let mut editable = AppConfig::load_or_default(&config_path)?;
-            editable.scaffold_webhook_quickstart(webhook);
+            editable.apply_setup_edits(SetupEdits {
+                webhook: args.webhook,
+                bot_token: args.bot_token,
+                default_channel: args.default_channel,
+                default_format: args.default_format,
+                daemon_base_url: args.daemon_base_url,
+            })?;
             editable.validate()?;
             editable.save(&config_path)?;
             println!("Saved {}", config_path.display());
@@ -324,12 +335,33 @@ async fn real_main() -> Result<()> {
         Commands::Hooks { command } => match command {
             HooksCommands::Install(args) => hooks::install(args),
         },
+        Commands::Release { command } => match command {
+            ReleaseCommands::Preflight { version, repo } => release_preflight::run(repo, version),
+        },
     }
 }
 
 async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Result<()> {
     let event = prepare_event(event)?;
     client.send_event(&event).await
+}
+
+fn run_explain(config: &AppConfig, args: ExplainArgs) -> Result<()> {
+    let json_output = args.json;
+    // Only normalize the event (for canonical_kind / template_context), skip
+    // the strict typed-envelope validation that prepare_event does — explain
+    // must work even with partial payloads an operator types by hand.
+    let event = crate::events::normalize_event(args.into_event()?);
+    let router = router::Router::new(Arc::new(config.clone()));
+    let provenance = router.explain(&event);
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&provenance)?);
+    } else {
+        print!("{provenance}");
+    }
+
+    Ok(())
 }
 
 fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {

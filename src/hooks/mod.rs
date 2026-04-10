@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+pub mod prompt_deliver;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

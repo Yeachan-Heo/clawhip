@@ -69,6 +69,16 @@ Recommended installation model:
 clawhip still pairs well with tmux when you want keyword/stale monitoring, but tmux is now
 optional and no longer the primary hook-registration surface.
 
+For tmux-backed recovery into an already-running hooked session, use:
+
+```bash
+clawhip deliver --session <tmux-session> --prompt "..." --max-enters 4
+```
+
+`clawhip deliver` validates repo-local prompt-submit hook setup, confirms the target pane is an
+active Codex/Claude (including OMC/OMX wrapper) session, then retries Enter until
+`.clawhip/state/prompt-submit.json` changes or the bounded retry limit is reached.
+
 ## Recipes
 
 ### Dev-channel follow-up cron for Clawdbot
@@ -265,6 +275,25 @@ Quick start:
 ```bash
 clawhip setup --webhook "https://discord.com/api/webhooks/..."
 ```
+
+Bounded setup presets also support:
+
+```bash
+clawhip setup \
+  --bot-token "discord-bot-token" \
+  --default-channel "1234567890" \
+  --default-format alert \
+  --daemon-base-url "http://127.0.0.1:25294"
+```
+
+`clawhip setup` stays non-interactive and intentionally limited to five presets only:
+- Discord webhook quickstart route
+- Discord bot token
+- Default channel
+- Default message format
+- Daemon base URL
+
+Advanced routes and monitor definitions are still edited manually in the config file or revisited through the bounded `clawhip config` editor surface.
 
 Route example:
 
@@ -543,14 +572,21 @@ clawhip tmux watch -s <existing-session> \
   --stale-minutes 10 \
   --format alert \
   --retry-enter true
+
+clawhip deliver \
+  --session <existing-session> \
+  --prompt "continue from the latest blocker and open a PR to dev" \
+  --max-enters 4
 ```
 
 Behavior:
 - Codex and Claude should own session launch and hook registration
 - `clawhip native hook` is the local thin-client ingress for provider payloads
 - `tmux new` / `tmux watch` are fallback paths for debugging or manual recovery
+- `deliver` is the prompt recovery path for an already-running hooked tmux-backed provider session
 - `tmux list` shows active daemon-known watches with source, registration timestamp, and parent-process info
 - final delivery still goes through daemon routing
+- `deliver` refuses arbitrary shells and requires repo-local prompt-submit-aware hook setup (`clawhip hooks install --all --scope project`)
 
 Routing note:
 - session names are labels for operators, not routing authority
@@ -773,7 +809,7 @@ Required live sign-off presets:
 ```bash
 clawhip                 # start daemon
 clawhip status          # daemon health
-clawhip config          # config management
+clawhip config          # bounded preset editor / config inspection
 clawhip send ...        # thin client custom event
 clawhip github ...      # thin client GitHub event
 clawhip git ...         # thin client git event

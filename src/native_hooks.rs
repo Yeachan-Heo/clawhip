@@ -150,96 +150,6 @@ pub fn incoming_event_from_native_hook_json(
             "/event_payload/toolName",
         ],
     );
-    let tmux_session = first_string(
-        payload,
-        &[
-            "/tmux_session",
-            "/tmuxSession",
-            "/context/tmux_session",
-            "/context/tmuxSession",
-            "/tmux/session",
-            "/context/tmux/session",
-            "/event_payload/tmux_session",
-            "/event_payload/tmuxSession",
-            "/event_payload/tmux/session",
-        ],
-    );
-    let tmux_window = first_string(
-        payload,
-        &[
-            "/tmux_window",
-            "/tmuxWindow",
-            "/context/tmux_window",
-            "/context/tmuxWindow",
-            "/tmux/window",
-            "/context/tmux/window",
-            "/event_payload/tmux_window",
-            "/event_payload/tmuxWindow",
-            "/event_payload/tmux/window",
-        ],
-    );
-    let tmux_pane = first_string(
-        payload,
-        &[
-            "/tmux_pane",
-            "/tmuxPane",
-            "/context/tmux_pane",
-            "/context/tmuxPane",
-            "/tmux/pane",
-            "/context/tmux/pane",
-            "/event_payload/tmux_pane",
-            "/event_payload/tmuxPane",
-            "/event_payload/tmux/pane",
-        ],
-    );
-    let tmux_pane_tty = first_string(
-        payload,
-        &[
-            "/tmux_pane_tty",
-            "/tmuxPaneTty",
-            "/context/tmux_pane_tty",
-            "/context/tmuxPaneTty",
-            "/tmux/pane_tty",
-            "/tmux/paneTty",
-            "/context/tmux/pane_tty",
-            "/context/tmux/paneTty",
-            "/event_payload/tmux_pane_tty",
-            "/event_payload/tmuxPaneTty",
-            "/event_payload/tmux/pane_tty",
-            "/event_payload/tmux/paneTty",
-        ],
-    );
-    let tmux_attached = first_boolish(
-        payload,
-        &[
-            "/tmux_attached",
-            "/tmuxAttached",
-            "/context/tmux_attached",
-            "/context/tmuxAttached",
-            "/tmux/attached",
-            "/context/tmux/attached",
-            "/event_payload/tmux_attached",
-            "/event_payload/tmuxAttached",
-            "/event_payload/tmux/attached",
-        ],
-    );
-    let tmux_client_count = first_u64ish(
-        payload,
-        &[
-            "/tmux_client_count",
-            "/tmuxClientCount",
-            "/context/tmux_client_count",
-            "/context/tmuxClientCount",
-            "/tmux/client_count",
-            "/tmux/clientCount",
-            "/context/tmux/client_count",
-            "/context/tmux/clientCount",
-            "/event_payload/tmux_client_count",
-            "/event_payload/tmuxClientCount",
-            "/event_payload/tmux/client_count",
-            "/event_payload/tmux/clientCount",
-        ],
-    );
 
     let event_payload = payload
         .get("event_payload")
@@ -298,30 +208,121 @@ pub fn incoming_event_from_native_hook_json(
     if let Some(tool_name) = tool_name {
         normalized.insert("tool_name".into(), json!(tool_name));
     }
-    if let Some(tmux_session) = tmux_session {
-        normalized.insert("tmux_session".into(), json!(tmux_session));
-    }
-    if let Some(tmux_window) = tmux_window {
-        normalized.insert("tmux_window".into(), json!(tmux_window));
-    }
-    if let Some(tmux_pane) = tmux_pane {
-        normalized.insert("tmux_pane".into(), json!(tmux_pane));
-    }
-    if let Some(tmux_pane_tty) = tmux_pane_tty {
-        normalized.insert("tmux_pane_tty".into(), json!(tmux_pane_tty));
-    }
-    if let Some(tmux_attached) = tmux_attached {
-        normalized.insert("tmux_attached".into(), json!(tmux_attached));
-    }
-    if let Some(tmux_client_count) = tmux_client_count {
-        normalized.insert("tmux_client_count".into(), json!(tmux_client_count));
-    }
+    copy_string_field(
+        &mut normalized,
+        payload,
+        "tmux_session",
+        &[
+            "/tmux_session",
+            "/tmuxSession",
+            "/context/tmux_session",
+            "/context/tmuxSession",
+            "/tmux/session",
+            "/context/tmux/session",
+            "/event_payload/tmux_session",
+            "/event_payload/tmuxSession",
+            "/event_payload/tmux/session",
+        ],
+    );
+    copy_string_field(
+        &mut normalized,
+        payload,
+        "tmux_window",
+        &[
+            "/tmux_window",
+            "/tmuxWindow",
+            "/context/tmux_window",
+            "/context/tmuxWindow",
+            "/tmux/window",
+            "/context/tmux/window",
+            "/event_payload/tmux_window",
+            "/event_payload/tmuxWindow",
+            "/event_payload/tmux/window",
+        ],
+    );
+    copy_string_field(
+        &mut normalized,
+        payload,
+        "tmux_pane",
+        &[
+            "/tmux_pane",
+            "/tmuxPane",
+            "/context/tmux_pane",
+            "/context/tmuxPane",
+            "/tmux/pane",
+            "/context/tmux/pane",
+            "/event_payload/tmux_pane",
+            "/event_payload/tmuxPane",
+            "/event_payload/tmux/pane",
+        ],
+    );
+    copy_string_field(
+        &mut normalized,
+        payload,
+        "tmux_pane_tty",
+        &[
+            "/tmux_pane_tty",
+            "/tmuxPaneTty",
+            "/context/tmux_pane_tty",
+            "/context/tmuxPaneTty",
+            "/tmux/pane_tty",
+            "/tmux/paneTty",
+            "/context/tmux/pane_tty",
+            "/context/tmux/paneTty",
+            "/event_payload/tmux_pane_tty",
+            "/event_payload/tmuxPaneTty",
+            "/event_payload/tmux/pane_tty",
+            "/event_payload/tmux/paneTty",
+        ],
+    );
+    copy_bool_field(
+        &mut normalized,
+        payload,
+        "tmux_attached",
+        &[
+            "/tmux_attached",
+            "/tmuxAttached",
+            "/context/tmux_attached",
+            "/context/tmuxAttached",
+            "/tmux/attached",
+            "/context/tmux/attached",
+            "/event_payload/tmux_attached",
+            "/event_payload/tmuxAttached",
+            "/event_payload/tmux/attached",
+        ],
+    );
+    copy_u64_field(
+        &mut normalized,
+        payload,
+        "tmux_client_count",
+        &[
+            "/tmux_client_count",
+            "/tmuxClientCount",
+            "/context/tmux_client_count",
+            "/context/tmuxClientCount",
+            "/tmux/client_count",
+            "/tmux/clientCount",
+            "/context/tmux/client_count",
+            "/context/tmux/clientCount",
+            "/event_payload/tmux_client_count",
+            "/event_payload/tmuxClientCount",
+            "/event_payload/tmux/client_count",
+            "/event_payload/tmux/clientCount",
+        ],
+    );
 
     apply_augmentation(
         &mut normalized,
         payload
             .get("augmentation")
             .or_else(|| payload.pointer("/event_payload/augmentation")),
+    );
+
+    apply_stop_context(
+        &mut normalized,
+        payload
+            .get("stop_context")
+            .or_else(|| payload.pointer("/event_payload/stop_context")),
     );
 
     Ok(crate::events::IncomingEvent {
@@ -343,7 +344,7 @@ pub fn native_hooks_installed(workdir: &Path) -> bool {
 
 pub fn generated_hook_script() -> &'static str {
     r#"#!/usr/bin/env node
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -388,36 +389,20 @@ function parseIntegerish(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return Math.trunc(value);
   }
-  if (typeof value !== 'string') {
-    return null;
-  }
+  if (typeof value !== 'string') return null;
   const trimmed = value.trim();
-  if (!/^-?\d+$/.test(trimmed)) {
-    return null;
-  }
+  if (!/^-?\d+$/.test(trimmed)) return null;
   return Number.parseInt(trimmed, 10);
 }
 
 function parseBoolish(value) {
-  if (typeof value === 'boolean') {
-    return value;
-  }
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value !== 0;
-  }
-  if (typeof value !== 'string') {
-    return null;
-  }
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return value !== 0;
+  if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  if (['1', 'true', 'yes', 'attached'].includes(normalized)) {
-    return true;
-  }
-  if (['0', 'false', 'no', 'detached'].includes(normalized)) {
-    return false;
-  }
+  if (!normalized) return null;
+  if (['1', 'true', 'yes', 'attached'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'detached'].includes(normalized)) return false;
   return null;
 }
 
@@ -447,6 +432,26 @@ function mergeAdditive(base, extra) {
   return output;
 }
 
+async function collectAugmentation(root, payload) {
+  const augmentDir = join(root, '.clawhip/hooks/augment');
+  if (!existsSync(augmentDir)) return null;
+
+  let merged = {};
+  for (const entry of readdirSync(augmentDir)) {
+    if (!entry.endsWith('.mjs') && !entry.endsWith('.js') && !entry.endsWith('.cjs')) continue;
+    const modulePath = join(augmentDir, entry);
+    const module = await import(pathToFileURL(modulePath).href);
+    const fn = module.default || module.augment;
+    if (typeof fn !== 'function') continue;
+    const result = await fn(payload);
+    if (result && typeof result === 'object') {
+      merged = mergeAdditive(merged, result);
+    }
+  }
+
+  return Object.keys(merged).length > 0 ? merged : null;
+}
+
 function collectTmuxMetadata(input, cwd) {
   const sources = [input, input?.context, input?.event_payload, input?.payload]
     .filter((value) => value && typeof value === 'object');
@@ -473,9 +478,7 @@ function collectTmuxMetadata(input, cwd) {
     for (const source of tmuxSources) {
       for (const key of keys) {
         const value = parseIntegerish(source[key]);
-        if (value !== null) {
-          return value;
-        }
+        if (value !== null) return value;
       }
     }
     return null;
@@ -485,9 +488,7 @@ function collectTmuxMetadata(input, cwd) {
     for (const source of tmuxSources) {
       for (const key of keys) {
         const value = parseBoolish(source[key]);
-        if (value !== null) {
-          return value;
-        }
+        if (value !== null) return value;
       }
     }
     return null;
@@ -498,12 +499,7 @@ function collectTmuxMetadata(input, cwd) {
   const tmuxWindow = pickString(['tmux_window', 'tmuxWindow', 'window']);
   const tmuxPane = pickString(['tmux_pane', 'tmuxPane', 'pane']);
   const tmuxPaneTty = pickString(['tmux_pane_tty', 'tmuxPaneTty', 'pane_tty', 'paneTty']);
-  const tmuxClientCount = pickInteger([
-    'tmux_client_count',
-    'tmuxClientCount',
-    'client_count',
-    'clientCount',
-  ]);
+  const tmuxClientCount = pickInteger(['tmux_client_count', 'tmuxClientCount', 'client_count', 'clientCount']);
   const tmuxAttached = pickBoolean(['tmux_attached', 'tmuxAttached', 'attached']);
 
   if (tmuxSession) direct.tmux_session = tmuxSession;
@@ -513,7 +509,6 @@ function collectTmuxMetadata(input, cwd) {
   if (tmuxClientCount !== null) direct.tmux_client_count = tmuxClientCount;
   if (tmuxAttached !== null) direct.tmux_attached = tmuxAttached;
 
-  let live = null;
   const tmuxTarget = process.env.TMUX_PANE || '';
   if (process.env.TMUX || tmuxTarget) {
     const result = spawnSync(
@@ -527,44 +522,71 @@ function collectTmuxMetadata(input, cwd) {
       { cwd, encoding: 'utf8' },
     );
     if (result.status === 0) {
-      const [session, window, pane, paneTty, attachedCount] = result.stdout
-        .trim()
-        .split('\u001f');
+      const [session, window, pane, paneTty, attachedCount] = result.stdout.trim().split('\u001f');
       const clientCount = parseIntegerish(attachedCount);
-      live = {};
-      if (session) live.tmux_session = session;
-      if (window) live.tmux_window = window;
-      if (pane) live.tmux_pane = pane;
-      if (paneTty) live.tmux_pane_tty = paneTty;
+      if (session && !direct.tmux_session) direct.tmux_session = session;
+      if (window && !direct.tmux_window) direct.tmux_window = window;
+      if (pane && !direct.tmux_pane) direct.tmux_pane = pane;
+      if (paneTty && !direct.tmux_pane_tty) direct.tmux_pane_tty = paneTty;
       if (clientCount !== null) {
-        live.tmux_client_count = clientCount;
-        live.tmux_attached = clientCount > 0;
+        if (direct.tmux_client_count === undefined) direct.tmux_client_count = clientCount;
+        if (direct.tmux_attached === undefined) direct.tmux_attached = clientCount > 0;
       }
     }
   }
 
-  const merged = mergeAdditive(direct, live || {});
-  return Object.keys(merged).length > 0 ? merged : null;
+  return Object.keys(direct).length > 0 ? direct : null;
 }
 
-async function collectAugmentation(root, payload) {
-  const augmentDir = join(root, '.clawhip/hooks/augment');
-  if (!existsSync(augmentDir)) return null;
+function truncate(text, maxLen = 200) {
+  if (!text || typeof text !== 'string') return '';
+  const trimmed = text.trim();
+  return trimmed.length <= maxLen ? trimmed : trimmed.slice(0, maxLen) + '…';
+}
 
-  let merged = {};
-  for (const entry of readdirSync(augmentDir)) {
-    if (!entry.endsWith('.mjs') && !entry.endsWith('.js') && !entry.endsWith('.cjs')) continue;
-    const modulePath = join(augmentDir, entry);
-    const module = await import(pathToFileURL(modulePath).href);
-    const fn = module.default || module.augment;
-    if (typeof fn !== 'function') continue;
-    const result = await fn(payload);
-    if (result && typeof result === 'object') {
-      merged = mergeAdditive(merged, result);
-    }
+function maybeWritePromptSubmitState(repoRoot, provider, eventName, input) {
+  const normalizedEvent = String(eventName || '').trim().toLowerCase();
+  if (
+    normalizedEvent !== 'userpromptsubmit' &&
+    normalizedEvent !== 'user-prompt-submit' &&
+    normalizedEvent !== 'prompt-submitted' &&
+    normalizedEvent !== 'session.prompt-submitted'
+  ) {
+    return;
   }
 
-  return Object.keys(merged).length > 0 ? merged : null;
+  try {
+    const promptText = input.prompt || input.user_prompt || input.message || '';
+    const path = join(repoRoot, '.clawhip', 'state', 'prompt-submit.json');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      observed_at: new Date().toISOString(),
+      provider,
+      event_name: eventName,
+      session_id: input.session_id || input.sessionId || null,
+      turn_id: input.turn_id || input.turnId || null,
+      prompt_summary: truncate(promptText),
+    }, null, 2) + '\n');
+  } catch {}
+}
+
+function maybeEnrichStopEvent(repoRoot, payload, eventName) {
+  const normalizedEvent = String(eventName || '').trim().toLowerCase();
+  if (normalizedEvent !== 'stop' && normalizedEvent !== 'sessionstop' && normalizedEvent !== 'session-stopped') {
+    return;
+  }
+  try {
+    const path = join(repoRoot, '.clawhip', 'state', 'prompt-submit.json');
+    if (!existsSync(path)) return;
+    const raw = readFileSync(path, 'utf8');
+    const state = parseJson(raw, null);
+    if (!state) return;
+    payload.stop_context = {
+      last_prompt_at: state.observed_at || null,
+      last_prompt_summary: state.prompt_summary || null,
+      last_turn_id: state.turn_id || null,
+    };
+  } catch {}
 }
 
 async function main() {
@@ -596,7 +618,6 @@ async function main() {
     prompt: input.prompt,
     event_payload: input,
   };
-
   if (tmuxMetadata) {
     Object.assign(payload, tmuxMetadata);
   }
@@ -619,6 +640,9 @@ async function main() {
   if (augmentation) {
     payload.augmentation = augmentation;
   }
+
+  maybeWritePromptSubmitState(repoRoot, provider, eventName, input);
+  maybeEnrichStopEvent(repoRoot, payload, eventName);
 
   spawnSync('clawhip', ['native', 'hook', '--provider', provider], {
     input: JSON.stringify(payload),
@@ -694,6 +718,33 @@ fn project_metadata_string(project_metadata: &Option<Value>, keys: &[&str]) -> O
 }
 
 fn infer_repo_root(directory: &str) -> Option<PathBuf> {
+    // Use --git-common-dir to derive the main repo root even when inside a
+    // worktree.  --show-toplevel returns the worktree root which is wrong for
+    // the repo_path field (issue #182).
+    if let Some(common_dir) = Command::new("git")
+        .args([
+            "-C",
+            directory,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        && let Some(repo_root) = Path::new(&common_dir).parent()
+    {
+        return Some(
+            repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf()),
+        );
+    }
+
+    // Fallback: --show-toplevel (correct for non-worktree checkouts).
     let output = Command::new("git")
         .args(["-C", directory, "rev-parse", "--show-toplevel"])
         .output()
@@ -750,6 +801,47 @@ fn apply_augmentation(payload: &mut Map<String, Value>, augmentation: Option<&Va
     payload.insert("augmentation".into(), Value::Object(augmentation.clone()));
 }
 
+/// For stop events, propagate the last-prompt context into top-level fields
+/// so templates and renderers can reference them without digging into nested
+/// objects.
+fn apply_stop_context(payload: &mut Map<String, Value>, stop_context: Option<&Value>) {
+    let Some(stop_context) = stop_context.and_then(Value::as_object) else {
+        return;
+    };
+
+    if let Some(summary) = stop_context
+        .get("last_prompt_summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !payload.contains_key("summary") {
+            payload.insert("summary".into(), json!(summary));
+        }
+        payload.insert("last_prompt_summary".into(), json!(summary));
+    }
+
+    if let Some(at) = stop_context
+        .get("last_prompt_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        payload.insert("last_prompt_at".into(), json!(at));
+    }
+
+    if let Some(turn_id) = stop_context
+        .get("last_turn_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        payload.insert("last_turn_id".into(), json!(turn_id));
+    }
+
+    payload.insert("stop_context".into(), Value::Object(stop_context.clone()));
+}
+
 fn merge_object_like(payload: &mut Map<String, Value>, key: &str, incoming: Value) {
     match (payload.get_mut(key), incoming) {
         (Some(Value::Object(existing)), Value::Object(incoming)) => {
@@ -790,10 +882,9 @@ fn first_string(payload: &Value, pointers: &[&str]) -> Option<String> {
     })
 }
 
-fn first_boolish(payload: &Value, pointers: &[&str]) -> Option<bool> {
+fn first_bool(payload: &Value, pointers: &[&str]) -> Option<bool> {
     pointers.iter().find_map(|pointer| {
-        let value = payload.pointer(pointer)?;
-        match value {
+        payload.pointer(pointer).and_then(|value| match value {
             Value::Bool(value) => Some(*value),
             Value::Number(value) => value.as_u64().map(|number| number != 0),
             Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
@@ -802,19 +893,51 @@ fn first_boolish(payload: &Value, pointers: &[&str]) -> Option<bool> {
                 _ => None,
             },
             _ => None,
-        }
+        })
     })
 }
 
-fn first_u64ish(payload: &Value, pointers: &[&str]) -> Option<u64> {
+fn first_u64(payload: &Value, pointers: &[&str]) -> Option<u64> {
     pointers.iter().find_map(|pointer| {
-        let value = payload.pointer(pointer)?;
-        match value {
-            Value::Number(value) => value.as_u64(),
-            Value::String(value) => value.trim().parse::<u64>().ok(),
+        payload.pointer(pointer).and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            Value::String(value) => value.trim().parse().ok(),
             _ => None,
-        }
+        })
     })
+}
+
+fn copy_string_field(
+    normalized: &mut Map<String, Value>,
+    payload: &Value,
+    key: &str,
+    pointers: &[&str],
+) {
+    if let Some(value) = first_string(payload, pointers) {
+        normalized.insert(key.to_string(), json!(value));
+    }
+}
+
+fn copy_bool_field(
+    normalized: &mut Map<String, Value>,
+    payload: &Value,
+    key: &str,
+    pointers: &[&str],
+) {
+    if let Some(value) = first_bool(payload, pointers) {
+        normalized.insert(key.to_string(), json!(value));
+    }
+}
+
+fn copy_u64_field(
+    normalized: &mut Map<String, Value>,
+    payload: &Value,
+    key: &str,
+    pointers: &[&str],
+) {
+    if let Some(value) = first_u64(payload, pointers) {
+        normalized.insert(key.to_string(), json!(value));
+    }
 }
 
 #[cfg(test)]
@@ -889,30 +1012,6 @@ mod tests {
     }
 
     #[test]
-    fn preserves_tmux_pane_metadata_from_native_hook_payloads() {
-        let event = incoming_event_from_native_hook_json(&json!({
-            "provider": "codex",
-            "directory": "/repo/clawhip",
-            "event_name": "SessionStart",
-            "tmux_session": "issue-180",
-            "tmux_window": "2",
-            "tmux_pane": "%11",
-            "tmux_pane_tty": "/dev/pts/42",
-            "tmux_attached": true,
-            "tmux_client_count": 3,
-            "event_payload": {}
-        }))
-        .expect("event");
-
-        assert_eq!(event.payload["tmux_session"], json!("issue-180"));
-        assert_eq!(event.payload["tmux_window"], json!("2"));
-        assert_eq!(event.payload["tmux_pane"], json!("%11"));
-        assert_eq!(event.payload["tmux_pane_tty"], json!("/dev/pts/42"));
-        assert_eq!(event.payload["tmux_attached"], json!(true));
-        assert_eq!(event.payload["tmux_client_count"], json!(3));
-    }
-
-    #[test]
     fn augmentation_can_add_context_without_overriding_base_fields() {
         let event = incoming_event_from_native_hook_json(&json!({
             "provider": "claude-code",
@@ -946,8 +1045,73 @@ mod tests {
         let script = generated_hook_script();
         assert!(script.contains(".clawhip/hooks/augment"));
         assert!(script.contains("clawhip', ['native', 'hook'"));
-        assert!(script.contains("TMUX_PANE"));
-        assert!(script.contains("session_attached"));
+    }
+
+    #[test]
+    fn preserves_tmux_metadata_from_native_payloads() {
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "codex",
+            "directory": "/repo/clawhip",
+            "event_name": "SessionStart",
+            "tmux_session": "omx-clawhip-dev",
+            "tmux_window": "3",
+            "tmux_pane": "%17",
+            "tmux_pane_tty": "/dev/pts/5",
+            "tmux_attached": true,
+            "tmux_client_count": 2,
+            "event_payload": {}
+        }))
+        .expect("event");
+
+        assert_eq!(event.payload["tmux_session"], json!("omx-clawhip-dev"));
+        assert_eq!(event.payload["tmux_window"], json!("3"));
+        assert_eq!(event.payload["tmux_pane"], json!("%17"));
+        assert_eq!(event.payload["tmux_pane_tty"], json!("/dev/pts/5"));
+        assert_eq!(event.payload["tmux_attached"], json!(true));
+        assert_eq!(event.payload["tmux_client_count"], json!(2));
+    }
+
+    #[test]
+    fn generated_hook_script_mentions_tmux_metadata_collection() {
+        let script = generated_hook_script();
+        assert!(script.contains("collectTmuxMetadata"));
+        assert!(script.contains("tmux_session"));
+        assert!(script.contains("tmux_client_count"));
+        assert!(script.contains("tmux_attached"));
+    }
+
+    #[test]
+    fn generated_hook_script_mentions_prompt_submit_state_recording() {
+        let script = generated_hook_script();
+        assert!(script.contains("maybeWritePromptSubmitState"));
+        assert!(script.contains(".clawhip', 'state', 'prompt-submit.json"));
+    }
+
+
+    #[test]
+    fn preserves_nested_tmux_metadata_from_native_payloads() {
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "codex",
+            "directory": "/repo/clawhip",
+            "event_name": "SessionStart",
+            "tmux": {
+                "session": "issue-180",
+                "window": "2",
+                "pane": "%11",
+                "pane_tty": "/dev/pts/42",
+                "attached": true,
+                "client_count": 3
+            },
+            "event_payload": {}
+        }))
+        .expect("event");
+
+        assert_eq!(event.payload["tmux_session"], json!("issue-180"));
+        assert_eq!(event.payload["tmux_window"], json!("2"));
+        assert_eq!(event.payload["tmux_pane"], json!("%11"));
+        assert_eq!(event.payload["tmux_pane_tty"], json!("/dev/pts/42"));
+        assert_eq!(event.payload["tmux_attached"], json!(true));
+        assert_eq!(event.payload["tmux_client_count"], json!(3));
     }
 
     #[test]
@@ -968,5 +1132,138 @@ mod tests {
         fs::write(&codex_config, "[projects]\n").unwrap();
 
         assert!(!native_hooks_installed(dir.path()));
+    }
+
+    #[test]
+    fn infer_repo_root_returns_main_repo_for_worktree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        git(&repo, &["init"]);
+        std::fs::write(repo.join("README.md"), "init\n").expect("write");
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        git(&repo, &["branch", "issue-182"]);
+
+        let wt = temp.path().join("wt-issue-182");
+        git(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "issue-182"],
+        );
+
+        let result = super::infer_repo_root(&wt.to_string_lossy());
+        let expected = repo.canonicalize().expect("canonical");
+        assert_eq!(
+            result,
+            Some(expected),
+            "infer_repo_root should return the main repo, not the worktree"
+        );
+    }
+
+    #[test]
+    fn stop_event_payload_surfaces_stop_context_summary() {
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "claude-code",
+            "directory": "/repo/clawhip",
+            "event_name": "Stop",
+            "stop_context": {
+                "last_prompt_at": "2026-04-10T12:34:56Z",
+                "last_prompt_summary": "wire up event provenance for issue 188",
+                "last_turn_id": "turn-99"
+            }
+        }))
+        .expect("event");
+
+        assert_eq!(event.kind, "session.stopped");
+        assert_eq!(
+            event.payload["last_prompt_summary"],
+            json!("wire up event provenance for issue 188")
+        );
+        assert_eq!(
+            event.payload["last_prompt_at"],
+            json!("2026-04-10T12:34:56Z")
+        );
+        assert_eq!(event.payload["last_turn_id"], json!("turn-99"));
+        // summary is backfilled from last_prompt_summary when absent, so the
+        // default renderer's inline/compact mode has something meaningful to show.
+        assert_eq!(
+            event.payload["summary"],
+            json!("wire up event provenance for issue 188")
+        );
+        // The original nested stop_context is retained for callers that want it.
+        assert!(event.payload["stop_context"].is_object());
+    }
+
+    #[test]
+    fn stop_event_without_stop_context_does_not_invent_summary() {
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "claude-code",
+            "directory": "/repo/clawhip",
+            "event_name": "Stop"
+        }))
+        .expect("event");
+
+        assert_eq!(event.kind, "session.stopped");
+        assert!(event.payload.get("stop_context").is_none());
+        assert!(event.payload.get("last_prompt_summary").is_none());
+        assert!(event.payload.get("summary").is_none());
+    }
+
+    #[test]
+    fn stop_event_respects_preexisting_summary_over_stop_context() {
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "claude-code",
+            "directory": "/repo/clawhip",
+            "event_name": "Stop",
+            "stop_context": {
+                "last_prompt_summary": "older prompt"
+            },
+            "augmentation": {
+                "summary": "explicit override"
+            }
+        }))
+        .expect("event");
+
+        // augmentation ran first and set summary; stop_context must not clobber it
+        assert_eq!(event.payload["summary"], json!("explicit override"));
+        // but the raw prompt context is still exposed for renderers that want it
+        assert_eq!(event.payload["last_prompt_summary"], json!("older prompt"));
+    }
+
+    #[test]
+    fn hook_script_saves_prompt_summary_and_enriches_stop_events() {
+        // Sanity-check the embedded JS hook script text so refactors of the
+        // string constant don't silently drop the stop-context plumbing.
+        let script = super::generated_hook_script();
+        assert!(script.contains("maybeEnrichStopEvent"));
+        assert!(script.contains("prompt_summary"));
+        assert!(script.contains("stop_context"));
+        assert!(script.contains("last_prompt_summary"));
     }
 }
