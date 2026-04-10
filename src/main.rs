@@ -30,7 +30,8 @@ use clap::Parser;
 
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, GitCommands, GithubCommands,
-    HooksCommands, MemoryCommands, NativeCommands, OmxCommands, PluginCommands, TmuxCommands,
+    HooksCommands, MemoryCommands, NativeCommands, OmxCommands, PluginCommands, SetupArgs,
+    TmuxCommands,
 };
 use crate::client::DaemonClient;
 use crate::config::AppConfig;
@@ -74,9 +75,9 @@ async fn real_main() -> Result<()> {
             let client = DaemonClient::from_config(config.as_ref());
             send_incoming_event(&client, args.into_event()?).await
         }
-        Commands::Setup { webhook } => {
+        Commands::Setup(args) => {
             let mut editable = AppConfig::load_or_default(&config_path)?;
-            editable.scaffold_webhook_quickstart(webhook);
+            apply_setup_args(&mut editable, args)?;
             editable.validate()?;
             editable.save(&config_path)?;
             println!("Saved {}", config_path.display());
@@ -301,6 +302,25 @@ async fn real_main() -> Result<()> {
         },
         Commands::EnableHook(args) => native_hooks::enable(args),
     }
+}
+
+fn apply_setup_args(config: &mut AppConfig, args: SetupArgs) -> Result<()> {
+    if let Some(webhook) = args.webhook {
+        config.scaffold_webhook_quickstart(webhook)?;
+    }
+    if let Some(bot_token) = args.bot_token {
+        config.set_discord_bot_token(bot_token);
+    }
+    if let Some(default_channel) = args.default_channel {
+        config.set_default_channel(default_channel);
+    }
+    if let Some(default_format) = args.default_format {
+        config.set_default_format(default_format);
+    }
+    if let Some(daemon_base_url) = args.daemon_base_url {
+        config.set_daemon_base_url(daemon_base_url);
+    }
+    Ok(())
 }
 
 async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Result<()> {

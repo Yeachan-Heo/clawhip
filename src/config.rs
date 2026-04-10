@@ -430,6 +430,17 @@ pub fn default_sink_name() -> String {
     "discord".to_string()
 }
 
+const CONFIG_EDITOR_MENU: [&str; 8] = [
+    "1) Set Discord bot token",
+    "2) Set daemon base URL",
+    "3) Set default channel",
+    "4) Set default format",
+    "5) Set Discord webhook quickstart route",
+    "6) Save and exit",
+    "7) Exit without saving",
+    "8) Print manual config template hint",
+];
+
 const DISCORD_TOKEN_ENV_VARS: [&str; 2] = ["DISCORD_TOKEN", "CLAWHIP_DISCORD_BOT_TOKEN"];
 
 fn merge_legacy_discord_field(
@@ -695,21 +706,28 @@ impl AppConfig {
     }
 
     pub fn scaffold_webhook_quickstart(&mut self, webhook: String) {
-        let webhook = webhook.trim().to_string();
-        if webhook.is_empty() {
-            return;
+        let webhook = normalize_text(Some(webhook));
+        if webhook.is_none() {
+            return Ok(());
         }
 
-        if let Some(route) = self.routes.iter_mut().find(|route| {
-            route.event == "*"
-                && route.filter.is_empty()
-                && route.mention.is_none()
-                && route.template.is_none()
-        }) {
-            route.sink = default_sink_name();
-            route.channel = None;
-            route.webhook = Some(webhook);
-            return;
+        let matches = self
+            .routes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, route)| is_canonical_quickstart_route(route).then_some(index))
+            .collect::<Vec<_>>();
+
+        if matches.len() > 1 {
+            return Err(
+                "multiple canonical quickstart routes found; clean up routes manually before updating the quickstart webhook"
+                    .into(),
+            );
+        }
+
+        if let Some(index) = matches.first().copied() {
+            self.routes[index].webhook = webhook;
+            return Ok(());
         }
 
         self.routes.push(RouteRule {
@@ -717,13 +735,38 @@ impl AppConfig {
             filter: BTreeMap::new(),
             sink: default_sink_name(),
             channel: None,
-            webhook: Some(webhook),
+            webhook,
             slack_webhook: None,
             mention: None,
             allow_dynamic_tokens: false,
             format: None,
             template: None,
         });
+        Ok(())
+    }
+
+    pub fn set_discord_bot_token(&mut self, bot_token: String) {
+        self.providers.discord.bot_token = normalize_secret(Some(bot_token));
+    }
+
+    pub fn set_default_channel(&mut self, channel: String) {
+        self.defaults.channel = normalize_text(Some(channel));
+    }
+
+    pub fn set_default_format(&mut self, format: MessageFormat) {
+        self.defaults.format = format;
+    }
+
+    pub fn set_daemon_base_url(&mut self, base_url: String) {
+        self.daemon.base_url =
+            normalize_text(Some(base_url)).unwrap_or_else(default_base_url);
+    }
+
+    fn canonical_quickstart_webhook(&self) -> Option<&str> {
+        self.routes
+            .iter()
+            .find(|route| is_canonical_quickstart_route(route))
+            .and_then(|route| route.webhook.as_deref())
     }
 
     pub fn daemon_base_url(&self) -> String {
@@ -747,31 +790,36 @@ impl AppConfig {
         loop {
             self.print_summary();
             println!("Choose an action:");
-            println!("  1) Set Discord bot token");
-            println!("  2) Set daemon base URL");
-            println!("  3) Set default channel");
-            println!("  4) Set default format");
-            println!("  5) Save and exit");
-            println!("  6) Exit without saving");
-            println!("  7) Print config template hint");
+            for line in CONFIG_EDITOR_MENU {
+                println!("  {line}");
+            }
             match prompt("Selection")?.trim() {
-                "1" => self.providers.discord.bot_token = empty_to_none(prompt("Bot token")?),
+                "1" => self.set_discord_bot_token(prompt("Bot token")?),
                 "2" => {
-                    self.daemon.base_url =
-                        prompt_with_default("Daemon base URL", Some(&self.daemon.base_url))?
+                    self.set_daemon_base_url(prompt_with_default(
+                        "Daemon base URL",
+                        Some(&self.daemon.base_url),
+                    )?)
                 }
-                "3" => self.defaults.channel = empty_to_none(prompt("Default channel")?),
-                "4" => self.defaults.format = prompt_format(Some(self.defaults.format.clone()))?,
+                "3" => self.set_default_channel(prompt("Default channel")?),
+                "4" => self.set_default_format(prompt_format(Some(self.defaults.format.clone()))?),
                 "5" => {
+                    let webhook = prompt_with_default(
+                        "Discord webhook quickstart route",
+                        self.canonical_quickstart_webhook(),
+                    )?;
+                    self.scaffold_webhook_quickstart(webhook)?;
+                }
+                "6" => {
                     self.save(path)?;
                     println!("Saved {}", path.display());
                     break;
                 }
-                "6" => {
+                "7" => {
                     println!("Discarded changes.");
                     break;
                 }
-                "7" => self.print_template_hint(),
+                "8" => self.print_template_hint(),
                 _ => println!("Unknown selection."),
             }
             println!();
@@ -809,7 +857,9 @@ impl AppConfig {
     }
 
     fn print_template_hint(&self) {
-        println!("Edit the config file directly for routes and monitor definitions.");
+        println!(
+            "Advanced routes and monitors are still edited manually in the config file."
+        );
         println!(
             "Sections: [providers.discord], [dispatch], [daemon], [cron], [[cron.jobs]], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
         );
@@ -895,6 +945,18 @@ impl AppConfig {
             .filter(|route| route.has_any_webhook_target())
             .count()
     }
+}
+
+fn is_canonical_quickstart_route(route: &RouteRule) -> bool {
+    route.event == "*"
+        && route.filter.is_empty()
+        && route.effective_sink() == "discord"
+        && route.channel.is_none()
+        && route.slack_webhook.is_none()
+        && route.mention.is_none()
+        && route.template.is_none()
+        && !route.allow_dynamic_tokens
+        && route.format.is_none()
 }
 
 fn prompt(label: &str) -> Result<String> {
@@ -1130,9 +1192,11 @@ mod tests {
     }
 
     #[test]
-    fn setup_scaffold_adds_tmux_keyword_webhook_route() {
+    fn setup_scaffold_adds_canonical_quickstart_route() {
         let mut config = AppConfig::default();
-        config.scaffold_webhook_quickstart(" https://discord.com/api/webhooks/123/abc ".into());
+        config
+            .scaffold_webhook_quickstart(" https://discord.com/api/webhooks/123/abc ".into())
+            .unwrap();
 
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.routes[0].event, "*");
@@ -1142,6 +1206,148 @@ mod tests {
         );
         assert_eq!(config.routes[0].sink, "discord");
         assert_eq!(config.routes[0].channel, None);
+    }
+
+    #[test]
+    fn setup_scaffold_updates_existing_canonical_quickstart_route_only() {
+        let mut config = AppConfig {
+            providers: ProvidersConfig {
+                discord: DiscordConfig {
+                    bot_token: Some("token".into()),
+                    legacy_default_channel: None,
+                },
+                slack: SlackConfig::default(),
+            },
+            routes: vec![
+                RouteRule {
+                    event: "*".into(),
+                    webhook: Some("https://discord.com/api/webhooks/old/abc".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    channel: Some("alerts".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        config
+            .scaffold_webhook_quickstart("https://discord.com/api/webhooks/new/xyz".into())
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 2);
+        assert_eq!(
+            config.routes[0].webhook.as_deref(),
+            Some("https://discord.com/api/webhooks/new/xyz")
+        );
+        assert_eq!(config.routes[1].channel.as_deref(), Some("alerts"));
+    }
+
+    #[test]
+    fn setup_scaffold_rejects_ambiguous_canonical_quickstart_routes() {
+        let mut config = AppConfig {
+            providers: ProvidersConfig {
+                discord: DiscordConfig {
+                    bot_token: Some("token".into()),
+                    legacy_default_channel: None,
+                },
+                slack: SlackConfig::default(),
+            },
+            routes: vec![
+                RouteRule {
+                    event: "*".into(),
+                    webhook: Some("https://discord.com/api/webhooks/1/abc".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "*".into(),
+                    webhook: Some("https://discord.com/api/webhooks/2/abc".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        let error = config
+            .scaffold_webhook_quickstart("https://discord.com/api/webhooks/3/abc".into())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("multiple canonical quickstart routes"));
+        assert_eq!(
+            config.routes[0].webhook.as_deref(),
+            Some("https://discord.com/api/webhooks/1/abc")
+        );
+        assert_eq!(
+            config.routes[1].webhook.as_deref(),
+            Some("https://discord.com/api/webhooks/2/abc")
+        );
+    }
+
+    #[test]
+    fn setup_setters_update_only_owned_nodes() {
+        let mut config = AppConfig {
+            providers: ProvidersConfig {
+                discord: DiscordConfig {
+                    bot_token: Some("old-token".into()),
+                    legacy_default_channel: None,
+                },
+                slack: SlackConfig::default(),
+            },
+            daemon: DaemonConfig {
+                base_url: "http://127.0.0.1:25294".into(),
+                ..DaemonConfig::default()
+            },
+            defaults: DefaultsConfig {
+                channel: Some("old-channel".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                channel: Some("ops".into()),
+                ..RouteRule::default()
+            }],
+            monitors: MonitorConfig {
+                github_token: Some("gh-token".into()),
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        config.set_discord_bot_token("new-token".into());
+        config.set_default_channel("new-channel".into());
+        config.set_default_format(MessageFormat::Alert);
+        config.set_daemon_base_url("http://127.0.0.1:4000".into());
+
+        assert_eq!(
+            config.providers.discord.bot_token.as_deref(),
+            Some("new-token")
+        );
+        assert_eq!(config.defaults.channel.as_deref(), Some("new-channel"));
+        assert_eq!(config.defaults.format, MessageFormat::Alert);
+        assert_eq!(config.daemon.base_url, "http://127.0.0.1:4000");
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].channel.as_deref(), Some("ops"));
+        assert_eq!(config.monitors.github_token.as_deref(), Some("gh-token"));
+    }
+
+    #[test]
+    fn config_editor_menu_matches_bounded_eight_item_surface() {
+        assert_eq!(
+            CONFIG_EDITOR_MENU,
+            [
+                "1) Set Discord bot token",
+                "2) Set daemon base URL",
+                "3) Set default channel",
+                "4) Set default format",
+                "5) Set Discord webhook quickstart route",
+                "6) Save and exit",
+                "7) Exit without saving",
+                "8) Print manual config template hint",
+            ]
+        );
     }
 
     #[test]
