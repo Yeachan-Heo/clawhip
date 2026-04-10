@@ -370,6 +370,17 @@ pub struct CronJob {
     pub channel: Option<String>,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
+    /// Optional path to a JSON state file that gates this job's emissions.
+    ///
+    /// When set, the cron scheduler reads the file before emitting. If the
+    /// file parses as `{"open_issues": 0, "open_prs": 0, ...}` (zero backlog)
+    /// **and** the canonical JSON fingerprint matches the one from the last
+    /// emission for this job, the scheduler suppresses the emission. Any
+    /// delta in the file (including fields beyond the backlog counters) or a
+    /// non-zero backlog causes the job to fire again immediately. Missing or
+    /// malformed state files fail open so existing jobs keep working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_file: Option<PathBuf>,
     #[serde(flatten)]
     pub kind: CronJobKind,
 }
@@ -1642,6 +1653,7 @@ message = " ping "
                         channel: Some("ops".into()),
                         mention: None,
                         format: None,
+                        state_file: None,
                         kind: CronJobKind::CustomMessage {
                             message: "first".into(),
                         },
@@ -1654,6 +1666,7 @@ message = " ping "
                         channel: Some("ops".into()),
                         mention: None,
                         format: None,
+                        state_file: None,
                         kind: CronJobKind::CustomMessage {
                             message: "second".into(),
                         },
