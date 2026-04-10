@@ -132,7 +132,22 @@ fn routing_metadata_for_cwd(cwd: Option<&str>) -> RoutingMetadata {
         .unwrap_or_else(|_| workdir.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    let repo_path = git_output(workdir, &["rev-parse", "--show-toplevel"]);
+    // Use --git-common-dir to derive the main repo root even when CWD is a
+    // worktree.  --show-toplevel would return the worktree root, making
+    // repo_path identical to worktree_path (issue #182).
+    let repo_path = git_output(
+        workdir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .as_deref()
+    .and_then(|common_dir| Path::new(common_dir).parent())
+    .and_then(|root| {
+        root.canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .to_str()
+            .map(ToString::to_string)
+    })
+    .or_else(|| git_output(workdir, &["rev-parse", "--show-toplevel"]));
     let project = detect_project(workdir).or_else(|| {
         repo_path
             .as_deref()
@@ -812,6 +827,68 @@ mod tests {
                 Duration::from_millis(2),
                 Duration::from_millis(4)
             ]
+        );
+    }
+
+    #[test]
+    fn routing_metadata_repo_path_returns_main_repo_for_worktree() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = StdCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&repo, &["init"]);
+        std::fs::write(repo.join("README.md"), "init\n").expect("write");
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        git(&repo, &["branch", "issue-182"]);
+
+        let wt = temp.path().join("wt-issue-182");
+        git(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "issue-182"],
+        );
+
+        let metadata = routing_metadata_for_cwd(Some(&wt.to_string_lossy()));
+        let expected_repo = repo
+            .canonicalize()
+            .expect("canonical")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(
+            metadata.repo_path.as_deref(),
+            Some(expected_repo.as_str()),
+            "repo_path should be main repo root, not worktree"
+        );
+        assert_eq!(metadata.branch.as_deref(), Some("issue-182"));
+        assert!(
+            metadata.worktree_path.as_deref() != metadata.repo_path.as_deref(),
+            "worktree_path and repo_path must differ for a worktree checkout"
         );
     }
 }

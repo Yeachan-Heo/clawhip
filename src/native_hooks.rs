@@ -644,6 +644,33 @@ fn project_metadata_string(project_metadata: &Option<Value>, keys: &[&str]) -> O
 }
 
 fn infer_repo_root(directory: &str) -> Option<PathBuf> {
+    // Use --git-common-dir to derive the main repo root even when inside a
+    // worktree.  --show-toplevel returns the worktree root which is wrong for
+    // the repo_path field (issue #182).
+    if let Some(common_dir) = Command::new("git")
+        .args([
+            "-C",
+            directory,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        && let Some(repo_root) = Path::new(&common_dir).parent()
+    {
+        return Some(
+            repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf()),
+        );
+    }
+
+    // Fallback: --show-toplevel (correct for non-worktree checkouts).
     let output = Command::new("git")
         .args(["-C", directory, "rev-parse", "--show-toplevel"])
         .output()
@@ -936,5 +963,57 @@ mod tests {
         assert!(script.contains("tmux_session"));
         assert!(script.contains("tmux_client_count"));
         assert!(script.contains("tmux_attached"));
+    }
+
+    #[test]
+    fn infer_repo_root_returns_main_repo_for_worktree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        git(&repo, &["init"]);
+        std::fs::write(repo.join("README.md"), "init\n").expect("write");
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        git(&repo, &["branch", "issue-182"]);
+
+        let wt = temp.path().join("wt-issue-182");
+        git(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "issue-182"],
+        );
+
+        let result = super::infer_repo_root(&wt.to_string_lossy());
+        let expected = repo.canonicalize().expect("canonical");
+        assert_eq!(
+            result,
+            Some(expected),
+            "infer_repo_root should return the main repo, not the worktree"
+        );
     }
 }
