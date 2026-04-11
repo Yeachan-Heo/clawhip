@@ -140,10 +140,9 @@ async fn wait_for_daemon(client: &Client, port: u16) {
             .get(format!("http://127.0.0.1:{port}/health"))
             .send()
             .await
+            && response.status().is_success()
         {
-            if response.status().is_success() {
-                return;
-            }
+            return;
         }
         sleep(Duration::from_millis(100)).await;
     }
