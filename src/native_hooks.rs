@@ -1,9 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[cfg(test)]
-use std::fs;
-
 use serde_json::{Map, Value, json};
 
 use crate::Result;
@@ -32,13 +29,6 @@ const NORMALIZATION_OUTCOME_FIELD: &str = "normalization_outcome";
 pub const NATIVE_NORMALIZATION_OUTCOME_FIELD: &str = "normalization_outcome";
 pub const NATIVE_NON_GIT_OUTCOME: &str = "non_git";
 pub const NATIVE_GIT_OUTCOME: &str = "git";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RoutingContext {
-    repo_path: String,
-    worktree_path: String,
-    repo_name: String,
-}
 
 pub fn incoming_event_from_native_hook_json(
     payload: &Value,
@@ -194,14 +184,9 @@ pub fn incoming_event_from_native_hook_json(
     normalized.insert("event_payload".into(), event_payload);
     normalized.insert("payload".into(), payload.clone());
     normalized.insert(
-        NATIVE_NORMALIZATION_OUTCOME_FIELD.into(),
-        json!(if routing_context.is_some() {
-            NATIVE_GIT_OUTCOME
-        } else {
-            NATIVE_NON_GIT_OUTCOME
-        }),
+        "routeable".into(),
+        json!(normalization_outcome == NATIVE_GIT_OUTCOME),
     );
-    normalized.insert("routeable".into(), json!(routing_context.is_some()));
 
     if let Some(directory) = directory {
         normalized.insert("directory".into(), json!(directory));

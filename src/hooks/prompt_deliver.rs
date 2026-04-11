@@ -238,7 +238,7 @@ fn detect_hook_setup(cwd: &Path) -> Result<HookSetup> {
     })?;
 
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-        && let Some(mut setup) = hook_setup_at(&home, HookDetectionScope::Global)
+        && let Some(setup) = hook_setup_at(&home, HookDetectionScope::Global)
     {
         return Ok(HookSetup {
             workdir: repo_root.clone(),
@@ -874,7 +874,6 @@ mod tests {
     #[serial]
     fn detect_hook_setup_uses_global_hooks_for_repo_workdir() {
         let tempdir = tempdir().expect("tempdir");
-        let fake_home = tempdir.path().join("home");
         let repo = tempdir.path().join("repo");
         let home = tempdir.path().join("home");
         let nested = repo.join("src/bin");
@@ -1046,7 +1045,6 @@ mod tests {
     #[serial]
     async fn deliver_fails_when_prompt_submit_records_but_pane_shows_no_progress() {
         let tempdir = tempdir().expect("tempdir");
-        let fake_home = tempdir.path().join("home");
         let workdir = tempdir.path().join("repo");
         git_init_repo(&workdir);
         let fake_home = tempdir.path().join("home");
@@ -1129,7 +1127,6 @@ mod tests {
     #[serial]
     async fn deliver_retries_enter_until_prompt_submit_marker_changes() {
         let tempdir = tempdir().expect("tempdir");
-        let fake_home = tempdir.path().join("home");
         let workdir = tempdir.path().join("repo");
         git_init_repo(&workdir);
         let fake_home = tempdir.path().join("home");

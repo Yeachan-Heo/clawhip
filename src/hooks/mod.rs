@@ -42,7 +42,7 @@ fn run_install(args: &HooksInstallArgs) -> Result<InstallReport> {
     let root = resolve_install_root(args)?;
     let providers = selected_providers(args);
     let mut generated_files = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
 
     let hook_script_path = root.join(HOOK_SCRIPT);
     write_generated_file(&hook_script_path, generated_hook_script(), args.force)?;
@@ -275,6 +275,8 @@ mod tests {
     fn install_project_scope_writes_global_provider_files_without_project_state() {
         let dir = tempdir().expect("tempdir");
         let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
         let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &home);

@@ -237,9 +237,9 @@ async fn post_native_hook(
 fn native_hook_should_drop(event: &IncomingEvent) -> bool {
     event
         .payload
-        .get("normalization_outcome")
+        .get(NATIVE_NORMALIZATION_OUTCOME_FIELD)
         .and_then(Value::as_str)
-        == Some("non_git")
+        == Some(NATIVE_NON_GIT_OUTCOME)
 }
 
 async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response::Response {
