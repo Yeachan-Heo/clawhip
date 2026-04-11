@@ -386,6 +386,10 @@ function inferRepoRoot(cwd) {
   return runGit(['rev-parse', '--show-toplevel'], cwd);
 }
 
+function inferWorktreeRoot(cwd) {
+  return runGit(['rev-parse', '--show-toplevel'], cwd);
+}
+
 function parseIntegerish(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return Math.trunc(value);
@@ -600,6 +604,7 @@ async function main() {
   const raw = await readStdin();
   const input = parseJson(raw, {});
   const directory = resolve(input.cwd || cwd);
+  const worktreeRoot = inferWorktreeRoot(directory);
   const repoRoot = inferRepoRoot(directory);
   const inGitRepo = Boolean(repoRoot);
   const tmuxMetadata = collectTmuxMetadata(input, cwd);
