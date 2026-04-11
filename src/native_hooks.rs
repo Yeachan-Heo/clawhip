@@ -372,6 +372,14 @@ function loadProjectMetadata(root) {
   return parseJson(readFileSync(path, 'utf8'), null);
 }
 
+function inferRepoRoot(cwd) {
+  const commonDir = runGit(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd);
+  if (commonDir) {
+    return dirname(commonDir);
+  }
+  return runGit(['rev-parse', '--show-toplevel'], cwd) || cwd;
+}
+
 function parseIntegerish(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return Math.trunc(value);
@@ -581,8 +589,8 @@ async function main() {
   const cwd = process.cwd();
   const raw = await readStdin();
   const input = parseJson(raw, {});
-  const repoRoot = runGit(['rev-parse', '--show-toplevel'], cwd) || cwd;
-  const projectMetadata = loadProjectMetadata(repoRoot);
+  const repoRoot = inferRepoRoot(cwd);
+  const projectMetadata = loadProjectMetadata(repoRoot) || loadProjectMetadata(input.cwd || cwd);
   const tmuxMetadata = collectTmuxMetadata(input, cwd);
   const eventName =
     input.hook_event_name || input.hookEventName || input.event_name || input.event || 'unknown';
@@ -1184,6 +1192,17 @@ mod tests {
         let script = generated_hook_script();
         assert!(script.contains("maybeWritePromptSubmitState"));
         assert!(script.contains(".clawhip', 'state', 'prompt-submit.json"));
+    }
+
+    #[test]
+    fn generated_hook_script_mentions_worktree_repo_root_fallback() {
+        let script = generated_hook_script();
+        assert!(script.contains("function inferRepoRoot(cwd)"));
+        assert!(script.contains("--git-common-dir"));
+        assert!(
+            script
+                .contains("loadProjectMetadata(repoRoot) || loadProjectMetadata(input.cwd || cwd)")
+        );
     }
 
     #[test]
