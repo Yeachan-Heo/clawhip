@@ -1199,7 +1199,10 @@ mod tests {
         let script = generated_hook_script();
         assert!(script.contains("function inferRepoRoot(cwd)"));
         assert!(script.contains("--git-common-dir"));
-        assert!(script.contains("loadProjectMetadata(repoRoot) || loadProjectMetadata(input.cwd || cwd)"));
+        assert!(
+            script
+                .contains("loadProjectMetadata(repoRoot) || loadProjectMetadata(input.cwd || cwd)")
+        );
     }
 
     #[test]
