@@ -289,8 +289,16 @@ mod tests {
         .expect("install");
 
         assert!(report.generated_files.contains(&home.join(HOOK_SCRIPT)));
-        assert!(report.generated_files.contains(&home.join(CODEX_HOOKS_FILE)));
-        assert!(report.generated_files.contains(&home.join(CLAUDE_SETTINGS_FILE)));
+        assert!(
+            report
+                .generated_files
+                .contains(&home.join(CODEX_HOOKS_FILE))
+        );
+        assert!(
+            report
+                .generated_files
+                .contains(&home.join(CLAUDE_SETTINGS_FILE))
+        );
         assert!(!dir.path().join(".clawhip/project.json").exists());
 
         if let Some(previous) = previous_home {

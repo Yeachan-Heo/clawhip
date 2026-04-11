@@ -87,7 +87,11 @@ pub fn incoming_event_from_native_hook_json(
                 .and_then(infer_repo_root)
                 .map(|path| path.to_string_lossy().into_owned())
         });
-    let normalization_outcome = if repo_path.is_some() { "git" } else { "non_git" };
+    let normalization_outcome = if repo_path.is_some() {
+        "git"
+    } else {
+        "non_git"
+    };
 
     let repo_name = first_string(
         payload,
@@ -972,6 +976,7 @@ fn copy_u64_field(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]

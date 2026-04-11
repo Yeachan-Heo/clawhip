@@ -136,7 +136,11 @@ fn spawn_daemon(config_path: &Path, home: &Path, port: u16) -> Child {
 async fn wait_for_daemon(client: &Client, port: u16) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Ok(response) = client.get(format!("http://127.0.0.1:{port}/health")).send().await {
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+        {
             if response.status().is_success() {
                 return;
             }
@@ -249,7 +253,9 @@ filter = { worktree_path = "/repo/clawhip.worktrees/issue-152" }
 
     let provenance: Value =
         serde_json::from_slice(&output.stdout).expect("parse explain provenance");
-    let deliveries = provenance["deliveries"].as_array().expect("deliveries array");
+    let deliveries = provenance["deliveries"]
+        .as_array()
+        .expect("deliveries array");
     let channels: Vec<&str> = deliveries
         .iter()
         .map(|delivery| delivery["channel"].as_str().expect("channel"))
@@ -342,7 +348,14 @@ async fn daemon_drops_non_git_native_hook_events_before_routing() {
     fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&non_repo).expect("create non-repo");
     let port = free_port();
-    write_config(&config, port, "");
+    write_config(
+        &config,
+        port,
+        r#"[[routes]]
+event = "*"
+webhook = "https://example.invalid/hook"
+"#,
+    );
 
     let mut child = spawn_daemon(&config, &home, port);
     let client = Client::builder()
