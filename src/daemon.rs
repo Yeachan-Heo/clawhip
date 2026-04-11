@@ -218,25 +218,28 @@ async fn post_native_hook(
         }
     };
 
-    if event
-        .payload
-        .get(NATIVE_NORMALIZATION_OUTCOME_FIELD)
-        .and_then(Value::as_str)
-        == Some(NATIVE_NON_GIT_OUTCOME)
-    {
+    if native_hook_should_drop(&event) {
         return (
             StatusCode::ACCEPTED,
             Json(json!({
                 "ok": true,
-                "dropped": true,
-                "reason": NATIVE_NON_GIT_OUTCOME,
                 "type": event.kind,
+                "dropped": true,
+                "reason": "non_git",
             })),
         )
             .into_response();
     }
 
     accept_event(&state, event).await
+}
+
+fn native_hook_should_drop(event: &IncomingEvent) -> bool {
+    event
+        .payload
+        .get("normalization_outcome")
+        .and_then(Value::as_str)
+        == Some("non_git")
 }
 
 async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response::Response {

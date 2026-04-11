@@ -27,6 +27,7 @@ pub const SHARED_HOOK_EVENTS: [&str; 5] = [
     "UserPromptSubmit",
     "Stop",
 ];
+const NORMALIZATION_OUTCOME_FIELD: &str = "normalization_outcome";
 
 pub const NATIVE_NORMALIZATION_OUTCOME_FIELD: &str = "normalization_outcome";
 pub const NATIVE_NON_GIT_OUTCOME: &str = "non_git";
@@ -74,21 +75,35 @@ pub fn incoming_event_from_native_hook_json(
             "/worktree_path",
         ],
     );
-    let directory = directory.map(|value| canonicalize_or_normalize_path(&value));
-    let explicit_worktree_path =
-        first_string(payload, &["/worktree_path", "/context/worktree_path"]);
-    let explicit_repo_path = first_string(payload, &["/repo_path", "/context/repo_path"]);
-    let routing_context = resolve_routing_context(
-        directory.as_deref(),
-        explicit_worktree_path.as_deref(),
-        explicit_repo_path.as_deref(),
-    );
-    let project_metadata = payload.get("project_metadata").cloned();
+    let directory = directory.and_then(|value| canonicalize_path(&value).or(Some(value)));
+    let worktree_path = first_string(payload, &["/worktree_path", "/context/worktree_path"])
+        .or_else(|| directory.clone())
+        .and_then(|value| canonicalize_path(&value).or(Some(value)));
+    let repo_path = first_string(payload, &["/repo_path", "/context/repo_path"])
+        .and_then(|value| canonicalize_path(&value).or(Some(value)))
+        .or_else(|| {
+            worktree_path
+                .as_deref()
+                .and_then(infer_repo_root)
+                .map(|path| path.to_string_lossy().into_owned())
+        });
+    let normalization_outcome = if repo_path.is_some() { "git" } else { "non_git" };
 
-    let repo_name = first_string(payload, &["/repo_name", "/context/repo_name"]).or_else(|| {
-        routing_context
-            .as_ref()
-            .map(|context| context.repo_name.clone())
+    let repo_name = first_string(
+        payload,
+        &[
+            "/repo_name",
+            "/context/repo_name",
+            "/project",
+            "/project_name",
+            "/projectName",
+        ],
+    )
+    .or_else(|| {
+        repo_path
+            .as_deref()
+            .or(worktree_path.as_deref())
+            .and_then(path_basename)
     });
     let project_name = first_string(
         payload,
@@ -101,7 +116,7 @@ pub fn incoming_event_from_native_hook_json(
             "/context/projectName",
         ],
     )
-    .or_else(|| project_metadata_string(&project_metadata, &["name", "project_name"]));
+    .filter(|_| normalization_outcome == "git");
     let project_id = first_string(
         payload,
         &[
@@ -111,7 +126,7 @@ pub fn incoming_event_from_native_hook_json(
             "/context/projectId",
         ],
     )
-    .or_else(|| project_metadata_string(&project_metadata, &["id", "project_id"]));
+    .filter(|_| normalization_outcome == "git");
 
     let source = first_string(
         payload,
@@ -168,6 +183,10 @@ pub fn incoming_event_from_native_hook_json(
         "normalized_event".into(),
         json!(normalized_event_label(canonical_kind)),
     );
+    normalized.insert(
+        NORMALIZATION_OUTCOME_FIELD.into(),
+        json!(normalization_outcome),
+    );
     normalized.insert("event_payload".into(), event_payload);
     normalized.insert("payload".into(), payload.clone());
     normalized.insert(
@@ -183,11 +202,13 @@ pub fn incoming_event_from_native_hook_json(
     if let Some(directory) = directory {
         normalized.insert("directory".into(), json!(directory));
     }
-    if let Some(routing_context) = routing_context.as_ref() {
-        normalized.insert("worktree_path".into(), json!(routing_context.worktree_path));
-        normalized.insert("repo_path".into(), json!(routing_context.repo_path));
+    if let Some(worktree_path) = worktree_path.filter(|_| normalization_outcome == "git") {
+        normalized.insert("worktree_path".into(), json!(worktree_path));
     }
-    if let Some(repo_name) = repo_name {
+    if let Some(repo_path) = repo_path {
+        normalized.insert("repo_path".into(), json!(repo_path));
+    }
+    if let Some(repo_name) = repo_name.filter(|_| normalization_outcome == "git") {
         normalized.insert("repo_name".into(), json!(repo_name));
     }
     if let Some(project_name) = project_name {
@@ -196,9 +217,6 @@ pub fn incoming_event_from_native_hook_json(
     }
     if let Some(project_id) = project_id {
         normalized.insert("project_id".into(), json!(project_id));
-    }
-    if let Some(project_metadata) = project_metadata {
-        normalized.insert("project_metadata".into(), project_metadata);
     }
     if let Some(session_id) = session_id {
         normalized.insert("session_id".into(), json!(session_id));
@@ -379,10 +397,6 @@ function inferRepoRoot(cwd) {
   return runGit(['rev-parse', '--show-toplevel'], cwd);
 }
 
-function inferWorktreeRoot(cwd) {
-  return runGit(['rev-parse', '--show-toplevel'], cwd);
-}
-
 function parseIntegerish(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return Math.trunc(value);
@@ -542,7 +556,8 @@ function truncate(text, maxLen = 200) {
   return trimmed.length <= maxLen ? trimmed : trimmed.slice(0, maxLen) + '…';
 }
 
-function maybeWritePromptSubmitState(worktreeRoot, provider, eventName, input) {
+function maybeWritePromptSubmitState(repoRoot, provider, eventName, input) {
+  if (!repoRoot) return;
   const normalizedEvent = String(eventName || '').trim().toLowerCase();
   if (
     normalizedEvent !== 'userpromptsubmit' &&
@@ -569,7 +584,8 @@ function maybeWritePromptSubmitState(worktreeRoot, provider, eventName, input) {
   } catch {}
 }
 
-function maybeEnrichStopEvent(worktreeRoot, payload, eventName) {
+function maybeEnrichStopEvent(repoRoot, payload, eventName) {
+  if (!repoRoot) return;
   const normalizedEvent = String(eventName || '').trim().toLowerCase();
   if (normalizedEvent !== 'stop' && normalizedEvent !== 'sessionstop' && normalizedEvent !== 'session-stopped') {
     return;
@@ -591,20 +607,22 @@ function maybeEnrichStopEvent(worktreeRoot, payload, eventName) {
 
 async function main() {
   const provider = arg('--provider') || process.env.CLAWHIP_PROVIDER || 'unknown';
-  const cwd = process.cwd();
+  const cwd = resolve(process.cwd());
   const raw = await readStdin();
   const input = parseJson(raw, {});
-  const worktreeRoot = inferWorktreeRoot(input.cwd || cwd);
-  const repoRoot = worktreeRoot ? inferRepoRoot(worktreeRoot) : '';
+  const directory = resolve(input.cwd || cwd);
+  const repoRoot = inferRepoRoot(directory);
+  const inGitRepo = Boolean(repoRoot);
   const tmuxMetadata = collectTmuxMetadata(input, cwd);
   const eventName =
     input.hook_event_name || input.hookEventName || input.event_name || input.event || 'unknown';
   const payload = {
     provider,
     source: provider,
-    directory: input.cwd || cwd,
+    directory,
     event_name: eventName,
     hook_event_name: eventName,
+    normalization_outcome: inGitRepo ? 'git' : 'non_git',
     session_id: input.session_id || input.sessionId,
     turn_id: input.turn_id || input.turnId,
     transcript_path: input.transcript_path || input.transcriptPath,
@@ -632,8 +650,13 @@ async function main() {
   if (tmuxMetadata) {
     Object.assign(payload, tmuxMetadata);
   }
+  if (inGitRepo) {
+    payload.repo_path = repoRoot;
+    payload.worktree_path = directory;
+    payload.repo_name = basename(repoRoot);
+  }
 
-  const augmentation = await collectAugmentation(worktreeRoot || input.cwd || cwd, payload);
+  const augmentation = inGitRepo ? await collectAugmentation(repoRoot, payload) : null;
   if (augmentation) {
     payload.augmentation = augmentation;
   }
@@ -710,88 +733,6 @@ fn normalized_event_label(kind: &str) -> &str {
     }
 }
 
-fn project_metadata_string(project_metadata: &Option<Value>, keys: &[&str]) -> Option<String> {
-    let metadata = project_metadata.as_ref()?.as_object()?;
-    keys.iter().find_map(|key| {
-        metadata
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-    })
-}
-
-fn resolve_routing_context(
-    directory: Option<&str>,
-    explicit_worktree_path: Option<&str>,
-    explicit_repo_path: Option<&str>,
-) -> Option<RoutingContext> {
-    let worktree_candidate = explicit_worktree_path
-        .or(directory)
-        .map(canonicalize_or_normalize_path)
-        .filter(|path| !path.is_empty())?;
-    let repo_candidate = explicit_repo_path
-        .map(canonicalize_or_normalize_path)
-        .filter(|path| !path.is_empty());
-
-    if Path::new(&worktree_candidate).exists() {
-        let worktree_root = infer_worktree_root(&worktree_candidate)?;
-        let repo_root = repo_candidate
-            .or_else(|| infer_repo_root(&worktree_root).map(pathbuf_to_string))
-            .unwrap_or_else(|| worktree_root.clone());
-        return Some(RoutingContext {
-            repo_name: path_basename(&repo_root)
-                .or_else(|| path_basename(&worktree_root))
-                .unwrap_or_else(|| "unknown".to_string()),
-            repo_path: repo_root,
-            worktree_path: worktree_root,
-        });
-    }
-
-    let repo_path = repo_candidate.unwrap_or_else(|| worktree_candidate.clone());
-    Some(RoutingContext {
-        repo_name: path_basename(&repo_path)
-            .or_else(|| path_basename(&worktree_candidate))
-            .unwrap_or_else(|| "unknown".to_string()),
-        repo_path,
-        worktree_path: worktree_candidate,
-    })
-}
-
-fn canonicalize_or_normalize_path(path: &str) -> String {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let path = Path::new(trimmed);
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn pathbuf_to_string(path: PathBuf) -> String {
-    path.to_string_lossy().into_owned()
-}
-
-fn infer_worktree_root(directory: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["-C", directory, "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    let trimmed = root.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(canonicalize_or_normalize_path(trimmed))
-    }
-}
-
 fn infer_repo_root(directory: &str) -> Option<PathBuf> {
     // Use --git-common-dir to derive the main repo root even when inside a
     // worktree.  --show-toplevel returns the worktree root which is wrong for
@@ -835,6 +776,17 @@ fn infer_repo_root(directory: &str) -> Option<PathBuf> {
         let path = PathBuf::from(trimmed);
         Some(path.canonicalize().unwrap_or(path))
     }
+}
+
+fn canonicalize_path(path: &str) -> Option<String> {
+    let candidate = Path::new(path);
+    if !candidate.exists() {
+        return None;
+    }
+    candidate
+        .canonicalize()
+        .ok()
+        .map(|value| value.to_string_lossy().into_owned())
 }
 
 fn path_basename(path: &str) -> Option<String> {
@@ -1057,16 +1009,26 @@ mod tests {
     }
 
     #[test]
-    fn repo_local_project_metadata_is_not_loaded_for_native_routing() {
+    fn ignores_project_metadata_from_project_json_for_routing_identity() {
         let dir = tempdir().expect("tempdir");
-        init_git_repo(dir.path());
-        fs::create_dir_all(dir.path().join(".clawhip")).unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".clawhip")).unwrap();
+        let output = Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git init");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         fs::write(
-            dir.path().join(CLAWHIP_PROJECT_FILE),
+            repo.join(CLAWHIP_PROJECT_FILE),
             serde_json::to_string_pretty(&json!({
                 "id": "clawhip-core",
-                "name": "clawhip",
-                "repo_name": "clawhip"
+                "name": "wrong-name",
+                "repo_name": "wrong-name"
             }))
             .unwrap(),
         )
@@ -1074,45 +1036,35 @@ mod tests {
 
         let event = incoming_event_from_native_hook_json(&json!({
             "provider": "codex",
-            "directory": dir.path(),
+            "directory": repo,
             "event_name": "SessionStart",
             "event_payload": {}
         }))
         .expect("event");
 
-        assert_eq!(
-            event.payload["repo_name"],
-            json!(
-                dir.path()
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            )
-        );
-        assert!(event.payload.get("project_id").is_none());
-        assert!(event.payload.get("project_name").is_none());
+        assert_eq!(event.payload["repo_name"], json!("repo"));
+        assert_eq!(event.payload["normalization_outcome"], json!("git"));
         assert!(event.payload.get("project_metadata").is_none());
     }
 
     #[test]
-    fn non_git_directory_normalizes_to_explicit_drop_outcome() {
+    fn marks_non_git_native_payloads_and_omits_repo_fields() {
         let dir = tempdir().expect("tempdir");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+
         let event = incoming_event_from_native_hook_json(&json!({
             "provider": "codex",
-            "directory": dir.path(),
+            "directory": scratch,
             "event_name": "SessionStart",
             "event_payload": {}
         }))
         .expect("event");
 
-        assert_eq!(
-            event.payload[NATIVE_NORMALIZATION_OUTCOME_FIELD],
-            json!(NATIVE_NON_GIT_OUTCOME)
-        );
-        assert_eq!(event.payload["routeable"], json!(false));
+        assert_eq!(event.payload["normalization_outcome"], json!("non_git"));
         assert!(event.payload.get("repo_path").is_none());
         assert!(event.payload.get("worktree_path").is_none());
+        assert!(event.payload.get("repo_name").is_none());
     }
 
     #[test]
@@ -1283,8 +1235,8 @@ mod tests {
         assert!(script.contains("function inferRepoRoot(cwd)"));
         assert!(script.contains("function inferWorktreeRoot(cwd)"));
         assert!(script.contains("--git-common-dir"));
-        assert!(script.contains("payload.normalization_outcome = 'non_git'"));
-        assert!(script.contains("const worktreeRoot = inferWorktreeRoot(input.cwd || cwd);"));
+        assert!(script.contains("normalization_outcome"));
+        assert!(!script.contains("loadProjectMetadata"));
     }
 
     #[test]

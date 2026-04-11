@@ -467,11 +467,47 @@ fn matching_routes_for<'a>(
         }
     }
 
+    preferred.sort_by(|left, right| {
+        route_specificity_score(right, context).cmp(&route_specificity_score(left, context))
+    });
+    heuristic.sort_by(|left, right| {
+        route_specificity_score(right, context).cmp(&route_specificity_score(left, context))
+    });
+
     if !prefer_metadata {
         preferred.extend(heuristic);
     }
 
     preferred
+}
+
+fn route_specificity_score(
+    route: &RouteRule,
+    context: &std::collections::BTreeMap<String, String>,
+) -> usize {
+    let path_rank = if route.filter.contains_key("worktree_path")
+        && context
+            .get("worktree_path")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        3
+    } else if route.filter.contains_key("repo_path")
+        && context
+            .get("repo_path")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        2
+    } else if route.filter.contains_key("repo_name")
+        && context
+            .get("repo_name")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        1
+    } else {
+        0
+    };
+
+    (path_rank * 100) + route.filter.len()
 }
 
 fn prefers_metadata_first_routing(

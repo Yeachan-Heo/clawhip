@@ -339,6 +339,7 @@ async fn daemon_drops_non_git_native_hook_events_before_routing() {
     let home = temp.path().join("home");
     let config = temp.path().join("config.toml");
     let non_repo = temp.path().join("scratch");
+    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&non_repo).expect("create non-repo");
     let port = free_port();
     write_config(&config, port, "");
