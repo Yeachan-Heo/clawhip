@@ -631,15 +631,51 @@ async function main() {
   maybeWritePromptSubmitState(repoRoot, provider, eventName, input);
   maybeEnrichStopEvent(repoRoot, payload, eventName);
 
-  spawnSync('clawhip', ['native', 'hook', '--provider', provider], {
+  const result = spawnSync('clawhip', ['native', 'hook', '--provider', provider], {
     input: JSON.stringify(payload),
     encoding: 'utf8',
-    stdio: ['pipe', 'ignore', 'ignore'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
+
+  if (result.error) {
+    const detail =
+      typeof result.error?.message === 'string' && result.error.message.trim()
+        ? result.error.message.trim()
+        : String(result.error);
+    console.error(`[clawhip] failed to launch native hook bridge: ${detail}`);
+    process.exit(typeof result.status === 'number' ? result.status : 1);
+  }
+
+  if (typeof result.status === 'number' && result.status !== 0) {
+    const detail =
+      typeof result.stderr === 'string' && result.stderr.trim()
+        ? result.stderr.trim()
+        : typeof result.stdout === 'string' && result.stdout.trim()
+          ? result.stdout.trim()
+          : '';
+    console.error(
+      detail
+        ? `[clawhip] native hook bridge exited with status ${result.status}\n${detail}`
+        : `[clawhip] native hook bridge exited with status ${result.status}`
+    );
+    process.exit(result.status);
+  }
+
+  if (result.signal) {
+    console.error(`[clawhip] native hook bridge terminated by signal ${result.signal}`);
+    process.exit(1);
+  }
 }
 
-main().catch(() => {
-  process.exit(0);
+main().catch((error) => {
+  const detail =
+    typeof error?.stack === 'string' && error.stack.trim()
+      ? error.stack.trim()
+      : typeof error?.message === 'string' && error.message.trim()
+        ? error.message.trim()
+        : String(error);
+  console.error(`[clawhip] native hook wrapper failed: ${detail}`);
+  process.exit(1);
 });
 "#
 }
@@ -933,6 +969,19 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    fn node_executable() -> Option<String> {
+        let output = Command::new("sh")
+            .arg("-lc")
+            .arg("command -v node")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() { None } else { Some(path) }
+    }
+
     #[test]
     fn maps_all_shared_hook_events() {
         let cases = [
@@ -1032,6 +1081,139 @@ mod tests {
         let script = generated_hook_script();
         assert!(script.contains(".clawhip/hooks/augment"));
         assert!(script.contains("clawhip', ['native', 'hook'"));
+    }
+
+    #[test]
+    fn generated_hook_script_surfaces_bridge_failures() {
+        let script = generated_hook_script();
+        assert!(script.contains("stdio: ['pipe', 'pipe', 'pipe']"));
+        assert!(script.contains("failed to launch native hook bridge"));
+        assert!(script.contains("native hook bridge exited with status"));
+        assert!(script.contains("native hook bridge terminated by signal"));
+        assert!(script.contains("native hook wrapper failed"));
+        assert!(script.contains("process.exit(1);"));
+    }
+
+    #[test]
+    fn generated_hook_script_e2e_surfaces_bridge_stderr_and_exit_code() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        let Some(node) = node_executable() else {
+            eprintln!("skipping native hook e2e: node unavailable");
+            return;
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let hook_dir = repo.join(".clawhip/hooks");
+        std::fs::create_dir_all(&hook_dir).expect("create hook dir");
+
+        let hook_path = hook_dir.join("native-hook.mjs");
+        std::fs::write(&hook_path, generated_hook_script()).expect("write hook script");
+        let mut hook_perms = std::fs::metadata(&hook_path)
+            .expect("hook metadata")
+            .permissions();
+        hook_perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, hook_perms).expect("chmod hook");
+
+        let fake_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&fake_bin).expect("create fake bin");
+        let fake_clawhip = fake_bin.join("clawhip");
+        std::fs::write(
+            &fake_clawhip,
+            "#!/bin/sh\necho 'fake native hook bridge failure' >&2\nexit 7\n",
+        )
+        .expect("write fake clawhip");
+        let mut fake_perms = std::fs::metadata(&fake_clawhip)
+            .expect("fake metadata")
+            .permissions();
+        fake_perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_clawhip, fake_perms).expect("chmod fake clawhip");
+
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut child = Command::new(&node)
+            .arg(&hook_path)
+            .arg("--provider")
+            .arg("codex")
+            .current_dir(&repo)
+            .env("PATH", format!("{}:{path}", fake_bin.display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn node hook");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(br#"{"event_name":"SessionStart","cwd":"."}"#)
+            .expect("write payload");
+        let output = child.wait_with_output().expect("wait for hook");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(7), "stderr: {stderr}");
+        assert!(
+            stderr.contains("fake native hook bridge failure"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("native hook bridge exited with status 7"),
+            "stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn generated_hook_script_e2e_surfaces_bridge_launch_failures() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        let Some(node) = node_executable() else {
+            eprintln!("skipping native hook e2e: node unavailable");
+            return;
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let hook_dir = repo.join(".clawhip/hooks");
+        std::fs::create_dir_all(&hook_dir).expect("create hook dir");
+
+        let hook_path = hook_dir.join("native-hook.mjs");
+        std::fs::write(&hook_path, generated_hook_script()).expect("write hook script");
+        let mut hook_perms = std::fs::metadata(&hook_path)
+            .expect("hook metadata")
+            .permissions();
+        hook_perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, hook_perms).expect("chmod hook");
+
+        let mut child = Command::new(&node)
+            .arg(&hook_path)
+            .arg("--provider")
+            .arg("codex")
+            .current_dir(&repo)
+            .env("PATH", temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn node hook");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(br#"{"event_name":"SessionStart","cwd":"."}"#)
+            .expect("write payload");
+        let output = child.wait_with_output().expect("wait for hook");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+        assert!(
+            stderr.contains("failed to launch native hook bridge"),
+            "stderr: {stderr}"
+        );
+        assert!(stderr.contains("ENOENT"), "stderr: {stderr}");
     }
 
     #[test]

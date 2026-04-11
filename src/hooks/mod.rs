@@ -338,4 +338,48 @@ mod tests {
             assert!(document["hooks"][event].is_array(), "missing {event}");
         }
     }
+
+    #[test]
+    fn write_generated_file_preserves_existing_content_without_force() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("generated.mjs");
+        fs::write(&path, "old\n").expect("seed file");
+
+        write_generated_file(&path, "new\n", false).expect("write");
+
+        assert_eq!(fs::read_to_string(&path).expect("read"), "old\n");
+    }
+
+    #[test]
+    fn write_generated_file_overwrites_existing_content_with_force() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("generated.mjs");
+        fs::write(&path, "old\n").expect("seed file");
+
+        write_generated_file(&path, "new\n", true).expect("write");
+
+        assert_eq!(fs::read_to_string(&path).expect("read"), "new\n");
+    }
+
+    #[test]
+    fn install_project_scope_force_refreshes_existing_hook_script() {
+        let dir = tempdir().expect("tempdir");
+        let hook_path = dir.path().join(HOOK_SCRIPT);
+        fs::create_dir_all(hook_path.parent().expect("hook parent")).expect("mkdirs");
+        fs::write(&hook_path, "stale wrapper\n").expect("seed stale hook");
+
+        run_install(&HooksInstallArgs {
+            all: true,
+            provider: Vec::new(),
+            scope: HookInstallScope::Project,
+            root: Some(dir.path().to_path_buf()),
+            force: true,
+        })
+        .expect("install");
+
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read"),
+            generated_hook_script()
+        );
+    }
 }
