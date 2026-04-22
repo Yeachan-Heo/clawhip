@@ -71,6 +71,9 @@ pub fn incoming_event_from_native_hook_json(
             .and_then(infer_repo_root)
             .map(|path| path.to_string_lossy().into_owned())
     });
+    let normalization_outcome = repo_path
+        .is_none()
+        .then(|| NATIVE_NON_GIT_OUTCOME.to_string());
     let project_metadata = load_effective_project_metadata(
         payload,
         repo_path.as_deref(),
@@ -178,6 +181,12 @@ pub fn incoming_event_from_native_hook_json(
         "normalized_event".into(),
         json!(normalized_event_label(canonical_kind)),
     );
+    if let Some(normalization_outcome) = normalization_outcome {
+        normalized.insert(
+            NATIVE_NORMALIZATION_OUTCOME_FIELD.into(),
+            json!(normalization_outcome),
+        );
+    }
     normalized.insert("event_payload".into(), event_payload);
     normalized.insert("payload".into(), payload.clone());
 

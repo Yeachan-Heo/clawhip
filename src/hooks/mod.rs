@@ -75,11 +75,7 @@ fn ensure_supported_install_scope(args: &HooksInstallArgs) -> Result<()> {
 
 fn resolve_install_root(args: &HooksInstallArgs) -> Result<PathBuf> {
     match args.scope {
-        HookInstallScope::Project => Ok(args
-            .root
-            .clone()
-            .unwrap_or(std::env::current_dir()?)
-            .canonicalize()?),
+        HookInstallScope::Project => home_dir(),
         HookInstallScope::Global => home_dir(),
     }
 }
@@ -287,8 +283,10 @@ mod tests {
 
     #[test]
     #[serial]
-    fn install_project_scope_writes_codex_hook_file_and_global_bridge() {
+    fn install_project_scope_shims_codex_to_global_bridge_only() {
         let dir = tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo dir");
         let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", dir.path());
@@ -298,7 +296,7 @@ mod tests {
             all: false,
             provider: vec![HookProvider::Codex],
             scope: HookInstallScope::Project,
-            root: Some(dir.path().to_path_buf()),
+            root: Some(repo.clone()),
             force: false,
         })
         .expect("project-scoped codex install should succeed");
@@ -313,11 +311,8 @@ mod tests {
                 .generated_files
                 .contains(&dir.path().join(CODEX_HOOKS_FILE))
         );
-        assert!(
-            report
-                .generated_files
-                .contains(&dir.path().join(CODEX_HOOKS_FILE))
-        );
+        assert!(!repo.join(HOOK_SCRIPT).exists());
+        assert!(!repo.join(CODEX_HOOKS_FILE).exists());
 
         if let Some(previous) = previous_home {
             unsafe {
