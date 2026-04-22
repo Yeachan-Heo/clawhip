@@ -23,6 +23,16 @@ pub struct SinkMessage {
     pub format: MessageFormat,
     pub content: String,
     pub payload: Value,
+    pub telemetry: Option<SinkTelemetry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkTelemetry {
+    pub correlation_id: String,
+    pub route_result: Option<String>,
+    pub route_index: Option<usize>,
+    pub target: String,
+    pub batch_count: Option<usize>,
 }
 
 #[async_trait]

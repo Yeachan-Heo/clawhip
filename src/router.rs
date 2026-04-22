@@ -15,6 +15,41 @@ use crate::sink::Sink;
 #[cfg(test)]
 use crate::sink::SinkMessage;
 use crate::sink::SinkTarget;
+use crate::telemetry;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTrace {
+    pub result: RouteTraceResult,
+    pub matched_route_index: Option<usize>,
+    pub event_pattern: Option<String>,
+    pub filter_keys: Vec<String>,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTraceResult {
+    Matched,
+    Fallback,
+    None,
+}
+
+impl RouteTraceResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::Fallback => "fallback",
+            Self::None => "none",
+        }
+    }
+
+    pub fn reason_code(self) -> &'static str {
+        match self {
+            Self::Matched => telemetry::reason::ROUTE_MATCHED,
+            Self::Fallback => telemetry::reason::ROUTE_FALLBACK,
+            Self::None => telemetry::reason::ROUTE_NONE,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDelivery {
@@ -24,6 +59,7 @@ pub struct ResolvedDelivery {
     pub mention: Option<String>,
     pub template: Option<String>,
     pub allow_dynamic_tokens: bool,
+    pub trace: RouteTrace,
 }
 
 pub struct Router {
@@ -48,6 +84,7 @@ impl Router {
                 format: delivery.format.clone(),
                 content,
                 payload: event.payload.clone(),
+                telemetry: None,
             };
             if let Err(error) = sink.send(&delivery.target, &message).await {
                 eprintln!(
@@ -61,16 +98,22 @@ impl Router {
     }
 
     pub async fn resolve(&self, event: &IncomingEvent) -> Result<Vec<ResolvedDelivery>> {
-        let routes = self.routes_for(event);
-        let routes = if routes.is_empty() {
-            vec![None]
-        } else {
-            routes.into_iter().map(Some).collect()
-        };
-        let mut deliveries = Vec::with_capacity(routes.len());
+        let context = event.template_context();
+        let matched_routes =
+            matching_routes_for(&self.config.routes, event.canonical_kind(), &context);
+        let mut deliveries = Vec::with_capacity(matched_routes.len().max(1));
 
-        for route in routes {
-            deliveries.push(self.resolve_delivery(event, route)?);
+        if matched_routes.is_empty() {
+            deliveries.push(self.resolve_delivery(event, None, None)?);
+        } else {
+            for route in matched_routes {
+                let index = self
+                    .config
+                    .routes
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, route));
+                deliveries.push(self.resolve_delivery(event, Some(route), index)?);
+            }
         }
 
         Ok(deliveries)
@@ -90,6 +133,7 @@ impl Router {
         &self,
         event: &IncomingEvent,
         route: Option<&RouteRule>,
+        matched_route_index: Option<usize>,
     ) -> Result<ResolvedDelivery> {
         let sink = route
             .map(RouteRule::effective_sink)
@@ -101,6 +145,22 @@ impl Router {
             .clone()
             .or_else(|| route.and_then(|route| route.format.clone()))
             .unwrap_or_else(|| self.config.defaults.format.clone());
+
+        let trace = RouteTrace {
+            result: if route.is_some() {
+                RouteTraceResult::Matched
+            } else if self.config.defaults.channel.is_some() {
+                RouteTraceResult::Fallback
+            } else {
+                RouteTraceResult::None
+            },
+            matched_route_index,
+            event_pattern: route.map(|route| route.event.clone()),
+            filter_keys: route
+                .map(|route| route.filter.keys().cloned().collect())
+                .unwrap_or_default(),
+            target: telemetry::safe_target_id(&target),
+        };
 
         Ok(ResolvedDelivery {
             sink,
@@ -114,6 +174,7 @@ impl Router {
                 .clone()
                 .or_else(|| route.and_then(|route| route.template.clone())),
             allow_dynamic_tokens: self.allow_dynamic_tokens_for(event, route),
+            trace,
         })
     }
 
@@ -184,11 +245,6 @@ impl Router {
         false
     }
 
-    fn routes_for<'a>(&'a self, event: &IncomingEvent) -> Vec<&'a RouteRule> {
-        let context = event.template_context();
-        matching_routes_for(&self.config.routes, event.canonical_kind(), &context)
-    }
-
     /// Produce a full provenance trace explaining how an event would be routed.
     ///
     /// Unlike [`resolve`](Self::resolve) this evaluates *every* configured route
@@ -257,7 +313,7 @@ impl Router {
                 .collect();
 
         let deliveries = if ordered_matched_indices.is_empty() {
-            match self.resolve_delivery(event, None) {
+            match self.resolve_delivery(event, None, None) {
                 Ok(d) => vec![delivery_explanation(&d, None)],
                 Err(_) => vec![],
             }
@@ -266,7 +322,7 @@ impl Router {
                 .iter()
                 .filter_map(|&idx| {
                     let route = &self.config.routes[idx];
-                    self.resolve_delivery(event, Some(route))
+                    self.resolve_delivery(event, Some(route), Some(idx))
                         .ok()
                         .map(|d| delivery_explanation(&d, Some(idx)))
                 })
@@ -709,6 +765,9 @@ mod tests {
             SinkTarget::DiscordChannel("fallback".into())
         );
         assert_eq!(deliveries[0].format, MessageFormat::Alert);
+        assert_eq!(deliveries[0].trace.result, RouteTraceResult::Fallback);
+        assert_eq!(deliveries[0].trace.matched_route_index, None);
+        assert_eq!(deliveries[0].trace.target, "discord:channel:fallback");
         assert_eq!(
             router
                 .render_delivery(&event, &deliveries[0], &DefaultRenderer)
@@ -716,6 +775,47 @@ mod tests {
                 .unwrap(),
             "🚨 wake up"
         );
+    }
+
+    #[tokio::test]
+    async fn matched_route_carries_trace_metadata() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("fallback".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                filter: [("session".to_string(), "issue-*".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("ops".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-214".into(), "error".into(), "boom".into(), None);
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+
+        assert_eq!(delivery.trace.result, RouteTraceResult::Matched);
+        assert_eq!(delivery.trace.matched_route_index, Some(0));
+        assert_eq!(
+            delivery.trace.event_pattern.as_deref(),
+            Some("tmux.keyword")
+        );
+        assert_eq!(delivery.trace.filter_keys, vec!["session".to_string()]);
+        assert_eq!(delivery.trace.target, "discord:channel:ops");
     }
 
     #[tokio::test]

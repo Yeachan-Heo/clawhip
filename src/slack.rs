@@ -108,6 +108,7 @@ mod tests {
             format: MessageFormat::Compact,
             content: "tmux:ops matched 'error' => boom".into(),
             payload: serde_json::json!({}),
+            telemetry: None,
         });
 
         assert_eq!(
@@ -132,6 +133,7 @@ mod tests {
             format: MessageFormat::Alert,
             content: "🚨 deploy <failed> & paging".into(),
             payload: serde_json::json!({}),
+            telemetry: None,
         });
 
         let blocks = payload

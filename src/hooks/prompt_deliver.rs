@@ -134,6 +134,12 @@ pub async fn run(args: DeliverArgs) -> Result<()> {
 pub async fn deliver(config: &PromptDeliverConfig) -> Result<DeliveryResult> {
     let mut pane = resolve_target_pane(&config.session).await?;
     let hook_setup = detect_hook_setup(&pane.cwd)?;
+    if hook_setup.install_scope == HookDetectionScope::Global
+        && pane.cwd.exists()
+        && infer_worktree_root(&pane.cwd).is_none()
+    {
+        return Err(non_repo_delivery_error(&pane.cwd));
+    }
     let provider = ensure_provider_ready(&mut pane, &hook_setup, config).await?;
     let effective_workdir = effective_workdir(&hook_setup, &pane.cwd)?;
     let marker_path = effective_workdir.join(PROMPT_SUBMIT_MARKER);
@@ -245,11 +251,15 @@ fn detect_hook_setup(cwd: &Path) -> Result<HookSetup> {
         return Ok(setup);
     }
 
-    Err(format!(
+    Err(non_repo_delivery_error(cwd))
+}
+
+fn non_repo_delivery_error(cwd: &Path) -> crate::DynError {
+    format!(
         "refusing delivery: '{}' is not inside a repo/workdir with prompt-submit-aware hook setup, and no global ~/.codex / ~/.claude clawhip hook install was detected",
         cwd.display()
     )
-    .into())
+    .into()
 }
 
 fn hook_setup_at(root: &Path, install_scope: HookDetectionScope) -> Option<HookSetup> {
