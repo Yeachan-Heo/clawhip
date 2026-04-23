@@ -29,6 +29,7 @@ mod update;
 use std::sync::Arc;
 
 use clap::Parser;
+use tokio::runtime::Builder;
 
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GitCommands,
@@ -46,12 +47,29 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, DynError>;
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = real_main().await {
+fn main() {
+    let cli = Cli::parse();
+    let runtime = match build_runtime(&cli) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("clawhip error: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = runtime.block_on(real_main(cli)) {
         eprintln!("clawhip error: {error}");
         std::process::exit(1);
     }
+}
+
+fn build_runtime(cli: &Cli) -> Result<tokio::runtime::Runtime> {
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(worker_threads) = cli.runtime_worker_threads() {
+        builder.worker_threads(worker_threads);
+    }
+    Ok(builder.build()?)
 }
 
 fn prepare_event(event: IncomingEvent) -> Result<IncomingEvent> {
@@ -60,14 +78,16 @@ fn prepare_event(event: IncomingEvent) -> Result<IncomingEvent> {
     Ok(event)
 }
 
-async fn real_main() -> Result<()> {
-    let cli = Cli::parse();
+async fn real_main(cli: Cli) -> Result<()> {
     let config_path = cli.config_path();
     let config = Arc::new(AppConfig::load_or_default(&config_path)?);
     let cron_state_path = crate::cron::default_state_path(&config_path);
 
-    match cli.command.unwrap_or(Commands::Start { port: None }) {
-        Commands::Start { port } => daemon::run(config, port, cron_state_path).await,
+    match cli.command.unwrap_or(Commands::Start {
+        port: None,
+        worker_threads: None,
+    }) {
+        Commands::Start { port, .. } => daemon::run(config, port, cron_state_path).await,
         Commands::Status => {
             let client = DaemonClient::from_config(config.as_ref());
             let health = client.health().await?;
