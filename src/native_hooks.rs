@@ -1179,7 +1179,7 @@ mod tests {
         let fake_clawhip = fake_bin.join("clawhip");
         std::fs::write(
             &fake_clawhip,
-            "#!/bin/sh\necho 'fake native hook bridge failure' >&2\nexit 7\n",
+            "#!/bin/sh\ncat >/dev/null\necho 'fake native hook bridge failure' >&2\nexit 7\n",
         )
         .expect("write fake clawhip");
         let mut fake_perms = std::fs::metadata(&fake_clawhip)
