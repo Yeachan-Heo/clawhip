@@ -13,6 +13,7 @@ use crate::config::{AppConfig, GitRepoMonitor};
 use crate::events::IncomingEvent;
 use crate::source::Source;
 use crate::source::git::{GitSnapshot, repo_display_name, snapshot_git_repo};
+use crate::telemetry;
 
 pub struct GitHubSource {
     config: Arc<AppConfig>,
@@ -119,6 +120,12 @@ async fn run_github_poll_cycle(
     state: &mut HashMap<String, GitHubRepoState>,
 ) {
     if let Err(error) = poll_github(config, github_client, tx, state).await {
+        telemetry::emit(source_record(
+            telemetry::event_name::SOURCE_DEGRADED,
+            "source_poll_failed",
+            None,
+            Some(error.to_string()),
+        ));
         eprintln!("clawhip source github poll failed: {error}");
     }
 }
@@ -128,6 +135,12 @@ async fn snapshot_github_repo(repo: &GitRepoMonitor) -> Result<GitSnapshot> {
         Ok(snapshot) => Ok(snapshot),
         Err(error) => match repo.github_repo.clone() {
             Some(github_repo) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_INVENTORY,
+                    "source_snapshot_fallback",
+                    Some(&repo.path),
+                    Some(error.to_string()),
+                ));
                 eprintln!(
                     "clawhip source github snapshot failed for {}: {error}; using configured github_repo={github_repo}",
                     repo.path
@@ -161,6 +174,12 @@ async fn poll_github(
         let snapshot = match snapshot_github_repo(repo).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_DEGRADED,
+                    "source_snapshot_failed",
+                    Some(&repo.path),
+                    Some(error.to_string()),
+                ));
                 eprintln!(
                     "clawhip source github snapshot failed for {}: {error}",
                     repo.path
@@ -244,6 +263,12 @@ async fn poll_issues(
             Ok(issues)
         }
         Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                Some(&repo.path),
+                Some(error.to_string()),
+            ));
             eprintln!(
                 "clawhip source GitHub issue polling failed for {}: {error}",
                 repo.path
@@ -301,6 +326,12 @@ async fn poll_pull_requests(
             Ok(prs)
         }
         Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                Some(&repo.path),
+                Some(error.to_string()),
+            ));
             eprintln!(
                 "clawhip source GitHub polling failed for {}: {error}",
                 repo.path
@@ -351,6 +382,12 @@ async fn poll_ci_statuses(
             Ok(ci)
         }
         Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                Some(&repo.path),
+                Some(error.to_string()),
+            ));
             eprintln!(
                 "clawhip source GitHub CI polling failed for {}: {error}",
                 repo.path
@@ -358,6 +395,24 @@ async fn poll_ci_statuses(
             Ok(previous.map(|entry| entry.ci.clone()).unwrap_or_default())
         }
     }
+}
+
+fn source_record(
+    event_name: &str,
+    reason_code: &str,
+    repo_path: Option<&str>,
+    error: Option<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let correlation = format!("source:github:{}", repo_path.unwrap_or("inventory"));
+    let mut record = telemetry::record(event_name, reason_code, correlation);
+    record.insert("source".to_string(), serde_json::json!("github"));
+    if let Some(repo_path) = repo_path {
+        record.insert("repo_path".to_string(), serde_json::json!(repo_path));
+    }
+    if let Some(error) = error {
+        record.insert("error".to_string(), serde_json::json!(error));
+    }
+    record
 }
 
 async fn send_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -> Result<()> {

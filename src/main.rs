@@ -23,6 +23,7 @@ mod router;
 mod sink;
 mod slack;
 mod source;
+mod telemetry;
 mod tmux_wrapper;
 mod update;
 

@@ -11,6 +11,7 @@ use crate::Result;
 use crate::config::{AppConfig, GitRepoMonitor};
 use crate::events::IncomingEvent;
 use crate::source::Source;
+use crate::telemetry;
 
 pub struct GitSource {
     config: Arc<AppConfig>,
@@ -437,6 +438,18 @@ fn should_skip_failed_monitor(state: &mut GitMonitorState, now: Instant) -> bool
     };
     if now < failure.next_retry_at {
         failure.suppressed_polls += 1;
+        if failure.suppressed_polls == 1 || failure.suppressed_polls % 10 == 0 {
+            telemetry::emit(source_record(SourceTelemetryInput {
+                event_name: telemetry::event_name::SOURCE_INVENTORY,
+                reason_code: "source_suppressed",
+                source: "git",
+                path: None,
+                classification: Some(failure.classification.as_str()),
+                message: Some(&failure.message),
+                attempts: Some(failure.attempts),
+                suppressed_polls: Some(failure.suppressed_polls),
+            }));
+        }
         return true;
     }
     false
@@ -446,6 +459,16 @@ fn clear_monitor_failure(state: &mut GitMonitorState, path: &str, context: &str)
     let Some(previous) = state.failure.take() else {
         return;
     };
+    telemetry::emit(source_record(SourceTelemetryInput {
+        event_name: "source_recovered",
+        reason_code: "source_recovered",
+        source: "git",
+        path: Some(path),
+        classification: Some(previous.classification.as_str()),
+        message: None,
+        attempts: Some(previous.attempts),
+        suppressed_polls: Some(previous.suppressed_polls),
+    }));
     eprintln!(
         "clawhip source git {context} recovered for {path} after {} failure(s) and {} suppressed poll(s)",
         previous.attempts, previous.suppressed_polls
@@ -473,6 +496,16 @@ fn record_monitor_failure(
         _ => (1, 0),
     };
     let backoff = git_monitor_backoff(attempts, poll_interval);
+    telemetry::emit(source_record(SourceTelemetryInput {
+        event_name: telemetry::event_name::SOURCE_DEGRADED,
+        reason_code: "source_snapshot_failed",
+        source: "git",
+        path: Some(path),
+        classification: Some(classification.as_str()),
+        message: Some(&message),
+        attempts: Some(attempts),
+        suppressed_polls: Some(suppressed_polls),
+    }));
     eprintln!(
         "clawhip source git {context} degraded for {path}: class={}, attempts={}, suppressed={}, next_retry_secs={}, error={message}",
         classification.as_str(),
@@ -496,6 +529,49 @@ fn git_monitor_backoff(attempts: u32, poll_interval: Duration) -> Duration {
         .saturating_mul(multiplier.into())
         .min(300);
     Duration::from_secs(capped.max(1))
+}
+
+struct SourceTelemetryInput<'a> {
+    event_name: &'a str,
+    reason_code: &'a str,
+    source: &'a str,
+    path: Option<&'a str>,
+    classification: Option<&'a str>,
+    message: Option<&'a str>,
+    attempts: Option<u32>,
+    suppressed_polls: Option<u32>,
+}
+
+fn source_record(input: SourceTelemetryInput<'_>) -> serde_json::Map<String, serde_json::Value> {
+    let correlation = format!(
+        "source:{}:{}",
+        input.source,
+        input.path.unwrap_or("inventory")
+    );
+    let mut record = telemetry::record(input.event_name, input.reason_code, correlation);
+    record.insert("source".to_string(), serde_json::json!(input.source));
+    if let Some(path) = input.path {
+        record.insert("path".to_string(), serde_json::json!(path));
+    }
+    if let Some(classification) = input.classification {
+        record.insert(
+            "classification".to_string(),
+            serde_json::json!(classification),
+        );
+    }
+    if let Some(message) = input.message {
+        record.insert("error".to_string(), serde_json::json!(message));
+    }
+    if let Some(attempts) = input.attempts {
+        record.insert("attempts".to_string(), serde_json::json!(attempts));
+    }
+    if let Some(suppressed_polls) = input.suppressed_polls {
+        record.insert(
+            "suppressed_polls".to_string(),
+            serde_json::json!(suppressed_polls),
+        );
+    }
+    record
 }
 
 fn classify_git_monitor_failure(message: &str) -> GitMonitorFailureClass {

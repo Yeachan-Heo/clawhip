@@ -31,6 +31,7 @@ use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
     WorkspaceSource, list_active_tmux_registrations,
 };
+use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
@@ -69,6 +70,10 @@ pub async fn run(
     config.validate()?;
     let token_source = config.discord_token_source();
     println!("clawhip v{VERSION} starting (token_source: {token_source})");
+    telemetry::emit(daemon_record(
+        telemetry::reason::DAEMON_STARTUP,
+        json!({"version": VERSION, "token_source": token_source}),
+    ));
 
     let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
     sinks.insert(
@@ -140,10 +145,15 @@ pub async fn run(
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
     println!(
         "clawhip daemon v{VERSION} listening on http://{} (token_source: {token_source})",
-        listener.local_addr()?
+        local_addr
     );
+    telemetry::emit(daemon_record(
+        telemetry::reason::DAEMON_LISTENING,
+        json!({"version": VERSION, "addr": local_addr.to_string(), "token_source": token_source}),
+    ));
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -155,7 +165,17 @@ where
     let source_name = source.name().to_string();
     tokio::spawn(async move {
         println!("clawhip source '{}' starting", source_name);
+        telemetry::emit(source_lifecycle_record(
+            telemetry::reason::SOURCE_START,
+            &source_name,
+            None,
+        ));
         if let Err(error) = source.run(tx.clone()).await {
+            telemetry::emit(source_lifecycle_record(
+                telemetry::reason::SOURCE_STOPPED,
+                &source_name,
+                Some(error.to_string()),
+            ));
             eprintln!("clawhip source '{}' stopped: {error}", source_name);
             if let Err(alert_error) = tx
                 .send(source_failure_alert_event(&source_name, &error.to_string()))
@@ -184,6 +204,50 @@ fn source_failure_alert_event(source_name: &str, error_message: &str) -> Incomin
     }
 
     event
+}
+
+fn daemon_record(reason_code: &str, details: Value) -> serde_json::Map<String, Value> {
+    let mut record = telemetry::record(
+        telemetry::event_name::DAEMON_PHASE,
+        reason_code,
+        format!("daemon:{reason_code}"),
+    );
+    record.insert("details".to_string(), details);
+    record
+}
+
+fn source_lifecycle_record(
+    reason_code: &str,
+    source_name: &str,
+    error: Option<String>,
+) -> serde_json::Map<String, Value> {
+    let event_name = if reason_code == telemetry::reason::SOURCE_STOPPED {
+        telemetry::event_name::SOURCE_DEGRADED
+    } else {
+        telemetry::event_name::SOURCE_INVENTORY
+    };
+    let mut record = telemetry::record(event_name, reason_code, format!("source:{source_name}"));
+    record.insert("source".to_string(), json!(source_name));
+    if let Some(error) = error {
+        record.insert("error".to_string(), json!(error));
+    }
+    record
+}
+
+fn event_record(
+    event_name: &str,
+    reason_code: &str,
+    event: &IncomingEvent,
+    details: Value,
+) -> serde_json::Map<String, Value> {
+    let mut record = telemetry::record(
+        event_name,
+        reason_code,
+        telemetry::correlation_id_for_event(event),
+    );
+    record.insert("event_kind".to_string(), json!(event.canonical_kind()));
+    record.insert("details".to_string(), details);
+    record
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -235,6 +299,7 @@ async fn post_native_hook(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    let raw_non_git = native_payload_is_non_git(&payload);
     let event = match incoming_event_from_native_hook_json(&payload) {
         Ok(event) => normalize_event(event),
         Err(error) => {
@@ -246,7 +311,13 @@ async fn post_native_hook(
         }
     };
 
-    if native_hook_should_drop(&event) {
+    if raw_non_git || native_hook_should_drop(&event) {
+        telemetry::emit(event_record(
+            telemetry::event_name::EVENT_DROPPED,
+            telemetry::reason::DROP_NON_GIT_NATIVE_HOOK,
+            &event,
+            json!({"dropped": true, "source": "native_hook"}),
+        ));
         return (
             StatusCode::ACCEPTED,
             Json(json!({
@@ -266,10 +337,37 @@ async fn post_native_hook(
     accept_event(&state, event).await
 }
 
+fn native_payload_is_non_git(payload: &Value) -> bool {
+    payload
+        .get(NATIVE_NORMALIZATION_OUTCOME_FIELD)
+        .and_then(Value::as_str)
+        == Some(NATIVE_NON_GIT_OUTCOME)
+        || payload
+            .get("event_payload")
+            .and_then(|payload| payload.get(NATIVE_NORMALIZATION_OUTCOME_FIELD))
+            .and_then(Value::as_str)
+            == Some(NATIVE_NON_GIT_OUTCOME)
+        || payload
+            .get("payload")
+            .and_then(|payload| payload.get(NATIVE_NORMALIZATION_OUTCOME_FIELD))
+            .and_then(Value::as_str)
+            == Some(NATIVE_NON_GIT_OUTCOME)
+}
+
 fn native_hook_should_drop(event: &IncomingEvent) -> bool {
-    event
+    if event
         .payload
         .get(NATIVE_NORMALIZATION_OUTCOME_FIELD)
+        .and_then(Value::as_str)
+        == Some(NATIVE_NON_GIT_OUTCOME)
+    {
+        return true;
+    }
+
+    event
+        .payload
+        .get("payload")
+        .and_then(|payload| payload.get(NATIVE_NORMALIZATION_OUTCOME_FIELD))
         .and_then(Value::as_str)
         == Some(NATIVE_NON_GIT_OUTCOME)
 }
@@ -388,15 +486,23 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
     };
 
     match enqueue_event(&state.tx, event.clone()).await {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "ok": true,
-                "type": event.kind,
-                "event_id": envelope.id.to_string(),
-            })),
-        )
-            .into_response(),
+        Ok(()) => {
+            telemetry::emit(event_record(
+                telemetry::event_name::EVENT_ACCEPTED,
+                telemetry::reason::ACCEPT_ENQUEUED,
+                &event,
+                json!({"event_id": envelope.id.to_string()}),
+            ));
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "ok": true,
+                    "type": event.kind,
+                    "event_id": envelope.id.to_string(),
+                })),
+            )
+                .into_response()
+        }
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"ok": false, "error": error.to_string()})),
@@ -1176,7 +1282,8 @@ mod tests {
             "provider": "codex",
             "event_name": "SessionStart",
             "directory": dir.path(),
-            "event_payload": {}
+            "event_payload": {},
+            "normalization_outcome": NATIVE_NON_GIT_OUTCOME
         });
 
         let response = post_native_hook(State(state), Json(payload))

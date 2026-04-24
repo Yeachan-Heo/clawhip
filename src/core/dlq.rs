@@ -11,6 +11,12 @@ pub struct DlqEntry {
     pub format: String,
     pub content: String,
     pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -47,8 +53,12 @@ mod tests {
             format: "compact".into(),
             content: "msg".into(),
             payload: json!({"repo":"clawhip"}),
+            correlation_id: Some("corr-1".into()),
+            content_bytes: Some(3),
+            payload_bytes: Some(18),
         });
         assert_eq!(dlq.entries().len(), 1);
         assert_eq!(dlq.entries()[0].payload["repo"], "clawhip");
+        assert_eq!(dlq.entries()[0].correlation_id.as_deref(), Some("corr-1"));
     }
 }

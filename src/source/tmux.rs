@@ -16,6 +16,7 @@ use crate::events::{IncomingEvent, MessageFormat, RoutingMetadata};
 use crate::keyword_window::{PendingKeywordHits, collect_keyword_hits};
 use crate::router::glob_match;
 use crate::source::Source;
+use crate::telemetry;
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
 
@@ -267,6 +268,12 @@ pub async fn list_active_tmux_registrations(
             sync_active_config_registrations(config, registry, &available_sessions).await;
         }
         Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                None,
+                Some(error.to_string()),
+            ));
             eprintln!("clawhip source tmux list-sessions failed: {error}");
         }
     }
@@ -284,6 +291,12 @@ async fn poll_tmux(
     let available_sessions = match list_tmux_sessions().await {
         Ok(sessions) => Some(sessions),
         Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                None,
+                Some(error.to_string()),
+            ));
             eprintln!("clawhip source tmux list-sessions failed: {error}");
             None
         }
@@ -327,6 +340,12 @@ async fn poll_tmux(
 
         match session_exists(session_name).await {
             Ok(false) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_INVENTORY,
+                    "source_missing",
+                    Some(session_name),
+                    None,
+                ));
                 sessions_to_unregister.push(session_name.clone());
                 flush_session_pending_keyword_hits(
                     &mut state.pending_keyword_hits,
@@ -341,6 +360,12 @@ async fn poll_tmux(
                 continue;
             }
             Err(error) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_DEGRADED,
+                    "source_poll_failed",
+                    Some(session_name),
+                    Some(error.to_string()),
+                ));
                 eprintln!(
                     "clawhip source tmux has-session failed for {}: {error}",
                     session_name
@@ -391,6 +416,12 @@ async fn poll_tmux(
                                 Some(hits)
                             } else {
                                 if should_emit_stale(existing, now, registration.stale_minutes) {
+                                    telemetry::emit(source_record(
+                                        telemetry::event_name::SOURCE_INVENTORY,
+                                        "stale_emitted",
+                                        Some(session_name),
+                                        None,
+                                    ));
                                     tx.emit(tmux_stale_event(
                                         registration,
                                         existing.session.clone(),
@@ -415,10 +446,18 @@ async fn poll_tmux(
                     }
                 }
             }
-            Err(error) => eprintln!(
-                "clawhip source tmux snapshot failed for {}: {error}",
-                session_name
-            ),
+            Err(error) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_DEGRADED,
+                    "source_snapshot_failed",
+                    Some(session_name),
+                    Some(error.to_string()),
+                ));
+                eprintln!(
+                    "clawhip source tmux snapshot failed for {}: {error}",
+                    session_name
+                );
+            }
         }
     }
 
@@ -436,6 +475,24 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
+}
+
+fn source_record(
+    event_name: &str,
+    reason_code: &str,
+    session: Option<&str>,
+    error: Option<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let correlation = format!("source:tmux:{}", session.unwrap_or("inventory"));
+    let mut record = telemetry::record(event_name, reason_code, correlation);
+    record.insert("source".to_string(), serde_json::json!("tmux"));
+    if let Some(session) = session {
+        record.insert("session".to_string(), serde_json::json!(session));
+    }
+    if let Some(error) = error {
+        record.insert("error".to_string(), serde_json::json!(error));
+    }
+    record
 }
 
 async fn sync_active_config_registrations(
