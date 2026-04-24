@@ -15,6 +15,7 @@ mod keyword_window;
 mod lifecycle;
 mod memory;
 mod native_hooks;
+mod native_observability;
 mod plugins;
 mod provenance;
 mod release_preflight;

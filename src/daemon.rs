@@ -24,6 +24,10 @@ use crate::native_hooks::{
     NATIVE_NON_GIT_OUTCOME, NATIVE_NORMALIZATION_OUTCOME_FIELD,
     incoming_event_from_native_hook_json,
 };
+use crate::native_observability::{
+    SharedNativeHookObservability, is_native_hook_event, native_event_telemetry_fields,
+    new_shared_native_hook_observability, snapshot_shared, with_native_observability,
+};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, Sink, SlackSink};
@@ -60,6 +64,7 @@ struct AppState {
     tx: mpsc::Sender<IncomingEvent>,
     tmux_registry: SharedTmuxRegistry,
     pending_update: SharedPendingUpdate,
+    native_observability: SharedNativeHookObservability,
 }
 
 pub async fn run(
@@ -85,9 +90,11 @@ pub async fn run(
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let native_observability = new_shared_native_hook_observability();
 
     let ci_batch_window = config.dispatch.ci_batch_window();
     let routine_batch_window = config.dispatch.routine_batch_window();
+    let dispatcher_native_observability = native_observability.clone();
     tokio::spawn(async move {
         let mut dispatcher = Dispatcher::new(
             rx,
@@ -96,6 +103,7 @@ pub async fn run(
             sinks,
             ci_batch_window,
             routine_batch_window,
+            dispatcher_native_observability,
         );
         if let Err(error) = dispatcher.run().await {
             eprintln!("clawhip dispatcher stopped: {error}");
@@ -142,6 +150,7 @@ pub async fn run(
         tx,
         tmux_registry,
         pending_update,
+        native_observability,
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -252,14 +261,21 @@ fn event_record(
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.tmux_registry.read().await.len();
+    let native_hooks = snapshot_shared(&state.native_observability);
     Json(health_payload(
         state.config.as_ref(),
         state.port,
         registered,
+        native_hooks,
     ))
 }
 
-fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize) -> Value {
+fn health_payload(
+    config: &AppConfig,
+    port: u16,
+    registered_tmux_sessions: usize,
+    native_hooks: Value,
+) -> Value {
     json!({
         "ok": true,
         "version": VERSION,
@@ -272,6 +288,7 @@ fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize
         "configured_workspace_monitors": config.monitors.workspace.len(),
         "configured_cron_jobs": config.cron.jobs.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
+        "native_hooks": native_hooks,
     })
 }
 
@@ -300,9 +317,67 @@ async fn post_native_hook(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     let raw_non_git = native_payload_is_non_git(&payload);
+    with_native_observability(&state.native_observability, |observability| {
+        observability.observe_received_raw(&payload);
+    });
+    eprintln!(
+        "clawhip native hook received: provider={} event={} repo={} session={}",
+        raw_native_field(
+            &payload,
+            &["/provider", "/source/provider", "/context/provider"],
+        ),
+        raw_native_field(
+            &payload,
+            &[
+                "/event_name",
+                "/event",
+                "/hook_event_name",
+                "/hookEventName",
+            ],
+        ),
+        raw_native_field(
+            &payload,
+            &[
+                "/repo_name",
+                "/context/repo_name",
+                "/project",
+                "/project_name",
+            ],
+        ),
+        raw_native_field(
+            &payload,
+            &[
+                "/session_id",
+                "/sessionId",
+                "/context/session_id",
+                "/event_payload/session_id",
+            ],
+        ),
+    );
+
     let event = match incoming_event_from_native_hook_json(&payload) {
         Ok(event) => normalize_event(event),
         Err(error) => {
+            with_native_observability(&state.native_observability, |observability| {
+                observability.observe_dropped_raw(&payload, "normalization_failed");
+            });
+            eprintln!(
+                "clawhip native hook dropped: provider={} event={} reason=normalization_failed error={}",
+                raw_native_field(
+                    &payload,
+                    &["/provider", "/source/provider", "/context/provider"],
+                ),
+                raw_native_field(
+                    &payload,
+                    &[
+                        "/event_name",
+                        "/event",
+                        "/hook_event_name",
+                        "/hookEventName",
+                    ],
+                ),
+                error
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"ok": false, "error": error.to_string()})),
@@ -311,6 +386,10 @@ async fn post_native_hook(
         }
     };
 
+    with_native_observability(&state.native_observability, |observability| {
+        observability.observe_normalized(&event);
+    });
+
     if raw_non_git || native_hook_should_drop(&event) {
         telemetry::emit(event_record(
             telemetry::event_name::EVENT_DROPPED,
@@ -318,6 +397,14 @@ async fn post_native_hook(
             &event,
             json!({"dropped": true, "source": "native_hook"}),
         ));
+        with_native_observability(&state.native_observability, |observability| {
+            observability.observe_dropped(&event, NATIVE_NON_GIT_OUTCOME);
+        });
+        eprintln!(
+            "clawhip native hook dropped: {} reason={}",
+            native_event_telemetry_fields(&event),
+            NATIVE_NON_GIT_OUTCOME
+        );
         return (
             StatusCode::ACCEPTED,
             Json(json!({
@@ -331,6 +418,15 @@ async fn post_native_hook(
     }
 
     if let Some(defer) = stale_native_replay_defer(&event, &payload) {
+        with_native_observability(&state.native_observability, |observability| {
+            observability.observe_deferred(&event, defer.reason);
+        });
+        eprintln!(
+            "clawhip native hook deferred: {} reason={} age_secs={}",
+            native_event_telemetry_fields(&event),
+            defer.reason,
+            defer.age.as_secs()
+        );
         return stale_replay_defer_response(&event.kind, &defer);
     }
 
@@ -352,6 +448,16 @@ fn native_payload_is_non_git(payload: &Value) -> bool {
             .and_then(|payload| payload.get(NATIVE_NORMALIZATION_OUTCOME_FIELD))
             .and_then(Value::as_str)
             == Some(NATIVE_NON_GIT_OUTCOME)
+}
+
+fn raw_native_field(payload: &Value, pointers: &[&str]) -> String {
+    pointers
+        .iter()
+        .find_map(|pointer| payload.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn native_hook_should_drop(event: &IncomingEvent) -> bool {
@@ -477,6 +583,11 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
     let envelope = match from_incoming_event(&event) {
         Ok(envelope) => envelope,
         Err(error) => {
+            if is_native_hook_event(&event) {
+                with_native_observability(&state.native_observability, |observability| {
+                    observability.observe_dropped(&event, "validation_error");
+                });
+            }
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"ok": false, "error": error.to_string()})),
@@ -503,11 +614,18 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
             )
                 .into_response()
         }
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"ok": false, "error": error.to_string()})),
-        )
-            .into_response(),
+        Err(error) => {
+            if is_native_hook_event(&event) {
+                with_native_observability(&state.native_observability, |observability| {
+                    observability.observe_dropped(&event, "queue_unavailable");
+                });
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -780,6 +898,7 @@ mod tests {
                 tx,
                 tmux_registry: Arc::new(RwLock::new(HashMap::new())),
                 pending_update: update::new_shared_pending_update(),
+                native_observability: new_shared_native_hook_observability(),
             },
             rx,
         )
@@ -860,7 +979,12 @@ mod tests {
         config.monitors.tmux.sessions.push(Default::default());
         config.monitors.workspace.push(Default::default());
 
-        let payload = health_payload(&config, 25294, 3);
+        let payload = health_payload(
+            &config,
+            25294,
+            3,
+            snapshot_shared(&new_shared_native_hook_observability()),
+        );
 
         assert_eq!(payload["ok"], Value::Bool(true));
         assert_eq!(payload["version"], Value::String(VERSION.to_string()));
@@ -870,6 +994,7 @@ mod tests {
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
+        assert!(payload["native_hooks"]["totals"]["received"].is_number());
     }
 
     #[tokio::test]
@@ -955,6 +1080,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -991,6 +1117,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -1020,6 +1147,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
         let event = IncomingEvent::agent_started(
             "worker-1".into(),
@@ -1053,6 +1181,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_native_hook_observability_counts_accepted_event() {
+        let repo = git_repo();
+        let payload = native_payload(repo.path(), "SessionStart");
+        let (tx, mut rx) = mpsc::channel(1);
+        let observability = new_shared_native_hook_observability();
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: observability.clone(),
+        };
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "session.started");
+
+        let snapshot = snapshot_shared(&observability);
+        assert_eq!(snapshot["totals"]["received"], json!(1));
+        assert_eq!(snapshot["totals"]["normalized"], json!(1));
+        assert_eq!(snapshot["recent_groups"][0]["provider"], json!("codex"));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_observability_counts_rejected_event() {
+        let (tx, _rx) = mpsc::channel(1);
+        let observability = new_shared_native_hook_observability();
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: observability.clone(),
+        };
+        let payload = json!({"provider": "codex", "event_name": "Bogus"});
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let snapshot = snapshot_shared(&observability);
+        assert_eq!(snapshot["totals"]["received"], json!(1));
+        assert_eq!(snapshot["totals"]["dropped"], json!(1));
+        assert_eq!(snapshot["reasons"]["normalization_failed"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_observability_counts_non_git_drop() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let observability = new_shared_native_hook_observability();
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: observability.clone(),
+        };
+        let dir = tempdir().expect("tempdir");
+        let payload = json!({
+            "provider": "codex",
+            "event_name": "SessionStart",
+            "directory": dir.path(),
+            "event_payload": {}
+        });
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(rx.try_recv().is_err());
+
+        let snapshot = snapshot_shared(&observability);
+        assert_eq!(snapshot["totals"]["received"], json!(1));
+        assert_eq!(snapshot["totals"]["normalized"], json!(1));
+        assert_eq!(snapshot["totals"]["dropped"], json!(1));
+        assert_eq!(snapshot["reasons"]["non_git"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_observability_counts_stale_defer() {
+        let repo = git_repo();
+        let mut payload = native_payload(repo.path(), "PostToolUse");
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("timestamp".into(), Value::String(stale_rfc3339()));
+        let (tx, mut rx) = mpsc::channel(1);
+        let observability = new_shared_native_hook_observability();
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: observability.clone(),
+        };
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(rx.try_recv().is_err());
+
+        let snapshot = snapshot_shared(&observability);
+        assert_eq!(snapshot["totals"]["received"], json!(1));
+        assert_eq!(snapshot["totals"]["normalized"], json!(1));
+        assert_eq!(snapshot["totals"]["deferred"], json!(1));
+        assert_eq!(snapshot["reasons"]["stale_replay"], json!(1));
+    }
+
+    #[tokio::test]
     async fn post_native_hook_accepts_codex_payload_and_queues_normalized_event() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("clawhip");
@@ -1074,6 +1320,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
         let payload = json!({
             "provider": "codex",
@@ -1113,6 +1360,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
         let payload = json!({
             "provider": "claude-code",
@@ -1276,6 +1524,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -1329,6 +1578,7 @@ mod tests {
             tx,
             tmux_registry: registry,
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
 
         let response = list_tmux(State(state)).await.into_response();
@@ -1363,6 +1613,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -1391,6 +1642,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: pending,
+            native_observability: new_shared_native_hook_observability(),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -1412,6 +1664,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
 
         let response = approve_update(State(state)).await.into_response();
@@ -1445,6 +1698,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: pending.clone(),
+            native_observability: new_shared_native_hook_observability(),
         };
 
         let response = dismiss_update(State(state)).await.into_response();
@@ -1466,6 +1720,7 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
         };
 
         let response = dismiss_update(State(state)).await.into_response();
