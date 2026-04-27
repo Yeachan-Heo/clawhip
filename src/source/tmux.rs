@@ -107,6 +107,13 @@ impl Source for TmuxSource {
         let mut state = TmuxMonitorState::default();
 
         loop {
+            if self.config.monitors.tmux.sessions.is_empty() && self.registry.read().await.is_empty() {
+                sleep(Duration::from_secs(
+                    self.config.monitors.poll_interval_secs.max(1),
+                ))
+                .await;
+                continue;
+            }
             poll_tmux(self.config.as_ref(), &self.registry, &tx, &mut state).await?;
             sleep(Duration::from_secs(
                 self.config.monitors.poll_interval_secs.max(1),

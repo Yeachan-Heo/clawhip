@@ -21,7 +21,7 @@ use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::native_hooks::incoming_event_from_native_hook_json;
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
-use crate::sink::{DiscordSink, Sink, SlackSink};
+use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
     WorkspaceSource, list_active_tmux_registrations,
@@ -54,6 +54,7 @@ pub async fn run(
         Box::new(DiscordSink::from_config(config.clone())?),
     );
     sinks.insert("slack".into(), Box::new(SlackSink::default()));
+    sinks.insert("localfile".into(), Box::new(LocalFileSink));
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
