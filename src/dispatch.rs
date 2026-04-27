@@ -933,6 +933,7 @@ fn sink_target_key(target: &SinkTarget) -> String {
         SinkTarget::DiscordChannel(channel) => format!("discord-channel:{channel}"),
         SinkTarget::DiscordWebhook(webhook) => format!("discord-webhook:{webhook}"),
         SinkTarget::SlackWebhook(webhook) => format!("slack-webhook:{webhook}"),
+        SinkTarget::LocalFile(path) => format!("localfile:{path}"),
     }
 }
 
@@ -1157,6 +1158,7 @@ mod tests {
                     channel_name: None,
                     webhook: Some(failing_webhook),
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -1170,6 +1172,7 @@ mod tests {
                     channel_name: None,
                     webhook: Some(successful_webhook),
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,

@@ -223,8 +223,8 @@ impl Router {
             .await?;
         match delivery.target {
             SinkTarget::DiscordChannel(channel) => Ok((channel, delivery.format, content)),
-            SinkTarget::DiscordWebhook(_) | SinkTarget::SlackWebhook(_) => {
-                Err("matched route uses a webhook instead of a channel".into())
+            SinkTarget::DiscordWebhook(_) | SinkTarget::SlackWebhook(_) | SinkTarget::LocalFile(_) => {
+                Err("matched route uses a non-channel target".into())
             }
         }
     }
@@ -381,6 +381,16 @@ impl Router {
                     )
                     .into()
                 }),
+            "localfile" => route
+                .and_then(RouteRule::local_file_target)
+                .map(|path| SinkTarget::LocalFile(path.to_string()))
+                .ok_or_else(|| {
+                    format!(
+                        "no local_path configured for event {}",
+                        event.canonical_kind()
+                    )
+                    .into()
+                }),
             other => Err(format!(
                 "unsupported sink '{other}' for event {}",
                 event.canonical_kind()
@@ -457,13 +467,14 @@ fn delivery_explanation(
     delivery: &ResolvedDelivery,
     matched_route_index: Option<usize>,
 ) -> DeliveryExplanation {
-    let (target_label, channel) = match &delivery.target {
-        SinkTarget::DiscordChannel(name) => {
-            (format!("DiscordChannel({name:?})"), Some(name.clone()))
-        }
-        SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
-        SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
-    };
+        let (target_label, channel) = match &delivery.target {
+            SinkTarget::DiscordChannel(name) => {
+                (format!("DiscordChannel({name:?})"), Some(name.clone()))
+            }
+            SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
+            SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
+            SinkTarget::LocalFile(path) => (format!("LocalFile({path})"), None),
+        };
 
     DeliveryExplanation {
         sink: delivery.sink.clone(),
@@ -679,6 +690,7 @@ mod tests {
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: Some("@ops".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -692,6 +704,7 @@ mod tests {
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: Some("@eng".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Compact),
@@ -746,6 +759,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -852,6 +866,7 @@ mod tests {
                     channel_name: None,
                     webhook: Some(failing_webhook),
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -865,6 +880,7 @@ mod tests {
                     channel_name: None,
                     webhook: Some(successful_webhook),
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -910,6 +926,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -948,6 +965,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -993,6 +1011,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@1465264645320474637>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1026,6 +1045,7 @@ mod tests {
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: Some("<@botid>".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -1041,6 +1061,7 @@ mod tests {
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: Some("<@botid>".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -1080,6 +1101,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: true,
                 format: None,
@@ -1109,6 +1131,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: true,
                 format: None,
@@ -1140,6 +1163,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -1175,6 +1199,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1210,6 +1235,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1249,6 +1275,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1296,6 +1323,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -1360,6 +1388,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1407,6 +1436,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1466,6 +1496,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1515,6 +1546,7 @@ mod tests {
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -1530,6 +1562,7 @@ mod tests {
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -1562,6 +1595,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1600,6 +1634,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1629,6 +1664,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1771,6 +1807,7 @@ mod tests {
                 channel_name: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1812,6 +1849,7 @@ mod tests {
                 channel_name: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1850,6 +1888,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1888,6 +1927,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1926,6 +1966,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1961,6 +2002,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -2055,6 +2097,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -2085,6 +2128,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -2192,6 +2236,7 @@ mod tests {
                 channel_name: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,

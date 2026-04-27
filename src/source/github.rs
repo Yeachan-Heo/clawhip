@@ -929,6 +929,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@1465264645320474637>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),

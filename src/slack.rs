@@ -22,6 +22,7 @@ impl SlackClient {
             SinkTarget::DiscordChannel(_) | SinkTarget::DiscordWebhook(_) => {
                 Err("cannot send Discord target via Slack client".into())
             }
+            SinkTarget::LocalFile(_) => Err("cannot send localfile target via Slack client".into()),
         }
     }
 
