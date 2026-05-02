@@ -179,11 +179,10 @@ fn is_default_review_marker_prose(lower_keyword: &str, line: &str) -> bool {
     if normalized == lower_keyword {
         return false;
     }
-    normalized
+    !normalized
         .strip_prefix(lower_keyword)
         .map(|suffix| suffix.starts_with(':'))
         .unwrap_or(false)
-        == false
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
