@@ -16,6 +16,20 @@ const LAUNCHER_NOISE_PATTERNS: &[&str] = &[
 pub struct KeywordHit {
     pub keyword: String,
     pub line: String,
+    pub provenance: Option<KeywordMatchProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeywordMatchProvenance {
+    pub pane_id: String,
+    pub pane_name: String,
+    pub cursor: Option<usize>,
+    pub source: KeywordMatchSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeywordMatchSource {
+    FreshOutput,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +66,29 @@ impl PendingKeywordHits {
     }
 }
 
+#[cfg(test)]
 pub fn collect_keyword_hits(previous: &str, current: &str, keywords: &[String]) -> Vec<KeywordHit> {
+    collect_keyword_hits_from_lines(appended_lines(previous, current), keywords, None)
+}
+
+pub fn collect_keyword_hits_with_provenance(
+    previous: &str,
+    current: &str,
+    keywords: &[String],
+    provenance: KeywordMatchProvenance,
+) -> Vec<KeywordHit> {
+    collect_keyword_hits_from_lines(
+        appended_lines(previous, current),
+        keywords,
+        Some(provenance),
+    )
+}
+
+fn collect_keyword_hits_from_lines(
+    lines: Vec<&str>,
+    keywords: &[String],
+    provenance: Option<KeywordMatchProvenance>,
+) -> Vec<KeywordHit> {
     if keywords.is_empty() {
         return Vec::new();
     }
@@ -64,7 +100,7 @@ pub fn collect_keyword_hits(previous: &str, current: &str, keywords: &[String]) 
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
 
-    for line in appended_lines(previous, current) {
+    for line in lines {
         if should_ignore_launcher_line(line) {
             continue;
         }
@@ -72,11 +108,18 @@ pub fn collect_keyword_hits(previous: &str, current: &str, keywords: &[String]) 
         let lower_line = line.to_ascii_lowercase();
         for (keyword, lower_keyword) in &normalized_keywords {
             if lower_line.contains(lower_keyword) {
+                if is_negated_default_failure_match(lower_keyword, &lower_line)
+                    || is_default_review_marker_prose(lower_keyword, line)
+                {
+                    continue;
+                }
+
                 let key = (keyword.clone(), line.to_string());
                 if seen.insert(key.clone()) {
                     hits.push(KeywordHit {
                         keyword: key.0,
                         line: key.1,
+                        provenance: provenance.clone(),
                     });
                 }
             }
@@ -84,6 +127,92 @@ pub fn collect_keyword_hits(previous: &str, current: &str, keywords: &[String]) 
     }
 
     hits
+}
+
+fn is_negated_default_failure_match(lower_keyword: &str, lower_line: &str) -> bool {
+    match lower_keyword {
+        "error" | "errors" => contains_any(
+            lower_line,
+            &[
+                "0 error",
+                "0 errors",
+                "zero error",
+                "zero errors",
+                "no error",
+                "no errors",
+                "without error",
+                "without errors",
+            ],
+        ),
+        "fail" | "fails" | "failed" | "failure" | "failures" => contains_any(
+            lower_line,
+            &[
+                "0 fail",
+                "0 fails",
+                "0 failure",
+                "0 failures",
+                "zero fail",
+                "zero fails",
+                "zero failure",
+                "zero failures",
+                "no fail",
+                "no fails",
+                "no failure",
+                "no failures",
+                "without fail",
+                "without fails",
+                "without failure",
+                "without failures",
+            ],
+        ),
+        _ => false,
+    }
+}
+
+fn is_default_review_marker_prose(lower_keyword: &str, line: &str) -> bool {
+    if !matches!(lower_keyword, "blocker" | "request_changes" | "approve") {
+        return false;
+    }
+
+    let trimmed = line.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized == lower_keyword {
+        return false;
+    }
+    normalized
+        .strip_prefix(lower_keyword)
+        .map(|suffix| suffix.starts_with(':'))
+        .unwrap_or(false)
+        == false
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| contains_bounded(haystack, needle))
+}
+
+fn contains_bounded(haystack: &str, needle: &str) -> bool {
+    let mut search_start = 0;
+    while let Some(relative_start) = haystack[search_start..].find(needle) {
+        let start = search_start + relative_start;
+        let end = start + needle.len();
+        let before_is_word = haystack[..start]
+            .chars()
+            .next_back()
+            .map(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            .unwrap_or(false);
+        let after_is_word = haystack[end..]
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            .unwrap_or(false);
+        if !before_is_word && !after_is_word {
+            return true;
+        }
+        search_start = end;
+    }
+    false
 }
 
 fn should_ignore_launcher_line(line: &str) -> bool {
@@ -131,10 +260,12 @@ mod tests {
                 KeywordHit {
                     keyword: "error".into(),
                     line: "error: failed".into(),
+                    provenance: None,
                 },
                 KeywordHit {
                     keyword: "error".into(),
                     line: "ERROR: FAILED".into(),
+                    provenance: None,
                 },
             ]
         );
@@ -153,6 +284,7 @@ mod tests {
             vec![KeywordHit {
                 keyword: "error".into(),
                 line: "error: failed".into(),
+                provenance: None,
             }]
         );
     }
@@ -170,6 +302,7 @@ mod tests {
             vec![KeywordHit {
                 keyword: "error".into(),
                 line: "error: failed".into(),
+                provenance: None,
             }]
         );
     }
@@ -187,6 +320,7 @@ mod tests {
             vec![KeywordHit {
                 keyword: "error".into(),
                 line: "error: real failure".into(),
+                provenance: None,
             }]
         );
     }
@@ -204,6 +338,7 @@ mod tests {
             vec![KeywordHit {
                 keyword: "error".into(),
                 line: "error: real failure".into(),
+                provenance: None,
             }]
         );
     }
@@ -221,6 +356,81 @@ mod tests {
             vec![KeywordHit {
                 keyword: "FAILED".into(),
                 line: "FAILED: actual application failure".into(),
+                provenance: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_suppresses_negated_default_failure_phrases() {
+        let hits = collect_keyword_hits(
+            "boot",
+            "boot
+0 errors, 0 warnings
+completed without failure
+no errors found
+error: real failure",
+            &["error".into()],
+        );
+
+        assert_eq!(
+            hits,
+            vec![KeywordHit {
+                keyword: "error".into(),
+                line: "error: real failure".into(),
+                provenance: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn negated_failure_suppression_requires_phrase_boundaries() {
+        let hits = collect_keyword_hits(
+            "boot",
+            "boot
+10 errors remain
+20 failures remain",
+            &["error".into(), "failure".into()],
+        );
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].line, "10 errors remain");
+        assert_eq!(hits[1].line, "20 failures remain");
+    }
+
+    #[test]
+    fn collect_keyword_hits_ignores_startup_prompt_boundary() {
+        let startup = "Fix issue #220
+End with PR URL or concrete BLOCKER
+ISSUE2843_PR_READY";
+
+        assert!(
+            collect_keyword_hits(
+                startup,
+                startup,
+                &["BLOCKER".into(), "ISSUE2843_PR_READY".into()]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_suppresses_default_marker_prose_but_keeps_custom_markers() {
+        let hits = collect_keyword_hits(
+            "armed",
+            "armed
+• Using ralph until PR/ blocker
+End with PR URL or concrete BLOCKER
+ISSUE2843_PR_READY",
+            &["BLOCKER".into(), "ISSUE2843_PR_READY".into()],
+        );
+
+        assert_eq!(
+            hits,
+            vec![KeywordHit {
+                keyword: "ISSUE2843_PR_READY".into(),
+                line: "ISSUE2843_PR_READY".into(),
+                provenance: None,
             }]
         );
     }
@@ -232,15 +442,18 @@ mod tests {
         pending.push(vec![KeywordHit {
             keyword: "error".into(),
             line: "error: failed".into(),
+            provenance: None,
         }]);
         pending.push(vec![
             KeywordHit {
                 keyword: "error".into(),
                 line: "error: failed".into(),
+                provenance: None,
             },
             KeywordHit {
                 keyword: "complete".into(),
                 line: "complete".into(),
+                provenance: None,
             },
         ]);
 
@@ -250,10 +463,12 @@ mod tests {
                 KeywordHit {
                     keyword: "error".into(),
                     line: "error: failed".into(),
+                    provenance: None,
                 },
                 KeywordHit {
                     keyword: "complete".into(),
                     line: "complete".into(),
+                    provenance: None,
                 },
             ]
         );
