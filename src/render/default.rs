@@ -263,21 +263,24 @@ impl Renderer for DefaultRenderer {
             ) => serde_json::to_string_pretty(payload)?,
 
             ("tmux.keyword", MessageFormat::Compact) => format!(
-                "tmux:{} matched '{}' => {}",
+                "tmux:{} matched '{}' => {}{}",
                 string_field(payload, "session")?,
                 string_field(payload, "keyword")?,
-                string_field(payload, "line")?
+                string_field(payload, "line")?,
+                tmux_keyword_provenance_suffix(payload)
             ),
             ("tmux.keyword", MessageFormat::Alert) => format!(
-                "🚨 tmux session {} hit keyword '{}': {}",
+                "🚨 tmux session {} hit keyword '{}': {}{}",
                 string_field(payload, "session")?,
                 string_field(payload, "keyword")?,
-                string_field(payload, "line")?
+                string_field(payload, "line")?,
+                tmux_keyword_provenance_suffix(payload)
             ),
             ("tmux.keyword", MessageFormat::Inline) => format!(
-                "[tmux:{}] {}",
+                "[tmux:{}] {}{}",
                 string_field(payload, "session")?,
-                string_field(payload, "line")?
+                string_field(payload, "line")?,
+                tmux_keyword_provenance_suffix(payload)
             ),
             ("tmux.keyword", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
@@ -731,6 +734,31 @@ fn render_aggregated_git_commit(payload: &Value, format: &MessageFormat) -> Resu
     Ok(Some(lines.join("\n")))
 }
 
+fn tmux_keyword_provenance_suffix(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(pane_id) = payload.get("pane_id").and_then(Value::as_str) {
+        let pane_name = payload.get("pane_name").and_then(Value::as_str);
+        match pane_name {
+            Some(pane_name) if !pane_name.is_empty() => {
+                parts.push(format!("pane {pane_id}/{pane_name}"));
+            }
+            _ => parts.push(format!("pane {pane_id}")),
+        }
+    }
+    if let Some(cursor) = payload.get("cursor").and_then(Value::as_u64) {
+        parts.push(format!("cursor {cursor}"));
+    }
+    if let Some(source) = payload.get("source").and_then(Value::as_str) {
+        parts.push(source.to_string());
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 fn render_aggregated_tmux_keyword(
     payload: &Value,
     format: &MessageFormat,
@@ -754,7 +782,10 @@ fn render_aggregated_tmux_keyword(
             if keyword.is_empty() || line.is_empty() {
                 None
             } else {
-                Some(format!("'{keyword}': {line}"))
+                Some(format!(
+                    "'{keyword}': {line}{}",
+                    tmux_keyword_provenance_suffix(hit)
+                ))
             }
         })
         .collect::<Vec<_>>();
@@ -883,6 +914,29 @@ mod tests {
             .render(&event, &MessageFormat::Compact)
             .unwrap();
         assert_eq!(rendered, "git:repo@main 1234567 ship it");
+    }
+
+    #[test]
+    fn renders_tmux_keyword_provenance_when_present() {
+        let mut event = IncomingEvent::tmux_keyword(
+            "issue-220".into(),
+            "ERROR_READY".into(),
+            "ERROR_READY".into(),
+            None,
+        );
+        event.payload["pane_id"] = json!("%3");
+        event.payload["pane_name"] = json!("0.1");
+        event.payload["cursor"] = json!(42);
+        event.payload["source"] = json!("fresh-output");
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Alert)
+            .unwrap();
+
+        assert_eq!(
+            rendered,
+            "🚨 tmux session issue-220 hit keyword 'ERROR_READY': ERROR_READY (pane %3/0.1, cursor 42, fresh-output)"
+        );
     }
 
     #[test]

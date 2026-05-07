@@ -68,7 +68,14 @@ impl PendingKeywordHits {
 
 #[cfg(test)]
 pub fn collect_keyword_hits(previous: &str, current: &str, keywords: &[String]) -> Vec<KeywordHit> {
-    collect_keyword_hits_from_lines(appended_lines(previous, current), keywords, None)
+    collect_keyword_hits_from_lines(
+        appended_lines_with_cursors(previous, current)
+            .into_iter()
+            .map(|(_, line)| (None, line))
+            .collect(),
+        keywords,
+        None,
+    )
 }
 
 pub fn collect_keyword_hits_with_provenance(
@@ -78,14 +85,17 @@ pub fn collect_keyword_hits_with_provenance(
     provenance: KeywordMatchProvenance,
 ) -> Vec<KeywordHit> {
     collect_keyword_hits_from_lines(
-        appended_lines(previous, current),
+        appended_lines_with_cursors(previous, current)
+            .into_iter()
+            .map(|(cursor, line)| (Some(cursor), line))
+            .collect(),
         keywords,
         Some(provenance),
     )
 }
 
 fn collect_keyword_hits_from_lines(
-    lines: Vec<&str>,
+    lines: Vec<(Option<usize>, &str)>,
     keywords: &[String],
     provenance: Option<KeywordMatchProvenance>,
 ) -> Vec<KeywordHit> {
@@ -100,7 +110,7 @@ fn collect_keyword_hits_from_lines(
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
 
-    for line in lines {
+    for (line_cursor, line) in lines {
         if should_ignore_launcher_line(line) {
             continue;
         }
@@ -119,7 +129,12 @@ fn collect_keyword_hits_from_lines(
                     hits.push(KeywordHit {
                         keyword: key.0,
                         line: key.1,
-                        provenance: provenance.clone(),
+                        provenance: provenance.clone().map(|mut provenance| {
+                            if let Some(cursor) = line_cursor {
+                                provenance.cursor = Some(cursor);
+                            }
+                            provenance
+                        }),
                     });
                 }
             }
@@ -221,12 +236,17 @@ fn should_ignore_launcher_line(line: &str) -> bool {
         .any(|pattern| trimmed.contains(pattern))
 }
 
-fn appended_lines<'a>(previous: &'a str, current: &'a str) -> Vec<&'a str> {
+fn appended_lines_with_cursors<'a>(previous: &'a str, current: &'a str) -> Vec<(usize, &'a str)> {
     let previous_lines = previous.lines().collect::<Vec<_>>();
     let current_lines = current.lines().collect::<Vec<_>>();
     let overlap = overlapping_suffix_prefix_len(&previous_lines, &current_lines);
 
-    current_lines.into_iter().skip(overlap).collect()
+    current_lines
+        .into_iter()
+        .enumerate()
+        .skip(overlap)
+        .map(|(index, line)| (index + 1, line))
+        .collect()
 }
 
 fn overlapping_suffix_prefix_len(previous: &[&str], current: &[&str]) -> usize {
@@ -431,6 +451,78 @@ ISSUE2843_PR_READY",
                 line: "ISSUE2843_PR_READY".into(),
                 provenance: None,
             }]
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_treats_existing_prompt_and_search_markers_as_existing_buffer() {
+        // Regression for #220 / Discord message 1502008605518594172:
+        // markers present in the user's initial prompt and search/query text
+        // are registration-time scrollback, not fresh model output.
+        let previous = "Welcome
+End with PR_READY #220 and summary
+Search keywords.*...PR_READY";
+        let current = "Welcome
+End with PR_READY #220 and summary
+Search keywords.*...PR_READY
+still running";
+
+        let hits = collect_keyword_hits(previous, current, &["PR_READY".into()]);
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn collect_keyword_hits_suppresses_existing_prompt_search_but_keeps_fresh_custom_marker() {
+        let previous = "Welcome
+End with PR_READY #220 and summary
+Search keywords.*...PR_READY";
+        let current = "Welcome
+End with PR_READY #220 and summary
+Search keywords.*...PR_READY
+still running
+PR_READY #220";
+
+        let hits = collect_keyword_hits_with_provenance(
+            previous,
+            current,
+            &["PR_READY".into()],
+            KeywordMatchProvenance {
+                pane_id: "%9".into(),
+                pane_name: "0.0".into(),
+                cursor: None,
+                source: KeywordMatchSource::FreshOutput,
+            },
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line, "PR_READY #220");
+        assert_eq!(hits[0].provenance.as_ref().unwrap().cursor, Some(5));
+    }
+
+    #[test]
+    fn collect_keyword_hits_keeps_exact_cursor_for_fresh_custom_marker() {
+        let hits = collect_keyword_hits_with_provenance(
+            "boot",
+            "boot
+working
+ISSUE220_PR_READY",
+            &["ISSUE220_PR_READY".into()],
+            KeywordMatchProvenance {
+                pane_id: "%7".into(),
+                pane_name: "0.0".into(),
+                cursor: None,
+                source: KeywordMatchSource::FreshOutput,
+            },
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].keyword, "ISSUE220_PR_READY");
+        assert_eq!(hits[0].line, "ISSUE220_PR_READY");
+        assert_eq!(hits[0].provenance.as_ref().unwrap().cursor, Some(3));
+        assert_eq!(
+            hits[0].provenance.as_ref().unwrap().source,
+            KeywordMatchSource::FreshOutput
         );
     }
 

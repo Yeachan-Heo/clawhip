@@ -234,7 +234,7 @@ pub async fn monitor_registered_session(
                             KeywordMatchProvenance {
                                 pane_id: pane.pane_id.clone(),
                                 pane_name: pane.pane_name.clone(),
-                                cursor: Some(pane.content.lines().count()),
+                                cursor: None,
                                 source: KeywordMatchSource::FreshOutput,
                             },
                         );
@@ -419,7 +419,7 @@ async fn poll_tmux(
                                     KeywordMatchProvenance {
                                         pane_id: pane.pane_id.clone(),
                                         pane_name: pane.pane_name.clone(),
-                                        cursor: Some(pane.content.lines().count()),
+                                        cursor: None,
                                         source: KeywordMatchSource::FreshOutput,
                                     },
                                 );
