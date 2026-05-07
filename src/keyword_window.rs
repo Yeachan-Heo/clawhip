@@ -119,7 +119,7 @@ fn collect_keyword_hits_from_lines(
         for (keyword, lower_keyword) in &normalized_keywords {
             if lower_line.contains(lower_keyword) {
                 if is_negated_default_failure_match(lower_keyword, &lower_line)
-                    || is_default_review_marker_prose(lower_keyword, line)
+                    || is_instruction_or_search_review_marker_prose(lower_keyword, line)
                 {
                     continue;
                 }
@@ -184,20 +184,26 @@ fn is_negated_default_failure_match(lower_keyword: &str, lower_line: &str) -> bo
     }
 }
 
-fn is_default_review_marker_prose(lower_keyword: &str, line: &str) -> bool {
+fn is_instruction_or_search_review_marker_prose(lower_keyword: &str, line: &str) -> bool {
     if !matches!(lower_keyword, "blocker" | "request_changes" | "approve") {
         return false;
     }
 
-    let trimmed = line.trim();
-    let normalized = trimmed.to_ascii_lowercase();
+    let normalized = line.trim().to_ascii_lowercase();
     if normalized == lower_keyword {
         return false;
     }
-    !normalized
-        .strip_prefix(lower_keyword)
-        .map(|suffix| suffix.starts_with(':'))
-        .unwrap_or(false)
+
+    // Only suppress obvious instruction/search prose that mentions the review
+    // marker as text to look for. Fresh verdict prose such as
+    // "Final verdict APPROVE with evidence" or "I found a BLOCKER..." must
+    // still alert; stale prompt/search scrollback is handled by the appended
+    // output boundary before this filter runs.
+    normalized.contains("end with")
+        || normalized.contains("search ")
+        || normalized.contains("query ")
+        || normalized.contains("keywords")
+        || normalized.contains("using ralph until")
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -434,7 +440,7 @@ ISSUE2843_PR_READY";
     }
 
     #[test]
-    fn collect_keyword_hits_suppresses_default_marker_prose_but_keeps_custom_markers() {
+    fn collect_keyword_hits_suppresses_instruction_marker_prose_but_keeps_custom_markers() {
         let hits = collect_keyword_hits(
             "armed",
             "armed
@@ -452,6 +458,39 @@ ISSUE2843_PR_READY",
                 provenance: None,
             }]
         );
+    }
+
+    #[test]
+    fn collect_keyword_hits_alerts_on_fresh_review_verdict_prose() {
+        let hits = collect_keyword_hits_with_provenance(
+            "armed",
+            "armed
+Final verdict APPROVE with evidence
+REQUEST_CHANGES with evidence
+I found a BLOCKER in tmux cursor handling",
+            &["APPROVE".into(), "REQUEST_CHANGES".into(), "BLOCKER".into()],
+            KeywordMatchProvenance {
+                pane_id: "%11".into(),
+                pane_name: "0.0".into(),
+                cursor: None,
+                source: KeywordMatchSource::FreshOutput,
+            },
+        );
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.line.as_str()).collect::<Vec<_>>(),
+            vec![
+                "Final verdict APPROVE with evidence",
+                "REQUEST_CHANGES with evidence",
+                "I found a BLOCKER in tmux cursor handling",
+            ]
+        );
+        assert_eq!(hits[0].keyword, "APPROVE");
+        assert_eq!(hits[0].provenance.as_ref().unwrap().cursor, Some(2));
+        assert_eq!(hits[1].keyword, "REQUEST_CHANGES");
+        assert_eq!(hits[1].provenance.as_ref().unwrap().cursor, Some(3));
+        assert_eq!(hits[2].keyword, "BLOCKER");
+        assert_eq!(hits[2].provenance.as_ref().unwrap().cursor, Some(4));
     }
 
     #[test]
