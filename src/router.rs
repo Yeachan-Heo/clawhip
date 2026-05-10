@@ -33,6 +33,30 @@ pub enum RouteTraceResult {
     None,
 }
 
+/// Returned when a sink lookup ends with no usable target. Carries
+/// `route_matched` so the dispatcher can distinguish "no route matched"
+/// (drop-by-design) from "route matched but target missing" (operator
+/// misconfiguration). Both still surface a stable `Display` message for
+/// backward-compatible logging.
+#[derive(Debug, Clone)]
+pub struct NoRouteTarget {
+    /// Canonical event kind that failed to resolve (e.g. `"tool.post"`,
+    /// `"github.push"`). Stored on the typed error so downcast consumers
+    /// can inspect it without parsing the Display message.
+    #[allow(dead_code)]
+    pub event_kind: String,
+    pub route_matched: bool,
+    pub message: String,
+}
+
+impl std::fmt::Display for NoRouteTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NoRouteTarget {}
+
 impl RouteTraceResult {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -365,8 +389,10 @@ impl Router {
                         .or_else(|| event.channel.clone())
                         .or_else(|| self.config.defaults.channel.clone())
                 }
-                .ok_or_else(|| {
-                    format!("no channel configured for event {}", event.canonical_kind())
+                .ok_or_else(|| NoRouteTarget {
+                    event_kind: event.canonical_kind().to_string(),
+                    route_matched: route.is_some(),
+                    message: format!("no channel configured for event {}", event.canonical_kind()),
                 })?;
 
                 Ok(SinkTarget::DiscordChannel(channel))
@@ -375,10 +401,14 @@ impl Router {
                 .and_then(RouteRule::slack_webhook_target)
                 .map(|webhook| SinkTarget::SlackWebhook(webhook.to_string()))
                 .ok_or_else(|| {
-                    format!(
-                        "no Slack webhook configured for event {}",
-                        event.canonical_kind()
-                    )
+                    NoRouteTarget {
+                        event_kind: event.canonical_kind().to_string(),
+                        route_matched: route.is_some(),
+                        message: format!(
+                            "no Slack webhook configured for event {}",
+                            event.canonical_kind()
+                        ),
+                    }
                     .into()
                 }),
             other => Err(format!(
@@ -774,6 +804,71 @@ mod tests {
                 .await
                 .unwrap(),
             "🚨 wake up"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_no_route_target_with_route_matched_false_when_unrouted() {
+        // No defaults.channel, no routes -> nothing matches, target_for fails
+        // and the typed error reports route_matched: false (drop-by-design).
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: None,
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::custom(None, "unrouted".into());
+
+        let err = router.resolve(&event).await.unwrap_err();
+        let typed = err
+            .downcast_ref::<NoRouteTarget>()
+            .expect("error should be NoRouteTarget");
+        assert!(
+            !typed.route_matched,
+            "no route matched the event — route_matched must be false"
+        );
+        assert_eq!(typed.event_kind, "custom");
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_no_route_target_with_route_matched_true_when_route_lacks_channel() {
+        // A route matches but neither it nor defaults supplies a channel ->
+        // typed error reports route_matched: true (operator misconfig).
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: None,
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::custom(None, "misconfigured".into());
+
+        let err = router.resolve(&event).await.unwrap_err();
+        let typed = err
+            .downcast_ref::<NoRouteTarget>()
+            .expect("error should be NoRouteTarget");
+        assert!(
+            typed.route_matched,
+            "route matched but had no target — route_matched must be true"
         );
     }
 

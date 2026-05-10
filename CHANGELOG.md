@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+- Changed: Distinguish drop-by-design from operator misconfig in dispatcher error
+  handling. Events that match no route emit `event_dropped`/`route_none` telemetry
+  silently (no stderr noise). Routes that match but have no usable target now emit
+  the new `route_target_missing` reason code AND retain the legacy `eprintln!` so
+  configuration drift remains visible. New typed error `router::NoRouteTarget`
+  carries `route_matched: bool` so the dispatcher can branch without parsing
+  strings.
+
 ## 0.6.8 - 2026-05-08
 
 ### Highlights

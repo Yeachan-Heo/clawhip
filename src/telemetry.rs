@@ -33,6 +33,7 @@ pub mod reason {
     pub const ROUTE_MATCHED: &str = "route_matched";
     pub const ROUTE_FALLBACK: &str = "route_fallback";
     pub const ROUTE_NONE: &str = "route_none";
+    pub const ROUTE_TARGET_MISSING: &str = "route_target_missing";
     pub const ROUTINE_BATCH_DEFERRED: &str = "routine_batch_deferred";
     pub const ROUTINE_BATCH_FLUSHED: &str = "routine_batch_flushed";
     pub const RENDER_FAILED: &str = "render_failed";

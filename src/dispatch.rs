@@ -13,7 +13,7 @@ use crate::native_observability::{
     with_native_observability,
 };
 use crate::render::Renderer;
-use crate::router::{ResolvedDelivery, Router};
+use crate::router::{NoRouteTarget, ResolvedDelivery, Router};
 use crate::sink::{Sink, SinkMessage, SinkTarget, SinkTelemetry};
 use crate::telemetry;
 
@@ -135,22 +135,32 @@ impl Dispatcher {
             }
             Err(error) => {
                 let error_message = error.to_string();
-                self.emit_dispatch_failure(
-                    &event,
-                    telemetry::reason::ROUTE_NONE,
-                    None,
-                    error_message.clone(),
-                );
+                let typed = error.downcast_ref::<NoRouteTarget>();
+                let reason = match typed {
+                    Some(t) if t.route_matched => telemetry::reason::ROUTE_TARGET_MISSING,
+                    _ => telemetry::reason::ROUTE_NONE,
+                };
+                self.emit_dispatch_failure(&event, reason, None, error_message.clone());
                 self.observe_native_route_outcome(
                     &event,
                     provenance.as_ref(),
                     None,
                     Some(error_message),
                 );
-                eprintln!(
-                    "clawhip dispatcher failed to resolve {}: {error}",
-                    event.canonical_kind()
+                // Drop-by-design (no route matched, no target) is intent, not failure —
+                // structured telemetry already emitted above; suppress legacy stderr noise.
+                // Misconfigured routes (route matched but target missing) keep the eprintln
+                // because they reflect operator config drift that warrants attention.
+                let drop_by_design = matches!(
+                    typed,
+                    Some(t) if !t.route_matched
                 );
+                if !drop_by_design {
+                    eprintln!(
+                        "clawhip dispatcher failed to resolve {}: {error}",
+                        event.canonical_kind()
+                    );
+                }
                 return;
             }
         };
@@ -175,22 +185,28 @@ impl Dispatcher {
             }
             Err(error) => {
                 let error_message = error.to_string();
-                self.emit_dispatch_failure(
-                    &event,
-                    telemetry::reason::ROUTE_NONE,
-                    None,
-                    error_message.clone(),
-                );
+                let typed = error.downcast_ref::<NoRouteTarget>();
+                let reason = match typed {
+                    Some(t) if t.route_matched => telemetry::reason::ROUTE_TARGET_MISSING,
+                    _ => telemetry::reason::ROUTE_NONE,
+                };
+                self.emit_dispatch_failure(&event, reason, None, error_message.clone());
                 self.observe_native_route_outcome(
                     &event,
                     provenance.as_ref(),
                     None,
                     Some(error_message),
                 );
-                eprintln!(
-                    "clawhip dispatcher failed to resolve {}: {error}",
-                    event.canonical_kind()
+                let drop_by_design = matches!(
+                    typed,
+                    Some(t) if !t.route_matched
                 );
+                if !drop_by_design {
+                    eprintln!(
+                        "clawhip dispatcher failed to resolve {}: {error}",
+                        event.canonical_kind()
+                    );
+                }
                 return;
             }
         };
