@@ -650,6 +650,52 @@ impl AppConfig {
         self.webhook_route_count() > 0
     }
 
+    fn has_localfile_routes(&self) -> bool {
+        self.routes.iter().any(|route| {
+            route.effective_sink() == "localfile" && route.local_file_target().is_some()
+        })
+    }
+
+    fn has_discord_delivery_requiring_bot_token(&self) -> bool {
+        self.default_channel_can_fallback_to_discord()
+            || self.routes.iter().any(|route| {
+                route.effective_sink() == "discord" && route.discord_webhook_target().is_none()
+            })
+            || self.monitors.git.repos.iter().any(|repo| {
+                repo.channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty())
+            })
+            || self.monitors.tmux.sessions.iter().any(|session| {
+                session
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty())
+            })
+            || self.monitors.workspace.iter().any(|workspace| {
+                workspace
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty())
+            })
+            || self.cron.jobs.iter().any(|job| {
+                job.channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty())
+            })
+    }
+
+    fn default_channel_can_fallback_to_discord(&self) -> bool {
+        self.defaults
+            .channel
+            .as_ref()
+            .is_some_and(|channel| !channel.trim().is_empty())
+            && !self
+                .routes
+                .iter()
+                .any(|route| route.event.trim() == "*" && route.filter.is_empty())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.dispatch.ci_batch_window_secs == 0 {
             return Err("dispatch.ci_batch_window_secs must be at least 1".into());
@@ -771,11 +817,15 @@ impl AppConfig {
             }
         }
 
-        if self.effective_token().is_none() && !self.has_webhook_routes() {
-            let has_localfile_route = self.routes.iter().any(|route| {
-                route.effective_sink() == "localfile" && route.local_file_target().is_some()
-            });
-            if !has_localfile_route {
+        if self.effective_token().is_none() {
+            if self.has_discord_delivery_requiring_bot_token() {
+                return Err(
+                    "missing Discord bot token for configured Discord channel delivery; configure [providers.discord].token (or legacy [discord].token), use route webhooks, or remove Discord channel routes"
+                        .into(),
+                );
+            }
+
+            if !self.has_webhook_routes() && !self.has_localfile_routes() {
                 return Err(
                     "missing Discord delivery config: configure [providers.discord].token (or legacy [discord].token), at least one route webhook, or a localfile route"
                         .into(),
@@ -1315,6 +1365,25 @@ mod tests {
     }
 
     #[test]
+    fn catch_all_webhook_with_default_channel_validates_without_bot_token() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "*".into(),
+                webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn slack_webhook_route_satisfies_delivery_validation_without_bot_token() {
         let config = AppConfig {
             routes: vec![RouteRule {
@@ -1327,6 +1396,68 @@ mod tests {
 
         assert!(config.validate().is_ok());
         assert_eq!(config.webhook_route_count(), 1);
+    }
+
+    #[test]
+    fn localfile_only_route_satisfies_delivery_validation_without_bot_token() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "localfile".into(),
+                local_path: Some("/tmp/clawhip/events.jsonl".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn localfile_route_does_not_bypass_missing_token_for_discord_channel_route() {
+        let config = AppConfig {
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "localfile".into(),
+                    local_path: Some("/tmp/clawhip/events.jsonl".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "git.commit".into(),
+                    sink: "discord".into(),
+                    channel: Some("ops".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("missing Discord bot token"));
+    }
+
+    #[test]
+    fn localfile_route_can_mix_with_discord_webhook_without_bot_token() {
+        let config = AppConfig {
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "localfile".into(),
+                    local_path: Some("/tmp/clawhip/events.jsonl".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "git.commit".into(),
+                    sink: "discord".into(),
+                    webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]

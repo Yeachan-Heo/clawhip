@@ -744,6 +744,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_localfile_route_targets_local_path() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "localfile".into(),
+                local_path: Some("/tmp/clawhip/events.jsonl".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-226".into(), "error".into(), "boom".into(), None);
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+
+        assert_eq!(delivery.sink, "localfile");
+        assert_eq!(
+            delivery.target,
+            SinkTarget::LocalFile("/tmp/clawhip/events.jsonl".into())
+        );
+        assert_eq!(delivery.trace.result, RouteTraceResult::Matched);
+    }
+
+    #[tokio::test]
     async fn resolve_uses_defaults_when_no_routes_match() {
         let config = AppConfig {
             defaults: DefaultsConfig {

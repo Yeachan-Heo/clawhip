@@ -24,7 +24,13 @@ fn truncate(value: Option<&str>, max_len: usize) -> Option<String> {
         if s.len() <= max_len {
             s.to_string()
         } else {
-            format!("{}…", &s[..max_len])
+            let boundary = s
+                .char_indices()
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= max_len)
+                .last()
+                .unwrap_or(0);
+            format!("{}…", &s[..boundary])
         }
     })
 }
@@ -74,5 +80,58 @@ impl Sink for LocalFileSink {
         });
         writeln!(file, "{}", serde_json::to_string(&record)?)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::MessageFormat;
+
+    #[test]
+    fn truncate_respects_utf8_char_boundaries() {
+        let input = format!("{}🚨", "a".repeat(239));
+
+        let truncated = truncate(Some(&input), 240).expect("truncated value");
+
+        assert_eq!(truncated, format!("{}…", "a".repeat(239)));
+    }
+
+    #[tokio::test]
+    async fn send_appends_jsonl_record_with_summarized_payload() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("events.jsonl");
+        let sink = LocalFileSink;
+        let message = SinkMessage {
+            event_kind: "session.finished".into(),
+            format: MessageFormat::Compact,
+            content: "done".into(),
+            payload: json!({
+                "provider": "codex",
+                "prompt": "ship it",
+                "event_payload": {
+                    "last_assistant_message": "complete"
+                }
+            }),
+            telemetry: None,
+        };
+        let target = SinkTarget::LocalFile(path.display().to_string());
+
+        sink.send(&target, &message).await.expect("first append");
+        sink.send(&target, &message).await.expect("second append");
+
+        let contents = std::fs::read_to_string(&path).expect("jsonl");
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let record: Value = serde_json::from_str(lines[0]).expect("json record");
+        assert_eq!(record["event_kind"], "session.finished");
+        assert_eq!(record["format"], "compact");
+        assert_eq!(record["content"], "done");
+        assert_eq!(record["summary_payload"]["provider"], "codex");
+        assert_eq!(record["summary_payload"]["prompt"], "ship it");
+        assert_eq!(
+            record["summary_payload"]["last_assistant_message"],
+            "complete"
+        );
     }
 }

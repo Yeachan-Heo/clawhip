@@ -1281,6 +1281,60 @@ PR created #7",
     }
 
     #[test]
+    fn merge_active_config_registrations_skips_active_wrapper_monitor_sessions() {
+        let mut registry = HashMap::from([(
+            "issue-226".into(),
+            RegisteredTmuxSession {
+                session: "issue-226".into(),
+                channel: Some("wrapper-alerts".into()),
+                mention: None,
+                routing: RoutingMetadata::default(),
+                keywords: vec!["wrapper-keyword".into()],
+                keyword_window_secs: 30,
+                stale_minutes: 10,
+                format: None,
+                registered_at: "2026-04-02T01:00:00Z".into(),
+                registration_source: RegistrationSource::CliNew,
+                parent_process: Some(ParentProcessInfo {
+                    pid: 42,
+                    name: Some("codex".into()),
+                }),
+                active_wrapper_monitor: true,
+            },
+        )]);
+
+        merge_active_config_registrations(
+            &mut registry,
+            BTreeMap::from([(
+                "issue-226".into(),
+                RegisteredTmuxSession {
+                    session: "issue-226".into(),
+                    channel: Some("config-alerts".into()),
+                    mention: None,
+                    routing: RoutingMetadata::default(),
+                    keywords: vec!["config-keyword".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T09:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            )]),
+        );
+
+        let registration = registry.get("issue-226").expect("wrapper registration");
+        assert!(registration.active_wrapper_monitor);
+        assert!(matches!(
+            registration.registration_source,
+            RegistrationSource::CliNew
+        ));
+        assert_eq!(registration.channel.as_deref(), Some("wrapper-alerts"));
+        assert_eq!(registration.keywords, vec!["wrapper-keyword"]);
+    }
+
+    #[test]
     fn registered_tmux_session_deserializes_without_new_audit_fields() {
         let registration: RegisteredTmuxSession = serde_json::from_value(serde_json::json!({
             "session": "issue-24",
