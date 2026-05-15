@@ -223,9 +223,9 @@ impl Router {
             .await?;
         match delivery.target {
             SinkTarget::DiscordChannel(channel) => Ok((channel, delivery.format, content)),
-            SinkTarget::DiscordWebhook(_) | SinkTarget::SlackWebhook(_) | SinkTarget::LocalFile(_) => {
-                Err("matched route uses a non-channel target".into())
-            }
+            SinkTarget::DiscordWebhook(_)
+            | SinkTarget::SlackWebhook(_)
+            | SinkTarget::LocalFile(_) => Err("matched route uses a non-channel target".into()),
         }
     }
 
@@ -467,14 +467,14 @@ fn delivery_explanation(
     delivery: &ResolvedDelivery,
     matched_route_index: Option<usize>,
 ) -> DeliveryExplanation {
-        let (target_label, channel) = match &delivery.target {
-            SinkTarget::DiscordChannel(name) => {
-                (format!("DiscordChannel({name:?})"), Some(name.clone()))
-            }
-            SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
-            SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
-            SinkTarget::LocalFile(path) => (format!("LocalFile({path})"), None),
-        };
+    let (target_label, channel) = match &delivery.target {
+        SinkTarget::DiscordChannel(name) => {
+            (format!("DiscordChannel({name:?})"), Some(name.clone()))
+        }
+        SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
+        SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
+        SinkTarget::LocalFile(path) => (format!("LocalFile({path})"), None),
+    };
 
     DeliveryExplanation {
         sink: delivery.sink.clone(),
@@ -809,6 +809,7 @@ mod tests {
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,

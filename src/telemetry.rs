@@ -110,6 +110,7 @@ pub fn safe_target_id(target: &SinkTarget) -> String {
         SinkTarget::SlackWebhook(webhook_url) => {
             format!("slack:webhook:{}", redacted_url_fingerprint(webhook_url))
         }
+        SinkTarget::LocalFile(path) => format!("localfile:{:016x}", fingerprint(path)),
     }
 }
 
@@ -184,6 +185,14 @@ mod tests {
             safe_target_id(&SinkTarget::DiscordChannel("ops".into())),
             "discord:channel:ops"
         );
+    }
+
+    #[test]
+    fn local_file_target_id_does_not_expose_path() {
+        let safe = safe_target_id(&SinkTarget::LocalFile("/tmp/clawhip/events.jsonl".into()));
+
+        assert!(safe.starts_with("localfile:"));
+        assert!(!safe.contains("/tmp/clawhip/events.jsonl"));
     }
 
     #[test]

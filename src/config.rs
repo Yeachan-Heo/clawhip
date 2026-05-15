@@ -772,10 +772,9 @@ impl AppConfig {
         }
 
         if self.effective_token().is_none() && !self.has_webhook_routes() {
-            let has_localfile_route = self
-                .routes
-                .iter()
-                .any(|route| route.effective_sink() == "localfile" && route.local_file_target().is_some());
+            let has_localfile_route = self.routes.iter().any(|route| {
+                route.effective_sink() == "localfile" && route.local_file_target().is_some()
+            });
             if !has_localfile_route {
                 return Err(
                     "missing Discord delivery config: configure [providers.discord].token (or legacy [discord].token), at least one route webhook, or a localfile route"
