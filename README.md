@@ -900,7 +900,20 @@ clawhip agent ...       # thin client agent lifecycle event
 clawhip native hook ... # provider-native hook thin client
 clawhip tmux ...        # thin client / wrapper surface
 clawhip plugin list     # list installed/bundled shell-hook plugins
+clawhip gajae status    # check local GAJAE CLI bridge availability
 ```
+
+
+## GAJAE CLI bridge
+
+`clawhip gajae` provides a small Rust CLI bridge for local GAJAE dogfooding:
+
+```bash
+clawhip gajae status
+clawhip gajae profile install
+```
+
+`status` discovers GAJAE from `GAJAE_BIN` first, then the `gajae` executable on `PATH`, and verifies it by running `gajae --help`. `profile install` forwards to `gajae clawhip profile install` with stdout/stderr attached so GAJAE owns the profile update flow.
 
 ## Internal PR fast-path
 

@@ -153,6 +153,11 @@ pub enum Commands {
     /// Shows which routes match, which filters pass/fail, and where the
     /// event would be delivered — useful for debugging config.
     Explain(ExplainArgs),
+    /// Bridge to the local gajae CLI.
+    Gajae {
+        #[command(subcommand)]
+        command: GajaeCommands,
+    },
     /// Release consistency checks.
     Release {
         #[command(subcommand)]
@@ -472,6 +477,23 @@ impl NativeHookArgs {
         }
         Ok(serde_json::from_str(trimmed)?)
     }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum GajaeCommands {
+    /// Check whether gajae is available.
+    Status,
+    /// Manage gajae-installed clawhip profiles.
+    Profile {
+        #[command(subcommand)]
+        command: GajaeProfileCommands,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum GajaeProfileCommands {
+    /// Install the clawhip profile through gajae.
+    Install,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1252,6 +1274,32 @@ mod tests {
         };
 
         assert!(args.follow);
+    }
+
+    #[test]
+    fn parses_gajae_status_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "gajae", "status"]);
+
+        let Commands::Gajae { command } = cli.command.expect("gajae command") else {
+            panic!("expected gajae command");
+        };
+
+        assert!(matches!(command, GajaeCommands::Status));
+    }
+
+    #[test]
+    fn parses_gajae_profile_install_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "gajae", "profile", "install"]);
+
+        let Commands::Gajae { command } = cli.command.expect("gajae command") else {
+            panic!("expected gajae command");
+        };
+
+        let GajaeCommands::Profile { command } = command else {
+            panic!("expected gajae profile command");
+        };
+
+        assert!(matches!(command, GajaeProfileCommands::Install));
     }
 
     #[test]
