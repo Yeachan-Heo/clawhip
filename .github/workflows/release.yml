@@ -117,6 +117,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
       - name: Ensure native build tools
         run: |
           set -euo pipefail
