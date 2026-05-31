@@ -64,7 +64,7 @@ jobs:
   plan:
     needs:
       - preflight
-    if: ${{ always() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') }}
+    if: ${{ always() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
