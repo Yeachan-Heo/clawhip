@@ -18,6 +18,45 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Ensure native build tools
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "Native build tools already available"
+            exit 0
+          fi
+
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            exit 1
+          fi
+
+          if [[ "$(id -u)" == "0" ]]; then
+            apt_get=(apt-get)
+          elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            apt_get=(sudo apt-get)
+          else
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            exit 1
+          fi
+
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends build-essential xz-utils
+
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is still missing after apt install."
+              exit 1
+            fi
+          done
       - run: cargo check
 
   test:
@@ -28,6 +67,45 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Ensure native build tools
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "Native build tools already available"
+            exit 0
+          fi
+
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            exit 1
+          fi
+
+          if [[ "$(id -u)" == "0" ]]; then
+            apt_get=(apt-get)
+          elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            apt_get=(sudo apt-get)
+          else
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            exit 1
+          fi
+
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends build-essential xz-utils
+
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is still missing after apt install."
+              exit 1
+            fi
+          done
       - run: cargo test
 
   clippy:
@@ -40,6 +118,45 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Ensure native build tools
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "Native build tools already available"
+            exit 0
+          fi
+
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            exit 1
+          fi
+
+          if [[ "$(id -u)" == "0" ]]; then
+            apt_get=(apt-get)
+          elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            apt_get=(sudo apt-get)
+          else
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            exit 1
+          fi
+
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends build-essential xz-utils
+
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is still missing after apt install."
+              exit 1
+            fi
+          done
       - run: cargo clippy -- -D warnings
 
   fmt:
@@ -51,6 +168,45 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Ensure native build tools
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "Native build tools already available"
+            exit 0
+          fi
+
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            exit 1
+          fi
+
+          if [[ "$(id -u)" == "0" ]]; then
+            apt_get=(apt-get)
+          elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            apt_get=(sudo apt-get)
+          else
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            exit 1
+          fi
+
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends build-essential xz-utils
+
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is still missing after apt install."
+              exit 1
+            fi
+          done
       - run: cargo fmt --all -- --check
 
   build:
@@ -62,6 +218,45 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Ensure native build tools
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "Native build tools already available"
+            exit 0
+          fi
+
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            exit 1
+          fi
+
+          if [[ "$(id -u)" == "0" ]]; then
+            apt_get=(apt-get)
+          elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            apt_get=(sudo apt-get)
+          else
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            exit 1
+          fi
+
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends build-essential xz-utils
+
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is still missing after apt install."
+              exit 1
+            fi
+          done
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:

@@ -55,6 +55,45 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Ensure native build tools
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "Native build tools already available"
+            exit 0
+          fi
+
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            exit 1
+          fi
+
+          if [[ "$(id -u)" == "0" ]]; then
+            apt_get=(apt-get)
+          elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            apt_get=(sudo apt-get)
+          else
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            exit 1
+          fi
+
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends build-essential xz-utils
+
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is still missing after apt install."
+              exit 1
+            fi
+          done
       - name: Build clawhip (release preflight needs the binary)
         run: cargo build --release
       - name: Release consistency preflight
@@ -78,6 +117,45 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Ensure native build tools
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing+=("$tool")
+            fi
+          done
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "Native build tools already available"
+            exit 0
+          fi
+
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            exit 1
+          fi
+
+          if [[ "$(id -u)" == "0" ]]; then
+            apt_get=(apt-get)
+          elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            apt_get=(sudo apt-get)
+          else
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            exit 1
+          fi
+
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends build-essential xz-utils
+
+          for tool in cc make xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is still missing after apt install."
+              exit 1
+            fi
+          done
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
