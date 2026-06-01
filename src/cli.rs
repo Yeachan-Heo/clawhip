@@ -249,6 +249,18 @@ pub struct VerifyBindingsArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Default, Args)]
+pub struct VerifyGatewayAllowlistArgs {
+    /// Path to the local Clawdbot gateway JSON config.
+    ///
+    /// Defaults to ~/.clawdbot/clawdbot.json when HOME is available.
+    #[arg(long = "gateway-config")]
+    pub gateway_config: Option<PathBuf>,
+    /// Emit machine-readable JSON instead of the human-readable text report.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 impl EmitArgs {
     pub fn into_event(self) -> crate::Result<crate::events::IncomingEvent> {
         let mut channel = None;
@@ -710,6 +722,12 @@ pub enum ConfigCommand {
     /// then queries the Discord API to confirm each channel exists and (optionally)
     /// matches the `channel_name` hint set alongside the ID.
     VerifyBindings(VerifyBindingsArgs),
+    /// Verify clawhip channel destinations are allowed by the local Clawdbot gateway config.
+    ///
+    /// Reads only the public-safe gateway channel allowlist shape and reports
+    /// channel IDs plus clawhip source labels; never dumps gateway tokens,
+    /// webhooks, payloads, or unrelated config fields.
+    VerifyGatewayAllowlist(VerifyGatewayAllowlistArgs),
 }
 
 #[cfg(test)]
@@ -1028,6 +1046,29 @@ mod tests {
             panic!("expected verify-bindings");
         };
         assert!(!args.json);
+    }
+
+    #[test]
+    fn parses_config_verify_gateway_allowlist_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "config",
+            "verify-gateway-allowlist",
+            "--gateway-config",
+            "/tmp/clawdbot.json",
+            "--json",
+        ]);
+        let Some(Commands::Config {
+            command: Some(ConfigCommand::VerifyGatewayAllowlist(args)),
+        }) = cli.command
+        else {
+            panic!("expected verify-gateway-allowlist");
+        };
+        assert_eq!(
+            args.gateway_config.as_deref(),
+            Some(std::path::Path::new("/tmp/clawdbot.json"))
+        );
+        assert!(args.json);
     }
 
     #[test]

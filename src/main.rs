@@ -10,6 +10,7 @@ mod dispatch;
 mod dynamic_tokens;
 mod event;
 mod events;
+mod gateway_allowlist;
 mod hooks;
 mod keyword_window;
 mod lifecycle;
@@ -36,7 +37,7 @@ use tokio::runtime::Builder;
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GitCommands,
     GithubCommands, HooksCommands, MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands,
-    SetupArgs, TmuxCommands, UpdateCommands, VerifyBindingsArgs,
+    SetupArgs, TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, SetupEdits};
@@ -317,6 +318,9 @@ async fn real_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
             ConfigCommand::VerifyBindings(args) => run_verify_bindings(config, args).await,
+            ConfigCommand::VerifyGatewayAllowlist(args) => {
+                run_verify_gateway_allowlist(config, args)
+            }
         },
         Commands::Plugin { command } => match command {
             PluginCommands::List => {
@@ -504,6 +508,31 @@ async fn run_verify_bindings(config: Arc<AppConfig>, args: VerifyBindingsArgs) -
     }
 
     if !audit.all_ok() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_verify_gateway_allowlist(
+    config: Arc<AppConfig>,
+    args: VerifyGatewayAllowlistArgs,
+) -> Result<()> {
+    let gateway_config_path = match args.gateway_config {
+        Some(path) => path,
+        None => gateway_allowlist::default_gateway_config_path().ok_or_else(|| {
+            "could not resolve default gateway config path; pass --gateway-config <path>"
+                .to_string()
+        })?,
+    };
+    let report = gateway_allowlist::verify_from_path(&config, &gateway_config_path)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{report}");
+    }
+
+    if !report.all_ok() {
         std::process::exit(1);
     }
     Ok(())

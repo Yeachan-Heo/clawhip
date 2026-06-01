@@ -758,6 +758,28 @@ Discord thread targets:
 - Diagnostics and binding verification only reference configured IDs and status
   outcomes; clawhip does not list or dump private channel/thread inventories.
 
+## Gateway allowlist diagnostics
+
+When clawhip sends through a local Clawdbot gateway, route channel IDs must also
+be present in the gateway's Discord allowlist. Check that boundary with:
+
+```bash
+clawhip config verify-gateway-allowlist
+clawhip config verify-gateway-allowlist --gateway-config ~/.clawdbot/clawdbot.json
+clawhip config verify-gateway-allowlist --json
+```
+
+The default gateway config path is `~/.clawdbot/clawdbot.json` when `HOME` is
+available; use `--gateway-config <path>` for any other local file. The command
+reads only `channels.discord.guilds[*].channels.<channel_id>.allow = true`,
+compares it with clawhip's configured Discord channel destinations, and exits
+non-zero when any destination is missing or not explicitly allowed.
+
+Output is public-safe by design: text and JSON reports include counts, clawhip
+source labels, and channel IDs only. They do not dump gateway tokens, webhook
+URLs, raw config payloads, or unrelated gateway fields. Webhooks, Slack routes,
+localfile routes, and thread-only targets are outside this allowlist check.
+
 ## Dynamic token contract
 
 Only for routes with:
@@ -870,6 +892,7 @@ Required live sign-off presets:
 clawhip                 # start daemon
 clawhip status          # daemon health
 clawhip config          # bounded preset editor / config inspection
+clawhip config verify-gateway-allowlist  # check Clawdbot gateway allowlist coverage
 clawhip send ...        # thin client custom event
 clawhip github ...      # thin client GitHub event
 clawhip git ...         # thin client git event

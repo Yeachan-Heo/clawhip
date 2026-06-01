@@ -41,6 +41,7 @@ pub enum BindingSource {
     Route { index: usize },
     GitMonitor { index: usize },
     TmuxMonitor { index: usize },
+    WorkspaceMonitor { index: usize },
 }
 
 impl fmt::Display for BindingSource {
@@ -50,6 +51,7 @@ impl fmt::Display for BindingSource {
             Self::Route { index } => write!(f, "routes[{}]", index + 1),
             Self::GitMonitor { index } => write!(f, "monitors.git.repos[{}]", index + 1),
             Self::TmuxMonitor { index } => write!(f, "monitors.tmux.sessions[{}]", index + 1),
+            Self::WorkspaceMonitor { index } => write!(f, "monitors.workspace[{}]", index + 1),
         }
     }
 }
@@ -86,7 +88,8 @@ pub fn collect_bindings(config: &AppConfig) -> Vec<ChannelBinding> {
 
     // routes
     for (index, route) in config.routes.iter().enumerate() {
-        if let Some(channel) = route.channel.as_deref()
+        if route.effective_sink() == "discord"
+            && let Some(channel) = route.channel.as_deref()
             && !channel.is_empty()
         {
             let label = if route.filter.is_empty() {
@@ -141,6 +144,20 @@ pub fn collect_bindings(config: &AppConfig) -> Vec<ChannelBinding> {
                 expected_name: session.channel_name.clone(),
                 source: BindingSource::TmuxMonitor { index },
                 label: format!("tmux:{}", session.session),
+            });
+        }
+    }
+
+    // workspace monitors
+    for (index, workspace) in config.monitors.workspace.iter().enumerate() {
+        if let Some(channel) = workspace.channel.as_deref()
+            && !channel.is_empty()
+        {
+            bindings.push(ChannelBinding {
+                channel_id: channel.to_string(),
+                expected_name: None,
+                source: BindingSource::WorkspaceMonitor { index },
+                label: format!("workspace:{}", workspace.path),
             });
         }
     }
@@ -321,7 +338,7 @@ mod tests {
 
     use crate::config::{
         DefaultsConfig, GitMonitorConfig, GitRepoMonitor, MonitorConfig, RouteRule,
-        TmuxMonitorConfig, TmuxSessionMonitor,
+        TmuxMonitorConfig, TmuxSessionMonitor, WorkspaceMonitor,
     };
 
     fn config_with_routes(routes: Vec<RouteRule>) -> AppConfig {
@@ -449,6 +466,29 @@ mod tests {
         let bindings = collect_bindings(&config);
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].label, "tmux:issue-42");
+    }
+
+    #[test]
+    fn collects_workspace_monitor_binding() {
+        let config = AppConfig {
+            monitors: MonitorConfig {
+                workspace: vec![WorkspaceMonitor {
+                    path: "/workspace".into(),
+                    channel: Some("555".into()),
+                    ..WorkspaceMonitor::default()
+                }],
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let bindings = collect_bindings(&config);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].channel_id, "555");
+        assert_eq!(
+            bindings[0].source,
+            BindingSource::WorkspaceMonitor { index: 0 }
+        );
+        assert_eq!(bindings[0].label, "workspace:/workspace");
     }
 
     #[test]
