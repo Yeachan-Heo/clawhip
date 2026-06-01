@@ -599,6 +599,7 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
 
     match enqueue_event(&state.tx, event.clone()).await {
         Ok(()) => {
+            expire_terminal_tmux_registration(state, &event).await;
             telemetry::emit(event_record(
                 telemetry::event_name::EVENT_ACCEPTED,
                 telemetry::reason::ACCEPT_ENQUEUED,
@@ -628,6 +629,55 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
                 .into_response()
         }
     }
+}
+
+async fn expire_terminal_tmux_registration(state: &AppState, event: &IncomingEvent) {
+    if !is_terminal_session_event(event.canonical_kind()) {
+        return;
+    }
+
+    let candidates = terminal_session_candidates(&event.payload);
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut registry = state.tmux_registry.write().await;
+    for session in candidates {
+        if registry.remove(&session).is_some() {
+            telemetry::emit(tmux_terminal_expiry_record(&session));
+        }
+    }
+}
+
+fn is_terminal_session_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "session.finished" | "session.stopped" | "session.pr-created"
+    )
+}
+
+fn tmux_terminal_expiry_record(session: &str) -> serde_json::Map<String, Value> {
+    let mut record = telemetry::record(
+        telemetry::event_name::SOURCE_INVENTORY,
+        "terminal_session_expired",
+        format!("source:tmux:{session}"),
+    );
+    record.insert("source".to_string(), json!("tmux"));
+    record.insert("session".to_string(), json!(session));
+    record
+}
+
+fn terminal_session_candidates(payload: &Value) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for key in ["session", "session_name", "session_id", "agent_name"] {
+        if let Some(value) = payload.get(key).and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() && !candidates.iter().any(|candidate| candidate == value) {
+                candidates.push(value.to_string());
+            }
+        }
+    }
+    candidates
 }
 
 async fn register_tmux(
@@ -905,6 +955,26 @@ mod tests {
         )
     }
 
+    fn tmux_registration(session: &str) -> RegisteredTmuxSession {
+        RegisteredTmuxSession {
+            session: session.into(),
+            channel: Some("alerts".into()),
+            mention: Some("<@123>".into()),
+            routing: RoutingMetadata::default(),
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 15,
+            format: None,
+            registered_at: "2026-04-02T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: Some(ParentProcessInfo {
+                pid: 4242,
+                name: Some("codex".into()),
+            }),
+            active_wrapper_monitor: true,
+        }
+    }
+
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = std::process::Command::new("git")
@@ -970,6 +1040,97 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .insert(path[path.len() - 1].to_string(), Value::String(value));
+    }
+
+    #[tokio::test]
+    async fn accepted_terminal_session_event_expires_matching_tmux_registration() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        registry
+            .write()
+            .await
+            .insert("issue-221".into(), tmux_registration("issue-221"));
+        registry
+            .write()
+            .await
+            .insert("still-active".into(), tmux_registration("still-active"));
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: registry.clone(),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "session.finished".into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "agent_name": "issue-221",
+                    "session": "issue-221",
+                    "session_id": "issue-221",
+                    "status": "finished"
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            rx.recv().await.expect("queued event").kind,
+            "session.finished"
+        );
+        let registry = registry.read().await;
+        assert!(!registry.contains_key("issue-221"));
+        assert!(registry.contains_key("still-active"));
+    }
+
+    #[tokio::test]
+    async fn accepted_non_terminal_session_event_preserves_tmux_registration() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        registry
+            .write()
+            .await
+            .insert("issue-221".into(), tmux_registration("issue-221"));
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: registry.clone(),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "session.blocked".into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "agent_name": "issue-221",
+                    "session": "issue-221",
+                    "status": "blocked"
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            rx.recv().await.expect("queued event").kind,
+            "session.blocked"
+        );
+        assert!(registry.read().await.contains_key("issue-221"));
     }
 
     #[test]

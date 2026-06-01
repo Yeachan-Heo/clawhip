@@ -184,6 +184,16 @@ pub async fn monitor_registered_session(
 
     loop {
         let now = Instant::now();
+        if !session_exists(&registration.session).await? {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_INVENTORY,
+                "source_missing",
+                Some(&registration.session),
+                None,
+            ));
+            break;
+        }
+
         flush_pending_keyword_hits(
             &mut pending_keyword_hits,
             &registration,
@@ -195,20 +205,6 @@ pub async fn monitor_registered_session(
         )
         .await?;
 
-        if !session_exists(&registration.session).await? {
-            flush_pending_keyword_hits(
-                &mut pending_keyword_hits,
-                &registration,
-                &client,
-                &registration.session,
-                now,
-                Duration::from_secs(registration.keyword_window_secs.max(1)),
-                true,
-            )
-            .await?;
-            break;
-        }
-
         let panes_snapshot = snapshot_tmux_session(&registration.session).await?;
         let mut active_panes = HashSet::new();
 
@@ -217,6 +213,10 @@ pub async fn monitor_registered_session(
             let pane_key = pane.pane_id.clone();
             let hash = content_hash(&pane.content);
             let latest_line = last_nonempty_line(&pane.content);
+
+            if pane.pane_dead {
+                pending_keyword_hits = None;
+            }
 
             match panes.get_mut(&pane_key) {
                 None => {
@@ -236,17 +236,21 @@ pub async fn monitor_registered_session(
                 Some(existing) => {
                     existing.pane_dead = pane.pane_dead;
                     if existing.content_hash != hash {
-                        let hits = collect_keyword_hits_with_provenance(
-                            &existing.snapshot,
-                            &pane.content,
-                            &registration.keywords,
-                            KeywordMatchProvenance {
-                                pane_id: pane.pane_id.clone(),
-                                pane_name: pane.pane_name.clone(),
-                                cursor: None,
-                                source: KeywordMatchSource::FreshOutput,
-                            },
-                        );
+                        let hits = if pane.pane_dead {
+                            Vec::new()
+                        } else {
+                            collect_keyword_hits_with_provenance(
+                                &existing.snapshot,
+                                &pane.content,
+                                &registration.keywords,
+                                KeywordMatchProvenance {
+                                    pane_id: pane.pane_id.clone(),
+                                    pane_name: pane.pane_name.clone(),
+                                    cursor: None,
+                                    source: KeywordMatchSource::FreshOutput,
+                                },
+                            )
+                        };
                         push_pending_keyword_hits(&mut pending_keyword_hits, now, hits);
 
                         existing.session = pane.session;
@@ -346,15 +350,6 @@ async fn poll_tmux(
         }
 
         let now = Instant::now();
-        flush_session_pending_keyword_hits(
-            &mut state.pending_keyword_hits,
-            session_name,
-            registration,
-            tx,
-            now,
-            false,
-        )
-        .await?;
 
         match session_exists(session_name).await {
             Ok(false) => {
@@ -365,15 +360,7 @@ async fn poll_tmux(
                     None,
                 ));
                 sessions_to_unregister.push(session_name.clone());
-                flush_session_pending_keyword_hits(
-                    &mut state.pending_keyword_hits,
-                    session_name,
-                    registration,
-                    tx,
-                    now,
-                    true,
-                )
-                .await?;
+                state.pending_keyword_hits.remove(session_name);
                 state.panes.retain(|_, pane| pane.session != *session_name);
                 continue;
             }
@@ -393,6 +380,16 @@ async fn poll_tmux(
             Ok(true) => {}
         }
 
+        flush_session_pending_keyword_hits(
+            &mut state.pending_keyword_hits,
+            session_name,
+            registration,
+            tx,
+            now,
+            false,
+        )
+        .await?;
+
         match snapshot_tmux_session(session_name).await {
             Ok(panes) => {
                 for pane in panes {
@@ -401,6 +398,10 @@ async fn poll_tmux(
                     let now = Instant::now();
                     let hash = content_hash(&pane.content);
                     let latest_line = last_nonempty_line(&pane.content);
+
+                    if pane.pane_dead {
+                        state.pending_keyword_hits.remove(session_name);
+                    }
 
                     let hits = match state.panes.get_mut(&pane_key) {
                         None => {
@@ -421,17 +422,21 @@ async fn poll_tmux(
                         Some(existing) => {
                             existing.pane_dead = pane.pane_dead;
                             if existing.content_hash != hash {
-                                let hits = collect_keyword_hits_with_provenance(
-                                    &existing.snapshot,
-                                    &pane.content,
-                                    &registration.keywords,
-                                    KeywordMatchProvenance {
-                                        pane_id: pane.pane_id.clone(),
-                                        pane_name: pane.pane_name.clone(),
-                                        cursor: None,
-                                        source: KeywordMatchSource::FreshOutput,
-                                    },
-                                );
+                                let hits = if pane.pane_dead {
+                                    Vec::new()
+                                } else {
+                                    collect_keyword_hits_with_provenance(
+                                        &existing.snapshot,
+                                        &pane.content,
+                                        &registration.keywords,
+                                        KeywordMatchProvenance {
+                                            pane_id: pane.pane_id.clone(),
+                                            pane_name: pane.pane_name.clone(),
+                                            cursor: None,
+                                            source: KeywordMatchSource::FreshOutput,
+                                        },
+                                    )
+                                };
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
                                 existing.content_hash = hash;
