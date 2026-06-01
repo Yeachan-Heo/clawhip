@@ -770,7 +770,12 @@ mod tests {
         assert!(!error.contains("secret-lane"));
         assert!(!error.contains("threads"));
         assert_eq!(client.dlq_entries().len(), 1);
-        assert_eq!(client.dlq_entries()[0].target, "discord:thread:thread-404");
+        assert!(
+            client.dlq_entries()[0]
+                .target
+                .starts_with("discord:thread:redacted:")
+        );
+        assert!(!client.dlq_entries()[0].target.contains("thread-404"));
     }
 
     #[tokio::test]

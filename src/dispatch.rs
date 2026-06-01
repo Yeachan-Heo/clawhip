@@ -264,8 +264,9 @@ impl Dispatcher {
                 format!("missing sink '{}'", delivery.sink),
             );
             eprintln!(
-                "clawhip dispatcher missing sink '{}' for target {:?}",
-                delivery.sink, delivery.target
+                "clawhip dispatcher missing sink '{}' for target {}",
+                delivery.sink,
+                safe_target_for_log(&delivery.target)
             );
             return;
         };
@@ -284,10 +285,10 @@ impl Dispatcher {
                     error.to_string(),
                 );
                 eprintln!(
-                    "clawhip dispatcher failed to render {} for {}/ {:?}: {error}",
+                    "clawhip dispatcher failed to render {} for {}/ {}: {error}",
                     event.canonical_kind(),
                     delivery.sink,
-                    delivery.target
+                    safe_target_for_log(&delivery.target)
                 );
                 return;
             }
@@ -324,8 +325,9 @@ impl Dispatcher {
                 format!("missing sink '{}'", first.delivery.sink),
             );
             eprintln!(
-                "clawhip dispatcher missing sink '{}' for batched target {:?}",
-                first.delivery.sink, first.delivery.target
+                "clawhip dispatcher missing sink '{}' for batched target {}",
+                first.delivery.sink,
+                safe_target_for_log(&first.delivery.target)
             );
             return;
         };
@@ -350,10 +352,10 @@ impl Dispatcher {
                         error.to_string(),
                     );
                     eprintln!(
-                        "clawhip dispatcher failed to render batched {} for {}/ {:?}: {error}",
+                        "clawhip dispatcher failed to render batched {} for {}/ {}: {error}",
                         item.event.canonical_kind(),
                         item.delivery.sink,
-                        item.delivery.target
+                        safe_target_for_log(&item.delivery.target)
                     );
                 }
             }
@@ -394,17 +396,12 @@ impl Dispatcher {
                 telemetry::reason::SINK_SEND_FAILED,
                 telemetry::correlation_id_for_message(&message.event_kind, &message.payload),
             );
-            record.insert(
-                "target".to_string(),
-                json!(telemetry::safe_target_id(target)),
-            );
+            let safe_target = safe_target_for_log(target);
+            record.insert("target".to_string(), json!(safe_target));
             record.insert("event_kind".to_string(), json!(message.event_kind));
             record.insert("error".to_string(), json!(error.to_string()));
             telemetry::emit(record);
-            eprintln!(
-                "clawhip dispatcher delivery failed to {:?}: {error}",
-                target
-            );
+            eprintln!("clawhip dispatcher delivery failed to {safe_target}: {error}");
         }
     }
 
@@ -928,6 +925,10 @@ fn normalized_delivery_text(value: Option<&str>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn safe_target_for_log(target: &SinkTarget) -> String {
+    telemetry::safe_target_id(target)
+}
+
 fn sink_target_key(target: &SinkTarget) -> String {
     match target {
         SinkTarget::DiscordChannel(channel) => format!("discord-channel:{channel}"),
@@ -990,6 +991,15 @@ mod tests {
                 "session_id": "sess-route"
             }),
         }
+    }
+
+    #[test]
+    fn dispatcher_log_target_redacts_thread_id() {
+        let raw_thread_id = "123456789012345678";
+        let safe = safe_target_for_log(&SinkTarget::DiscordThread(raw_thread_id.into()));
+
+        assert!(safe.starts_with("discord:thread:redacted:"));
+        assert!(!safe.contains(raw_thread_id));
     }
 
     fn dispatcher_with_observability(

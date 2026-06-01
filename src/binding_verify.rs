@@ -107,30 +107,10 @@ pub fn collect_bindings(config: &AppConfig) -> Vec<ChannelBinding> {
             });
         }
 
-        if let Some(thread) = route.thread.as_deref()
-            && !thread.is_empty()
-        {
-            let label = if route.filter.is_empty() {
-                format!("event={} thread", route.event)
-            } else {
-                let filters: Vec<String> = route
-                    .filter
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect();
-                format!(
-                    "event={} thread filter={{{}}}",
-                    route.event,
-                    filters.join(", ")
-                )
-            };
-            bindings.push(ChannelBinding {
-                channel_id: thread.to_string(),
-                expected_name: None,
-                source: BindingSource::Route { index },
-                label,
-            });
-        }
+        // Discord threads are intentionally excluded from channel-binding
+        // verification. The public verify-bindings output is a channel audit;
+        // treating thread IDs as channel IDs would expose private thread
+        // identifiers and live thread names through text/JSON diagnostics.
     }
 
     // git monitors
@@ -388,20 +368,44 @@ mod tests {
     }
 
     #[test]
-    fn collects_route_thread_binding_without_inventory_details() {
+    fn skips_route_thread_binding_to_keep_diagnostics_public_safe() {
         let config = config_with_routes(vec![RouteRule {
             event: "session.*".into(),
-            thread: Some("555".into()),
+            thread: Some("123456789012345678".into()),
+            channel_name: Some("private-thread-name".into()),
             ..RouteRule::default()
         }]);
 
         let bindings = collect_bindings(&config);
 
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].channel_id, "555");
-        assert_eq!(bindings[0].expected_name, None);
-        assert_eq!(bindings[0].source, BindingSource::Route { index: 0 });
-        assert_eq!(bindings[0].label, "event=session.* thread");
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn audit_text_and_json_do_not_expose_thread_id_or_name() {
+        let config = config_with_routes(vec![RouteRule {
+            event: "session.*".into(),
+            thread: Some("123456789012345678".into()),
+            channel_name: Some("private-thread-name".into()),
+            ..RouteRule::default()
+        }]);
+        let audit = BindingAudit {
+            verdicts: collect_bindings(&config)
+                .into_iter()
+                .map(|binding| BindingVerdict {
+                    binding,
+                    verdict: VerdictKind::NoToken,
+                })
+                .collect(),
+        };
+
+        let text = audit.to_string();
+        let json = serde_json::to_string(&audit).unwrap();
+
+        for rendered in [text, json] {
+            assert!(!rendered.contains("123456789012345678"));
+            assert!(!rendered.contains("private-thread-name"));
+        }
     }
 
     #[test]

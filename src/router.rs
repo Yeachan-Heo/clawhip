@@ -477,7 +477,7 @@ fn delivery_explanation(
         SinkTarget::DiscordChannel(name) => {
             (format!("DiscordChannel({name:?})"), Some(name.clone()))
         }
-        SinkTarget::DiscordThread(id) => (format!("DiscordThread({id:?})"), None),
+        SinkTarget::DiscordThread(_) => (telemetry::safe_target_id(&delivery.target), None),
         SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
         SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
         SinkTarget::LocalFile(path) => (format!("LocalFile({path})"), None),
@@ -896,7 +896,13 @@ mod tests {
             delivery.target,
             SinkTarget::DiscordThread("thread-123".into())
         );
-        assert_eq!(delivery.trace.target, "discord:thread:thread-123");
+        assert!(
+            delivery
+                .trace
+                .target
+                .starts_with("discord:thread:redacted:")
+        );
+        assert!(!delivery.trace.target.contains("thread-123"));
     }
 
     #[tokio::test]
@@ -2611,5 +2617,37 @@ mod tests {
         assert!(parsed["routes"].is_array());
         assert!(parsed["deliveries"].is_array());
         assert_eq!(parsed["deliveries"][0]["sink"], "discord");
+    }
+
+    #[test]
+    fn explain_redacts_thread_target_in_text_and_json() {
+        let raw_thread_id = "123456789012345678";
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "session.*".into(),
+                sink: "discord".into(),
+                thread: Some(raw_thread_id.into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent {
+            kind: "session.finished".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({"session_id":"sess-1"}),
+        };
+
+        let provenance = router.explain(&event);
+        let text = provenance.to_string();
+        let serialized = serde_json::to_string(&provenance).unwrap();
+
+        for rendered in [text, serialized] {
+            assert!(rendered.contains("discord:thread:redacted:"));
+            assert!(!rendered.contains(raw_thread_id));
+        }
     }
 }
