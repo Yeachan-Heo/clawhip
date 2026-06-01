@@ -11,7 +11,108 @@
 
 > **⭐ Optional support:** the interactive repo-local install paths (`./install.sh` and `clawhip install` from a clone) can offer to star this repo after a successful install when `gh` is installed and authenticated. Skip it with `--skip-star-prompt` or `CLAWHIP_SKIP_STAR_PROMPT=1`.
 
-clawhip is a daemon-first Discord notification router with a typed event pipeline, extracted sources, and a clean renderer/sink split.
+**gajae-claw (clawhip) is the control plane for agents:** route events from GitHub, Discord, tmux, and other tools to the right human or agent, record what happened, and separate automatic actions from approval-required actions.
+
+## Start with recipes
+
+Use clawhip when you have an event, a destination, and a policy for whether the next step can happen automatically or needs a human/operator approval. These recipes use placeholder channel IDs and names; replace them with your own public-safe values.
+
+### Recipe 1: PR opened -> notify the maintainer/project channel
+
+When GitHub reports a pull request event, route it to the project channel so the right maintainer sees it.
+
+```toml
+# ~/.clawhip/config.toml
+[[routes]]
+event = "github.pr-status-changed"
+filter = { repo = "my-app" }
+sink = "discord"
+channel = "PROJECT_CHANNEL_ID"
+format = "compact"
+```
+
+Example event shape:
+
+```json
+{
+  "source": "github",
+  "event": "pull_request.opened",
+  "repo": "my-app",
+  "pr": 42,
+  "action": "notify",
+  "target": "PROJECT_CHANNEL_ID"
+}
+```
+
+Result: clawhip records the routed event and posts a compact PR notification to the project channel.
+
+### Recipe 2: CI failed twice -> summarize and escalate
+
+Let routine CI status flow to the project channel, but reserve an escalation route for repeated failures. Your CI watcher or automation can emit the second-failure event after it observes two failed runs for the same PR or branch.
+
+```toml
+# ~/.clawhip/config.toml
+[[routes]]
+event = "github.ci-failed"
+filter = { repo = "my-app" }
+sink = "discord"
+channel = "PROJECT_CHANNEL_ID"
+format = "compact"
+
+[[routes]]
+event = "ci.failed-twice"
+filter = { repo = "my-app" }
+sink = "discord"
+channel = "ESCALATION_CHANNEL_ID"
+format = "alert"
+```
+
+Example escalation payload:
+
+```json
+{
+  "source": "ci-watcher",
+  "event": "ci.failed-twice",
+  "repo": "my-app",
+  "branch": "feature/auth-flow",
+  "summary": "CI failed twice on the same PR; test logs point at integration/auth_test.",
+  "action": "summarize_and_escalate",
+  "target": "ESCALATION_CHANNEL_ID"
+}
+```
+
+Result: normal failures stay low-noise; repeated failures get a short summary in the escalation channel.
+
+### Recipe 3: cleanup, merge, or config change requested -> require operator approval
+
+Some requests should notify an operator instead of letting an agent act immediately. Send those events to an approval channel and keep the requested action in the message body.
+
+```toml
+# ~/.clawhip/config.toml
+[[routes]]
+event = "agent.approval-requested"
+filter = { repo = "my-app" }
+sink = "discord"
+channel = "APPROVAL_CHANNEL_ID"
+format = "alert"
+```
+
+Example approval event:
+
+```json
+{
+  "source": "agent",
+  "event": "agent.approval-requested",
+  "repo": "my-app",
+  "request": "merge PR #42 after checks pass",
+  "reason": "merge changes the shared branch and should be operator-approved",
+  "policy": "approval_required",
+  "action": "notify_operator",
+  "target": "APPROVAL_CHANNEL_ID"
+}
+```
+
+Result: clawhip records the request and alerts an operator; the agent waits for explicit approval before cleanup, merge, or config-changing work.
 
 Human install pitch:
 
@@ -80,71 +181,6 @@ clawhip deliver --session <tmux-session> --prompt "..." --max-enters 4
 `clawhip deliver` validates repo-local prompt-submit hook setup, confirms the target pane is an
 active Codex/Claude (including OMC/OMX wrapper) session, then retries Enter until
 `.clawhip/state/prompt-submit.json` changes or the bounded retry limit is reached.
-
-## Recipes
-
-### Dev-channel follow-up cron for Clawdbot
-
-One practical pattern is:
-
-```text
-system cron -> clawhip send -> Discord dev channel -> Clawdbot follows up on open PRs/issues
-```
-
-This works well when you want a lightweight scheduler that nudges your dev channels every 30 minutes without keeping a gateway/LLM session open just for reminders.
-
-Example follow-up script:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# dev-followup.sh
-# Send a periodic follow-up to active dev channels.
-
-CHANNELS=(
-  "1480171113253175356|clawhip"
-  "1480171113253175357|gaebal-gajae-api"
-  "1480171113253175358|worker-ops"
-)
-
-MENTION="<@1465264645320474637>"
-
-for entry in "${CHANNELS[@]}"; do
-  IFS='|' read -r channel_id project_name <<< "$entry"
-
-  clawhip send \
-    --channel "$channel_id" \
-    --message "🔄 **[$project_name] Dev follow-up** $MENTION — check open PRs/issues, review open blockers, merge anything ready, and continue any stalled work."
-done
-```
-
-You can also send one-off nudges manually:
-
-```bash
-clawhip send \
-  --channel 1480171113253175356 \
-  --message "🔄 **[clawhip] Dev follow-up** <@1465264645320474637> — check open PRs/issues, review blockers, and continue anything stalled."
-
-clawhip send \
-  --channel 1480171113253175357 \
-  --message "🔄 **[gaebal-gajae-api] PR sweep** <@1465264645320474637> — review open PRs, merge anything ready, and post blockers on anything stuck."
-```
-
-Example system cron config:
-
-```crontab
-SHELL=/bin/bash
-PATH=/usr/local/bin:/usr/bin:/bin
-
-*/30 * * * * bellman /home/bellman/bin/dev-followup.sh >> /tmp/dev-followup.log 2>&1
-```
-
-Operational notes:
-- keep one channel entry per active repo/project
-- mention your Clawdbot/OpenClaw bot user so the bot actually wakes up and acts
-- use plain operational language like "check open PRs/issues", "review blockers", and "continue stalled work"
-- this keeps scheduling outside the agent loop: cron handles timing, clawhip handles delivery, Discord handles the handoff
 
 ## Filesystem-offloaded memory pattern
 
@@ -673,8 +709,8 @@ Route model:
 event = "github.*"
 filter = { repo = "clawhip" }
 sink = "discord"
-channel = "1480171113253175356"
-mention = "<@1465264645320474637>"
+channel = "PROJECT_CHANNEL_ID"
+mention = "@maintainer-or-team"
 format = "compact"
 allow_dynamic_tokens = false
 
@@ -682,7 +718,7 @@ allow_dynamic_tokens = false
 event = "session.*"
 filter = { tool = "omx", repo_name = "clawhip" }
 sink = "discord"
-channel = "1480171113253175356"
+channel = "PROJECT_CHANNEL_ID"
 format = "compact"
 allow_dynamic_tokens = false
 
@@ -690,7 +726,7 @@ allow_dynamic_tokens = false
 event = "agent.*"
 filter = { project = "clawhip" }
 sink = "discord"
-channel = "1480171113253175356"
+channel = "PROJECT_CHANNEL_ID"
 format = "alert"
 allow_dynamic_tokens = false
 ```

@@ -104,7 +104,7 @@ Recommended route shape:
 [[routes]]
 event = "native.*"
 filter = { provider = "codex", repo_path = "*/clawhip" }
-channel = "1480171113253175356"
+channel = "PROJECT_CHANNEL_ID"
 format = "compact"
 ```
 

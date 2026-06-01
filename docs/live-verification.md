@@ -14,10 +14,10 @@ Recommended environment:
 
 ```bash
 export CLAWHIP_REPO=Yeachan-Heo/clawhip
-export CLAWHIP_CHANNEL=1480171113253175356
+export CLAWHIP_CHANNEL=TEST_CHANNEL_ID
 export CLAWHIP_DAEMON_URL=http://127.0.0.1:25294
 export CLAWHIP_BOT_TOKEN='<discord-bot-token>'
-export CLAWHIP_MENTION='<@1465264645320474637>'
+export CLAWHIP_MENTION='@maintainer-or-team'
 ```
 
 ## Real built-in preset checklist
@@ -140,4 +140,4 @@ On March 11, 2026, a real validation was run for the custom send path:
 - local daemon health/status returned ok on `http://127.0.0.1:25294`
 - `cargo run -q -- send --message "🧪 clawhip live verification (...)"` exited successfully
 - guild-wide search confirmed actual Discord delivery by the `clawhip` webhook bot
-- delivery landed in `#ops` (`1477003109564678174`), confirming the configured wildcard webhook route was active
+- delivery landed in the configured test channel, confirming the configured wildcard webhook route was active
