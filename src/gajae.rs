@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
 const GAJAE_ENV: &str = "GAJAE_BIN";
 const GAJAE_PATH_NAME: &str = "gajae";
@@ -12,7 +12,6 @@ const PROFILE_INSTALL_ARGS: &[&str] = &["clawhip", "profile", "install"];
 #[derive(Debug, Clone, Copy)]
 pub enum GajaeCommand {
     Status,
-    ProfileInstall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +29,8 @@ pub struct CommandExit {
 
 pub trait CommandRunner {
     fn output(&mut self, program: &Path, args: &[&str]) -> io::Result<CommandOutput>;
-    fn status_inherited(&mut self, program: &Path, args: &[&str]) -> io::Result<CommandExit>;
+    fn status_inherited_output(&mut self, program: &Path, args: &[&str])
+    -> io::Result<CommandExit>;
 }
 
 #[derive(Debug, Default)]
@@ -46,9 +46,14 @@ impl CommandRunner for StdCommandRunner {
         })
     }
 
-    fn status_inherited(&mut self, program: &Path, args: &[&str]) -> io::Result<CommandExit> {
+    fn status_inherited_output(
+        &mut self,
+        program: &Path,
+        args: &[&str],
+    ) -> io::Result<CommandExit> {
         let status = Command::new(program)
             .args(args)
+            .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()?;
@@ -63,9 +68,6 @@ pub fn run(command: GajaeCommand) -> Result<()> {
     let mut runner = StdCommandRunner;
     match command {
         GajaeCommand::Status => run_status_with(&mut runner, |name| std::env::var_os(name)),
-        GajaeCommand::ProfileInstall => {
-            run_profile_install_with(&mut runner, |name| std::env::var_os(name))
-        }
     }
 }
 
@@ -101,13 +103,18 @@ fn run_status_with(
     }
 }
 
+pub fn run_profile_install() -> Result<CommandExit> {
+    let mut runner = StdCommandRunner;
+    run_profile_install_with(&mut runner, |name| std::env::var_os(name))
+}
+
 fn run_profile_install_with(
     runner: &mut impl CommandRunner,
     env_var: impl Fn(&str) -> Option<OsString>,
-) -> Result<()> {
+) -> Result<CommandExit> {
     let bin = discover_gajae_with(env_var);
     let status = runner
-        .status_inherited(&bin, PROFILE_INSTALL_ARGS)
+        .status_inherited_output(&bin, PROFILE_INSTALL_ARGS)
         .with_context(|| {
             format!(
                 "failed to run {} {}",
@@ -116,17 +123,17 @@ fn run_profile_install_with(
             )
         })?;
 
-    if status.success {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "gajae clawhip profile install failed{}",
-            status
-                .code
-                .map(|code| format!(" with exit code {code}"))
-                .unwrap_or_else(|| " without an exit code".to_string())
-        ))
-    }
+    Ok(status)
+}
+
+pub fn profile_install_failure_message(status: CommandExit) -> String {
+    format!(
+        "gajae clawhip profile install failed{}",
+        status
+            .code
+            .map(|code| format!(" with exit code {code}"))
+            .unwrap_or_else(|| " without an exit code".to_string())
+    )
 }
 
 fn concise_detail(stderr: &str) -> String {
@@ -144,7 +151,8 @@ mod tests {
     struct Call {
         program: PathBuf,
         args: Vec<String>,
-        inherited: bool,
+        inherits_stdout_stderr: bool,
+        stdin_null: bool,
     }
 
     #[derive(Debug)]
@@ -186,7 +194,8 @@ mod tests {
             self.calls.push(Call {
                 program: program.to_path_buf(),
                 args: args.iter().map(|arg| (*arg).to_string()).collect(),
-                inherited: false,
+                inherits_stdout_stderr: false,
+                stdin_null: false,
             });
             self.output_result
                 .as_ref()
@@ -194,11 +203,16 @@ mod tests {
                 .map_err(|error| io::Error::new(error.kind(), error.to_string()))
         }
 
-        fn status_inherited(&mut self, program: &Path, args: &[&str]) -> io::Result<CommandExit> {
+        fn status_inherited_output(
+            &mut self,
+            program: &Path,
+            args: &[&str],
+        ) -> io::Result<CommandExit> {
             self.calls.push(Call {
                 program: program.to_path_buf(),
                 args: args.iter().map(|arg| (*arg).to_string()).collect(),
-                inherited: true,
+                inherits_stdout_stderr: true,
+                stdin_null: true,
             });
             self.status_result
                 .as_ref()
@@ -220,7 +234,8 @@ mod tests {
             vec![Call {
                 program: PathBuf::from("/custom/gajae"),
                 args: vec!["--help".into()],
-                inherited: false,
+                inherits_stdout_stderr: false,
+                stdin_null: false,
             }]
         );
     }
@@ -253,9 +268,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_install_constructs_expected_args_and_inherits_stdio() {
+    fn profile_install_constructs_expected_args_inherits_output_and_closes_stdin() {
         let mut runner = MockRunner::available();
-        run_profile_install_with(&mut runner, |_| None).expect("install should pass");
+        let status = run_profile_install_with(&mut runner, |_| None).expect("install should run");
+        assert!(status.success);
 
         assert_eq!(
             runner.calls,
@@ -265,7 +281,8 @@ mod tests {
                     .iter()
                     .map(|arg| (*arg).to_string())
                     .collect(),
-                inherited: true,
+                inherits_stdout_stderr: true,
+                stdin_null: true,
             }]
         );
     }
@@ -273,11 +290,14 @@ mod tests {
     #[test]
     fn profile_install_fails_on_nonzero_status() {
         let mut runner = MockRunner::failing_status(17);
-        let error = run_profile_install_with(&mut runner, |_| None).expect_err("nonzero fails");
+        let status =
+            run_profile_install_with(&mut runner, |_| None).expect("nonzero still reports status");
+        assert_eq!(status.code, Some(17));
 
+        let message = profile_install_failure_message(status);
         assert!(
-            error.to_string().contains("exit code 17"),
-            "unexpected error: {error}"
+            message.contains("exit code 17"),
+            "unexpected message: {message}"
         );
     }
 }

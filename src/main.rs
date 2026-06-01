@@ -357,7 +357,16 @@ async fn real_main(cli: Cli) -> Result<()> {
             GajaeCommands::Status => Ok(gajae::run(gajae::GajaeCommand::Status)?),
             GajaeCommands::Profile { command } => match command {
                 GajaeProfileCommands::Install => {
-                    Ok(gajae::run(gajae::GajaeCommand::ProfileInstall)?)
+                    let status = gajae::run_profile_install()?;
+                    if status.success {
+                        Ok(())
+                    } else {
+                        eprintln!(
+                            "clawhip error: {}",
+                            gajae::profile_install_failure_message(status)
+                        );
+                        std::process::exit(status.code.unwrap_or(1));
+                    }
                 }
             },
         },
