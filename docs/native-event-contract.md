@@ -25,6 +25,28 @@ v1 intentionally supports only the five events shared by Codex and Claude:
 Provider-specific extra events stay out of the shared route surface until clawhip adopts them
 explicitly.
 
+### Question-request bridge
+
+`PreToolUse` and `PostToolUse` payloads whose `tool_name` is an explicit ask-user tool are
+normalized as a `question.requested` route key and delivered through the existing
+`session.blocked` alert semantics. Supported ask-tool names are matched by identifier, not by
+message prose:
+
+- `ask`
+- `ask_user`
+- `ask_user_question`
+- `AskUserQuestion`
+- `askuserquestion`
+
+This covers Codex/OMX-compatible hooks, Pi/GJC ask tools, and Claude Code's
+`askuserquestion` tool without treating arbitrary question marks as alerts.
+
+Question alerts are public-safe by default. clawhip exposes only bounded `summary`,
+`question`, and `question_summary` fields derived from common tool-input keys such as
+`question`, `prompt`, or `message`; control characters and newlines are collapsed and the
+summary is truncated. The original ask tool input/response is not retained in the normalized
+`payload`/`event_payload` copies for question alerts.
+
 ## Preferred ingress
 
 Use the generic provider-native thin client:
@@ -54,6 +76,7 @@ fields for routing:
 - `tool_name`
 - `command`
 - `summary`
+- `question_summary` (question-request bridge only)
 - `event_timestamp`
 
 ### Notes

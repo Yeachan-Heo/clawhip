@@ -1353,6 +1353,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_native_hook_queues_ask_tool_as_session_blocked() {
+        let repo = git_repo();
+        let mut payload = native_payload(repo.path(), "PreToolUse");
+        payload["provider"] = json!("claude-code");
+        payload["event_payload"]["tool_name"] = json!("askuserquestion");
+        payload["event_payload"]["tool_input"] = json!({
+            "question": "Need operator approval?\nDo not dump the full transcript."
+        });
+
+        let (response_json, mut rx) = post_native_payload(payload).await;
+        assert_eq!(response_json["ok"], json!(true));
+        assert_eq!(response_json["type"], json!("session.blocked"));
+
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "session.blocked");
+        assert_eq!(queued.payload["tool"], json!("claude-code"));
+        assert_eq!(queued.payload["agent_name"], json!("claude-code"));
+        assert_eq!(queued.payload["route_key"], json!("question.requested"));
+        assert_eq!(
+            queued.payload["summary"],
+            json!("Need operator approval? Do not dump the full transcript.")
+        );
+        assert_eq!(queued.payload["event_payload"]["redacted"], json!(true));
+        assert!(queued.payload["event_payload"].get("tool_input").is_none());
+    }
+
+    #[tokio::test]
     async fn post_native_hook_rejects_unsupported_event() {
         let (tx, _rx) = mpsc::channel(1);
         let state = AppState {

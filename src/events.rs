@@ -2055,4 +2055,32 @@ mod tests {
             assert_eq!(event.payload["normalized_event"], json!(expected_status));
         }
     }
+
+    #[test]
+    fn normalize_event_maps_question_requested_to_session_blocked() {
+        let event = normalize_event(IncomingEvent {
+            kind: "question.requested".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "tool": "codex",
+                "agent_name": "codex",
+                "session_id": "sess-234",
+                "repo_name": "clawhip",
+                "tool_name": "ask_user_question",
+                "route_key": "question.requested",
+                "question_summary": "Approve the deploy?",
+                "summary": "Approve the deploy?"
+            }),
+        });
+
+        assert_eq!(event.kind, "session.blocked");
+        assert_eq!(event.payload["raw_event"], json!("question.requested"));
+        assert_eq!(event.payload["contract_event"], json!("session.blocked"));
+        assert_eq!(event.payload["status"], json!("blocked"));
+        assert_eq!(event.payload["normalized_event"], json!("blocked"));
+        assert_eq!(event.payload["summary"], json!("Approve the deploy?"));
+    }
 }

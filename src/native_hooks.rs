@@ -46,7 +46,7 @@ pub fn incoming_event_from_native_hook_json(
         ],
     )
     .ok_or_else(|| "missing native hook event name".to_string())?;
-    let canonical_kind = map_shared_event(&event_name)
+    let mut canonical_kind = map_shared_event(&event_name)
         .ok_or_else(|| format!("unsupported native hook event '{event_name}'"))?;
 
     let directory = first_string(
@@ -180,6 +180,10 @@ pub fn incoming_event_from_native_hook_json(
         .cloned()
         .or_else(|| payload.get("payload").cloned())
         .unwrap_or_else(|| json!({}));
+    let question_request = detect_question_request(&event_name, tool_name.as_deref(), payload);
+    if question_request.is_some() {
+        canonical_kind = "question.requested";
+    }
 
     let mut normalized = Map::new();
     normalized.insert("provider".into(), json!(provider.clone()));
@@ -192,8 +196,30 @@ pub fn incoming_event_from_native_hook_json(
         "normalized_event".into(),
         json!(normalized_event_label(canonical_kind)),
     );
-    normalized.insert("event_payload".into(), event_payload);
-    normalized.insert("payload".into(), payload.clone());
+    if let Some(question_request) = &question_request {
+        normalized.insert(
+            "event_payload".into(),
+            safe_question_payload(&event_payload, question_request),
+        );
+        normalized.insert(
+            "payload".into(),
+            safe_question_payload(payload, question_request),
+        );
+        normalized.insert("route_key".into(), json!("question.requested"));
+        normalized.insert("question".into(), json!(question_request.summary.clone()));
+        normalized.insert(
+            "question_summary".into(),
+            json!(question_request.summary.clone()),
+        );
+        normalized.insert("summary".into(), json!(question_request.summary.clone()));
+        normalized.insert(
+            "question_source".into(),
+            json!(question_request.source.clone()),
+        );
+    } else {
+        normalized.insert("event_payload".into(), event_payload);
+        normalized.insert("payload".into(), payload.clone());
+    }
 
     if let Some(directory) = directory {
         normalized.insert("directory".into(), json!(directory));
@@ -745,9 +771,198 @@ fn normalized_event_label(kind: &str) -> &str {
         "session.started" => "started",
         "tool.pre" => "pre-tool-use",
         "tool.post" => "post-tool-use",
+        "question.requested" => "question.requested",
         "session.prompt-submitted" => "prompt-submitted",
         "session.stopped" => "stop",
         _ => kind,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuestionRequest {
+    source: String,
+    summary: String,
+}
+
+fn detect_question_request(
+    event_name: &str,
+    tool_name: Option<&str>,
+    payload: &Value,
+) -> Option<QuestionRequest> {
+    let event = event_name.trim().to_ascii_lowercase().replace('-', "");
+    if event != "pretooluse" && event != "posttooluse" {
+        return None;
+    }
+
+    let tool_name = tool_name?;
+    if !is_question_tool_name(tool_name) {
+        return None;
+    }
+
+    let summary = first_string(
+        payload,
+        &[
+            "/tool_input/question",
+            "/tool_input/prompt",
+            "/tool_input/message",
+            "/tool_input/query",
+            "/tool_input/input",
+            "/event_payload/tool_input/question",
+            "/event_payload/tool_input/prompt",
+            "/event_payload/tool_input/message",
+            "/event_payload/tool_input/query",
+            "/event_payload/tool_input/input",
+            "/payload/tool_input/question",
+            "/payload/tool_input/prompt",
+            "/payload/tool_input/message",
+            "/payload/tool_input/query",
+            "/payload/tool_input/input",
+            "/event_payload/question",
+            "/event_payload/prompt",
+            "/event_payload/message",
+            "/payload/question",
+            "/payload/prompt",
+            "/payload/message",
+        ],
+    )
+    .map(|value| public_safe_summary(&value, 160))
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| format!("operator question requested via {tool_name}"));
+
+    Some(QuestionRequest {
+        source: "ask-tool".to_string(),
+        summary,
+    })
+}
+
+fn is_question_tool_name(tool_name: &str) -> bool {
+    let normalized = tool_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+
+    matches!(
+        normalized.as_str(),
+        "ask" | "askuser" | "askuserquestion" | "askquestion" | "userquestion"
+    )
+}
+
+fn public_safe_summary(value: &str, max_chars: usize) -> String {
+    let collapsed = value
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || ch == '\n' || ch == '\r' || ch == '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    truncate_chars(&collapsed, max_chars)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(1);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn safe_question_payload(payload: &Value, question_request: &QuestionRequest) -> Value {
+    let mut safe = Map::new();
+    copy_safe_payload_string(&mut safe, payload, "provider", &["/provider"]);
+    copy_safe_payload_string(&mut safe, payload, "source", &["/source"]);
+    copy_safe_payload_string(
+        &mut safe,
+        payload,
+        "event_name",
+        &[
+            "/event_name",
+            "/event",
+            "/hook_event_name",
+            "/hookEventName",
+        ],
+    );
+    copy_safe_payload_string(
+        &mut safe,
+        payload,
+        "tool_name",
+        &[
+            "/tool_name",
+            "/toolName",
+            "/event_payload/tool_name",
+            "/event_payload/toolName",
+        ],
+    );
+    copy_safe_payload_string(
+        &mut safe,
+        payload,
+        "session_id",
+        &[
+            "/session_id",
+            "/sessionId",
+            "/event_payload/session_id",
+            "/event_payload/sessionId",
+        ],
+    );
+    copy_safe_payload_string(&mut safe, payload, "turn_id", &["/turn_id", "/turnId"]);
+    copy_safe_payload_string(
+        &mut safe,
+        payload,
+        "repo_path",
+        &["/repo_path", "/context/repo_path"],
+    );
+    copy_safe_payload_string(
+        &mut safe,
+        payload,
+        "worktree_path",
+        &["/worktree_path", "/context/worktree_path"],
+    );
+    copy_safe_payload_string(
+        &mut safe,
+        payload,
+        "repo_name",
+        &["/repo_name", "/context/repo_name"],
+    );
+    copy_safe_payload_string(
+        &mut safe,
+        payload,
+        "project",
+        &["/project", "/project_name", "/projectName"],
+    );
+    copy_safe_payload_string(&mut safe, payload, "directory", &["/directory", "/cwd"]);
+    copy_safe_payload_string(&mut safe, payload, "model", &["/model", "/context/model"]);
+    safe.insert(
+        "question_summary".to_string(),
+        json!(question_request.summary.clone()),
+    );
+    safe.insert(
+        "question_source".to_string(),
+        json!(question_request.source.clone()),
+    );
+    safe.insert("redacted".to_string(), json!(true));
+    safe.entry("redaction_reason".to_string())
+        .or_insert_with(|| json!("question request payload omitted"));
+    Value::Object(safe)
+}
+
+fn copy_safe_payload_string(
+    safe: &mut Map<String, Value>,
+    payload: &Value,
+    key: &str,
+    pointers: &[&str],
+) {
+    if let Some(value) = first_string(payload, pointers) {
+        safe.insert(key.to_string(), json!(public_safe_summary(&value, 160)));
     }
 }
 
@@ -1065,6 +1280,101 @@ mod tests {
             assert_eq!(event.payload["provider"], json!(provider));
             assert_eq!(event.payload["repo_name"], json!("clawhip"));
         }
+    }
+
+    #[test]
+    fn maps_supported_ask_tool_events_to_question_requested() {
+        let cases = [
+            ("codex", "PreToolUse", "ask"),
+            ("gjc", "PreToolUse", "ask_user"),
+            ("pi", "PostToolUse", "ask_user_question"),
+            ("claude-code", "PreToolUse", "askuserquestion"),
+            ("claude-code", "PreToolUse", "AskUserQuestion"),
+        ];
+
+        for (provider, event_name, tool_name) in cases {
+            let event = incoming_event_from_native_hook_json(&json!({
+                "provider": provider,
+                "directory": "/repo/clawhip",
+                "event_name": event_name,
+                "session_id": "sess-234",
+                "event_payload": {
+                    "tool_name": tool_name,
+                    "tool_input": {
+                        "question": "Should I continue?\nThis second line should collapse."
+                    }
+                }
+            }))
+            .expect("event");
+
+            assert_eq!(event.kind, "question.requested", "{provider}:{tool_name}");
+            assert_eq!(event.payload["route_key"], json!("question.requested"));
+            assert_eq!(event.payload["session_id"], json!("sess-234"));
+            assert_eq!(event.payload["repo_name"], json!("clawhip"));
+            assert_eq!(event.payload["tool_name"], json!(tool_name));
+            assert_eq!(
+                event.payload["summary"],
+                json!("Should I continue? This second line should collapse.")
+            );
+            assert_eq!(
+                event.payload["event_payload"]["redacted"],
+                json!(true),
+                "raw ask payload should not survive in event_payload"
+            );
+            assert!(
+                event.payload["event_payload"].get("tool_input").is_none(),
+                "tool_input should be omitted from public-safe question payload"
+            );
+            assert!(
+                event.payload["payload"].get("tool_input").is_none(),
+                "top-level raw tool_input should be omitted from public-safe payload"
+            );
+        }
+    }
+
+    #[test]
+    fn question_request_summary_is_public_safe_and_bounded() {
+        let long_question = format!("{}{}", "A".repeat(200), "\nsecret-ish second line");
+        let event = incoming_event_from_native_hook_json(&json!({
+            "provider": "codex",
+            "directory": "/repo/clawhip",
+            "event_name": "PreToolUse",
+            "tool_name": "ask_user_question",
+            "tool_input": {
+                "prompt": long_question
+            }
+        }))
+        .expect("event");
+
+        let summary = event.payload["summary"].as_str().expect("summary");
+        assert_eq!(event.kind, "question.requested");
+        assert!(summary.chars().count() <= 160);
+        assert!(summary.ends_with('…'));
+        assert!(!summary.contains('\n'));
+    }
+
+    #[test]
+    fn does_not_map_question_marks_or_normal_tools_to_question_requested() {
+        let prose_question = incoming_event_from_native_hook_json(&json!({
+            "provider": "codex",
+            "directory": "/repo/clawhip",
+            "event_name": "UserPromptSubmit",
+            "prompt": "Can you run tests?"
+        }))
+        .expect("event");
+        assert_eq!(prose_question.kind, "session.prompt-submitted");
+
+        let normal_tool = incoming_event_from_native_hook_json(&json!({
+            "provider": "codex",
+            "directory": "/repo/clawhip",
+            "event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "printf 'continue?'"
+            }
+        }))
+        .expect("event");
+        assert_eq!(normal_tool.kind, "tool.pre");
     }
 
     #[test]
