@@ -723,6 +723,14 @@ format = "compact"
 allow_dynamic_tokens = false
 
 [[routes]]
+event = "session.*"
+filter = { tool = "omx", repo_name = "clawhip", session_id = "sess-123" }
+sink = "discord"
+thread = "DISCORD_THREAD_ID"
+format = "compact"
+allow_dynamic_tokens = false
+
+[[routes]]
 event = "agent.*"
 filter = { project = "clawhip" }
 sink = "discord"
@@ -736,6 +744,19 @@ Resolution rules:
 2. payload filter match
 3. route sink / target / format / template / mention applied
 4. default fallback used if route fields absent
+
+Discord thread targets:
+- Use `thread = "DISCORD_THREAD_ID"` on a Discord route to deliver directly into
+  a thread. This is explicit; clawhip does not infer threads from `channel` IDs,
+  names, session labels, or payload fields.
+- A Discord route may set exactly one delivery target: `channel`, `thread`, or
+  `webhook`.
+- Thread delivery uses the configured thread ID as the Discord message target.
+  If Discord reports the thread as archived, missing, forbidden, or otherwise
+  unreachable, clawhip records a concise delivery error and does **not**
+  automatically fall back to the parent channel.
+- Diagnostics and binding verification only reference configured IDs and status
+  outcomes; clawhip does not list or dump private channel/thread inventories.
 
 ## Dynamic token contract
 

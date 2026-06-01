@@ -140,6 +140,11 @@ pub struct RouteRule {
     #[serde(default = "default_sink_name")]
     pub sink: String,
     pub channel: Option<String>,
+    /// Explicit Discord thread ID target. Discord threads are channel-like
+    /// endpoints, but keeping this separate from `channel` preserves operator
+    /// intent and avoids hidden ID heuristics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
     /// Human-readable Discord channel name hint for binding verification.
     /// When set, `clawhip config verify-bindings` compares the live channel
     /// name against this value to detect drift.
@@ -163,6 +168,7 @@ impl Default for RouteRule {
             filter: BTreeMap::new(),
             sink: default_sink_name(),
             channel: None,
+            thread: None,
             channel_name: None,
             webhook: None,
             slack_webhook: None,
@@ -196,6 +202,12 @@ impl RouteRule {
     pub fn discord_webhook_target(&self) -> Option<&str> {
         (self.effective_sink() == "discord")
             .then(|| non_empty_trimmed(self.webhook.as_deref()))
+            .flatten()
+    }
+
+    pub fn discord_thread_target(&self) -> Option<&str> {
+        (self.effective_sink() == "discord")
+            .then(|| non_empty_trimmed(self.thread.as_deref()))
             .flatten()
     }
 
@@ -707,6 +719,7 @@ impl AppConfig {
         for (index, route) in self.routes.iter().enumerate() {
             let sink = route.effective_sink();
             let has_channel = normalize_secret(route.channel.clone()).is_some();
+            let has_thread = route.discord_thread_target().is_some();
             let has_discord_webhook = route.discord_webhook_target().is_some();
             let has_slack_webhook = route.slack_webhook_target().is_some();
             if route.sink.trim().is_empty() && !has_slack_webhook {
@@ -726,9 +739,12 @@ impl AppConfig {
 
             match sink {
                 "discord" => {
-                    if has_channel && has_discord_webhook {
+                    let configured_targets = usize::from(has_channel)
+                        + usize::from(has_thread)
+                        + usize::from(has_discord_webhook);
+                    if configured_targets > 1 {
                         return Err(format!(
-                            "route #{} ({}) cannot set both channel and webhook",
+                            "route #{} ({}) must set only one Discord target: channel, thread, or webhook",
                             index + 1,
                             route.event
                         )
@@ -896,6 +912,7 @@ impl AppConfig {
                     filter: BTreeMap::new(),
                     sink: default_sink_name(),
                     channel: None,
+                    thread: None,
                     channel_name: None,
                     webhook: Some(webhook),
                     slack_webhook: None,
@@ -954,6 +971,7 @@ impl AppConfig {
         match existing {
             Some(route) => {
                 route.channel = Some(channel_id);
+                route.thread = None;
                 route.channel_name = channel_name;
                 route.webhook = None;
             }
@@ -965,6 +983,7 @@ impl AppConfig {
                     filter,
                     sink: default_sink_name(),
                     channel: Some(channel_id),
+                    thread: None,
                     channel_name,
                     webhook: None,
                     slack_webhook: None,
@@ -1351,6 +1370,33 @@ mod tests {
     }
 
     #[test]
+    fn load_or_default_parses_discord_thread_route_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[providers.discord]
+token = "bot-token"
+
+[[routes]]
+event = "session.*"
+sink = "discord"
+thread = "123456789012345678"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(
+            config.routes[0].thread.as_deref(),
+            Some("123456789012345678")
+        );
+        assert_eq!(config.routes[0].channel, None);
+    }
+
+    #[test]
     fn webhook_route_satisfies_delivery_validation_without_bot_token() {
         let config = AppConfig {
             routes: vec![RouteRule {
@@ -1461,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn route_cannot_set_channel_and_webhook() {
+    fn discord_route_cannot_set_multiple_targets() {
         let config = AppConfig {
             providers: ProvidersConfig {
                 discord: DiscordConfig {
@@ -1474,7 +1520,7 @@ mod tests {
                 event: "tmux.keyword".into(),
                 sink: default_sink_name(),
                 channel: Some("123".into()),
-                webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                thread: Some("456".into()),
                 slack_webhook: None,
                 ..RouteRule::default()
             }],
@@ -1482,7 +1528,7 @@ mod tests {
         };
 
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("cannot set both channel and webhook"));
+        assert!(error.contains("only one Discord target"));
     }
 
     #[test]

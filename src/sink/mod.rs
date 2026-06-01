@@ -15,6 +15,7 @@ pub use slack::SlackSink;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SinkTarget {
     DiscordChannel(String),
+    DiscordThread(String),
     DiscordWebhook(String),
     SlackWebhook(String),
     LocalFile(String),

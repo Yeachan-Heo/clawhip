@@ -104,6 +104,7 @@ pub fn stable_correlation_id(event_kind: &str, payload: &Value) -> String {
 pub fn safe_target_id(target: &SinkTarget) -> String {
     match target {
         SinkTarget::DiscordChannel(channel_id) => format!("discord:channel:{channel_id}"),
+        SinkTarget::DiscordThread(thread_id) => format!("discord:thread:{thread_id}"),
         SinkTarget::DiscordWebhook(webhook_url) => {
             format!("discord:webhook:{}", redacted_url_fingerprint(webhook_url))
         }

@@ -926,6 +926,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("route-channel".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,

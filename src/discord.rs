@@ -134,6 +134,9 @@ impl DiscordClient {
                 SinkTarget::DiscordChannel(channel_id) => {
                     self.send_message(channel_id, &message.content).await
                 }
+                SinkTarget::DiscordThread(thread_id) => {
+                    self.send_thread_message(thread_id, &message.content).await
+                }
                 SinkTarget::DiscordWebhook(webhook_url) => {
                     self.send_webhook(webhook_url, &message.content).await
                 }
@@ -291,6 +294,29 @@ impl DiscordClient {
         .await
     }
 
+    async fn send_thread_message(
+        &self,
+        thread_id: &str,
+        content: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
+        let url = format!(
+            "{}/channels/{}/messages",
+            self.api_base.trim_end_matches('/'),
+            thread_id
+        );
+        let client = self.bot_client.as_ref().ok_or_else(|| DiscordSendError {
+            message: "missing Discord bot token for thread delivery; configure [providers.discord].token (or legacy [discord].token) or use a channel/webhook route".to_string(),
+            retry_after: None,
+            status: None,
+        })?;
+
+        self.execute_request(
+            client.post(url).json(&json!({ "content": content })),
+            "Discord thread request",
+        )
+        .await
+    }
+
     async fn send_webhook(
         &self,
         webhook_url: &str,
@@ -322,8 +348,13 @@ impl DiscordClient {
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        let message = if label == "Discord thread request" {
+            discord_thread_error_message(status)
+        } else {
+            format!("{label} failed with {status}: {body}")
+        };
         Err(DiscordSendError {
-            message: format!("{label} failed with {status}: {body}"),
+            message,
             retry_after: parse_retry_after(status, &body),
             status: Some(status.as_u16()),
         })
@@ -488,9 +519,22 @@ fn parse_retry_after(status: StatusCode, body: &str) -> Option<Duration> {
         .map(Duration::from_secs_f64)
 }
 
+fn discord_thread_error_message(status: StatusCode) -> String {
+    let detail = match status {
+        StatusCode::BAD_REQUEST => "thread may be archived or not writable by the bot",
+        StatusCode::FORBIDDEN => "thread is unreachable by the bot",
+        StatusCode::NOT_FOUND => "thread is missing or unreachable by the bot",
+        StatusCode::UNAUTHORIZED => "Discord bot token is invalid for thread delivery",
+        StatusCode::TOO_MANY_REQUESTS => "Discord rate limited thread delivery",
+        _ => "thread delivery failed",
+    };
+    format!("Discord thread delivery failed with {status}: {detail}")
+}
+
 fn target_rate_limit_key(target: &SinkTarget) -> String {
     match target {
         SinkTarget::DiscordChannel(channel_id) => format!("discord:channel:{channel_id}"),
+        SinkTarget::DiscordThread(thread_id) => format!("discord:thread:{thread_id}"),
         SinkTarget::DiscordWebhook(webhook_url) => format!("discord:webhook:{webhook_url}"),
         SinkTarget::SlackWebhook(webhook_url) => format!("slack:webhook:{webhook_url}"),
         SinkTarget::LocalFile(path) => format!("localfile:{path}"),
@@ -647,6 +691,86 @@ mod tests {
         );
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.shutdown().await.ok();
+    }
+
+    async fn serve_once_capture(
+        listener: tokio::net::TcpListener,
+        status_line: &'static str,
+        body: &'static str,
+    ) -> String {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0_u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        let response = format!(
+            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.ok();
+        request
+    }
+
+    #[tokio::test]
+    async fn thread_target_posts_to_thread_message_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once_capture(listener, "HTTP/1.1 204 No Content", ""));
+
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let message = SinkMessage {
+            event_kind: "session.finished".into(),
+            format: MessageFormat::Compact,
+            content: "done".into(),
+            payload: json!({"session_id":"sess-1"}),
+            telemetry: None,
+        };
+
+        client
+            .send(&SinkTarget::DiscordThread("thread-123".into()), &message)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+
+        assert!(request.starts_with("POST /channels/thread-123/messages "));
+        assert!(request.contains("\"content\":\"done\""));
+        assert!(client.dlq_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_target_error_is_public_safe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let private_body = r#"{"message":"Missing Access: private thread #secret-lane","threads":["secret-lane"]}"#;
+        let server = tokio::spawn(serve_once_capture(
+            listener,
+            "HTTP/1.1 403 Forbidden",
+            private_body,
+        ));
+
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let message = SinkMessage {
+            event_kind: "session.failed".into(),
+            format: MessageFormat::Alert,
+            content: "failed".into(),
+            payload: json!({"session_id":"sess-2"}),
+            telemetry: None,
+        };
+
+        let error = client
+            .send(&SinkTarget::DiscordThread("thread-404".into()), &message)
+            .await
+            .unwrap_err()
+            .to_string();
+        let _ = server.await.unwrap();
+
+        assert!(error.contains("thread is unreachable"));
+        assert!(!error.contains("secret-lane"));
+        assert!(!error.contains("threads"));
+        assert_eq!(client.dlq_entries().len(), 1);
+        assert_eq!(client.dlq_entries()[0].target, "discord:thread:thread-404");
     }
 
     #[tokio::test]

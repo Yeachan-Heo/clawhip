@@ -106,6 +106,31 @@ pub fn collect_bindings(config: &AppConfig) -> Vec<ChannelBinding> {
                 label,
             });
         }
+
+        if let Some(thread) = route.thread.as_deref()
+            && !thread.is_empty()
+        {
+            let label = if route.filter.is_empty() {
+                format!("event={} thread", route.event)
+            } else {
+                let filters: Vec<String> = route
+                    .filter
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect();
+                format!(
+                    "event={} thread filter={{{}}}",
+                    route.event,
+                    filters.join(", ")
+                )
+            };
+            bindings.push(ChannelBinding {
+                channel_id: thread.to_string(),
+                expected_name: None,
+                source: BindingSource::Route { index },
+                label,
+            });
+        }
     }
 
     // git monitors
@@ -351,6 +376,7 @@ mod tests {
             event: "*".into(),
             filter,
             channel: Some("222".into()),
+            thread: None,
             channel_name: Some("clawhip-dev".into()),
             ..RouteRule::default()
         }]);
@@ -359,6 +385,23 @@ mod tests {
         assert_eq!(bindings[0].channel_id, "222");
         assert_eq!(bindings[0].expected_name.as_deref(), Some("clawhip-dev"));
         assert!(bindings[0].label.contains("repo=clawhip"));
+    }
+
+    #[test]
+    fn collects_route_thread_binding_without_inventory_details() {
+        let config = config_with_routes(vec![RouteRule {
+            event: "session.*".into(),
+            thread: Some("555".into()),
+            ..RouteRule::default()
+        }]);
+
+        let bindings = collect_bindings(&config);
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].channel_id, "555");
+        assert_eq!(bindings[0].expected_name, None);
+        assert_eq!(bindings[0].source, BindingSource::Route { index: 0 });
+        assert_eq!(bindings[0].label, "event=session.* thread");
     }
 
     #[test]

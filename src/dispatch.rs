@@ -931,6 +931,7 @@ fn normalized_delivery_text(value: Option<&str>) -> String {
 fn sink_target_key(target: &SinkTarget) -> String {
     match target {
         SinkTarget::DiscordChannel(channel) => format!("discord-channel:{channel}"),
+        SinkTarget::DiscordThread(thread) => format!("discord-thread:{thread}"),
         SinkTarget::DiscordWebhook(webhook) => format!("discord-webhook:{webhook}"),
         SinkTarget::SlackWebhook(webhook) => format!("slack-webhook:{webhook}"),
         SinkTarget::LocalFile(path) => format!("localfile:{path}"),
@@ -1155,6 +1156,7 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: None,
+                    thread: None,
                     channel_name: None,
                     webhook: Some(failing_webhook),
                     slack_webhook: None,
@@ -1169,6 +1171,7 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: None,
+                    thread: None,
                     channel_name: None,
                     webhook: Some(successful_webhook),
                     slack_webhook: None,
