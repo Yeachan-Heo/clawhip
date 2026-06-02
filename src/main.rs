@@ -6,6 +6,7 @@ mod core;
 mod cron;
 mod daemon;
 mod discord;
+mod discord_watch;
 mod dispatch;
 mod dynamic_tokens;
 mod event;

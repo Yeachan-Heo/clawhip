@@ -2,11 +2,13 @@ pub mod body;
 pub mod compat;
 
 pub use body::{
-    AgentEvent, CustomEvent, GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent,
-    GitHubCIEvent, GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent, GitHubReleaseEvent,
-    TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
+    AgentEvent, CustomEvent, DiscordNudgeIntentEvent, GitBranchChangedEvent,
+    GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent, GitHubIssueEvent, GitHubPREvent,
+    GitHubPRStatusEvent, GitHubReleaseEvent, TmuxKeywordAggregatedEvent, TmuxKeywordEvent,
+    TmuxStaleEvent, WorkspaceEvent,
 };
 
+use crate::discord_watch::DiscordMessageCreateEvent;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -36,6 +38,8 @@ pub enum EventBody {
     GitHubReleasePublished(GitHubReleaseEvent),
     GitHubReleasePrereleased(GitHubReleaseEvent),
     GitHubReleaseEdited(GitHubReleaseEvent),
+    DiscordMessageCreate(DiscordMessageCreateEvent),
+    DiscordWatchNudgeIntent(DiscordNudgeIntentEvent),
     TmuxKeyword(TmuxKeywordEvent),
     TmuxKeywordAggregated(TmuxKeywordAggregatedEvent),
     TmuxStale(TmuxStaleEvent),

@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::Result;
 use crate::VERSION;
@@ -65,6 +65,8 @@ struct AppState {
     tmux_registry: SharedTmuxRegistry,
     pending_update: SharedPendingUpdate,
     native_observability: SharedNativeHookObservability,
+    cron_state_path: PathBuf,
+    discord_watch_lock: Arc<Mutex<()>>,
 }
 
 pub async fn run(
@@ -117,7 +119,10 @@ pub async fn run(
         tx.clone(),
     );
     spawn_source(WorkspaceSource::new(config.clone()), tx.clone());
-    spawn_source(CronSource::new(config.clone(), cron_state_path), tx.clone());
+    spawn_source(
+        CronSource::new(config.clone(), cron_state_path.clone()),
+        tx.clone(),
+    );
 
     let pending_update = update::new_shared_pending_update();
     {
@@ -152,6 +157,8 @@ pub async fn run(
         tmux_registry,
         pending_update,
         native_observability,
+        cron_state_path,
+        discord_watch_lock: Arc::new(Mutex::new(())),
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -597,6 +604,21 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
         }
     };
 
+    if event.canonical_kind() == "discord.message-create" {
+        if let Err(error) = handle_discord_watch(state, &event).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+        return local_only_event_response(&event, &envelope);
+    }
+
+    if event.canonical_kind() == "discord-watch.nudge-intent" {
+        return local_only_event_response(&event, &envelope);
+    }
+
     match enqueue_event(&state.tx, event.clone()).await {
         Ok(()) => {
             expire_terminal_tmux_registration(state, &event).await;
@@ -629,6 +651,34 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
                 .into_response()
         }
     }
+}
+
+fn local_only_event_response(
+    event: &IncomingEvent,
+    envelope: &crate::event::EventEnvelope,
+) -> axum::response::Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true,
+            "type": event.kind,
+            "event_id": envelope.id.to_string(),
+            "local_only": true,
+        })),
+    )
+        .into_response()
+}
+
+async fn handle_discord_watch(state: &AppState, event: &IncomingEvent) -> Result<()> {
+    let now_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    let _guard = state.discord_watch_lock.lock().await;
+    crate::discord_watch::handle_local_intent_event(
+        &state.config.discord_watch,
+        &state.cron_state_path,
+        event,
+        now_ms as i64,
+    )?;
+    Ok(())
 }
 
 async fn expire_terminal_tmux_registration(state: &AppState, event: &IncomingEvent) {
@@ -950,6 +1000,8 @@ mod tests {
                 tmux_registry: Arc::new(RwLock::new(HashMap::new())),
                 pending_update: update::new_shared_pending_update(),
                 native_observability: new_shared_native_hook_observability(),
+                cron_state_path: PathBuf::from("cron-state.json"),
+                discord_watch_lock: Arc::new(Mutex::new(())),
             },
             rx,
         )
@@ -1061,6 +1113,8 @@ mod tests {
             tmux_registry: registry.clone(),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = accept_event(
@@ -1106,6 +1160,8 @@ mod tests {
             tmux_registry: registry.clone(),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = accept_event(
@@ -1243,6 +1299,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -1280,6 +1338,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -1310,6 +1370,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let event = IncomingEvent::agent_started(
             "worker-1".into(),
@@ -1343,6 +1405,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discord_watch_nudge_intent_ingress_is_local_only_without_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "discord-watch.nudge-intent".into(),
+                channel: Some("must-not-route".into()),
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "id": "intent-1",
+                    "created_at_ms": 1000,
+                    "reasons": ["t3-channel-backlog"],
+                    "source_channel_id": "fixture-general",
+                    "source_channel_name": "general",
+                    "nudge_target_channel_id": "fixture-nudge-target",
+                    "content": "UltraWorkers: <#fixture-general> / general 스윕하라.",
+                    "local_only": true
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "local nudge intents must not enter generic Discord dispatch routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_watch_message_create_writes_local_intent_without_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dir = tempdir().expect("tempdir");
+        let intents = dir.path().join("discord-watch-intents.jsonl");
+        let mut config = AppConfig::default();
+        config.discord_watch.enabled = true;
+        config.discord_watch.gaebal_gajae_user_id = "fixture-gaebal".into();
+        config.discord_watch.watched_channels = vec![crate::config::DiscordWatchChannel {
+            id: "fixture-general".into(),
+            name: "general".into(),
+        }];
+        config.discord_watch.owner_user_ids = vec!["owner".into()];
+        config.discord_watch.state_file = Some(dir.path().join("discord-watch-state.json"));
+        config.discord_watch.intent_file = Some(intents.clone());
+        let state = AppState {
+            config: Arc::new(config),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: dir.path().join("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "discord.message-create".into(),
+                channel: Some("dm".into()),
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "message_id": "dm1",
+                    "channel_id": "dm",
+                    "channel_name": "owner-dm",
+                    "author_id": "owner",
+                    "content": "please sweep",
+                    "mentions": [],
+                    "direct_message": true,
+                    "author_is_owner": false,
+                    "timestamp_ms": 1000
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "discord watch ingress must not enqueue for live dispatch"
+        );
+        let jsonl = fs::read_to_string(intents).expect("intent jsonl");
+        assert!(
+            jsonl.contains("\"local_only\":true"),
+            "intent must be persisted as local-only JSONL"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_watch_local_intent_write_failure_rejects_without_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dir = tempdir().expect("tempdir");
+        let mut config = AppConfig::default();
+        config.discord_watch.enabled = true;
+        config.discord_watch.gaebal_gajae_user_id = "fixture-gaebal".into();
+        config.discord_watch.watched_channels = vec![crate::config::DiscordWatchChannel {
+            id: "fixture-general".into(),
+            name: "general".into(),
+        }];
+        config.discord_watch.owner_user_ids = vec!["owner".into()];
+        config.discord_watch.state_file = Some(dir.path().join("discord-watch-state.json"));
+        config.discord_watch.intent_file = Some(dir.path().to_path_buf());
+        let state = AppState {
+            config: Arc::new(config),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: dir.path().join("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "discord.message-create".into(),
+                channel: Some("dm".into()),
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "message_id": "dm1",
+                    "channel_id": "dm",
+                    "channel_name": "owner-dm",
+                    "author_id": "owner",
+                    "content": "please sweep",
+                    "mentions": [],
+                    "direct_message": true,
+                    "author_is_owner": false,
+                    "timestamp_ms": 1000
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "failed local intent writes must not fall through to dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_watch_serializes_concurrent_threshold_updates() {
+        let (tx, mut rx) = mpsc::channel(5);
+        let dir = tempdir().expect("tempdir");
+        let intents = dir.path().join("discord-watch-intents.jsonl");
+        let mut config = AppConfig::default();
+        config.discord_watch.enabled = true;
+        config.discord_watch.gaebal_gajae_user_id = "fixture-gaebal".into();
+        config.discord_watch.watched_channels = vec![crate::config::DiscordWatchChannel {
+            id: "fixture-general".into(),
+            name: "general".into(),
+        }];
+        config.discord_watch.global_cooldown_ms = 0;
+        config.discord_watch.channel_cooldown_ms = 0;
+        config.discord_watch.state_file = Some(dir.path().join("discord-watch-state.json"));
+        config.discord_watch.intent_file = Some(intents.clone());
+        let gaebal = config.discord_watch.gaebal_gajae_user_id.clone();
+        let state = AppState {
+            config: Arc::new(config),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: dir.path().join("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let event = |id: &str| IncomingEvent {
+            kind: "discord.message-create".into(),
+            channel: Some("fixture-general".into()),
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "message_id": id,
+                "channel_id": "fixture-general",
+                "channel_name": "general",
+                "author_id": "user",
+                "content": format!("<@{gaebal}>"),
+                "mentions": [gaebal.as_str()],
+                "direct_message": false,
+                "author_is_owner": false,
+                "timestamp_ms": 1000
+            }),
+        };
+
+        let (r1, r2, r3, r4, r5) = tokio::join!(
+            accept_event(&state, event("m1")),
+            accept_event(&state, event("m2")),
+            accept_event(&state, event("m3")),
+            accept_event(&state, event("m4")),
+            accept_event(&state, event("m5")),
+        );
+        for response in [r1, r2, r3, r4, r5] {
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "discord watch ingress must remain local-only under concurrency"
+        );
+        let jsonl = fs::read_to_string(intents).expect("intent jsonl");
+        assert_eq!(jsonl.lines().count(), 1);
+        assert!(jsonl.contains("t1-pending-mentions"));
+    }
+
+    #[tokio::test]
     async fn post_native_hook_observability_counts_accepted_event() {
         let repo = git_repo();
         let payload = native_payload(repo.path(), "SessionStart");
@@ -1355,6 +1643,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: observability.clone(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -1381,6 +1671,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: observability.clone(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let payload = json!({"provider": "codex", "event_name": "Bogus"});
 
@@ -1406,6 +1698,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: observability.clone(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -1445,6 +1739,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: observability.clone(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -1483,6 +1779,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let payload = json!({
             "provider": "codex",
@@ -1550,6 +1848,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let payload = json!({
             "provider": "claude-code",
@@ -1714,6 +2014,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -1768,6 +2070,8 @@ mod tests {
             tmux_registry: registry,
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = list_tmux(State(state)).await.into_response();
@@ -1803,6 +2107,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -1832,6 +2138,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: pending,
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -1854,6 +2162,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = approve_update(State(state)).await.into_response();
@@ -1888,6 +2198,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: pending.clone(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = dismiss_update(State(state)).await.into_response();
@@ -1910,6 +2222,8 @@ mod tests {
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = dismiss_update(State(state)).await.into_response();

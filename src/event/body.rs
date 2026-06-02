@@ -129,6 +129,14 @@ pub struct WorkspaceEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DiscordNudgeIntentEvent {
+    pub intent_id: String,
+    pub reasons: Vec<String>,
+    pub content: String,
+    pub local_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CustomEvent {
     pub kind: String,
     pub message: String,

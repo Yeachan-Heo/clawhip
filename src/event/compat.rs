@@ -4,8 +4,8 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::event::{
-    AgentEvent, CustomEvent, EventBody, EventEnvelope, EventMetadata, EventPriority,
-    GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent,
+    AgentEvent, CustomEvent, DiscordNudgeIntentEvent, EventBody, EventEnvelope, EventMetadata,
+    EventPriority, GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent,
     GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent, GitHubReleaseEvent,
     TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
@@ -65,6 +65,30 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
         "github.release-edited" => Ok(EventBody::GitHubReleaseEdited(github_release_event(
             payload,
         )?)),
+        "discord.message-create" => Ok(EventBody::DiscordMessageCreate(serde_json::from_value(
+            payload.clone(),
+        )?)),
+        "discord-watch.nudge-intent" => Ok(EventBody::DiscordWatchNudgeIntent(
+            DiscordNudgeIntentEvent {
+                intent_id: string_field(payload, "id")?,
+                reasons: payload
+                    .get("reasons")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                content: string_field(payload, "content")?,
+                local_only: payload
+                    .get("local_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+        )),
         "github.ci-failed" => Ok(EventBody::GitHubCIFailed(GitHubCIEvent {
             repo: string_field(payload, "repo")?,
             number: payload.get("number").and_then(Value::as_u64),
