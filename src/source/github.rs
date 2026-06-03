@@ -507,10 +507,10 @@ fn collect_ci_events(
 ) -> Vec<IncomingEvent> {
     let mut events = Vec::new();
     for (key, ci) in current {
-        let changed = previous
-            .get(key)
-            .map(|old| old.status != ci.status || old.conclusion != ci.conclusion)
-            .unwrap_or(true);
+        let changed = match previous.get(key) {
+            Some(old) => old.status != ci.status || old.conclusion != ci.conclusion,
+            None => ci.status != "completed",
+        };
         if !changed {
             continue;
         }
@@ -1223,6 +1223,27 @@ mod tests {
             events[0].payload["url"],
             json!("https://github.com/Yeachan-Heo/clawhip/actions/runs/1")
         );
+    }
+
+    #[test]
+    fn initial_terminal_ci_detection_is_suppressed_as_baseline() {
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            ..GitRepoMonitor::default()
+        };
+        for conclusion in ["success", "failure", "cancelled"] {
+            let previous = HashMap::new();
+            let current_ci = ci_snapshot(58, "CI / test", "completed", Some(conclusion));
+            let current = [(current_ci.dedupe_key(), current_ci)]
+                .into_iter()
+                .collect();
+
+            let events = collect_ci_events(&repo, "clawhip", &previous, &current);
+            assert!(
+                events.is_empty(),
+                "initial completed CI with conclusion {conclusion} should only seed the baseline"
+            );
+        }
     }
 
     #[test]
