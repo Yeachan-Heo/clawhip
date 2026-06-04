@@ -488,12 +488,42 @@ pub enum GajaeCommands {
         #[command(subcommand)]
         command: GajaeProfileCommands,
     },
+    /// Validate and ingest gajae receipt families.
+    Receipt {
+        #[command(subcommand)]
+        command: GajaeReceiptCommands,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum GajaeProfileCommands {
     /// Install the clawhip profile through gajae.
     Install,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum GajaeReceiptCommands {
+    /// Validate a receipt and emit a bounded public-safe clawhip event.
+    Ingest(GajaeReceiptIngestArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct GajaeReceiptIngestArgs {
+    /// GAJAE receipt family to validate.
+    #[arg(long)]
+    pub family: String,
+    /// Receipt JSON file to validate.
+    #[arg(long, conflicts_with = "stdin")]
+    pub file: Option<PathBuf>,
+    /// Read receipt JSON from stdin before validation.
+    #[arg(long, conflicts_with = "file")]
+    pub stdin: bool,
+    /// Send the validated event to the local clawhip daemon.
+    #[arg(long, default_value_t = false)]
+    pub send: bool,
+    /// Override the destination channel when sending to the daemon.
+    #[arg(long)]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

@@ -38,9 +38,9 @@ use tokio::runtime::Builder;
 
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GajaeCommands,
-    GajaeProfileCommands, GitCommands, GithubCommands, HooksCommands, MemoryCommands,
-    NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, TmuxCommands, UpdateCommands,
-    VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    GajaeProfileCommands, GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands,
+    MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, TmuxCommands,
+    UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, SetupEdits};
@@ -368,6 +368,32 @@ async fn real_main(cli: Cli) -> Result<()> {
                         );
                         std::process::exit(status.code.unwrap_or(1));
                     }
+                }
+            },
+            GajaeCommands::Receipt { command } => match command {
+                GajaeReceiptCommands::Ingest(args) => {
+                    let source = if let Some(file) = args.file {
+                        gajae::ReceiptSource::File(file)
+                    } else if args.stdin {
+                        let input = gajae::read_receipt_stdin(&mut std::io::stdin())?;
+                        gajae::ReceiptSource::Stdin(input)
+                    } else {
+                        return Err("receipt ingest requires --file or --stdin".into());
+                    };
+                    let send = args.send;
+                    let result = gajae::ingest_receipt(gajae::ReceiptIngestRequest {
+                        family: args.family,
+                        source,
+                        channel: args.channel,
+                    })?;
+                    if send {
+                        let client = DaemonClient::from_config(config.as_ref());
+                        send_incoming_event(&client, result.event).await?;
+                        println!("{{\"status\":\"sent\"}}");
+                    } else {
+                        println!("{}", serde_json::to_string(&result.event)?);
+                    }
+                    Ok(())
                 }
             },
         },
