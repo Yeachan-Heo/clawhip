@@ -119,13 +119,19 @@ async fn run_handler_with_bin(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn GAJAE handler {}", bin.display()))?;
+    let mut child = spawn_handler_command(&mut command, bin).await?;
     if let Some(mut stdin) = child.stdin.take() {
         let event_json = serde_json::to_vec(event)?;
-        stdin.write_all(&event_json).await?;
-        stdin.shutdown().await?;
+        if let Err(error) = stdin.write_all(&event_json).await {
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                return Err(error.into());
+            }
+        }
+        if let Err(error) = stdin.shutdown().await {
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                return Err(error.into());
+            }
+        }
     }
 
     let stdout = child
@@ -202,6 +208,26 @@ async fn run_handler_with_bin(
         Ok(HandlerOutcome::ApprovalRequired(parsed))
     } else {
         Ok(HandlerOutcome::Completed(parsed))
+    }
+}
+
+async fn spawn_handler_command(
+    command: &mut tokio::process::Command,
+    bin: &Path,
+) -> Result<tokio::process::Child> {
+    let mut attempts = 0;
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(26) && attempts < 10 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to spawn GAJAE handler {}", bin.display()));
+            }
+        }
     }
 }
 
@@ -1159,6 +1185,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1267,10 +1294,16 @@ mod tests {
     fn write_fake_gajae(script: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fake-gajae.sh");
-        fs::write(&path, script).expect("write fake gajae");
-        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        let tmp_path = dir.path().join("fake-gajae.sh.tmp");
+        {
+            let mut file = fs::File::create(&tmp_path).expect("create fake gajae");
+            file.write_all(script.as_bytes()).expect("write fake gajae");
+            file.sync_all().expect("sync fake gajae");
+        }
+        let mut permissions = fs::metadata(&tmp_path).expect("metadata").permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("chmod fake gajae");
+        fs::set_permissions(&tmp_path, permissions).expect("chmod fake gajae");
+        fs::rename(&tmp_path, &path).expect("install fake gajae");
         (dir, path)
     }
 
