@@ -122,15 +122,15 @@ async fn run_handler_with_bin(
     let mut child = spawn_handler_command(&mut command, bin).await?;
     if let Some(mut stdin) = child.stdin.take() {
         let event_json = serde_json::to_vec(event)?;
-        if let Err(error) = stdin.write_all(&event_json).await {
-            if error.kind() != io::ErrorKind::BrokenPipe {
-                return Err(error.into());
-            }
+        if let Err(error) = stdin.write_all(&event_json).await
+            && error.kind() != io::ErrorKind::BrokenPipe
+        {
+            return Err(error.into());
         }
-        if let Err(error) = stdin.shutdown().await {
-            if error.kind() != io::ErrorKind::BrokenPipe {
-                return Err(error.into());
-            }
+        if let Err(error) = stdin.shutdown().await
+            && error.kind() != io::ErrorKind::BrokenPipe
+        {
+            return Err(error.into());
         }
     }
 
@@ -1185,7 +1185,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     #[derive(Debug, Clone, PartialEq, Eq)]
