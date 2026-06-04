@@ -499,6 +499,45 @@ pub enum GajaeCommands {
 pub enum GajaeProfileCommands {
     /// Install the clawhip profile through gajae.
     Install,
+    /// Inspect the installed GAJAE clawhip route profile without executing routes.
+    Inspect(GajaeProfileFileArgs),
+    /// Explain which GAJAE route would match an event without executing it.
+    Explain(GajaeProfileExplainArgs),
+    /// Validate a GAJAE route profile apply plan; live apply is approval-gated.
+    Apply(GajaeProfileApplyArgs),
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct GajaeProfileFileArgs {
+    /// Read this profile/routes file instead of auto-discovering the installed GAJAE profile.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct GajaeProfileExplainArgs {
+    /// Read this profile/routes file instead of auto-discovering the installed GAJAE profile.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+    /// GAJAE event name to explain, e.g. github.pr.opened.
+    #[arg(long)]
+    pub event: String,
+    /// Optional repository label to include in the explanation report.
+    #[arg(long)]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct GajaeProfileApplyArgs {
+    /// Read this profile/routes file instead of auto-discovering the installed GAJAE profile.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+    /// Validate and explain the apply plan without executing commands.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    /// Placeholder approval gate for future live apply support; does not enable execution yet.
+    #[arg(long, default_value_t = false)]
+    pub approve: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1330,6 +1369,75 @@ mod tests {
         };
 
         assert!(matches!(command, GajaeProfileCommands::Install));
+    }
+
+    #[test]
+    fn parses_gajae_profile_inspect_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "gajae",
+            "profile",
+            "inspect",
+            "--file",
+            "routes.yml",
+        ]);
+
+        let Commands::Gajae { command } = cli.command.expect("gajae command") else {
+            panic!("expected gajae command");
+        };
+        let GajaeCommands::Profile { command } = command else {
+            panic!("expected gajae profile command");
+        };
+        let GajaeProfileCommands::Inspect(args) = command else {
+            panic!("expected gajae profile inspect command");
+        };
+
+        assert_eq!(args.file, Some(PathBuf::from("routes.yml")));
+    }
+
+    #[test]
+    fn parses_gajae_profile_explain_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "gajae",
+            "profile",
+            "explain",
+            "--event",
+            "github.pr.opened",
+            "--repo",
+            "clawhip",
+        ]);
+
+        let Commands::Gajae { command } = cli.command.expect("gajae command") else {
+            panic!("expected gajae command");
+        };
+        let GajaeCommands::Profile { command } = command else {
+            panic!("expected gajae profile command");
+        };
+        let GajaeProfileCommands::Explain(args) = command else {
+            panic!("expected gajae profile explain command");
+        };
+
+        assert_eq!(args.event, "github.pr.opened");
+        assert_eq!(args.repo.as_deref(), Some("clawhip"));
+    }
+
+    #[test]
+    fn parses_gajae_profile_apply_dry_run_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "gajae", "profile", "apply", "--dry-run"]);
+
+        let Commands::Gajae { command } = cli.command.expect("gajae command") else {
+            panic!("expected gajae command");
+        };
+        let GajaeCommands::Profile { command } = command else {
+            panic!("expected gajae profile command");
+        };
+        let GajaeProfileCommands::Apply(args) = command else {
+            panic!("expected gajae profile apply command");
+        };
+
+        assert!(args.dry_run);
+        assert!(!args.approve);
     }
 
     #[test]

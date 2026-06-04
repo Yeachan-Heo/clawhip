@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -15,10 +16,381 @@ const GAJAE_PATH_NAME: &str = "gajae";
 const PROFILE_INSTALL_ARGS: &[&str] = &["clawhip", "profile", "install"];
 const SUMMARY_LIMIT: usize = 240;
 const RECEIPT_STDIN_LIMIT: usize = 1_048_576;
+const DEFAULT_ROUTES_PATH: &str = ".clawhip/gajae.routes.yml";
+const DEFAULT_RUNTIME_DIR: &str = ".gajae/runtime";
+const PROFILE_FILE_NAME: &str = "clawhip-profile.yml";
+const SUPPORTED_EVENTS: &[&str] = &[
+    "github.issue.opened",
+    "github.issue.comment",
+    "github.pr.opened",
+    "github.pr.synchronize",
+    "github.check.failed",
+    "session.completed",
+    "session.stale",
+    "heartbeat",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub enum GajaeCommand {
     Status,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProfileInspectOptions {
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileExplainOptions {
+    pub file: Option<PathBuf>,
+    pub event: String,
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProfileApplyOptions {
+    pub file: Option<PathBuf>,
+    pub dry_run: bool,
+    pub approve: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GajaeRouteProfile {
+    source: PathBuf,
+    name: Option<String>,
+    routes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteValidation {
+    unknown_events: Vec<String>,
+    unsupported_commands: Vec<(String, String)>,
+}
+
+impl RouteValidation {
+    fn is_clean(&self) -> bool {
+        self.unknown_events.is_empty() && self.unsupported_commands.is_empty()
+    }
+}
+
+pub fn run_profile_inspect(options: ProfileInspectOptions) -> Result<()> {
+    let profile = load_profile(options.file.as_deref())?;
+    let validation = validate_profile(&profile);
+    println!(
+        "GAJAE clawhip profile: {}",
+        profile.name.as_deref().unwrap_or("unknown")
+    );
+    println!("source: {}", profile.source.display());
+    println!("routes: {}", profile.routes.len());
+    for (event, command) in &profile.routes {
+        println!("- {event}: {command}");
+    }
+    print_validation(&validation);
+    if validation.is_clean() {
+        Ok(())
+    } else {
+        bail!("GAJAE profile validation failed")
+    }
+}
+
+pub fn run_profile_explain(options: ProfileExplainOptions) -> Result<()> {
+    let profile = load_profile(options.file.as_deref())?;
+    let validation = validate_profile(&profile);
+    if !SUPPORTED_EVENTS.contains(&options.event.as_str()) {
+        bail!("unknown GAJAE event name: {}", options.event);
+    }
+    if !validation.is_clean() {
+        print_validation(&validation);
+        bail!("GAJAE profile validation failed")
+    }
+
+    println!("event: {}", options.event);
+    if let Some(repo) = options.repo.as_deref() {
+        println!("repo: {repo}");
+    }
+    match profile.routes.get(&options.event) {
+        Some(command) => {
+            println!("match: yes");
+            println!("route command: {command}");
+            println!("action: explain-only; command not executed");
+            Ok(())
+        }
+        None => {
+            println!("match: no");
+            println!("action: explain-only; no command executed");
+            Ok(())
+        }
+    }
+}
+
+pub fn run_profile_apply(options: ProfileApplyOptions) -> Result<()> {
+    if !options.dry_run {
+        if options.approve {
+            bail!(
+                "live GAJAE profile apply is approval-gated and not implemented by this safe inspector"
+            );
+        }
+        bail!("refusing live GAJAE profile apply; rerun with --dry-run to inspect safely");
+    }
+
+    let profile = load_profile(options.file.as_deref())?;
+    let validation = validate_profile(&profile);
+    println!("GAJAE profile apply dry-run");
+    println!("source: {}", profile.source.display());
+    println!("would inspect routes: {}", profile.routes.len());
+    println!("would execute commands: 0");
+    print_validation(&validation);
+    if validation.is_clean() {
+        println!("dry-run result: supported; live apply still requires a separate approval gate");
+        Ok(())
+    } else {
+        bail!("GAJAE profile dry-run detected unsupported route entries")
+    }
+}
+
+fn load_profile(explicit_file: Option<&Path>) -> Result<GajaeRouteProfile> {
+    let source = match explicit_file {
+        Some(path) => path.to_path_buf(),
+        None => discover_profile_path()?,
+    };
+    let contents = fs::read_to_string(&source).with_context(|| {
+        format!(
+            "failed to read GAJAE profile route file {}",
+            source.display()
+        )
+    })?;
+    parse_profile(&contents, source)
+}
+
+fn discover_profile_path() -> Result<PathBuf> {
+    let routes = PathBuf::from(DEFAULT_ROUTES_PATH);
+    if routes.is_file() {
+        return Ok(routes);
+    }
+
+    let runtime_dir = Path::new(DEFAULT_RUNTIME_DIR);
+    if runtime_dir.is_dir() {
+        let mut candidates = Vec::new();
+        for entry in
+            fs::read_dir(runtime_dir).context("failed to inspect GAJAE runtime directory")?
+        {
+            let entry = entry.context("failed to inspect GAJAE runtime entry")?;
+            let candidate = entry.path().join(PROFILE_FILE_NAME);
+            if candidate.is_file() {
+                candidates.push(candidate);
+            }
+        }
+        candidates.sort();
+        if let Some(candidate) = candidates.into_iter().next() {
+            return Ok(candidate);
+        }
+    }
+
+    bail!(
+        "GAJAE clawhip profile not found; expected {DEFAULT_ROUTES_PATH} or {DEFAULT_RUNTIME_DIR}/*/{PROFILE_FILE_NAME}"
+    )
+}
+
+fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
+    let mut name = None;
+    let mut routes = BTreeMap::new();
+    let mut top_level = None::<String>;
+    let mut in_routes = false;
+    let mut route_event = None::<String>;
+    let mut parent_stack: Vec<(usize, String)> = Vec::new();
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let without_comment = raw_line
+            .split_once('#')
+            .map_or(raw_line, |(before, _)| before);
+        if without_comment.trim().is_empty() {
+            continue;
+        }
+        if without_comment.trim_start().starts_with('-') {
+            continue;
+        }
+        let indent = without_comment.chars().take_while(|ch| *ch == ' ').count();
+        if indent != raw_line.len() - raw_line.trim_start_matches(' ').len() || indent % 2 != 0 {
+            bail!("invalid GAJAE profile syntax at line {line_number}");
+        }
+        let trimmed = without_comment.trim();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            bail!("invalid GAJAE profile syntax at line {line_number}");
+        };
+        let key = key.trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            bail!("invalid GAJAE profile key at line {line_number}");
+        }
+        let value = clean_scalar(value.trim());
+
+        while parent_stack
+            .last()
+            .is_some_and(|(level, _)| *level >= indent)
+        {
+            parent_stack.pop();
+        }
+        if value.is_none() {
+            parent_stack.push((indent, key.to_string()));
+        }
+        let parent = parent_stack.last().map(|(_, key)| key.as_str());
+
+        if indent == 0 {
+            top_level = Some(key.to_string());
+            in_routes = key == "routes";
+            route_event = None;
+            validate_top_level_key(key, source.as_path(), line_number)?;
+            if key == "profile" || key == "name" {
+                name = value;
+            }
+            continue;
+        }
+
+        if matches!(top_level.as_deref(), Some("clawhipProfile")) && indent == 2 {
+            validate_clawhip_profile_key(key, line_number)?;
+            in_routes = key == "routes";
+            route_event = None;
+            if key == "name" {
+                name = value;
+            }
+            continue;
+        }
+
+        if in_routes {
+            if indent == routes_indent(top_level.as_deref()) {
+                route_event = Some(key.to_string());
+                if let Some(command) = value {
+                    routes.insert(key.to_string(), command);
+                }
+                continue;
+            }
+            if key == "command" {
+                let event = route_event.clone().ok_or_else(|| {
+                    anyhow::anyhow!("invalid GAJAE profile route command at line {line_number}")
+                })?;
+                let command = value.ok_or_else(|| {
+                    anyhow::anyhow!("invalid GAJAE profile route command at line {line_number}")
+                })?;
+                routes.insert(event, command);
+                continue;
+            }
+            bail!("unsupported GAJAE profile route key at line {line_number}");
+        }
+
+        if matches!(parent, Some("safety" | "followUp" | "gajae")) {
+            continue;
+        }
+    }
+
+    if routes.is_empty() {
+        bail!("GAJAE profile contains no routes");
+    }
+
+    Ok(GajaeRouteProfile {
+        source,
+        name,
+        routes,
+    })
+}
+
+fn clean_scalar(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let cleaned = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value);
+    Some(cleaned.to_string())
+}
+
+fn routes_indent(top_level: Option<&str>) -> usize {
+    if matches!(top_level, Some("clawhipProfile")) {
+        4
+    } else {
+        2
+    }
+}
+
+fn validate_top_level_key(key: &str, source: &Path, line_number: usize) -> Result<()> {
+    let profile_file = source.file_name().and_then(|name| name.to_str()) == Some(PROFILE_FILE_NAME);
+    let allowed = if profile_file {
+        matches!(
+            key,
+            "runtime"
+                | "category"
+                | "displayName"
+                | "gajae"
+                | "clawhipProfile"
+                | "safety"
+                | "operatorConnectionsRequiredLater"
+                | "name"
+                | "description"
+                | "routesFile"
+                | "followUp"
+                | "routes"
+                | "profile"
+        )
+    } else {
+        matches!(key, "profile" | "routes")
+    };
+    if allowed {
+        Ok(())
+    } else {
+        bail!("unsupported GAJAE profile key `{key}` at line {line_number}")
+    }
+}
+
+fn validate_clawhip_profile_key(key: &str, line_number: usize) -> Result<()> {
+    if matches!(
+        key,
+        "name" | "description" | "routesFile" | "safety" | "followUp" | "routes"
+    ) {
+        Ok(())
+    } else {
+        bail!("unsupported GAJAE clawhipProfile key `{key}` at line {line_number}")
+    }
+}
+
+fn validate_profile(profile: &GajaeRouteProfile) -> RouteValidation {
+    let mut unknown_events = Vec::new();
+    let mut unsupported_commands = Vec::new();
+    for (event, command) in &profile.routes {
+        if !SUPPORTED_EVENTS.contains(&event.as_str()) {
+            unknown_events.push(event.clone());
+        }
+        if !command_matches_event(command, event) {
+            unsupported_commands.push((event.clone(), command.clone()));
+        }
+    }
+    RouteValidation {
+        unknown_events,
+        unsupported_commands,
+    }
+}
+
+fn command_matches_event(command: &str, event: &str) -> bool {
+    command == format!("gajae handle {event}")
+        || command == format!("gajae runtime handle --router clawhip --event {event}")
+}
+
+fn print_validation(validation: &RouteValidation) {
+    if validation.is_clean() {
+        println!("validation: ok");
+        return;
+    }
+    println!("validation: failed");
+    for event in &validation.unknown_events {
+        println!("unknown event: {event}");
+    }
+    for (event, _) in &validation.unsupported_commands {
+        println!("unsupported command for event: {event}");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +874,105 @@ mod tests {
                 .map(Clone::clone)
                 .map_err(|error| io::Error::new(error.kind(), error.to_string()))
         }
+    }
+
+    #[test]
+    fn profile_parser_loads_routes_file_and_validates_supported_commands() {
+        let profile = parse_profile(
+            r#"
+profile: gajae
+routes:
+  github.pr.opened:
+    command: gajae handle github.pr.opened
+  heartbeat:
+    command: gajae runtime handle --router clawhip --event heartbeat
+"#,
+            PathBuf::from(".clawhip/gajae.routes.yml"),
+        )
+        .expect("profile should parse");
+
+        assert_eq!(profile.name.as_deref(), Some("gajae"));
+        assert_eq!(profile.routes.len(), 2);
+        assert!(validate_profile(&profile).is_clean());
+    }
+
+    #[test]
+    fn profile_parser_loads_nested_clawhip_profile_routes() {
+        let profile = parse_profile(
+            r#"
+runtime: hermes
+clawhipProfile:
+  name: gajae
+  routes:
+    github.issue.opened:
+      command: gajae handle github.issue.opened
+safety:
+  liveClawhipEnablement: false
+"#,
+            PathBuf::from(".gajae/runtime/hermes/clawhip-profile.yml"),
+        )
+        .expect("nested profile should parse");
+
+        assert_eq!(profile.name.as_deref(), Some("gajae"));
+        assert_eq!(
+            profile
+                .routes
+                .get("github.issue.opened")
+                .map(String::as_str),
+            Some("gajae handle github.issue.opened")
+        );
+        assert!(validate_profile(&profile).is_clean());
+    }
+
+    #[test]
+    fn profile_validation_detects_unknown_events_and_unsupported_commands() {
+        let profile = parse_profile(
+            r#"
+routes:
+  github.pr.closed:
+    command: gajae handle github.pr.closed
+  github.pr.opened:
+    command: rm -rf /tmp/example
+"#,
+            PathBuf::from(".clawhip/gajae.routes.yml"),
+        )
+        .expect("profile should parse before semantic validation");
+
+        let validation = validate_profile(&profile);
+        assert_eq!(validation.unknown_events, vec!["github.pr.closed"]);
+        assert_eq!(validation.unsupported_commands.len(), 1);
+        assert_eq!(validation.unsupported_commands[0].0, "github.pr.opened");
+    }
+
+    #[test]
+    fn malformed_profile_error_is_sanitized_without_raw_input() {
+        let raw_secret = "routes:\n  github.pr.opened command: secret-token-123\n";
+        let error = parse_profile(raw_secret, PathBuf::from(".clawhip/gajae.routes.yml"))
+            .expect_err("malformed profile should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("line 2"), "unexpected message: {message}");
+        assert!(
+            !message.contains("secret-token-123"),
+            "leaked raw input: {message}"
+        );
+        assert!(
+            !message.contains("github.pr.opened command"),
+            "leaked raw input: {message}"
+        );
+    }
+
+    #[test]
+    fn route_file_rejects_unknown_top_level_key_without_raw_value() {
+        let error = parse_profile(
+            "routes:\n  heartbeat:\n    command: gajae handle heartbeat\nprivate: secret-token-123\n",
+            PathBuf::from(".clawhip/gajae.routes.yml"),
+        )
+        .expect_err("unknown key should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("unsupported GAJAE profile key `private`"));
+        assert!(!message.contains("secret-token-123"));
     }
 
     #[test]

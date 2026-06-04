@@ -369,6 +369,25 @@ async fn real_main(cli: Cli) -> Result<()> {
                         std::process::exit(status.code.unwrap_or(1));
                     }
                 }
+                GajaeProfileCommands::Inspect(args) => {
+                    Ok(gajae::run_profile_inspect(gajae::ProfileInspectOptions {
+                        file: args.file,
+                    })?)
+                }
+                GajaeProfileCommands::Explain(args) => {
+                    Ok(gajae::run_profile_explain(gajae::ProfileExplainOptions {
+                        file: args.file,
+                        event: args.event,
+                        repo: args.repo,
+                    })?)
+                }
+                GajaeProfileCommands::Apply(args) => {
+                    Ok(gajae::run_profile_apply(gajae::ProfileApplyOptions {
+                        file: args.file,
+                        dry_run: args.dry_run,
+                        approve: args.approve,
+                    })?)
+                }
             },
             GajaeCommands::Receipt { command } => match command {
                 GajaeReceiptCommands::Ingest(args) => {
