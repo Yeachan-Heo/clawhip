@@ -506,11 +506,15 @@ async function collectAugmentation(root, payload) {
 }
 
 function collectTmuxMetadata(input, cwd) {
-  const sources = [input, input?.context, input?.event_payload, input?.payload]
-    .filter((value) => value && typeof value === 'object');
+  const sources = [input];
+  for (const key of ['context', 'event_payload', 'payload']) {
+    const value = input && typeof input === 'object' ? input[key] : null;
+    if (value && typeof value === 'object') sources.push(value);
+  }
+  const objectSources = sources.filter((value) => value && typeof value === 'object');
   const tmuxSources = [
-    ...sources,
-    ...sources
+    ...objectSources,
+    ...objectSources
       .map((value) => value.tmux)
       .filter((value) => value && typeof value === 'object'),
   ];
@@ -710,7 +714,7 @@ async function main() {
 
   if (result.error) {
     const detail =
-      typeof result.error?.message === 'string' && result.error.message.trim()
+      result.error && typeof result.error.message === 'string' && result.error.message.trim()
         ? result.error.message.trim()
         : String(result.error);
     console.error(`[clawhip] failed to launch native hook bridge: ${detail}`);
@@ -736,9 +740,9 @@ async function main() {
 
 main().catch((error) => {
   const detail =
-    typeof error?.stack === 'string' && error.stack.trim()
+    error && typeof error.stack === 'string' && error.stack.trim()
       ? error.stack.trim()
-      : typeof error?.message === 'string' && error.message.trim()
+      : error && typeof error.message === 'string' && error.message.trim()
         ? error.message.trim()
         : String(error);
   console.error(`[clawhip] native hook wrapper failed: ${detail}`);
@@ -1453,6 +1457,8 @@ mod tests {
         assert!(script.contains("native hook bridge terminated by signal"));
         assert!(script.contains("native hook wrapper failed"));
         assert!(script.contains("process.exit(1);"));
+        assert!(!script.contains("?."));
+        assert!(!script.contains("??"));
     }
 
     #[test]
