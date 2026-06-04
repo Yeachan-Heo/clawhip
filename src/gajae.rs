@@ -19,6 +19,7 @@ const RECEIPT_STDIN_LIMIT: usize = 1_048_576;
 const DEFAULT_ROUTES_PATH: &str = ".clawhip/gajae.routes.yml";
 const DEFAULT_RUNTIME_DIR: &str = ".gajae/runtime";
 const PROFILE_FILE_NAME: &str = "clawhip-profile.yml";
+const MAX_PROFILE_BYTES: usize = 256 * 1024;
 const SUPPORTED_EVENTS: &[&str] = &[
     "github.issue.opened",
     "github.issue.comment",
@@ -161,12 +162,7 @@ fn load_profile_from_cwd(explicit_file: Option<&Path>, cwd: &Path) -> Result<Gaj
         Some(path) => path.to_path_buf(),
         None => discover_profile_path()?,
     };
-    let contents = fs::read_to_string(&source).with_context(|| {
-        format!(
-            "failed to read GAJAE profile route file {}",
-            source.display()
-        )
-    })?;
+    let contents = read_bounded_profile(&source, "GAJAE profile route file")?;
     let profile = parse_profile(&contents, source)?;
     if !profile.routes.is_empty() {
         return Ok(profile);
@@ -176,17 +172,26 @@ fn load_profile_from_cwd(explicit_file: Option<&Path>, cwd: &Path) -> Result<Gaj
         return Ok(profile);
     };
     let routes_source = resolve_routes_file(routes_file, profile.source.as_path(), cwd)?;
-    let routes_contents = fs::read_to_string(&routes_source).with_context(|| {
-        format!(
-            "failed to read referenced GAJAE routes file {}",
-            routes_source.display()
-        )
-    })?;
+    let routes_contents = read_bounded_profile(&routes_source, "referenced GAJAE routes file")?;
     let mut routes_profile = parse_profile(&routes_contents, routes_source)?;
     if routes_profile.name.is_none() {
         routes_profile.name = profile.name;
     }
     Ok(routes_profile)
+}
+
+fn read_bounded_profile(path: &Path, description: &str) -> Result<String> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read {description} {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_PROFILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {description} {}", path.display()))?;
+    if bytes.len() > MAX_PROFILE_BYTES {
+        bail!("{description} exceeds maximum size of {MAX_PROFILE_BYTES} bytes");
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("{description} {} is not valid UTF-8", path.display()))
 }
 
 fn resolve_routes_file(routes_file: &Path, source: &Path, cwd: &Path) -> Result<PathBuf> {
@@ -276,14 +281,17 @@ fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
         if without_comment.trim().is_empty() {
             continue;
         }
-        if without_comment.trim_start().starts_with('-') {
-            continue;
-        }
         let indent = without_comment.chars().take_while(|ch| *ch == ' ').count();
         if indent != raw_line.len() - raw_line.trim_start_matches(' ').len() || indent % 2 != 0 {
             bail!("invalid GAJAE profile syntax at line {line_number}");
         }
         let trimmed = without_comment.trim();
+        if trimmed.starts_with('-') {
+            if in_routes && indent >= routes_indent(top_level.as_deref()) {
+                bail!("unsupported GAJAE list-style route entry at line {line_number}");
+            }
+            continue;
+        }
         let Some((key, value)) = trimmed.split_once(':') else {
             bail!("invalid GAJAE profile syntax at line {line_number}");
         };
@@ -1063,6 +1071,103 @@ routes:
         );
         assert_eq!(profile.source, routes_path);
         assert!(validate_profile(&profile).is_clean());
+    }
+
+    #[test]
+    fn profile_loader_rejects_oversized_primary_profile_without_raw_contents() {
+        let temp = tempdir().expect("tempdir");
+        let profile_path = temp.path().join(".clawhip/gajae.routes.yml");
+        fs::create_dir_all(profile_path.parent().expect("profile parent")).expect("profile dir");
+        fs::write(
+            &profile_path,
+            format!(
+                "routes:\n  heartbeat:\n    command: gajae handle heartbeat\n# {}\n",
+                "secret-token-123".repeat(MAX_PROFILE_BYTES / 16)
+            ),
+        )
+        .expect("write oversized profile");
+
+        let error = load_profile_from_cwd(Some(profile_path.as_path()), temp.path())
+            .expect_err("oversized primary profile should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("exceeds maximum size"));
+        assert!(!message.contains("secret-token-123"));
+    }
+
+    #[test]
+    fn profile_loader_rejects_oversized_referenced_routes_without_raw_contents() {
+        let temp = tempdir().expect("tempdir");
+        let profile_path = temp
+            .path()
+            .join(".gajae/runtime/hermes/clawhip-profile.yml");
+        fs::create_dir_all(profile_path.parent().expect("profile parent")).expect("profile dir");
+        let routes_path = temp.path().join(".clawhip/gajae.routes.yml");
+        fs::create_dir_all(routes_path.parent().expect("routes parent")).expect("routes dir");
+        fs::write(
+            &profile_path,
+            r#"
+runtime: hermes
+clawhipProfile:
+  name: gajae
+  routesFile: .clawhip/gajae.routes.yml
+"#,
+        )
+        .expect("write profile");
+        fs::write(
+            &routes_path,
+            format!(
+                "routes:\n  heartbeat:\n    command: gajae handle heartbeat\n# {}\n",
+                "secret-token-123".repeat(MAX_PROFILE_BYTES / 16)
+            ),
+        )
+        .expect("write oversized routes");
+
+        let error = load_profile_from_cwd(Some(profile_path.as_path()), temp.path())
+            .expect_err("oversized referenced routes should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("referenced GAJAE routes file"));
+        assert!(message.contains("exceeds maximum size"));
+        assert!(!message.contains("secret-token-123"));
+    }
+
+    #[test]
+    fn profile_parser_rejects_list_style_route_entries() {
+        let error = parse_profile(
+            r#"
+routes:
+  - event: github.issue.opened
+  heartbeat:
+    command: gajae handle heartbeat
+"#,
+            PathBuf::from(".clawhip/gajae.routes.yml"),
+        )
+        .expect_err("list-style routes should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("list-style route entry"));
+        assert!(message.contains("line 3"));
+        assert!(!message.contains("github.issue.opened"));
+    }
+
+    #[test]
+    fn profile_parser_rejects_nested_list_style_route_entries() {
+        let error = parse_profile(
+            r#"
+runtime: hermes
+clawhipProfile:
+  routes:
+    - event: github.issue.opened
+"#,
+            PathBuf::from(".gajae/runtime/hermes/clawhip-profile.yml"),
+        )
+        .expect_err("nested list-style routes should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("list-style route entry"));
+        assert!(message.contains("line 5"));
+        assert!(!message.contains("github.issue.opened"));
     }
 
     #[test]
