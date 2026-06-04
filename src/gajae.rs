@@ -58,6 +58,7 @@ pub struct ProfileApplyOptions {
 struct GajaeRouteProfile {
     source: PathBuf,
     name: Option<String>,
+    routes_file: Option<PathBuf>,
     routes: BTreeMap<String, String>,
 }
 
@@ -149,6 +150,13 @@ pub fn run_profile_apply(options: ProfileApplyOptions) -> Result<()> {
 }
 
 fn load_profile(explicit_file: Option<&Path>) -> Result<GajaeRouteProfile> {
+    load_profile_from_cwd(
+        explicit_file,
+        &std::env::current_dir().context("failed to inspect current directory")?,
+    )
+}
+
+fn load_profile_from_cwd(explicit_file: Option<&Path>, cwd: &Path) -> Result<GajaeRouteProfile> {
     let source = match explicit_file {
         Some(path) => path.to_path_buf(),
         None => discover_profile_path()?,
@@ -159,7 +167,66 @@ fn load_profile(explicit_file: Option<&Path>) -> Result<GajaeRouteProfile> {
             source.display()
         )
     })?;
-    parse_profile(&contents, source)
+    let profile = parse_profile(&contents, source)?;
+    if !profile.routes.is_empty() {
+        return Ok(profile);
+    }
+
+    let Some(routes_file) = profile.routes_file.as_deref() else {
+        return Ok(profile);
+    };
+    let routes_source = resolve_routes_file(routes_file, profile.source.as_path(), cwd)?;
+    let routes_contents = fs::read_to_string(&routes_source).with_context(|| {
+        format!(
+            "failed to read referenced GAJAE routes file {}",
+            routes_source.display()
+        )
+    })?;
+    let mut routes_profile = parse_profile(&routes_contents, routes_source)?;
+    if routes_profile.name.is_none() {
+        routes_profile.name = profile.name;
+    }
+    Ok(routes_profile)
+}
+
+fn resolve_routes_file(routes_file: &Path, source: &Path, cwd: &Path) -> Result<PathBuf> {
+    let cwd = cwd
+        .canonicalize()
+        .context("failed to inspect current directory")?;
+    let mut candidates = Vec::new();
+    if routes_file.is_absolute() {
+        candidates.push(routes_file.to_path_buf());
+    } else {
+        candidates.push(cwd.join(routes_file));
+        if let Some(parent) = source.parent() {
+            let candidate = parent.join(routes_file);
+            if !candidates.iter().any(|path| path == &candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    let mut escaped = false;
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let canonical = candidate.canonicalize().with_context(|| {
+            format!(
+                "failed to inspect referenced GAJAE routes file {}",
+                candidate.display()
+            )
+        })?;
+        if canonical.starts_with(&cwd) {
+            return Ok(candidate);
+        }
+        escaped = true;
+    }
+
+    if escaped {
+        bail!("referenced GAJAE routes file is outside the current workspace");
+    }
+    bail!("referenced GAJAE routes file not found")
 }
 
 fn discover_profile_path() -> Result<PathBuf> {
@@ -197,6 +264,8 @@ fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
     let mut top_level = None::<String>;
     let mut in_routes = false;
     let mut route_event = None::<String>;
+    let mut route_missing_command = None::<(String, usize)>;
+    let mut routes_file = None::<PathBuf>;
     let mut parent_stack: Vec<(usize, String)> = Vec::new();
 
     for (index, raw_line) in contents.lines().enumerate() {
@@ -236,31 +305,51 @@ fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
         let parent = parent_stack.last().map(|(_, key)| key.as_str());
 
         if indent == 0 {
+            ensure_route_has_command(&route_missing_command)?;
             top_level = Some(key.to_string());
             in_routes = key == "routes";
             route_event = None;
+            route_missing_command = None;
             validate_top_level_key(key, source.as_path(), line_number)?;
             if key == "profile" || key == "name" {
-                name = value;
+                name = value.clone();
+            }
+            if key == "routesFile" {
+                let value = value.ok_or_else(|| {
+                    anyhow::anyhow!("invalid GAJAE routesFile at line {line_number}")
+                })?;
+                routes_file = Some(PathBuf::from(value));
             }
             continue;
         }
 
         if matches!(top_level.as_deref(), Some("clawhipProfile")) && indent == 2 {
+            ensure_route_has_command(&route_missing_command)?;
             validate_clawhip_profile_key(key, line_number)?;
             in_routes = key == "routes";
             route_event = None;
+            route_missing_command = None;
             if key == "name" {
-                name = value;
+                name = value.clone();
+            }
+            if key == "routesFile" {
+                let value = value.ok_or_else(|| {
+                    anyhow::anyhow!("invalid GAJAE routesFile at line {line_number}")
+                })?;
+                routes_file = Some(PathBuf::from(value));
             }
             continue;
         }
 
         if in_routes {
             if indent == routes_indent(top_level.as_deref()) {
+                ensure_route_has_command(&route_missing_command)?;
                 route_event = Some(key.to_string());
                 if let Some(command) = value {
                     routes.insert(key.to_string(), command);
+                    route_missing_command = None;
+                } else {
+                    route_missing_command = Some((key.to_string(), line_number));
                 }
                 continue;
             }
@@ -271,6 +360,7 @@ fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
                 let command = value.ok_or_else(|| {
                     anyhow::anyhow!("invalid GAJAE profile route command at line {line_number}")
                 })?;
+                route_missing_command = None;
                 routes.insert(event, command);
                 continue;
             }
@@ -281,16 +371,25 @@ fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
             continue;
         }
     }
+    ensure_route_has_command(&route_missing_command)?;
 
-    if routes.is_empty() {
+    if routes.is_empty() && routes_file.is_none() {
         bail!("GAJAE profile contains no routes");
     }
 
     Ok(GajaeRouteProfile {
         source,
         name,
+        routes_file,
         routes,
     })
+}
+
+fn ensure_route_has_command(route_missing_command: &Option<(String, usize)>) -> Result<()> {
+    if let Some((event, line_number)) = route_missing_command {
+        bail!("GAJAE profile route `{event}` missing command at line {line_number}");
+    }
+    Ok(())
 }
 
 fn clean_scalar(value: &str) -> Option<String> {
@@ -772,6 +871,7 @@ fn concise_detail(stderr: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Call {
@@ -922,6 +1022,65 @@ safety:
             Some("gajae handle github.issue.opened")
         );
         assert!(validate_profile(&profile).is_clean());
+    }
+
+    #[test]
+    fn profile_loader_follows_clawhip_profile_routes_file_from_cwd() {
+        let temp = tempdir().expect("tempdir");
+        let profile_path = temp
+            .path()
+            .join(".gajae/runtime/hermes/clawhip-profile.yml");
+        fs::create_dir_all(profile_path.parent().expect("profile parent")).expect("profile dir");
+        let routes_path = temp.path().join(".clawhip/gajae.routes.yml");
+        fs::create_dir_all(routes_path.parent().expect("routes parent")).expect("routes dir");
+        fs::write(
+            &profile_path,
+            r#"
+runtime: hermes
+clawhipProfile:
+  name: gajae
+  routesFile: .clawhip/gajae.routes.yml
+"#,
+        )
+        .expect("write profile");
+        fs::write(
+            &routes_path,
+            r#"
+routes:
+  heartbeat:
+    command: gajae handle heartbeat
+"#,
+        )
+        .expect("write routes");
+
+        let profile = load_profile_from_cwd(Some(profile_path.as_path()), temp.path())
+            .expect("profile should load referenced routes");
+
+        assert_eq!(profile.name.as_deref(), Some("gajae"));
+        assert_eq!(
+            profile.routes.get("heartbeat").map(String::as_str),
+            Some("gajae handle heartbeat")
+        );
+        assert_eq!(profile.source, routes_path);
+        assert!(validate_profile(&profile).is_clean());
+    }
+
+    #[test]
+    fn profile_parser_rejects_missing_command_route_even_with_valid_route() {
+        let error = parse_profile(
+            r#"
+routes:
+  github.issue.opened:
+  heartbeat:
+    command: gajae handle heartbeat
+"#,
+            PathBuf::from(".clawhip/gajae.routes.yml"),
+        )
+        .expect_err("missing command should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("github.issue.opened"));
+        assert!(message.contains("missing command"));
     }
 
     #[test]
