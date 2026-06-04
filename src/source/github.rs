@@ -61,6 +61,7 @@ struct GitHubRepoState {
     issues: HashMap<u64, IssueSnapshot>,
     prs: HashMap<u64, PullRequestSnapshot>,
     ci: HashMap<String, GitHubCISnapshot>,
+    ci_baseline_established: bool,
 }
 
 #[derive(Clone)]
@@ -212,8 +213,16 @@ async fn poll_github(
                     previous.map(|entry| entry.prs.clone()).unwrap_or_default()
                 }
             };
-        let ci = match poll_ci_statuses(config, github_client, repo, &snapshot, previous, &prs, tx)
-            .await
+        let (ci, ci_baseline_established) = match poll_ci_statuses(
+            config,
+            github_client,
+            repo,
+            &snapshot,
+            previous,
+            &prs,
+            tx,
+        )
+        .await
         {
             Ok(ci) => ci,
             Err(error) => {
@@ -221,11 +230,24 @@ async fn poll_github(
                     "clawhip source GitHub CI processing failed for {}: {error}",
                     repo.path
                 );
-                previous.map(|entry| entry.ci.clone()).unwrap_or_default()
+                (
+                    previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
+                    previous
+                        .map(|entry| entry.ci_baseline_established)
+                        .unwrap_or(false),
+                )
             }
         };
 
-        state.insert(repo.path.clone(), GitHubRepoState { issues, prs, ci });
+        state.insert(
+            repo.path.clone(),
+            GitHubRepoState {
+                issues,
+                prs,
+                ci,
+                ci_baseline_established,
+            },
+        );
     }
 
     Ok(())
@@ -349,13 +371,23 @@ async fn poll_ci_statuses(
     previous: Option<&GitHubRepoState>,
     prs: &HashMap<u64, PullRequestSnapshot>,
     tx: &mpsc::Sender<IncomingEvent>,
-) -> Result<HashMap<String, GitHubCISnapshot>> {
+) -> Result<(HashMap<String, GitHubCISnapshot>, bool)> {
     if !repo.emit_pr_status {
-        return Ok(previous.map(|entry| entry.ci.clone()).unwrap_or_default());
+        return Ok((
+            previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
+            previous
+                .map(|entry| entry.ci_baseline_established)
+                .unwrap_or(false),
+        ));
     }
 
     let Some(client) = github_client else {
-        return Ok(previous.map(|entry| entry.ci.clone()).unwrap_or_default());
+        return Ok((
+            previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
+            previous
+                .map(|entry| entry.ci_baseline_established)
+                .unwrap_or(false),
+        ));
     };
 
     let open_prs = prs
@@ -375,11 +407,17 @@ async fn poll_ci_statuses(
     {
         Ok(ci) => {
             if let Some(previous) = previous {
-                for event in collect_ci_events(repo, &snapshot.repo_name, &previous.ci, &ci) {
+                for event in collect_ci_events(
+                    repo,
+                    &snapshot.repo_name,
+                    previous.ci_baseline_established,
+                    &previous.ci,
+                    &ci,
+                ) {
                     send_event(tx, event).await?;
                 }
             }
-            Ok(ci)
+            Ok((ci, true))
         }
         Err(error) => {
             telemetry::emit(source_record(
@@ -392,7 +430,12 @@ async fn poll_ci_statuses(
                 "clawhip source GitHub CI polling failed for {}: {error}",
                 repo.path
             );
-            Ok(previous.map(|entry| entry.ci.clone()).unwrap_or_default())
+            Ok((
+                previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
+                previous
+                    .map(|entry| entry.ci_baseline_established)
+                    .unwrap_or(false),
+            ))
         }
     }
 }
@@ -502,6 +545,7 @@ fn collect_issue_events(
 fn collect_ci_events(
     repo: &GitRepoMonitor,
     repo_name: &str,
+    previous_ci_baseline_established: bool,
     previous: &HashMap<String, GitHubCISnapshot>,
     current: &HashMap<String, GitHubCISnapshot>,
 ) -> Vec<IncomingEvent> {
@@ -509,7 +553,7 @@ fn collect_ci_events(
     for (key, ci) in current {
         let changed = match previous.get(key) {
             Some(old) => old.status != ci.status || old.conclusion != ci.conclusion,
-            None => ci.status != "completed",
+            None => previous_ci_baseline_established || ci.status != "completed",
         };
         if !changed {
             continue;
@@ -1058,11 +1102,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let prs = HashMap::new();
 
-        let ci = poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, &tx)
-            .await
-            .unwrap();
+        let (ci, ci_baseline_established) =
+            poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, &tx)
+                .await
+                .unwrap();
 
         assert_eq!(ci.len(), 1);
+        assert!(ci_baseline_established);
         assert!(
             rx.try_recv().is_err(),
             "first poll after startup should prime CI baseline without emitting historical events"
@@ -1208,7 +1254,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let events = collect_ci_events(&repo, "clawhip", &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", false, &previous, &current);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-started");
         assert_eq!(events[0].channel.as_deref(), Some("dev-channel"));
@@ -1238,11 +1284,41 @@ mod tests {
                 .into_iter()
                 .collect();
 
-            let events = collect_ci_events(&repo, "clawhip", &previous, &current);
+            let events = collect_ci_events(&repo, "clawhip", false, &previous, &current);
             assert!(
                 events.is_empty(),
                 "initial completed CI with conclusion {conclusion} should only seed the baseline"
             );
+        }
+    }
+
+    #[test]
+    fn absent_terminal_ci_after_baseline_emits_completion_events() {
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            ..GitRepoMonitor::default()
+        };
+
+        for (conclusion, expected_kind) in [
+            ("failure", "github.ci-failed"),
+            ("success", "github.ci-passed"),
+            ("cancelled", "github.ci-cancelled"),
+        ] {
+            let previous = HashMap::new();
+            let current_ci = ci_snapshot(58, "CI / test", "completed", Some(conclusion));
+            let current = [(current_ci.dedupe_key(), current_ci)]
+                .into_iter()
+                .collect();
+
+            let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
+            assert_eq!(
+                events.len(),
+                1,
+                "completed CI with conclusion {conclusion} should emit after baseline"
+            );
+            assert_eq!(events[0].canonical_kind(), expected_kind);
+            assert_eq!(events[0].payload["status"], json!("completed"));
+            assert_eq!(events[0].payload["conclusion"], json!(conclusion));
         }
     }
 
@@ -1256,7 +1332,7 @@ mod tests {
         let previous = [(ci.dedupe_key(), ci.clone())].into_iter().collect();
         let current = [(ci.dedupe_key(), ci)].into_iter().collect();
 
-        let events = collect_ci_events(&repo, "clawhip", &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
         assert!(events.is_empty());
     }
 
@@ -1275,7 +1351,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let events = collect_ci_events(&repo, "clawhip", &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-failed");
         assert_eq!(events[0].payload["workflow"], json!("CI / test"));
@@ -1298,7 +1374,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let events = collect_ci_events(&repo, "clawhip", &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-passed");
     }
@@ -1318,7 +1394,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let events = collect_ci_events(&repo, "clawhip", &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-cancelled");
     }
