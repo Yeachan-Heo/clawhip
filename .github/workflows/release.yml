@@ -363,15 +363,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          manifest_values="$RUNNER_TEMP/dist-manifest-values"
+          python3 - <<'PY' > "$manifest_values"
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("dist-manifest.json").read_text())
+          print("true" if manifest.get("announcement_is_prerelease") is True else "false")
+          print(manifest["announcement_title"])
+          Path("${RUNNER_TEMP}/notes.txt").write_text(manifest["announcement_github_body"])
+          PY
+
+          mapfile -t manifest_lines < "$manifest_values"
           prerelease_flag=()
-          if jq -e '.announcement_is_prerelease == true' dist-manifest.json > /dev/null; then
+          if [[ "${manifest_lines[0]}" == "true" ]]; then
             prerelease_flag=(--prerelease)
           fi
-
-          announcement_title="$(jq -er '.announcement_title' dist-manifest.json)"
-
-          # Write and read notes from a file to avoid quoting breaking things
-          jq -er '.announcement_github_body' dist-manifest.json > "$RUNNER_TEMP/notes.txt"
+          announcement_title="${manifest_lines[1]}"
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" "${prerelease_flag[@]}" --title "$announcement_title" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
