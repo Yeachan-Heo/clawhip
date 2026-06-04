@@ -1175,6 +1175,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: Some("first".into()),
+                    gajae: None,
                 },
                 RouteRule {
                     event: "tmux.keyword".into(),
@@ -1190,6 +1191,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: Some("second".into()),
+                    gajae: None,
                 },
             ],
             ..AppConfig::default()

@@ -33,6 +33,44 @@ pub struct AppConfig {
     pub discord_watch: DiscordWatchConfig,
     #[serde(default, skip_serializing_if = "crate::update::UpdateConfig::is_empty")]
     pub update: crate::update::UpdateConfig,
+    #[serde(default, skip_serializing_if = "GajaeConfig::is_empty")]
+    pub gajae: GajaeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GajaeConfig {
+    #[serde(default)]
+    pub handlers_enabled: bool,
+    #[serde(default = "default_gajae_handler_timeout_ms")]
+    pub handler_timeout_ms: u64,
+    #[serde(default = "default_gajae_handler_max_output_bytes")]
+    pub handler_max_output_bytes: usize,
+}
+
+impl Default for GajaeConfig {
+    fn default() -> Self {
+        Self {
+            handlers_enabled: false,
+            handler_timeout_ms: default_gajae_handler_timeout_ms(),
+            handler_max_output_bytes: default_gajae_handler_max_output_bytes(),
+        }
+    }
+}
+
+impl GajaeConfig {
+    fn is_empty(&self) -> bool {
+        !self.handlers_enabled
+            && self.handler_timeout_ms == default_gajae_handler_timeout_ms()
+            && self.handler_max_output_bytes == default_gajae_handler_max_output_bytes()
+    }
+}
+
+fn default_gajae_handler_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_gajae_handler_max_output_bytes() -> usize {
+    16 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -161,6 +199,17 @@ pub struct RouteRule {
     pub allow_dynamic_tokens: bool,
     pub format: Option<MessageFormat>,
     pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gajae: Option<GajaeRouteAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GajaeRouteAction {
+    pub subcommand: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub requires_approval: bool,
 }
 
 impl Default for RouteRule {
@@ -179,6 +228,7 @@ impl Default for RouteRule {
             allow_dynamic_tokens: false,
             format: None,
             template: None,
+            gajae: None,
         }
     }
 }
@@ -859,12 +909,35 @@ impl AppConfig {
             return Err("discord_watch cooldowns must be non-negative".into());
         }
 
+        if self.gajae.handlers_enabled {
+            if self.gajae.handler_timeout_ms == 0 {
+                return Err(
+                    "gajae.handler_timeout_ms must be at least 1 when GAJAE handlers are enabled"
+                        .into(),
+                );
+            }
+            if self.gajae.handler_max_output_bytes == 0 {
+                return Err("gajae.handler_max_output_bytes must be at least 1 when GAJAE handlers are enabled".into());
+            }
+        }
+
         for (index, route) in self.routes.iter().enumerate() {
             let sink = route.effective_sink();
             let has_channel = normalize_secret(route.channel.clone()).is_some();
             let has_thread = route.discord_thread_target().is_some();
             let has_discord_webhook = route.discord_webhook_target().is_some();
             let has_slack_webhook = route.slack_webhook_target().is_some();
+            if let Some(gajae) = &route.gajae {
+                let subcommand = gajae.subcommand.trim();
+                if subcommand.is_empty() {
+                    return Err(format!(
+                        "route #{} ({}) GAJAE handler must set subcommand",
+                        index + 1,
+                        route.event
+                    )
+                    .into());
+                }
+            }
             if route.sink.trim().is_empty() && !has_slack_webhook {
                 return Err(
                     format!("route #{} ({}) must set a sink", index + 1, route.event).into(),
@@ -1067,6 +1140,7 @@ impl AppConfig {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: None,
+                    gajae: None,
                 });
                 Ok(())
             }
@@ -1138,6 +1212,7 @@ impl AppConfig {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: None,
+                    gajae: None,
                 });
             }
         }
@@ -1284,6 +1359,15 @@ impl AppConfig {
             route.slack_webhook = normalize_text(route.slack_webhook.clone());
             route.mention = normalize_text(route.mention.clone());
             route.template = normalize_text(route.template.clone());
+            if let Some(gajae) = &mut route.gajae {
+                gajae.subcommand =
+                    normalize_text(Some(gajae.subcommand.clone())).unwrap_or_default();
+                gajae.args = gajae
+                    .args
+                    .iter()
+                    .filter_map(|arg| normalize_text(Some(arg.clone())))
+                    .collect();
+            }
         }
 
         for repo in &mut self.monitors.git.repos {

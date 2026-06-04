@@ -915,6 +915,24 @@ clawhip gajae profile install
 
 `status` discovers GAJAE from `GAJAE_BIN` first, then the `gajae` executable on `PATH`, and verifies it by running `gajae --help`. `profile install` forwards to `gajae clawhip profile install` with stdout/stderr attached so GAJAE owns the profile update flow.
 
+GAJAE route handlers are daemon-side and default off. Enable them explicitly and attach a bounded handler to an approved route:
+
+```toml
+[gajae]
+handlers_enabled = true
+handler_timeout_ms = 5000
+handler_max_output_bytes = 16384
+
+[[routes]]
+event = "github.pr-*"
+filter = { repo = "clawhip" }
+sink = "discord"
+channel = "OPS_CHANNEL_ID"
+gajae = { subcommand = "handle-event", args = ["--profile", "safe"] }
+```
+
+Handler execution uses the `GAJAE_BIN` override or `gajae` on `PATH`, runs only fixed allowlisted GAJAE handler subcommands, passes the event JSON on child stdin, closes parent stdin, enforces timeout/output caps, and emits `gajae.handler.completed`, `gajae.handler.failed`, `gajae.handler.timeout`, or `gajae.handler.approval-required` through normal routing. Handler output is data-only; mutation-shaped output is converted to an approval-required event instead of being applied automatically.
+
 ## Internal PR fast-path
 
 Before opening or updating an internal PR from a Rust worktree, run:

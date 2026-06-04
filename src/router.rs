@@ -703,6 +703,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
                     template: None,
+                    gajae: None,
                 },
                 RouteRule {
                     event: "tmux.*".into(),
@@ -718,6 +719,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Compact),
                     template: Some("duplicate: {line}".into()),
+                    gajae: None,
                 },
             ],
             ..AppConfig::default()
@@ -799,6 +801,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -850,6 +853,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -945,6 +949,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: Some("first".into()),
+                    gajae: None,
                 },
                 RouteRule {
                     event: "tmux.keyword".into(),
@@ -960,6 +965,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: Some("second".into()),
+                    gajae: None,
                 },
             ],
             ..AppConfig::default()
@@ -1007,6 +1013,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1047,6 +1054,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1094,6 +1102,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1129,6 +1138,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
                     template: None,
+                    gajae: None,
                 },
                 RouteRule {
                     event: "tmux.*".into(),
@@ -1146,6 +1156,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
                     template: None,
+                    gajae: None,
                 },
             ],
             ..AppConfig::default()
@@ -1187,6 +1198,7 @@ mod tests {
                 allow_dynamic_tokens: true,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1218,6 +1230,7 @@ mod tests {
                 allow_dynamic_tokens: true,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1251,6 +1264,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1288,6 +1302,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1325,6 +1340,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1366,6 +1382,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1415,6 +1432,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1481,6 +1499,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1530,6 +1549,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1591,6 +1611,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1642,6 +1663,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: None,
+                    gajae: None,
                 },
                 RouteRule {
                     event: "github.*".into(),
@@ -1659,6 +1681,7 @@ mod tests {
                     allow_dynamic_tokens: false,
                     format: None,
                     template: None,
+                    gajae: None,
                 },
             ],
             ..AppConfig::default()
@@ -1693,6 +1716,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1733,6 +1757,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1764,6 +1789,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1908,6 +1934,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1951,6 +1978,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -1991,6 +2019,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -2031,6 +2060,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -2071,6 +2101,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -2108,6 +2139,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -2204,6 +2236,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -2236,6 +2269,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -2345,6 +2379,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };

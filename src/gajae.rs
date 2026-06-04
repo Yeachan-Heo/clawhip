@@ -5,9 +5,11 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
+use tokio::io::AsyncWriteExt;
 
 use crate::events::IncomingEvent;
 
@@ -51,6 +53,155 @@ const SUPPORTED_EVENTS: &[&str] = &[
     "tmux.keyword",
     "tmux.stale",
 ];
+const HANDLER_ARGS_PREFIX: &[&str] = &["clawhip", "handler"];
+const ALLOWED_HANDLER_SUBCOMMANDS: &[&str] = &["handle-event", "route-action", "summarize-event"];
+const DIAGNOSTIC_BYTES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerAction {
+    pub subcommand: String,
+    pub args: Vec<String>,
+    pub requires_approval: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandlerLimits {
+    pub timeout: Duration,
+    pub max_output_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandlerOutcome {
+    Completed(Value),
+    ApprovalRequired(Value),
+    Failed {
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+    TimedOut,
+}
+
+pub async fn run_handler(
+    action: &HandlerAction,
+    event: &Value,
+    limits: HandlerLimits,
+) -> Result<HandlerOutcome> {
+    validate_handler_action(action)?;
+    let bin = discover_gajae_with(|name| std::env::var_os(name));
+    run_handler_with_bin(&bin, action, event, limits).await
+}
+
+async fn run_handler_with_bin(
+    bin: &Path,
+    action: &HandlerAction,
+    event: &Value,
+    limits: HandlerLimits,
+) -> Result<HandlerOutcome> {
+    if limits.timeout.is_zero() {
+        bail!("GAJAE handler timeout must be nonzero");
+    }
+    if limits.max_output_bytes == 0 {
+        bail!("GAJAE handler max output must be nonzero");
+    }
+
+    let mut command = tokio::process::Command::new(bin);
+    command
+        .args(handler_args(action))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn GAJAE handler {}", bin.display()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let event_json = serde_json::to_vec(event)?;
+        stdin.write_all(&event_json).await?;
+        stdin.shutdown().await?;
+    }
+
+    let output = match tokio::time::timeout(limits.timeout, child.wait_with_output()).await {
+        Ok(output) => output?,
+        Err(_) => return Ok(HandlerOutcome::TimedOut),
+    };
+
+    let diagnostic_limit = limits.max_output_bytes.min(DIAGNOSTIC_BYTES);
+    let stdout = bounded_bytes(&output.stdout, diagnostic_limit);
+    let stderr = bounded_bytes(&output.stderr, diagnostic_limit);
+    if !output.status.success() {
+        return Ok(HandlerOutcome::Failed {
+            code: output.status.code(),
+            stdout: diagnostic_text(&stdout),
+            stderr: diagnostic_text(&stderr),
+        });
+    }
+
+    let parsed = if stdout.trim_ascii().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&stdout).unwrap_or_else(|_| {
+            json!({
+                "summary": diagnostic_text(&stdout),
+            })
+        })
+    };
+
+    if action.requires_approval || output_requests_mutation(&parsed) {
+        Ok(HandlerOutcome::ApprovalRequired(parsed))
+    } else {
+        Ok(HandlerOutcome::Completed(parsed))
+    }
+}
+
+fn validate_handler_action(action: &HandlerAction) -> Result<()> {
+    let subcommand = action.subcommand.trim();
+    if !ALLOWED_HANDLER_SUBCOMMANDS.contains(&subcommand) {
+        bail!("unsupported GAJAE handler subcommand '{subcommand}'");
+    }
+    if action.args.iter().any(|arg| arg.contains('\0')) {
+        bail!("GAJAE handler arguments must not contain NUL bytes");
+    }
+    Ok(())
+}
+
+fn handler_args(action: &HandlerAction) -> Vec<String> {
+    HANDLER_ARGS_PREFIX
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .chain(std::iter::once(action.subcommand.clone()))
+        .chain(action.args.clone())
+        .collect()
+}
+
+fn output_requests_mutation(value: &Value) -> bool {
+    value
+        .get("mutation_requested")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("requires_approval")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || value.get("mutation").is_some()
+        || value.get("mutations").is_some()
+}
+
+fn bounded_bytes(bytes: &[u8], max: usize) -> Vec<u8> {
+    bytes.iter().copied().take(max).collect()
+}
+
+fn diagnostic_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.chars()
+        .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t')
+        .collect::<String>()
+        .lines()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum GajaeCommand {
@@ -912,8 +1063,9 @@ fn concise_detail(stderr: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
-
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Call {
         program: PathBuf,
@@ -1015,6 +1167,149 @@ mod tests {
                 .map(Clone::clone)
                 .map_err(|error| io::Error::new(error.kind(), error.to_string()))
         }
+    }
+
+    fn write_fake_gajae(script: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fake-gajae.sh");
+        fs::write(&path, script).expect("write fake gajae");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod fake gajae");
+        (dir, path)
+    }
+
+    fn handler_action() -> HandlerAction {
+        HandlerAction {
+            subcommand: "handle-event".into(),
+            args: vec!["--label".into(), "semi;colon $(touch nope)".into()],
+            requires_approval: false,
+        }
+    }
+
+    fn handler_limits(timeout_ms: u64, max_output_bytes: usize) -> HandlerLimits {
+        HandlerLimits {
+            timeout: Duration::from_millis(timeout_ms),
+            max_output_bytes,
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_passes_fixed_args_and_event_json_stdin_without_shell_interpolation() {
+        let script = r#"#!/bin/sh
+printf '%s\n' "$@" > "$FAKE_ARG_FILE"
+python3 -c 'import json, os, sys; data=json.load(sys.stdin); open(os.environ["FAKE_STDIN_FILE"], "w").write(data["type"] + "\n")'
+printf '{"summary":"ok"}'
+"#;
+        let (_dir, bin) = write_fake_gajae(script);
+        let out_dir = tempdir().expect("out tempdir");
+        let arg_file = out_dir.path().join("args.txt");
+        let stdin_file = out_dir.path().join("stdin.txt");
+        unsafe {
+            std::env::set_var("FAKE_ARG_FILE", &arg_file);
+            std::env::set_var("FAKE_STDIN_FILE", &stdin_file);
+        }
+
+        let outcome = run_handler_with_bin(
+            &bin,
+            &handler_action(),
+            &json!({"type": "github.pr.opened"}),
+            handler_limits(1_000, 1_024),
+        )
+        .await
+        .expect("handler should run");
+
+        assert_eq!(outcome, HandlerOutcome::Completed(json!({"summary": "ok"})));
+        let args = fs::read_to_string(&arg_file).expect("args file");
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            vec![
+                "clawhip",
+                "handler",
+                "handle-event",
+                "--label",
+                "semi;colon $(touch nope)"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(stdin_file).expect("stdin file"),
+            "github.pr.opened\n"
+        );
+        assert!(!out_dir.path().join("nope").exists());
+    }
+
+    #[tokio::test]
+    async fn handler_timeout_reports_timeout() {
+        let (_dir, bin) = write_fake_gajae("#!/bin/sh\nsleep 2\n");
+        let outcome = run_handler_with_bin(
+            &bin,
+            &handler_action(),
+            &json!({"type": "github.pr.opened"}),
+            handler_limits(10, 1_024),
+        )
+        .await
+        .expect("handler should time out cleanly");
+
+        assert_eq!(outcome, HandlerOutcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn handler_nonzero_bounds_diagnostics() {
+        let script = "#!/bin/sh\npython3 -c 'import sys; sys.stdout.write(\"o\" * 2000); sys.stderr.write(\"e\" * 2000)'\nexit 17\n";
+        let (_dir, bin) = write_fake_gajae(script);
+        let outcome = run_handler_with_bin(
+            &bin,
+            &handler_action(),
+            &json!({"type": "github.pr.opened"}),
+            handler_limits(1_000, 1_024),
+        )
+        .await
+        .expect("handler should report failure");
+
+        let HandlerOutcome::Failed {
+            code,
+            stdout,
+            stderr,
+        } = outcome
+        else {
+            panic!("unexpected outcome")
+        };
+        assert_eq!(code, Some(17));
+        assert!(stdout.len() <= DIAGNOSTIC_BYTES);
+        assert!(stderr.len() <= DIAGNOSTIC_BYTES);
+    }
+
+    #[tokio::test]
+    async fn handler_mutating_output_requires_approval() {
+        let (_dir, bin) = write_fake_gajae(
+            "#!/bin/sh\nprintf '{\"mutation_requested\":true,\"summary\":\"needs approval\"}'\n",
+        );
+        let outcome = run_handler_with_bin(
+            &bin,
+            &handler_action(),
+            &json!({"type": "github.pr.opened"}),
+            handler_limits(1_000, 1_024),
+        )
+        .await
+        .expect("handler should run");
+
+        assert_eq!(
+            outcome,
+            HandlerOutcome::ApprovalRequired(
+                json!({"mutation_requested": true, "summary": "needs approval"})
+            )
+        );
+    }
+
+    #[test]
+    fn handler_rejects_unapproved_subcommand() {
+        let action = HandlerAction {
+            subcommand: "sh -c touch nope".into(),
+            args: Vec::new(),
+            requires_approval: false,
+        };
+
+        assert!(validate_handler_action(&action).is_err());
     }
 
     #[test]

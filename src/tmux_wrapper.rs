@@ -747,6 +747,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };
@@ -856,6 +857,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: None,
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };

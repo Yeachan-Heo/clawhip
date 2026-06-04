@@ -979,6 +979,7 @@ mod tests {
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
                 template: None,
+                gajae: None,
             }],
             ..AppConfig::default()
         };

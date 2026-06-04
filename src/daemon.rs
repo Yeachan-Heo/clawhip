@@ -15,11 +15,12 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::Result;
 use crate::VERSION;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, GajaeRouteAction, RouteRule};
 use crate::cron::CronSource;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
+use crate::gajae::{HandlerAction, HandlerLimits, HandlerOutcome};
 use crate::native_hooks::{
     NATIVE_NON_GIT_OUTCOME, NATIVE_NORMALIZATION_OUTCOME_FIELD,
     incoming_event_from_native_hook_json,
@@ -619,6 +620,33 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
         return local_only_event_response(&event, &envelope);
     }
 
+    if let Some(handler_event) = run_matching_gajae_handler(state, &event).await {
+        return enqueue_accepted_event(state, handler_event).await;
+    }
+
+    enqueue_accepted_event(state, event).await
+}
+
+async fn enqueue_accepted_event(
+    state: &AppState,
+    event: IncomingEvent,
+) -> axum::response::Response {
+    let envelope = match from_incoming_event(&event) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            if is_native_hook_event(&event) {
+                with_native_observability(&state.native_observability, |observability| {
+                    observability.observe_dropped(&event, "validation_error");
+                });
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
     match enqueue_event(&state.tx, event.clone()).await {
         Ok(()) => {
             expire_terminal_tmux_registration(state, &event).await;
@@ -667,6 +695,180 @@ fn local_only_event_response(
         })),
     )
         .into_response()
+}
+
+async fn run_matching_gajae_handler(
+    state: &AppState,
+    event: &IncomingEvent,
+) -> Option<IncomingEvent> {
+    if !state.config.gajae.handlers_enabled {
+        return None;
+    }
+    if event.canonical_kind().starts_with("gajae.handler.") {
+        return None;
+    }
+
+    let route = matching_gajae_route(&state.config, event)?;
+    let action = handler_action(route.gajae.as_ref()?);
+    let event_json = handler_event_json(event);
+    let limits = HandlerLimits {
+        timeout: Duration::from_millis(state.config.gajae.handler_timeout_ms),
+        max_output_bytes: state.config.gajae.handler_max_output_bytes,
+    };
+
+    let outcome = match crate::gajae::run_handler(&action, &event_json, limits).await {
+        Ok(outcome) => outcome,
+        Err(error) => HandlerOutcome::Failed {
+            code: None,
+            stdout: String::new(),
+            stderr: bounded_handler_text(&error.to_string()),
+        },
+    };
+
+    Some(handler_outcome_event(event, &action, outcome))
+}
+
+fn matching_gajae_route<'a>(config: &'a AppConfig, event: &IncomingEvent) -> Option<&'a RouteRule> {
+    let context = event.template_context();
+    config
+        .routes
+        .iter()
+        .filter(|route| route.gajae.is_some())
+        .filter(|route| route_matches_event(route, event.canonical_kind(), &context))
+        .max_by_key(|route| route_specificity(route, &context))
+}
+
+fn route_matches_event(
+    route: &RouteRule,
+    canonical_kind: &str,
+    context: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    route_event_candidates(canonical_kind)
+        .iter()
+        .any(|candidate| crate::router::glob_match(&route.event, candidate))
+        && route.filter.iter().all(|(key, expected)| {
+            context
+                .get(key)
+                .map(|actual| crate::router::glob_match(expected, actual))
+                .unwrap_or(false)
+        })
+}
+
+fn route_event_candidates(canonical_kind: &str) -> [&str; 2] {
+    let suffix = canonical_kind
+        .split_once('.')
+        .map(|(_, suffix)| suffix)
+        .unwrap_or(canonical_kind);
+    [canonical_kind, suffix]
+}
+
+fn route_specificity(
+    route: &RouteRule,
+    context: &std::collections::BTreeMap<String, String>,
+) -> usize {
+    let path_rank = if route.filter.contains_key("worktree_path")
+        && context
+            .get("worktree_path")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        3
+    } else if route.filter.contains_key("repo_path")
+        && context
+            .get("repo_path")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        2
+    } else if route.filter.contains_key("repo_name")
+        && context
+            .get("repo_name")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        1
+    } else {
+        0
+    };
+
+    (path_rank * 100) + route.filter.len()
+}
+
+fn handler_action(config: &GajaeRouteAction) -> HandlerAction {
+    HandlerAction {
+        subcommand: config.subcommand.clone(),
+        args: config.args.clone(),
+        requires_approval: config.requires_approval,
+    }
+}
+
+fn handler_event_json(event: &IncomingEvent) -> Value {
+    json!({
+        "type": event.canonical_kind(),
+        "payload": event.payload,
+        "channel": event.channel,
+        "mention": event.mention,
+        "format": event.format.as_ref().map(|format| format.as_str()),
+        "template": event.template,
+    })
+}
+
+fn handler_outcome_event(
+    source: &IncomingEvent,
+    action: &HandlerAction,
+    outcome: HandlerOutcome,
+) -> IncomingEvent {
+    let (kind, payload) = match outcome {
+        HandlerOutcome::Completed(output) => (
+            "gajae.handler.completed",
+            json!({
+                "source_event": source.canonical_kind(),
+                "subcommand": action.subcommand,
+                "output": output,
+            }),
+        ),
+        HandlerOutcome::ApprovalRequired(output) => (
+            "gajae.handler.approval-required",
+            json!({
+                "source_event": source.canonical_kind(),
+                "subcommand": action.subcommand,
+                "output": output,
+                "approval_required": true,
+            }),
+        ),
+        HandlerOutcome::Failed {
+            code,
+            stdout,
+            stderr,
+        } => (
+            "gajae.handler.failed",
+            json!({
+                "source_event": source.canonical_kind(),
+                "subcommand": action.subcommand,
+                "exit_code": code,
+                "stdout": bounded_handler_text(&stdout),
+                "stderr": bounded_handler_text(&stderr),
+            }),
+        ),
+        HandlerOutcome::TimedOut => (
+            "gajae.handler.timeout",
+            json!({
+                "source_event": source.canonical_kind(),
+                "subcommand": action.subcommand,
+                "timeout": true,
+            }),
+        ),
+    };
+
+    IncomingEvent {
+        kind: kind.to_string(),
+        channel: source.channel.clone(),
+        mention: None,
+        format: Some(MessageFormat::Compact),
+        template: None,
+        payload,
+    }
+}
+
+fn bounded_handler_text(value: &str) -> String {
+    value.chars().take(512).collect()
 }
 
 async fn handle_discord_watch(state: &AppState, event: &IncomingEvent) -> Result<()> {
@@ -1025,6 +1227,91 @@ mod tests {
             }),
             active_wrapper_monitor: true,
         }
+    }
+
+    fn gajae_test_event() -> IncomingEvent {
+        IncomingEvent {
+            kind: "github.pr.opened".into(),
+            channel: Some("ops".into()),
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({"repo": "clawhip", "number": 250}),
+        }
+    }
+
+    #[test]
+    fn gajae_handler_completed_event_is_typed_and_bounded_to_data_output() {
+        let action = HandlerAction {
+            subcommand: "handle-event".into(),
+            args: Vec::new(),
+            requires_approval: false,
+        };
+        let event = handler_outcome_event(
+            &gajae_test_event(),
+            &action,
+            HandlerOutcome::Completed(json!({"summary": "ok"})),
+        );
+
+        assert_eq!(event.kind, "gajae.handler.completed");
+        assert_eq!(event.payload["source_event"], json!("github.pr.opened"));
+        assert_eq!(event.payload["output"]["summary"], json!("ok"));
+    }
+
+    #[test]
+    fn gajae_handler_timeout_event_is_bounded() {
+        let action = HandlerAction {
+            subcommand: "handle-event".into(),
+            args: vec!["--profile".into(), "safe".into()],
+            requires_approval: false,
+        };
+        let event = handler_outcome_event(&gajae_test_event(), &action, HandlerOutcome::TimedOut);
+
+        assert_eq!(event.kind, "gajae.handler.timeout");
+        assert_eq!(event.payload["timeout"], json!(true));
+        assert!(event.payload.get("stdout").is_none());
+        assert!(event.payload.get("stderr").is_none());
+    }
+
+    #[test]
+    fn gajae_handler_failed_event_bounds_diagnostics_without_raw_dump() {
+        let action = HandlerAction {
+            subcommand: "handle-event".into(),
+            args: Vec::new(),
+            requires_approval: false,
+        };
+        let raw = "x".repeat(2_000);
+        let event = handler_outcome_event(
+            &gajae_test_event(),
+            &action,
+            HandlerOutcome::Failed {
+                code: Some(17),
+                stdout: raw.clone(),
+                stderr: raw,
+            },
+        );
+
+        assert_eq!(event.kind, "gajae.handler.failed");
+        assert_eq!(event.payload["exit_code"], json!(17));
+        assert!(event.payload["stdout"].as_str().unwrap().len() <= 512);
+        assert!(event.payload["stderr"].as_str().unwrap().len() <= 512);
+    }
+
+    #[test]
+    fn gajae_handler_mutating_output_requires_approval_event() {
+        let action = HandlerAction {
+            subcommand: "handle-event".into(),
+            args: Vec::new(),
+            requires_approval: false,
+        };
+        let event = handler_outcome_event(
+            &gajae_test_event(),
+            &action,
+            HandlerOutcome::ApprovalRequired(json!({"mutation_requested": true})),
+        );
+
+        assert_eq!(event.kind, "gajae.handler.approval-required");
+        assert_eq!(event.payload["approval_required"], json!(true));
     }
 
     fn git_repo() -> tempfile::TempDir {
