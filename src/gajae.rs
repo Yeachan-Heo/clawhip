@@ -21,14 +21,35 @@ const DEFAULT_RUNTIME_DIR: &str = ".gajae/runtime";
 const PROFILE_FILE_NAME: &str = "clawhip-profile.yml";
 const MAX_PROFILE_BYTES: usize = 256 * 1024;
 const SUPPORTED_EVENTS: &[&str] = &[
-    "github.issue.opened",
-    "github.issue.comment",
-    "github.pr.opened",
-    "github.pr.synchronize",
-    "github.check.failed",
-    "session.completed",
-    "session.stale",
-    "heartbeat",
+    "github.issue-opened",
+    "github.issue-commented",
+    "github.issue-closed",
+    "github.pr-status-changed",
+    "github.release-published",
+    "github.release-prereleased",
+    "github.release-edited",
+    "github.ci-started",
+    "github.ci-failed",
+    "github.ci-passed",
+    "github.ci-cancelled",
+    "session.started",
+    "session.blocked",
+    "session.finished",
+    "session.failed",
+    "session.retry-needed",
+    "session.pr-created",
+    "session.test-started",
+    "session.test-finished",
+    "session.test-failed",
+    "session.handoff-needed",
+    "session.prompt-submitted",
+    "session.prompt-delivered",
+    "session.prompt-delivery-failed",
+    "session.stopped",
+    "tool.pre",
+    "tool.post",
+    "tmux.keyword",
+    "tmux.stale",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -85,7 +106,8 @@ pub fn run_profile_inspect(options: ProfileInspectOptions) -> Result<()> {
     println!("source: {}", profile.source.display());
     println!("routes: {}", profile.routes.len());
     for (event, command) in &profile.routes {
-        println!("- {event}: {command}");
+        println!("- {event}:");
+        println!("  command: {}", summarize_route_command(command, event));
     }
     print_validation(&validation);
     if validation.is_clean() {
@@ -113,7 +135,10 @@ pub fn run_profile_explain(options: ProfileExplainOptions) -> Result<()> {
     match profile.routes.get(&options.event) {
         Some(command) => {
             println!("match: yes");
-            println!("route command: {command}");
+            println!(
+                "route command: {}",
+                summarize_route_command(command, &options.event)
+            );
             println!("action: explain-only; command not executed");
             Ok(())
         }
@@ -484,6 +509,14 @@ fn validate_profile(profile: &GajaeRouteProfile) -> RouteValidation {
 fn command_matches_event(command: &str, event: &str) -> bool {
     command == format!("gajae handle {event}")
         || command == format!("gajae runtime handle --router clawhip --event {event}")
+}
+
+fn summarize_route_command(command: &str, event: &str) -> &'static str {
+    if command_matches_event(command, event) {
+        "supported GAJAE handler (command redacted)"
+    } else {
+        "unsupported command (redacted)"
+    }
 }
 
 fn print_validation(validation: &RouteValidation) {
@@ -990,10 +1023,10 @@ mod tests {
             r#"
 profile: gajae
 routes:
-  github.pr.opened:
-    command: gajae handle github.pr.opened
-  heartbeat:
-    command: gajae runtime handle --router clawhip --event heartbeat
+  github.pr-status-changed:
+    command: gajae handle github.pr-status-changed
+  session.started:
+    command: gajae runtime handle --router clawhip --event session.started
 "#,
             PathBuf::from(".clawhip/gajae.routes.yml"),
         )
@@ -1012,8 +1045,8 @@ runtime: hermes
 clawhipProfile:
   name: gajae
   routes:
-    github.issue.opened:
-      command: gajae handle github.issue.opened
+    github.issue-opened:
+      command: gajae handle github.issue-opened
 safety:
   liveClawhipEnablement: false
 "#,
@@ -1025,9 +1058,9 @@ safety:
         assert_eq!(
             profile
                 .routes
-                .get("github.issue.opened")
+                .get("github.issue-opened")
                 .map(String::as_str),
-            Some("gajae handle github.issue.opened")
+            Some("gajae handle github.issue-opened")
         );
         assert!(validate_profile(&profile).is_clean());
     }
@@ -1055,8 +1088,8 @@ clawhipProfile:
             &routes_path,
             r#"
 routes:
-  heartbeat:
-    command: gajae handle heartbeat
+  session.started:
+    command: gajae handle session.started
 "#,
         )
         .expect("write routes");
@@ -1066,8 +1099,8 @@ routes:
 
         assert_eq!(profile.name.as_deref(), Some("gajae"));
         assert_eq!(
-            profile.routes.get("heartbeat").map(String::as_str),
-            Some("gajae handle heartbeat")
+            profile.routes.get("session.started").map(String::as_str),
+            Some("gajae handle session.started")
         );
         assert_eq!(profile.source, routes_path);
         assert!(validate_profile(&profile).is_clean());
@@ -1081,7 +1114,7 @@ routes:
         fs::write(
             &profile_path,
             format!(
-                "routes:\n  heartbeat:\n    command: gajae handle heartbeat\n# {}\n",
+                "routes:\n  session.started:\n    command: gajae handle session.started\n# {}\n",
                 "secret-token-123".repeat(MAX_PROFILE_BYTES / 16)
             ),
         )
@@ -1117,7 +1150,7 @@ clawhipProfile:
         fs::write(
             &routes_path,
             format!(
-                "routes:\n  heartbeat:\n    command: gajae handle heartbeat\n# {}\n",
+                "routes:\n  session.started:\n    command: gajae handle session.started\n# {}\n",
                 "secret-token-123".repeat(MAX_PROFILE_BYTES / 16)
             ),
         )
@@ -1137,9 +1170,9 @@ clawhipProfile:
         let error = parse_profile(
             r#"
 routes:
-  - event: github.issue.opened
-  heartbeat:
-    command: gajae handle heartbeat
+  - event: github.issue-opened
+  session.started:
+    command: gajae handle session.started
 "#,
             PathBuf::from(".clawhip/gajae.routes.yml"),
         )
@@ -1148,7 +1181,7 @@ routes:
 
         assert!(message.contains("list-style route entry"));
         assert!(message.contains("line 3"));
-        assert!(!message.contains("github.issue.opened"));
+        assert!(!message.contains("github.issue-opened"));
     }
 
     #[test]
@@ -1158,7 +1191,7 @@ routes:
 runtime: hermes
 clawhipProfile:
   routes:
-    - event: github.issue.opened
+    - event: github.issue-opened
 "#,
             PathBuf::from(".gajae/runtime/hermes/clawhip-profile.yml"),
         )
@@ -1167,7 +1200,7 @@ clawhipProfile:
 
         assert!(message.contains("list-style route entry"));
         assert!(message.contains("line 5"));
-        assert!(!message.contains("github.issue.opened"));
+        assert!(!message.contains("github.issue-opened"));
     }
 
     #[test]
@@ -1175,16 +1208,16 @@ clawhipProfile:
         let error = parse_profile(
             r#"
 routes:
-  github.issue.opened:
-  heartbeat:
-    command: gajae handle heartbeat
+  github.issue-opened:
+  session.started:
+    command: gajae handle session.started
 "#,
             PathBuf::from(".clawhip/gajae.routes.yml"),
         )
         .expect_err("missing command should fail");
         let message = error.to_string();
 
-        assert!(message.contains("github.issue.opened"));
+        assert!(message.contains("github.issue-opened"));
         assert!(message.contains("missing command"));
     }
 
@@ -1195,7 +1228,7 @@ routes:
 routes:
   github.pr.closed:
     command: gajae handle github.pr.closed
-  github.pr.opened:
+  github.pr-status-changed:
     command: rm -rf /tmp/example
 "#,
             PathBuf::from(".clawhip/gajae.routes.yml"),
@@ -1205,12 +1238,84 @@ routes:
         let validation = validate_profile(&profile);
         assert_eq!(validation.unknown_events, vec!["github.pr.closed"]);
         assert_eq!(validation.unsupported_commands.len(), 1);
-        assert_eq!(validation.unsupported_commands[0].0, "github.pr.opened");
+        assert_eq!(
+            validation.unsupported_commands[0].0,
+            "github.pr-status-changed"
+        );
+    }
+
+    #[test]
+    fn profile_validation_accepts_current_events_and_rejects_stale_dotted_events() {
+        let current = parse_profile(
+            r#"
+routes:
+  github.issue-opened:
+    command: gajae handle github.issue-opened
+  github.issue-commented:
+    command: gajae handle github.issue-commented
+  github.issue-closed:
+    command: gajae handle github.issue-closed
+  github.pr-status-changed:
+    command: gajae handle github.pr-status-changed
+  session.started:
+    command: gajae handle session.started
+  session.blocked:
+    command: gajae handle session.blocked
+  session.finished:
+    command: gajae handle session.finished
+  tmux.stale:
+    command: gajae handle tmux.stale
+"#,
+            PathBuf::from(".clawhip/gajae.routes.yml"),
+        )
+        .expect("current profile should parse");
+        assert!(validate_profile(&current).is_clean());
+
+        let stale = parse_profile(
+            r#"
+routes:
+  github.issue.opened:
+    command: gajae handle github.issue.opened
+  github.pr.opened:
+    command: gajae handle github.pr.opened
+  session.completed:
+    command: gajae handle session.completed
+  session.stale:
+    command: gajae handle session.stale
+"#,
+            PathBuf::from(".clawhip/gajae.routes.yml"),
+        )
+        .expect("stale profile should parse before semantic validation");
+        assert_eq!(
+            validate_profile(&stale).unknown_events,
+            vec![
+                "github.issue.opened",
+                "github.pr.opened",
+                "session.completed",
+                "session.stale",
+            ]
+        );
+    }
+
+    #[test]
+    fn profile_command_summary_redacts_raw_command_details() {
+        let event = "github.issue-opened";
+        let secret_command = "gajae handle github.issue-opened --token secret-token-123 --webhook https://hooks.example/secret --path /home/operator/private";
+
+        assert_eq!(
+            summarize_route_command("gajae handle github.issue-opened", event),
+            "supported GAJAE handler (command redacted)"
+        );
+        let summary = summarize_route_command(secret_command, event);
+        assert_eq!(summary, "unsupported command (redacted)");
+        assert!(!summary.contains("secret-token-123"));
+        assert!(!summary.contains("https://hooks.example/secret"));
+        assert!(!summary.contains("/home/operator/private"));
     }
 
     #[test]
     fn malformed_profile_error_is_sanitized_without_raw_input() {
-        let raw_secret = "routes:\n  github.pr.opened command: secret-token-123\n";
+        let raw_secret = "routes:\n  github.pr-status-changed command: secret-token-123\n";
         let error = parse_profile(raw_secret, PathBuf::from(".clawhip/gajae.routes.yml"))
             .expect_err("malformed profile should fail");
         let message = error.to_string();
@@ -1221,7 +1326,7 @@ routes:
             "leaked raw input: {message}"
         );
         assert!(
-            !message.contains("github.pr.opened command"),
+            !message.contains("github.pr-status-changed command"),
             "leaked raw input: {message}"
         );
     }
@@ -1229,7 +1334,7 @@ routes:
     #[test]
     fn route_file_rejects_unknown_top_level_key_without_raw_value() {
         let error = parse_profile(
-            "routes:\n  heartbeat:\n    command: gajae handle heartbeat\nprivate: secret-token-123\n",
+            "routes:\n  session.started:\n    command: gajae handle session.started\nprivate: secret-token-123\n",
             PathBuf::from(".clawhip/gajae.routes.yml"),
         )
         .expect_err("unknown key should fail");

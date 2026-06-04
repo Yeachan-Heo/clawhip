@@ -519,7 +519,7 @@ pub struct GajaeProfileExplainArgs {
     /// Read this profile/routes file instead of auto-discovering the installed GAJAE profile.
     #[arg(long)]
     pub file: Option<PathBuf>,
-    /// GAJAE event name to explain, e.g. github.pr.opened.
+    /// GAJAE event name to explain, e.g. github.pr-status-changed.
     #[arg(long)]
     pub event: String,
     /// Optional repository label to include in the explanation report.
@@ -1403,7 +1403,7 @@ mod tests {
             "profile",
             "explain",
             "--event",
-            "github.pr.opened",
+            "github.pr-status-changed",
             "--repo",
             "clawhip",
         ]);
@@ -1418,7 +1418,7 @@ mod tests {
             panic!("expected gajae profile explain command");
         };
 
-        assert_eq!(args.event, "github.pr.opened");
+        assert_eq!(args.event, "github.pr-status-changed");
         assert_eq!(args.repo.as_deref(), Some("clawhip"));
     }
 

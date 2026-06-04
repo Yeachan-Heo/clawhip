@@ -280,3 +280,195 @@ exit 42
     assert!(!stderr.contains("/secret/token/path"), "stderr={stderr}");
     assert!(stderr.len() < 420, "stderr too long: {}", stderr.len());
 }
+
+#[test]
+fn gajae_profile_inspect_accepts_current_events_and_rejects_stale_dotted_events() {
+    let temp = TempDir::new().expect("tempdir");
+    let current_profile = temp.path().join("current.yml");
+    fs::write(
+        &current_profile,
+        r#"
+routes:
+  github.issue-opened:
+    command: gajae handle github.issue-opened
+  github.issue-commented:
+    command: gajae handle github.issue-commented
+  github.issue-closed:
+    command: gajae handle github.issue-closed
+  github.pr-status-changed:
+    command: gajae handle github.pr-status-changed
+  session.started:
+    command: gajae handle session.started
+  session.blocked:
+    command: gajae handle session.blocked
+  session.finished:
+    command: gajae handle session.finished
+"#,
+    )
+    .expect("write current profile");
+
+    let output = Command::new(clawhip_bin())
+        .args([
+            "--config",
+            temp.path().join("config.toml").to_str().expect("utf8 path"),
+            "gajae",
+            "profile",
+            "inspect",
+            "--file",
+            current_profile.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("inspect current profile");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stale_profile = temp.path().join("stale.yml");
+    fs::write(
+        &stale_profile,
+        r#"
+routes:
+  github.issue.opened:
+    command: gajae handle github.issue.opened
+  github.pr.opened:
+    command: gajae handle github.pr.opened
+  session.completed:
+    command: gajae handle session.completed
+  session.stale:
+    command: gajae handle session.stale
+"#,
+    )
+    .expect("write stale profile");
+
+    let output = Command::new(clawhip_bin())
+        .args([
+            "--config",
+            temp.path().join("config.toml").to_str().expect("utf8 path"),
+            "gajae",
+            "profile",
+            "inspect",
+            "--file",
+            stale_profile.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("inspect stale profile");
+    assert!(
+        !output.status.success(),
+        "stale profile unexpectedly passed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unknown event: github.issue.opened"));
+    assert!(stdout.contains("unknown event: github.pr.opened"));
+    assert!(stdout.contains("unknown event: session.completed"));
+    assert!(stdout.contains("unknown event: session.stale"));
+}
+
+#[test]
+fn gajae_profile_inspect_and_explain_success_summarize_supported_commands() {
+    let temp = TempDir::new().expect("tempdir");
+    let profile = temp.path().join("profile.yml");
+    let config = temp.path().join("config.toml");
+    fs::write(
+        &profile,
+        r#"
+routes:
+  github.issue-opened:
+    command: gajae handle github.issue-opened
+"#,
+    )
+    .expect("write profile");
+
+    for command in ["inspect", "explain"] {
+        let mut args = vec![
+            "--config",
+            config.to_str().expect("utf8 path"),
+            "gajae",
+            "profile",
+            command,
+            "--file",
+            profile.to_str().expect("utf8 path"),
+        ];
+        if command == "explain" {
+            args.push("--event");
+            args.push("github.issue-opened");
+        }
+
+        let output = Command::new(clawhip_bin())
+            .args(args)
+            .output()
+            .expect("run profile command");
+        assert!(
+            output.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("supported GAJAE handler (command redacted)"));
+        assert!(!stdout.contains("gajae handle github.issue-opened"));
+    }
+}
+
+#[test]
+fn gajae_profile_inspect_and_explain_redact_route_command_details() {
+    let temp = TempDir::new().expect("tempdir");
+    let profile = temp.path().join("profile.yml");
+    let config = temp.path().join("config.toml");
+    fs::write(
+        &profile,
+        r#"
+routes:
+  github.issue-opened:
+    command: gajae handle github.issue-opened --token secret-token-123 --webhook https://hooks.example/secret --path /home/operator/private
+"#,
+    )
+    .expect("write profile");
+
+    for command in ["inspect", "explain"] {
+        let mut args = vec![
+            "--config",
+            config.to_str().expect("utf8 path"),
+            "gajae",
+            "profile",
+            command,
+            "--file",
+            profile.to_str().expect("utf8 path"),
+        ];
+        if command == "explain" {
+            args.push("--event");
+            args.push("github.issue-opened");
+        }
+
+        let output = Command::new(clawhip_bin())
+            .args(args)
+            .output()
+            .expect("run profile command");
+        assert!(
+            !output.status.success(),
+            "secret-bearing command should fail validation"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(combined.contains("unsupported command for event: github.issue-opened"));
+        assert!(
+            !combined.contains("secret-token-123"),
+            "leaked token: {combined}"
+        );
+        assert!(
+            !combined.contains("https://hooks.example/secret"),
+            "leaked webhook URL: {combined}"
+        );
+        assert!(
+            !combined.contains("/home/operator/private"),
+            "leaked private path: {combined}"
+        );
+        assert!(
+            !combined.contains("gajae handle github.issue-opened --token"),
+            "leaked raw command: {combined}"
+        );
+    }
+}
