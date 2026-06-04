@@ -183,6 +183,7 @@ if IFS= read -r inherited_input; then
 fi
 receipt_file="${4:?missing file}"
 printf '%s' "$receipt_file" > "$GAJAE_FILE_LOG"
+stat -c '%a' "$receipt_file" > "$GAJAE_MODE_LOG"
 printf '{"receipt_id":"stdin-1","summary":"stdin receipt ok"}\n'
 "#,
     );
@@ -199,6 +200,7 @@ printf '{"receipt_id":"stdin-1","summary":"stdin receipt ok"}\n'
         .env("GAJAE_BIN", &stub)
         .env("GAJAE_ARG_LOG", temp.path().join("gajae.args"))
         .env("GAJAE_FILE_LOG", temp.path().join("gajae.file"))
+        .env("GAJAE_MODE_LOG", temp.path().join("gajae.mode"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -224,6 +226,15 @@ printf '{"receipt_id":"stdin-1","summary":"stdin receipt ok"}\n'
         "runtime-followup-receipt validate --file ".to_string()
             + &fs::read_to_string(temp.path().join("gajae.file")).expect("file log")
             + "\n"
+    );
+    let receipt_file = fs::read_to_string(temp.path().join("gajae.file")).expect("file log");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("gajae.mode")).expect("mode log"),
+        "600\n"
+    );
+    assert!(
+        !Path::new(receipt_file.as_str()).exists(),
+        "temporary stdin receipt file should be deleted: {receipt_file}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

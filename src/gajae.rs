@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -252,7 +253,16 @@ fn write_receipt_tempfile(input: &[u8]) -> Result<TempReceiptFile> {
         "clawhip-gajae-receipt-{}.json",
         uuid::Uuid::new_v4()
     ));
-    fs::write(&path, input).context("failed to write temporary receipt file")?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .context("failed to create temporary receipt file")?;
+    file.write_all(input)
+        .context("failed to write temporary receipt file")?;
+    file.sync_all()
+        .context("failed to sync temporary receipt file")?;
     Ok(TempReceiptFile { path })
 }
 
