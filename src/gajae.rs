@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::events::IncomingEvent;
 
@@ -81,6 +81,11 @@ pub enum HandlerOutcome {
     },
     TimedOut,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    capped: bool,
+}
 
 pub async fn run_handler(
     action: &HandlerAction,
@@ -92,6 +97,7 @@ pub async fn run_handler(
     run_handler_with_bin(&bin, action, event, limits).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_handler_with_bin(
     bin: &Path,
     action: &HandlerAction,
@@ -122,28 +128,72 @@ async fn run_handler_with_bin(
         stdin.shutdown().await?;
     }
 
-    let output = match tokio::time::timeout(limits.timeout, child.wait_with_output()).await {
-        Ok(output) => output?,
-        Err(_) => return Ok(HandlerOutcome::TimedOut),
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("GAJAE handler stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("GAJAE handler stderr pipe unavailable"))?;
+    let mut stdout_task = tokio::spawn(read_bounded_output(stdout, limits.max_output_bytes));
+    let mut stderr_task = tokio::spawn(read_bounded_output(stderr, limits.max_output_bytes));
+    let mut stdout_output: Option<BoundedOutput> = None;
+    let mut stderr_output: Option<BoundedOutput> = None;
+    let timeout = tokio::time::sleep(limits.timeout);
+    tokio::pin!(timeout);
+
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status?,
+            stdout_result = &mut stdout_task, if stdout_output.is_none() => {
+                let output = stdout_result??;
+                let capped = output.capped;
+                stdout_output = Some(output);
+                if capped {
+                    let _ = child.start_kill();
+                    break child.wait().await?;
+                }
+            }
+            stderr_result = &mut stderr_task, if stderr_output.is_none() => {
+                let output = stderr_result??;
+                let capped = output.capped;
+                stderr_output = Some(output);
+                if capped {
+                    let _ = child.start_kill();
+                    break child.wait().await?;
+                }
+            }
+            _ = &mut timeout => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Ok(HandlerOutcome::TimedOut);
+            }
+        }
     };
 
+    let stdout = finish_bounded_task(stdout_output, stdout_task).await?;
+    let stderr = finish_bounded_task(stderr_output, stderr_task).await?;
+
     let diagnostic_limit = limits.max_output_bytes.min(DIAGNOSTIC_BYTES);
-    let stdout = bounded_bytes(&output.stdout, diagnostic_limit);
-    let stderr = bounded_bytes(&output.stderr, diagnostic_limit);
-    if !output.status.success() {
+    let stdout_diagnostic = bounded_bytes(&stdout.bytes, diagnostic_limit);
+    let stderr_diagnostic = bounded_bytes(&stderr.bytes, diagnostic_limit);
+    if !status.success() || stdout.capped || stderr.capped {
         return Ok(HandlerOutcome::Failed {
-            code: output.status.code(),
-            stdout: diagnostic_text(&stdout),
-            stderr: diagnostic_text(&stderr),
+            code: status.code(),
+            stdout: diagnostic_text(&stdout_diagnostic),
+            stderr: diagnostic_text(&stderr_diagnostic),
         });
     }
 
-    let parsed = if stdout.trim_ascii().is_empty() {
+    let parsed = if stdout.bytes.iter().all(u8::is_ascii_whitespace) {
         json!({})
     } else {
-        serde_json::from_slice(&stdout).unwrap_or_else(|_| {
+        serde_json::from_slice(&stdout.bytes).unwrap_or_else(|_| {
             json!({
-                "summary": diagnostic_text(&stdout),
+                "summary": diagnostic_text(&stdout_diagnostic),
             })
         })
     };
@@ -152,6 +202,51 @@ async fn run_handler_with_bin(
         Ok(HandlerOutcome::ApprovalRequired(parsed))
     } else {
         Ok(HandlerOutcome::Completed(parsed))
+    }
+}
+
+async fn read_bounded_output<R>(mut reader: R, max: usize) -> io::Result<BoundedOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max.min(8 * 1024));
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let remaining = max.saturating_sub(bytes.len());
+        let read_limit = remaining.saturating_add(1).min(buffer.len());
+        if read_limit == 0 {
+            return Ok(BoundedOutput {
+                bytes,
+                capped: true,
+            });
+        }
+
+        let read = reader.read(&mut buffer[..read_limit]).await?;
+        if read == 0 {
+            return Ok(BoundedOutput {
+                bytes,
+                capped: false,
+            });
+        }
+        if read > remaining {
+            bytes.extend_from_slice(&buffer[..remaining]);
+            return Ok(BoundedOutput {
+                bytes,
+                capped: true,
+            });
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+}
+
+async fn finish_bounded_task(
+    output: Option<BoundedOutput>,
+    task: tokio::task::JoinHandle<io::Result<BoundedOutput>>,
+) -> Result<BoundedOutput> {
+    match output {
+        Some(output) => Ok(output),
+        None => Ok(task.await??),
     }
 }
 
@@ -1261,7 +1356,7 @@ printf '{"summary":"ok"}'
             &bin,
             &handler_action(),
             &json!({"type": "github.pr.opened"}),
-            handler_limits(1_000, 1_024),
+            handler_limits(1_000, 4_096),
         )
         .await
         .expect("handler should report failure");
@@ -1277,6 +1372,41 @@ printf '{"summary":"ok"}'
         assert_eq!(code, Some(17));
         assert!(stdout.len() <= DIAGNOSTIC_BYTES);
         assert!(stderr.len() <= DIAGNOSTIC_BYTES);
+    }
+
+    #[tokio::test]
+    async fn handler_output_cap_kills_process_and_retains_only_bounded_bytes() {
+        let script = r#"#!/bin/sh
+while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done
+printf 'not killed' > "$FAKE_MARKER_FILE"
+"#;
+        let (_dir, bin) = write_fake_gajae(script);
+        let out_dir = tempdir().expect("out tempdir");
+        let marker_file = out_dir.path().join("marker.txt");
+        unsafe {
+            std::env::set_var("FAKE_MARKER_FILE", &marker_file);
+        }
+
+        let started = std::time::Instant::now();
+        let outcome = run_handler_with_bin(
+            &bin,
+            &handler_action(),
+            &json!({"type": "github.pr.opened"}),
+            handler_limits(5_000, 64),
+        )
+        .await
+        .expect("handler should be killed on output cap");
+
+        let HandlerOutcome::Failed { stdout, stderr, .. } = outcome else {
+            panic!("unexpected outcome")
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "output cap should kill before timeout"
+        );
+        assert!(stdout.len() <= 64);
+        assert!(stderr.len() <= 64);
+        assert!(!marker_file.exists());
     }
 
     #[tokio::test]
