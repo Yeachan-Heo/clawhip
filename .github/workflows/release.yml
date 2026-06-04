@@ -314,8 +314,6 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
-    outputs:
-      val: ${{ steps.host.outputs.manifest }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -360,15 +358,22 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+        shell: bash
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          set -euo pipefail
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          prerelease_flag=()
+          if jq -e '.announcement_is_prerelease == true' dist-manifest.json > /dev/null; then
+            prerelease_flag=(--prerelease)
+          fi
+
+          announcement_title="$(jq -er '.announcement_title' dist-manifest.json)"
+
+          # Write and read notes from a file to avoid quoting breaking things
+          jq -er '.announcement_github_body' dist-manifest.json > "$RUNNER_TEMP/notes.txt"
+
+          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" "${prerelease_flag[@]}" --title "$announcement_title" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   # Publish to crates.io
   publish-crates:
