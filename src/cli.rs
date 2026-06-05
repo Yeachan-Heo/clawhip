@@ -483,6 +483,8 @@ impl NativeHookArgs {
 pub enum GajaeCommands {
     /// Check whether gajae is available.
     Status,
+    /// Verify GAJAE-native receipts, profile install, and public-safe output readiness.
+    Preflight,
     /// Manage gajae-installed clawhip profiles.
     Profile {
         #[command(subcommand)]
@@ -1354,6 +1356,17 @@ mod tests {
         };
 
         assert!(matches!(command, GajaeCommands::Status));
+    }
+
+    #[test]
+    fn parses_gajae_preflight_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "gajae", "preflight"]);
+
+        let Commands::Gajae { command } = cli.command.expect("gajae command") else {
+            panic!("expected gajae command");
+        };
+
+        assert!(matches!(command, GajaeCommands::Preflight));
     }
 
     #[test]

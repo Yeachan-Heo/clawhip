@@ -911,9 +911,10 @@ clawhip gajae status    # check local GAJAE CLI bridge availability
 ```bash
 clawhip gajae status
 clawhip gajae profile install
+clawhip gajae preflight
 ```
 
-`status` discovers GAJAE from `GAJAE_BIN` first, then the `gajae` executable on `PATH`, and verifies it by running `gajae --help`. `profile install` forwards to `gajae clawhip profile install` with stdout/stderr attached so GAJAE owns the profile update flow.
+`status` discovers GAJAE from `GAJAE_BIN` first, then the `gajae` executable on `PATH`, and verifies it by running `gajae --help`. `profile install` forwards to `gajae clawhip profile install` with stdout/stderr attached so GAJAE owns the profile update flow. `preflight` is the public-safe readiness check: it verifies GAJAE discovery, required receipt validators, the installed clawhip profile, public-safe output mode, and disabled raw-payload export, then prints a concise JSON summary safe to paste into issues or PRs. Preflight does not mutate cron/config, does not contact GitHub, and does not require GAJAE for baseline clawhip routing.
 
 ## Internal PR fast-path
 

@@ -24,6 +24,92 @@ fn gajae_stub(temp: &TempDir, contents: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn gajae_preflight_prints_public_safe_ready_summary() {
+    let temp = TempDir::new().expect("tempdir");
+    let profile = temp.path().join(".clawhip/gajae.routes.yml");
+    fs::create_dir_all(profile.parent().expect("profile parent")).expect("profile dir");
+    fs::write(
+        &profile,
+        r#"
+profile: gajae
+safety:
+  publicSafeOutput: true
+  rawPayloadExport: false
+routes:
+  session.started:
+    command: gajae handle session.started
+"#,
+    )
+    .expect("write profile");
+    let stub = gajae_stub(
+        &temp,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "--help" ]]; then
+  printf 'gajae help\n'
+  exit 0
+fi
+if [[ "${2:-}" == "validate" && "${3:-}" == "--help" ]]; then
+  printf '%s\n' "$1" >> "$GAJAE_ARG_LOG"
+  exit 0
+fi
+exit 64
+"#,
+    );
+
+    let output = Command::new(clawhip_bin())
+        .args(["gajae", "preflight"])
+        .current_dir(temp.path())
+        .env("GAJAE_BIN", &stub)
+        .env("GAJAE_ARG_LOG", temp.path().join("gajae.args"))
+        .output()
+        .expect("run preflight");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json summary");
+    assert_eq!(summary["ready"], true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("public_safe_output"));
+    assert!(!stdout.contains("raw body"));
+}
+
+#[test]
+fn gajae_preflight_reports_missing_profile_install_step() {
+    let temp = TempDir::new().expect("tempdir");
+    let stub = gajae_stub(
+        &temp,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "--help" ]]; then
+  exit 0
+fi
+if [[ "${2:-}" == "validate" && "${3:-}" == "--help" ]]; then
+  exit 0
+fi
+exit 64
+"#,
+    );
+
+    let output = Command::new(clawhip_bin())
+        .args(["gajae", "preflight"])
+        .current_dir(temp.path())
+        .env("GAJAE_BIN", &stub)
+        .output()
+        .expect("run preflight");
+
+    assert!(!output.status.success());
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json summary");
+    assert_eq!(summary["ready"], false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("clawhip gajae profile install"));
+    assert!(!stdout.contains("secret"));
+}
+
+#[test]
 fn gajae_profile_install_does_not_forward_parent_stdin() {
     let temp = TempDir::new().expect("tempdir");
     let stub = gajae_stub(

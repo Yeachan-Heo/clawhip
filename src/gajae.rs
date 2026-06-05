@@ -20,6 +20,13 @@ const DEFAULT_ROUTES_PATH: &str = ".clawhip/gajae.routes.yml";
 const DEFAULT_RUNTIME_DIR: &str = ".gajae/runtime";
 const PROFILE_FILE_NAME: &str = "clawhip-profile.yml";
 const MAX_PROFILE_BYTES: usize = 256 * 1024;
+const REQUIRED_RECEIPT_FAMILIES: &[&str] = &[
+    "runtime-followup-receipt",
+    "mutation-plan",
+    "review-verdict-evidence",
+    "merge-hold-decision",
+];
+
 const SUPPORTED_EVENTS: &[&str] = &[
     "github.issue-opened",
     "github.issue-commented",
@@ -82,6 +89,8 @@ struct GajaeRouteProfile {
     name: Option<String>,
     routes_file: Option<PathBuf>,
     routes: BTreeMap<String, String>,
+    public_safe_output: Option<bool>,
+    raw_payload_export: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +105,30 @@ impl RouteValidation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreflightCheck {
+    name: &'static str,
+    status: &'static str,
+    detail: String,
+}
+
+impl PreflightCheck {
+    fn pass(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: "pass",
+            detail: detail.into(),
+        }
+    }
+
+    fn fail(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: "fail",
+            detail: detail.into(),
+        }
+    }
+}
 pub fn run_profile_inspect(options: ProfileInspectOptions) -> Result<()> {
     let profile = load_profile(options.file.as_deref())?;
     let validation = validate_profile(&profile);
@@ -296,6 +329,9 @@ fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
     let mut route_event = None::<String>;
     let mut route_missing_command = None::<(String, usize)>;
     let mut routes_file = None::<PathBuf>;
+    let mut public_safe_output = None;
+    let mut raw_payload_export = None;
+
     let mut parent_stack: Vec<(usize, String)> = Vec::new();
 
     for (index, raw_line) in contents.lines().enumerate() {
@@ -400,6 +436,14 @@ fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
             bail!("unsupported GAJAE profile route key at line {line_number}");
         }
 
+        if matches!(parent, Some("safety")) {
+            if key == "publicSafeOutput" {
+                public_safe_output = parse_bool_flag(value.as_deref(), key, line_number)?;
+            }
+            if key == "rawPayloadExport" || key == "exportRawPayload" {
+                raw_payload_export = parse_bool_flag(value.as_deref(), key, line_number)?;
+            }
+        }
         if matches!(parent, Some("safety" | "followUp" | "gajae")) {
             continue;
         }
@@ -415,6 +459,8 @@ fn parse_profile(contents: &str, source: PathBuf) -> Result<GajaeRouteProfile> {
         name,
         routes_file,
         routes,
+        public_safe_output,
+        raw_payload_export,
     })
 }
 
@@ -439,6 +485,15 @@ fn clean_scalar(value: &str) -> Option<String> {
         })
         .unwrap_or(value);
     Some(cleaned.to_string())
+}
+
+fn parse_bool_flag(value: Option<&str>, key: &str, line_number: usize) -> Result<Option<bool>> {
+    match value {
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(_) => bail!("invalid GAJAE boolean flag `{key}` at line {line_number}"),
+        None => Ok(None),
+    }
 }
 
 fn routes_indent(top_level: Option<&str>) -> usize {
@@ -469,7 +524,7 @@ fn validate_top_level_key(key: &str, source: &Path, line_number: usize) -> Resul
                 | "profile"
         )
     } else {
-        matches!(key, "profile" | "routes")
+        matches!(key, "profile" | "routes" | "safety")
     };
     if allowed {
         Ok(())
@@ -530,6 +585,26 @@ fn print_validation(validation: &RouteValidation) {
     }
     for (event, _) in &validation.unsupported_commands {
         println!("unsupported command for event: {event}");
+    }
+}
+fn profile_validation_summary(validation: &RouteValidation) -> String {
+    let mut parts = Vec::new();
+    if !validation.unknown_events.is_empty() {
+        parts.push(format!(
+            "{} unknown events",
+            validation.unknown_events.len()
+        ));
+    }
+    if !validation.unsupported_commands.is_empty() {
+        parts.push(format!(
+            "{} unsupported commands",
+            validation.unsupported_commands.len()
+        ));
+    }
+    if parts.is_empty() {
+        "validation ok".to_string()
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -653,6 +728,140 @@ fn run_status_with(
             bail!("gajae unavailable: set {GAJAE_ENV} or install `{GAJAE_PATH_NAME}` on PATH")
         }
         Err(error) => Err(error).with_context(|| format!("failed to run {} --help", bin.display())),
+    }
+}
+pub fn run_preflight() -> Result<()> {
+    let mut runner = StdCommandRunner;
+    run_preflight_with(&mut runner, |name| std::env::var_os(name), None)
+}
+
+fn run_preflight_with(
+    runner: &mut impl CommandRunner,
+    env_var: impl Fn(&str) -> Option<OsString>,
+    explicit_file: Option<&Path>,
+) -> Result<()> {
+    let mut checks = Vec::new();
+    let bin = discover_gajae_with(env_var);
+    match runner.output(&bin, &["--help"]) {
+        Ok(output) if output.success => {
+            checks.push(PreflightCheck::pass("gajae", bin.display().to_string()));
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            checks.push(PreflightCheck::fail(
+                "gajae",
+                format!("{} --help failed{}", bin.display(), concise_detail(&stderr)),
+            ));
+            return finish_preflight(checks);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            checks.push(PreflightCheck::fail(
+                "gajae",
+                format!("set {GAJAE_ENV} or install `{GAJAE_PATH_NAME}` on PATH"),
+            ));
+            return finish_preflight(checks);
+        }
+        Err(error) => {
+            checks.push(PreflightCheck::fail(
+                "gajae",
+                format!("failed to run {} --help: {error}", bin.display()),
+            ));
+            return finish_preflight(checks);
+        }
+    }
+
+    for family in REQUIRED_RECEIPT_FAMILIES {
+        let args = [*family, "validate", "--help"];
+        match runner.output_with_stdin(&bin, &args, None) {
+            Ok(output) if output.success => checks.push(PreflightCheck::pass(
+                "validator",
+                format!("{family} validate available"),
+            )),
+            Ok(_) => checks.push(PreflightCheck::fail(
+                "validator",
+                format!("{family} validate unavailable"),
+            )),
+            Err(error) => checks.push(PreflightCheck::fail(
+                "validator",
+                format!("{family} validate unavailable: {error}"),
+            )),
+        }
+    }
+
+    match load_profile(explicit_file) {
+        Ok(profile) => {
+            checks.push(PreflightCheck::pass(
+                "profile",
+                format!("installed at {}", profile.source.display()),
+            ));
+            let validation = validate_profile(&profile);
+            if validation.is_clean() {
+                checks.push(PreflightCheck::pass(
+                    "profile_routes",
+                    format!("{} supported routes", profile.routes.len()),
+                ));
+            } else {
+                checks.push(PreflightCheck::fail(
+                    "profile_routes",
+                    profile_validation_summary(&validation),
+                ));
+            }
+            if profile.public_safe_output == Some(true) {
+                checks.push(PreflightCheck::pass(
+                    "public_safe_output",
+                    "public-safe output mode enabled",
+                ));
+            } else {
+                checks.push(PreflightCheck::fail(
+                    "public_safe_output",
+                    "run `clawhip gajae profile install` to enable public-safe output mode",
+                ));
+            }
+            if profile.raw_payload_export == Some(false) {
+                checks.push(PreflightCheck::pass(
+                    "raw_payload_export",
+                    "raw payload export disabled",
+                ));
+            } else {
+                checks.push(PreflightCheck::fail(
+                    "raw_payload_export",
+                    "run `clawhip gajae profile install` with no raw-payload export required",
+                ));
+            }
+        }
+        Err(error) => checks.push(PreflightCheck::fail(
+            "profile",
+            format!("run `clawhip gajae profile install`: {error}"),
+        )),
+    }
+
+    finish_preflight(checks)
+}
+
+fn finish_preflight(checks: Vec<PreflightCheck>) -> Result<()> {
+    let ready = checks.iter().all(|check| check.status == "pass");
+    let failures = checks
+        .iter()
+        .filter(|check| check.status == "fail")
+        .map(|check| json!({"check": check.name, "detail": check.detail}))
+        .collect::<Vec<_>>();
+    let checks_json = checks
+        .iter()
+        .map(|check| json!({"check": check.name, "status": check.status, "detail": check.detail}))
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "ready": ready,
+            "checks": checks_json,
+            "failures": failures,
+            "next_step": if ready { Value::Null } else { json!("fix failed checks; profile step is `clawhip gajae profile install`") },
+        }))?
+    );
+    if ready {
+        Ok(())
+    } else {
+        bail!("GAJAE preflight failed")
     }
 }
 
@@ -1163,6 +1372,130 @@ clawhipProfile:
         assert!(message.contains("referenced GAJAE routes file"));
         assert!(message.contains("exceeds maximum size"));
         assert!(!message.contains("secret-token-123"));
+    }
+
+    #[test]
+    fn preflight_accepts_profile_validators_and_safe_output() {
+        let temp = tempdir().expect("tempdir");
+        let profile_path = temp.path().join(".clawhip/gajae.routes.yml");
+        fs::create_dir_all(profile_path.parent().expect("profile parent")).expect("profile dir");
+        fs::write(
+            &profile_path,
+            r#"
+profile: gajae
+safety:
+  publicSafeOutput: true
+  rawPayloadExport: false
+routes:
+  session.started:
+    command: gajae handle session.started
+"#,
+        )
+        .expect("write profile");
+        let mut runner = MockRunner::available();
+
+        run_preflight_with(
+            &mut runner,
+            |_| Some(OsString::from("/custom/gajae")),
+            Some(profile_path.as_path()),
+        )
+        .expect("preflight should pass");
+
+        assert_eq!(runner.calls[0].program, PathBuf::from("/custom/gajae"));
+        assert_eq!(runner.calls[0].args, vec!["--help"]);
+        let validator_calls = runner
+            .calls
+            .iter()
+            .filter(|call| call.args.len() == 3 && call.args[1] == "validate")
+            .count();
+        assert_eq!(validator_calls, REQUIRED_RECEIPT_FAMILIES.len());
+    }
+
+    #[test]
+    fn preflight_fails_when_gajae_missing_before_profile_or_validators() {
+        let mut runner = MockRunner {
+            output_result: Err(io::Error::new(io::ErrorKind::NotFound, "missing")),
+            ..MockRunner::available()
+        };
+
+        let error = run_preflight_with(&mut runner, |_| None, None)
+            .expect_err("missing gajae should fail preflight");
+
+        assert_eq!(runner.calls.len(), 1);
+        assert_eq!(runner.calls[0].args, vec!["--help"]);
+        assert_eq!(error.to_string(), "GAJAE preflight failed");
+    }
+
+    #[test]
+    fn preflight_fails_when_profile_missing_with_install_step() {
+        let temp = tempdir().expect("tempdir");
+        let missing_profile = temp.path().join("missing.yml");
+        let mut runner = MockRunner::available();
+
+        let error = run_preflight_with(&mut runner, |_| None, Some(missing_profile.as_path()))
+            .expect_err("missing profile should fail preflight");
+
+        assert_eq!(error.to_string(), "GAJAE preflight failed");
+        assert_eq!(runner.calls.len(), REQUIRED_RECEIPT_FAMILIES.len() + 1);
+    }
+
+    #[test]
+    fn preflight_fails_when_validator_unavailable() {
+        let temp = tempdir().expect("tempdir");
+        let profile_path = temp.path().join(".clawhip/gajae.routes.yml");
+        fs::create_dir_all(profile_path.parent().expect("profile parent")).expect("profile dir");
+        fs::write(
+            &profile_path,
+            r#"
+profile: gajae
+safety:
+  publicSafeOutput: true
+  rawPayloadExport: false
+routes:
+  session.started:
+    command: gajae handle session.started
+"#,
+        )
+        .expect("write profile");
+        let mut runner = MockRunner {
+            output_with_stdin_result: Ok(CommandOutput {
+                success: false,
+                stdout: Vec::new(),
+                stderr: b"unavailable".to_vec(),
+            }),
+            ..MockRunner::available()
+        };
+
+        let error = run_preflight_with(&mut runner, |_| None, Some(profile_path.as_path()))
+            .expect_err("missing validator should fail preflight");
+
+        assert_eq!(error.to_string(), "GAJAE preflight failed");
+    }
+
+    #[test]
+    fn preflight_fails_when_profile_requires_unsafe_output() {
+        let temp = tempdir().expect("tempdir");
+        let profile_path = temp.path().join(".clawhip/gajae.routes.yml");
+        fs::create_dir_all(profile_path.parent().expect("profile parent")).expect("profile dir");
+        fs::write(
+            &profile_path,
+            r#"
+profile: gajae
+safety:
+  publicSafeOutput: false
+  rawPayloadExport: true
+routes:
+  session.started:
+    command: gajae handle session.started
+"#,
+        )
+        .expect("write profile");
+        let mut runner = MockRunner::available();
+
+        let error = run_preflight_with(&mut runner, |_| None, Some(profile_path.as_path()))
+            .expect_err("unsafe profile should fail preflight");
+
+        assert_eq!(error.to_string(), "GAJAE preflight failed");
     }
 
     #[test]

@@ -356,6 +356,7 @@ async fn real_main(cli: Cli) -> Result<()> {
         },
         Commands::Gajae { command } => match command {
             GajaeCommands::Status => Ok(gajae::run(gajae::GajaeCommand::Status)?),
+            GajaeCommands::Preflight => Ok(gajae::run_preflight()?),
             GajaeCommands::Profile { command } => match command {
                 GajaeProfileCommands::Install => {
                     let status = gajae::run_profile_install()?;
