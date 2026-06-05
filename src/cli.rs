@@ -485,6 +485,8 @@ pub enum GajaeCommands {
     Status,
     /// Verify GAJAE-native receipts, profile install, and public-safe output readiness.
     Preflight,
+    /// Diagnose GAJAE CLI/profile conformance without mutating local profiles.
+    Doctor(GajaeDoctorArgs),
     /// Manage gajae-installed clawhip profiles.
     Profile {
         #[command(subcommand)]
@@ -501,6 +503,8 @@ pub enum GajaeCommands {
 pub enum GajaeProfileCommands {
     /// Install the clawhip profile through gajae.
     Install,
+    /// Verify the installed GAJAE clawhip profile and handler commands without executing routes.
+    Verify(GajaeProfileVerifyArgs),
     /// Inspect the installed GAJAE clawhip route profile without executing routes.
     Inspect(GajaeProfileFileArgs),
     /// Explain which GAJAE route would match an event without executing it.
@@ -540,6 +544,23 @@ pub struct GajaeProfileApplyArgs {
     /// Placeholder approval gate for future live apply support; does not enable execution yet.
     #[arg(long, default_value_t = false)]
     pub approve: bool,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct GajaeDoctorArgs {
+    /// Optional owner/repo used to check whether GAJAE can produce a dry-run clawhip onboard plan.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Read this profile/routes file instead of auto-discovering the installed GAJAE profile.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct GajaeProfileVerifyArgs {
+    /// Read this profile/routes file instead of auto-discovering the installed GAJAE profile.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

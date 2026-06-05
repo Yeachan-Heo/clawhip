@@ -355,6 +355,17 @@ pub struct ProfileApplyOptions {
     pub approve: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DoctorOptions {
+    pub repo: Option<String>,
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProfileVerifyOptions {
+    pub file: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GajaeRouteProfile {
     source: PathBuf,
@@ -1000,6 +1011,367 @@ fn run_status_with(
             bail!("gajae unavailable: set {GAJAE_ENV} or install `{GAJAE_PATH_NAME}` on PATH")
         }
         Err(error) => Err(error).with_context(|| format!("failed to run {} --help", bin.display())),
+    }
+}
+
+pub fn run_doctor(options: DoctorOptions) -> Result<()> {
+    let mut runner = StdCommandRunner;
+    run_doctor_with(&mut runner, |name| std::env::var_os(name), options)
+}
+
+fn run_doctor_with(
+    runner: &mut impl CommandRunner,
+    env_var: impl Fn(&str) -> Option<OsString>,
+    options: DoctorOptions,
+) -> Result<()> {
+    let bin = discover_gajae_with(env_var);
+    let mut checks = Vec::new();
+    if !check_gajae_help(runner, &bin, &mut checks) {
+        return finish_conformance("doctor", checks);
+    }
+    check_schema_capabilities(runner, &bin, &mut checks);
+    check_receipt_validators(runner, &bin, &mut checks);
+    check_profile_and_handlers(runner, &bin, options.file.as_deref(), &mut checks);
+    if let Some(repo) = options.repo.as_deref() {
+        check_onboard_plan(runner, &bin, repo, &mut checks);
+    } else {
+        checks.push(PreflightCheck::pass(
+            "onboard_plan",
+            "skipped; pass --repo owner/repo to verify dry-run plan support",
+        ));
+    }
+    finish_conformance("doctor", checks)
+}
+
+pub fn run_profile_verify(options: ProfileVerifyOptions) -> Result<()> {
+    let mut runner = StdCommandRunner;
+    run_profile_verify_with(&mut runner, |name| std::env::var_os(name), options)
+}
+
+fn run_profile_verify_with(
+    runner: &mut impl CommandRunner,
+    env_var: impl Fn(&str) -> Option<OsString>,
+    options: ProfileVerifyOptions,
+) -> Result<()> {
+    let bin = discover_gajae_with(env_var);
+    let mut checks = Vec::new();
+    if !check_gajae_help(runner, &bin, &mut checks) {
+        return finish_conformance("profile_verify", checks);
+    }
+    check_receipt_validators(runner, &bin, &mut checks);
+    check_profile_and_handlers(runner, &bin, options.file.as_deref(), &mut checks);
+    finish_conformance("profile_verify", checks)
+}
+
+fn check_gajae_help(
+    runner: &mut impl CommandRunner,
+    bin: &Path,
+    checks: &mut Vec<PreflightCheck>,
+) -> bool {
+    match runner.output(bin, &["--help"]) {
+        Ok(output) if output.success => {
+            checks.push(PreflightCheck::pass("gajae_help", "gajae --help succeeded"));
+            true
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            checks.push(PreflightCheck::fail(
+                "gajae_help",
+                format!("gajae --help failed{}", concise_detail(&stderr)),
+            ));
+            false
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            checks.push(PreflightCheck::fail(
+                "gajae_help",
+                format!("set {GAJAE_ENV} or install `{GAJAE_PATH_NAME}` on PATH"),
+            ));
+            false
+        }
+        Err(error) => {
+            checks.push(PreflightCheck::fail(
+                "gajae_help",
+                format!("failed to run gajae --help: {error}"),
+            ));
+            false
+        }
+    }
+}
+
+fn check_schema_capabilities(
+    runner: &mut impl CommandRunner,
+    bin: &Path,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    let args = ["schema", "list", "--capabilities"];
+    match runner.output_with_stdin(bin, &args, None) {
+        Ok(output) if output.success => {
+            let missing = missing_receipt_families(&output.stdout);
+            if missing.is_empty() {
+                checks.push(PreflightCheck::pass(
+                    "schema_capabilities",
+                    "required receipt families advertised",
+                ));
+            } else {
+                checks.push(PreflightCheck::fail(
+                    "schema_capabilities",
+                    format!("missing receipt families: {}", missing.join(", ")),
+                ));
+            }
+        }
+        Ok(_) => checks.push(PreflightCheck::fail(
+            "schema_capabilities",
+            "`gajae schema list --capabilities` failed",
+        )),
+        Err(error) => checks.push(PreflightCheck::fail(
+            "schema_capabilities",
+            format!("`gajae schema list --capabilities` unavailable: {error}"),
+        )),
+    }
+}
+
+fn check_receipt_validators(
+    runner: &mut impl CommandRunner,
+    bin: &Path,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    for family in REQUIRED_RECEIPT_FAMILIES {
+        let args = [*family, "validate", "--help"];
+        match runner.output_with_stdin(bin, &args, None) {
+            Ok(output) if output.success => checks.push(PreflightCheck::pass(
+                "receipt_validator",
+                format!("{family} validate available"),
+            )),
+            Ok(_) => checks.push(PreflightCheck::fail(
+                "receipt_validator",
+                format!("{family} validate missing; update GAJAE or profile family mapping"),
+            )),
+            Err(error) => checks.push(PreflightCheck::fail(
+                "receipt_validator",
+                format!("{family} validate unavailable: {error}"),
+            )),
+        }
+    }
+}
+
+fn check_profile_and_handlers(
+    runner: &mut impl CommandRunner,
+    bin: &Path,
+    explicit_file: Option<&Path>,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    match load_profile(explicit_file) {
+        Ok(profile) => {
+            checks.push(PreflightCheck::pass(
+                "profile",
+                format!("loaded {} routes", profile.routes.len()),
+            ));
+            let validation = validate_profile(&profile);
+            if validation.is_clean() {
+                checks.push(PreflightCheck::pass(
+                    "profile_routes",
+                    format!("{} supported routes", profile.routes.len()),
+                ));
+                check_handler_commands(runner, bin, &profile, checks);
+                check_profile_safety(&profile, checks);
+            } else {
+                checks.push(PreflightCheck::fail(
+                    "profile_routes",
+                    format!(
+                        "{}; rerun `clawhip gajae profile install` for current handler names",
+                        profile_validation_summary(&validation)
+                    ),
+                ));
+            }
+        }
+        Err(error) => checks.push(PreflightCheck::fail(
+            "profile",
+            format!("run `clawhip gajae profile install`: {error}"),
+        )),
+    }
+}
+
+fn check_handler_commands(
+    runner: &mut impl CommandRunner,
+    bin: &Path,
+    profile: &GajaeRouteProfile,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    let mut commands = profile
+        .routes
+        .iter()
+        .filter_map(|(event, command)| handler_probe_args(command, event))
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
+    if commands.is_empty() {
+        checks.push(PreflightCheck::fail(
+            "handler_command",
+            "no supported GAJAE handler commands found in profile",
+        ));
+        return;
+    }
+    for args in commands {
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        match runner.output_with_stdin(bin, &arg_refs, None) {
+            Ok(output) if output.success => checks.push(PreflightCheck::pass(
+                "handler_command",
+                format!("{} available", handler_probe_summary(&args)),
+            )),
+            Ok(_) => checks.push(PreflightCheck::fail(
+                "handler_command",
+                format!(
+                    "{} missing or renamed; rerun `clawhip gajae profile install` with current GAJAE",
+                    handler_probe_summary(&args)
+                ),
+            )),
+            Err(error) => checks.push(PreflightCheck::fail(
+                "handler_command",
+                format!("{} unavailable: {error}", handler_probe_summary(&args)),
+            )),
+        }
+    }
+}
+
+fn check_profile_safety(profile: &GajaeRouteProfile, checks: &mut Vec<PreflightCheck>) {
+    if profile.public_safe_output == Some(true) {
+        checks.push(PreflightCheck::pass(
+            "public_safe_output",
+            "public-safe output mode enabled",
+        ));
+    } else {
+        checks.push(PreflightCheck::fail(
+            "public_safe_output",
+            "run `clawhip gajae profile install` to enable public-safe output mode",
+        ));
+    }
+    if profile.raw_payload_export == Some(false) {
+        checks.push(PreflightCheck::pass(
+            "raw_payload_export",
+            "raw payload export disabled",
+        ));
+    } else {
+        checks.push(PreflightCheck::fail(
+            "raw_payload_export",
+            "run `clawhip gajae profile install` with no raw-payload export required",
+        ));
+    }
+}
+
+fn check_onboard_plan(
+    runner: &mut impl CommandRunner,
+    bin: &Path,
+    repo: &str,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    if !valid_repo_label(repo) {
+        checks.push(PreflightCheck::fail(
+            "onboard_plan",
+            "repo must be public owner/repo syntax",
+        ));
+        return;
+    }
+    let args = [
+        "operator",
+        "onboard",
+        "plan",
+        "--repo",
+        repo,
+        "--router",
+        "clawhip",
+        "--dry-run",
+    ];
+    match runner.output_with_stdin(bin, &args, None) {
+        Ok(output) if output.success => checks.push(PreflightCheck::pass(
+            "onboard_plan",
+            "dry-run clawhip onboard plan available",
+        )),
+        Ok(_) => checks.push(PreflightCheck::fail(
+            "onboard_plan",
+            "dry-run clawhip onboard plan unavailable; update GAJAE operator onboard support",
+        )),
+        Err(error) => checks.push(PreflightCheck::fail(
+            "onboard_plan",
+            format!("dry-run clawhip onboard plan unavailable: {error}"),
+        )),
+    }
+}
+
+fn missing_receipt_families(stdout: &[u8]) -> Vec<&'static str> {
+    let text = String::from_utf8_lossy(stdout);
+    REQUIRED_RECEIPT_FAMILIES
+        .iter()
+        .copied()
+        .filter(|family| !text.contains(family))
+        .collect()
+}
+
+fn handler_probe_args(command: &str, event: &str) -> Option<Vec<String>> {
+    if command == format!("gajae handle {event}") {
+        Some(vec!["handle".into(), event.into(), "--help".into()])
+    } else if command == format!("gajae runtime handle --router clawhip --event {event}") {
+        Some(vec![
+            "runtime".into(),
+            "handle".into(),
+            "--router".into(),
+            "clawhip".into(),
+            "--event".into(),
+            event.into(),
+            "--help".into(),
+        ])
+    } else {
+        None
+    }
+}
+
+fn handler_probe_summary(args: &[String]) -> String {
+    if args.first().map(String::as_str) == Some("runtime") {
+        "runtime handle --router clawhip".to_string()
+    } else {
+        "handle <event>".to_string()
+    }
+}
+
+fn valid_repo_label(repo: &str) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    !owner.is_empty()
+        && !name.is_empty()
+        && !name.contains('/')
+        && owner.bytes().all(is_repo_label_byte)
+        && name.bytes().all(is_repo_label_byte)
+}
+
+fn is_repo_label_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+fn finish_conformance(kind: &'static str, checks: Vec<PreflightCheck>) -> Result<()> {
+    let conformant = checks.iter().all(|check| check.status == "pass");
+    let failures = checks
+        .iter()
+        .filter(|check| check.status == "fail")
+        .map(|check| json!({"check": check.name, "detail": check.detail}))
+        .collect::<Vec<_>>();
+    let checks_json = checks
+        .iter()
+        .map(|check| json!({"check": check.name, "status": check.status, "detail": check.detail}))
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "kind": kind,
+            "conformant": conformant,
+            "checks": checks_json,
+            "failures": failures,
+            "next_step": if conformant { Value::Null } else { json!("fix failed checks; reinstall the clawhip GAJAE profile with `clawhip gajae profile install` when handler names drift") },
+        }))?
+    );
+    if conformant {
+        Ok(())
+    } else {
+        bail!("GAJAE conformance diagnostics failed")
     }
 }
 pub fn run_preflight() -> Result<()> {

@@ -912,9 +912,11 @@ clawhip gajae status    # check local GAJAE CLI bridge availability
 clawhip gajae status
 clawhip gajae profile install
 clawhip gajae preflight
+clawhip gajae doctor --repo owner/repo
+clawhip gajae profile verify
 ```
 
-`status` discovers GAJAE from `GAJAE_BIN` first, then the `gajae` executable on `PATH`, and verifies it by running `gajae --help`. `profile install` forwards to `gajae clawhip profile install` with stdout/stderr attached so GAJAE owns the profile update flow. `preflight` is the public-safe readiness check: it verifies GAJAE discovery, required receipt validators, the installed clawhip profile, public-safe output mode, and disabled raw-payload export, then prints a concise JSON summary safe to paste into issues or PRs. Preflight does not mutate cron/config, does not contact GitHub, and does not require GAJAE for baseline clawhip routing.
+`status` discovers GAJAE from `GAJAE_BIN` first, then the `gajae` executable on `PATH`, and verifies it by running `gajae --help`. `profile install` forwards to `gajae clawhip profile install` with stdout/stderr attached so GAJAE owns the profile update flow. `preflight` is the #257 public-safe readiness check: it verifies GAJAE discovery, required receipt validators, the installed clawhip profile, public-safe output mode, and disabled raw-payload export, then prints a concise JSON summary safe to paste into issues or PRs. Preflight does not mutate cron/config, does not contact GitHub, and does not require GAJAE for baseline clawhip routing. `doctor` extends those bounded diagnostics with schema capability, handler-command drift, and optional dry-run onboard-plan checks. `profile verify` checks the installed profile and handler commands without executing routes. Doctor and verify never run `gajae clawhip profile install` and never mutate live profiles.
 
 GAJAE route handlers are daemon-side and default off. Enable them explicitly and attach a bounded handler to an approved route:
 

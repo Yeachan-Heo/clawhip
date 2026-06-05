@@ -357,6 +357,10 @@ async fn real_main(cli: Cli) -> Result<()> {
         Commands::Gajae { command } => match command {
             GajaeCommands::Status => Ok(gajae::run(gajae::GajaeCommand::Status)?),
             GajaeCommands::Preflight => Ok(gajae::run_preflight()?),
+            GajaeCommands::Doctor(args) => Ok(gajae::run_doctor(gajae::DoctorOptions {
+                repo: args.repo,
+                file: args.file,
+            })?),
             GajaeCommands::Profile { command } => match command {
                 GajaeProfileCommands::Install => {
                     let status = gajae::run_profile_install()?;
@@ -369,6 +373,11 @@ async fn real_main(cli: Cli) -> Result<()> {
                         );
                         std::process::exit(status.code.unwrap_or(1));
                     }
+                }
+                GajaeProfileCommands::Verify(args) => {
+                    Ok(gajae::run_profile_verify(gajae::ProfileVerifyOptions {
+                        file: args.file,
+                    })?)
                 }
                 GajaeProfileCommands::Inspect(args) => {
                     Ok(gajae::run_profile_inspect(gajae::ProfileInspectOptions {

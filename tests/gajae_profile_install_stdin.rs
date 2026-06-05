@@ -110,6 +110,235 @@ exit 64
 }
 
 #[test]
+fn gajae_doctor_succeeds_with_fake_gajae_without_mutating_profile() {
+    let temp = TempDir::new().expect("tempdir");
+    let profile = temp.path().join("profile.yml");
+    fs::write(
+        &profile,
+        r#"
+profile: gajae
+safety:
+  publicSafeOutput: true
+  rawPayloadExport: false
+routes:
+  github.issue-opened:
+    command: gajae handle github.issue-opened
+  session.started:
+    command: gajae runtime handle --router clawhip --event session.started
+"#,
+    )
+    .expect("write profile");
+    let stub = gajae_stub(
+        &temp,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$GAJAE_ARG_LOG"
+if IFS= read -r inherited_input; then
+  printf 'unexpected stdin: %s\n' "$inherited_input" >&2
+  exit 66
+fi
+if [[ "$1" == "--help" ]]; then
+  exit 0
+fi
+if [[ "$1" == "schema" && "${2:-}" == "list" && "${3:-}" == "--capabilities" ]]; then
+  printf 'runtime-followup-receipt mutation-plan review-verdict-evidence merge-hold-decision\n'
+  exit 0
+fi
+if [[ "${2:-}" == "validate" && "${3:-}" == "--help" ]]; then
+  exit 0
+fi
+if [[ "$1" == "handle" && "${3:-}" == "--help" ]]; then
+  exit 0
+fi
+if [[ "$1" == "runtime" && "${2:-}" == "handle" && "${3:-}" == "--router" && "${4:-}" == "clawhip" && "${5:-}" == "--event" && "${7:-}" == "--help" ]]; then
+  exit 0
+fi
+if [[ "$1" == "operator" && "${2:-}" == "onboard" && "${3:-}" == "plan" && "${4:-}" == "--repo" && "${6:-}" == "--router" && "${7:-}" == "clawhip" && "${8:-}" == "--dry-run" ]]; then
+  exit 0
+fi
+exit 64
+"#,
+    );
+
+    let output = Command::new(clawhip_bin())
+        .args([
+            "gajae",
+            "doctor",
+            "--file",
+            profile.to_str().expect("profile path"),
+            "--repo",
+            "owner/repo",
+        ])
+        .env("GAJAE_BIN", &stub)
+        .env("GAJAE_ARG_LOG", temp.path().join("gajae.args"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn doctor")
+        .wait_with_output()
+        .expect("wait doctor");
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json summary");
+    assert_eq!(summary["kind"], "doctor");
+    assert_eq!(summary["conformant"], true);
+    let args = fs::read_to_string(temp.path().join("gajae.args")).expect("arg log");
+    assert!(args.contains("--help\n"));
+    assert!(args.contains("schema list --capabilities\n"));
+    assert!(args.contains("operator onboard plan --repo owner/repo --router clawhip --dry-run\n"));
+    assert!(
+        !args.contains("profile install"),
+        "doctor must not mutate profile: {args}"
+    );
+}
+
+#[test]
+fn gajae_profile_verify_reports_missing_gajae_public_safely() {
+    let temp = TempDir::new().expect("tempdir");
+    let missing = temp.path().join("missing-gajae");
+
+    let output = Command::new(clawhip_bin())
+        .args(["gajae", "profile", "verify"])
+        .env("GAJAE_BIN", &missing)
+        .output()
+        .expect("run verify");
+
+    assert!(!output.status.success());
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json summary");
+    assert_eq!(summary["kind"], "profile_verify");
+    assert_eq!(summary["conformant"], false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("gajae_help"), "stdout={stdout}");
+    assert!(!stdout.contains("secret"), "stdout={stdout}");
+    assert!(stdout.len() < 1_000, "stdout too long: {}", stdout.len());
+}
+
+#[test]
+fn gajae_profile_verify_reports_renamed_handler_without_installing() {
+    let temp = TempDir::new().expect("tempdir");
+    let profile = temp.path().join("profile.yml");
+    fs::write(
+        &profile,
+        r#"
+profile: gajae
+safety:
+  publicSafeOutput: true
+  rawPayloadExport: false
+routes:
+  github.issue-opened:
+    command: gajae handle github.issue-opened
+"#,
+    )
+    .expect("write profile");
+    let stub = gajae_stub(
+        &temp,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$GAJAE_ARG_LOG"
+if [[ "$1" == "--help" ]]; then
+  exit 0
+fi
+if [[ "${2:-}" == "validate" && "${3:-}" == "--help" ]]; then
+  exit 0
+fi
+if [[ "$1" == "handle" ]]; then
+  printf '/home/operator/secret/profile command renamed and no longer exists %0500d\n' 1 >&2
+  exit 64
+fi
+exit 64
+"#,
+    );
+
+    let output = Command::new(clawhip_bin())
+        .args([
+            "gajae",
+            "profile",
+            "verify",
+            "--file",
+            profile.to_str().expect("profile path"),
+        ])
+        .env("GAJAE_BIN", &stub)
+        .env("GAJAE_ARG_LOG", temp.path().join("gajae.args"))
+        .output()
+        .expect("run verify");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("missing or renamed"), "stdout={stdout}");
+    assert!(!stdout.contains("/home/operator/secret"), "stdout={stdout}");
+    assert!(stdout.len() < 2_000, "stdout too long: {}", stdout.len());
+    let args = fs::read_to_string(temp.path().join("gajae.args")).expect("arg log");
+    assert!(args.contains("handle github.issue-opened --help\n"));
+    assert!(
+        !args.contains("profile install"),
+        "verify must not mutate profile: {args}"
+    );
+}
+
+#[test]
+fn gajae_profile_verify_reports_mismatched_profile_without_raw_command_leak() {
+    let temp = TempDir::new().expect("tempdir");
+    let profile = temp.path().join("profile.yml");
+    fs::write(
+        &profile,
+        r#"
+profile: gajae
+safety:
+  publicSafeOutput: true
+  rawPayloadExport: false
+routes:
+  github.issue-opened:
+    command: gajae renamed-handler github.issue-opened --token secret-token-123
+"#,
+    )
+    .expect("write profile");
+    let stub = gajae_stub(
+        &temp,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$GAJAE_ARG_LOG"
+if [[ "$1" == "--help" ]]; then
+  exit 0
+fi
+if [[ "${2:-}" == "validate" && "${3:-}" == "--help" ]]; then
+  exit 0
+fi
+exit 64
+"#,
+    );
+
+    let output = Command::new(clawhip_bin())
+        .args([
+            "gajae",
+            "profile",
+            "verify",
+            "--file",
+            profile.to_str().expect("profile path"),
+        ])
+        .env("GAJAE_BIN", &stub)
+        .env("GAJAE_ARG_LOG", temp.path().join("gajae.args"))
+        .output()
+        .expect("run verify");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unsupported commands"), "stdout={stdout}");
+    assert!(!stdout.contains("secret-token-123"), "stdout={stdout}");
+    assert!(!stdout.contains("renamed-handler"), "stdout={stdout}");
+    let args = fs::read_to_string(temp.path().join("gajae.args")).expect("arg log");
+    assert!(
+        !args.contains("profile install"),
+        "verify must not mutate profile: {args}"
+    );
+}
+
+#[test]
 fn gajae_profile_install_does_not_forward_parent_stdin() {
     let temp = TempDir::new().expect("tempdir");
     let stub = gajae_stub(
