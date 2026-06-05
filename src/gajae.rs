@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -1557,6 +1558,62 @@ pub struct ReceiptIngestResult {
     pub event: IncomingEvent,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubMutationPlanRequest {
+    pub repo: String,
+    pub kind: String,
+    pub target: String,
+    pub body: Option<String>,
+    pub label: Option<String>,
+    pub actor: Option<String>,
+    pub existing_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GithubMutationPlan {
+    pub family: &'static str,
+    pub schema: &'static str,
+    pub status: &'static str,
+    pub action: PlannedGithubAction,
+    pub idempotency_key: String,
+    pub duplicate: bool,
+    pub authority_required: bool,
+    pub blocked: bool,
+    pub block_reason: Option<&'static str>,
+    pub execution: MutationExecutionBoundary,
+    pub body_digest: Option<BoundedBodyDigest>,
+    pub compensation_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannedGithubAction {
+    pub provider: &'static str,
+    pub repo: String,
+    pub kind: String,
+    pub risk: &'static str,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MutationExecutionBoundary {
+    pub mode: &'static str,
+    pub executed: bool,
+    pub follow_up_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoundedBodyDigest {
+    pub algorithm: &'static str,
+    pub hex: String,
+    pub bytes: usize,
+    pub chars: usize,
+    pub capped: bool,
+}
+
 pub fn read_receipt_stdin(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut input = Vec::new();
     reader
@@ -1631,6 +1688,157 @@ fn write_receipt_tempfile(input: &[u8]) -> Result<TempReceiptFile> {
 #[derive(Debug)]
 struct TempReceiptFile {
     path: PathBuf,
+}
+pub fn github_mutation_plan(request: GithubMutationPlanRequest) -> Result<GithubMutationPlan> {
+    let kind = normalize_action_kind(&request.kind)?;
+    let protected = protected_github_action(kind);
+    let repo = public_identifier(&request.repo, "repo")?;
+    let target = public_identifier(&request.target, "target")?;
+    let label = request
+        .label
+        .as_deref()
+        .map(|value| public_identifier(value, "label"))
+        .transpose()?;
+    let actor = request
+        .actor
+        .as_deref()
+        .map(|value| public_identifier(value, "actor"))
+        .transpose()?;
+    let body_digest = request.body.as_deref().map(bounded_body_digest);
+    let idempotency_key = github_mutation_idempotency_key(
+        &repo,
+        kind,
+        &target,
+        label.as_deref(),
+        actor.as_deref(),
+        body_digest.as_ref(),
+    );
+    let duplicate = request
+        .existing_keys
+        .iter()
+        .any(|key| key.trim() == idempotency_key);
+    let status = if duplicate {
+        "duplicate-suppressed"
+    } else if protected {
+        "blocked"
+    } else {
+        "planned"
+    };
+
+    Ok(GithubMutationPlan {
+        family: "mutation-plan",
+        schema: "gajae.mutation-plan.github.v1",
+        status,
+        action: PlannedGithubAction {
+            provider: "github",
+            repo: repo.clone(),
+            kind: kind.to_string(),
+            risk: if protected { "protected" } else { "low" },
+            target: target.clone(),
+            label,
+            actor,
+        },
+        idempotency_key: idempotency_key.clone(),
+        duplicate,
+        authority_required: protected,
+        blocked: protected,
+        block_reason: protected.then_some("authority-required"),
+        execution: MutationExecutionBoundary {
+            mode: "plan-only",
+            executed: false,
+            follow_up_required: !duplicate,
+        },
+        body_digest,
+        compensation_ref: format!("github:{repo}:{kind}:{target}"),
+    })
+}
+
+fn normalize_action_kind(kind: &str) -> Result<&'static str> {
+    match kind.trim() {
+        "comment" | "issue-comment" | "pr-comment" => Ok("comment"),
+        "label" | "add-label" => Ok("label"),
+        "review-request" | "request-review" => Ok("review-request"),
+        "draft-pr" | "draft-pr-proposal" => Ok("draft-pr"),
+        "close-issue" | "issue-close" => Ok("close-issue"),
+        "branch-push" | "push" => Ok("branch-push"),
+        "release" => Ok("release"),
+        "retag" => Ok("retag"),
+        "merge" => Ok("merge"),
+        _ => bail!("unsupported GitHub mutation action kind"),
+    }
+}
+
+fn protected_github_action(kind: &str) -> bool {
+    matches!(
+        kind,
+        "branch-push" | "close-issue" | "release" | "retag" | "merge"
+    )
+}
+
+fn public_identifier(value: &str, field: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("GitHub mutation {field} is required");
+    }
+    if value.len() > 160 {
+        bail!("GitHub mutation {field} exceeds public-safe length");
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        bail!("GitHub mutation {field} must be a single public identifier");
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("token") || lower.contains("secret") || lower.contains("password") {
+        bail!("GitHub mutation {field} is not public-safe");
+    }
+    Ok(value.to_string())
+}
+
+fn github_mutation_idempotency_key(
+    repo: &str,
+    kind: &str,
+    target: &str,
+    label: Option<&str>,
+    actor: Option<&str>,
+    body_digest: Option<&BoundedBodyDigest>,
+) -> String {
+    let label = label.unwrap_or("");
+    let actor = actor.unwrap_or("");
+    let body = body_digest.map(|digest| digest.hex.as_str()).unwrap_or("");
+    let canonical = format!("github\0{repo}\0{kind}\0{target}\0{label}\0{actor}\0{body}");
+    format!(
+        "gajae:mutation-plan:github:{}",
+        fnv1a64_hex(canonical.as_bytes())
+    )
+}
+
+fn bounded_body_digest(body: &str) -> BoundedBodyDigest {
+    const BODY_DIGEST_LIMIT: usize = 4096;
+    let bytes = body.as_bytes();
+    let capped = bytes.len() > BODY_DIGEST_LIMIT;
+    let digest_bytes = if capped {
+        &bytes[..BODY_DIGEST_LIMIT]
+    } else {
+        bytes
+    };
+    BoundedBodyDigest {
+        algorithm: "fnv1a64-bounded-4096",
+        hex: fnv1a64_hex(digest_bytes),
+        bytes: bytes.len(),
+        chars: body.chars().count(),
+        capped,
+    }
+}
+
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 impl TempReceiptFile {
@@ -1731,6 +1939,93 @@ fn sanitize_family(family: &str) -> Result<String> {
 
 fn validation_detail(_output: &CommandOutput) -> String {
     ": validator rejected receipt".to_string()
+}
+
+#[cfg(test)]
+mod mutation_plan_tests {
+    use super::*;
+
+    #[test]
+    fn github_mutation_plan_is_plan_only_and_uses_body_digest() {
+        let plan = github_mutation_plan(GithubMutationPlanRequest {
+            repo: "Yeachan-Heo/clawhip".into(),
+            kind: "comment".into(),
+            target: "256".into(),
+            body: Some("safe public comment with secret-token-123 inside raw body".into()),
+            label: None,
+            actor: Some("clawdbot".into()),
+            existing_keys: Vec::new(),
+        })
+        .expect("comment plan should build");
+
+        assert_eq!(plan.family, "mutation-plan");
+        assert_eq!(plan.status, "planned");
+        assert_eq!(plan.action.risk, "low");
+        assert_eq!(plan.execution.mode, "plan-only");
+        assert!(!plan.execution.executed);
+        assert!(!plan.authority_required);
+        let digest = plan.body_digest.as_ref().expect("digest");
+        assert_eq!(digest.algorithm, "fnv1a64-bounded-4096");
+        assert!(!digest.capped);
+
+        let serialized = serde_json::to_string(&plan).expect("serialize");
+        assert!(serialized.contains("body_digest"));
+        assert!(!serialized.contains("safe public comment"));
+        assert!(!serialized.contains("secret-token-123"));
+    }
+
+    #[test]
+    fn github_mutation_plan_duplicate_suppression_is_deterministic() {
+        let request = GithubMutationPlanRequest {
+            repo: "Yeachan-Heo/clawhip".into(),
+            kind: "label".into(),
+            target: "256".into(),
+            body: None,
+            label: Some("bug".into()),
+            actor: None,
+            existing_keys: Vec::new(),
+        };
+        let first = github_mutation_plan(request.clone()).expect("first plan");
+        let second = github_mutation_plan(request).expect("second plan");
+        assert_eq!(first.idempotency_key, second.idempotency_key);
+        assert!(!first.duplicate);
+
+        let duplicate = github_mutation_plan(GithubMutationPlanRequest {
+            repo: "Yeachan-Heo/clawhip".into(),
+            kind: "add-label".into(),
+            target: "256".into(),
+            body: None,
+            label: Some("bug".into()),
+            actor: None,
+            existing_keys: vec![first.idempotency_key.clone()],
+        })
+        .expect("duplicate plan");
+        assert_eq!(duplicate.idempotency_key, first.idempotency_key);
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.status, "duplicate-suppressed");
+        assert!(!duplicate.execution.follow_up_required);
+    }
+
+    #[test]
+    fn github_mutation_plan_blocks_protected_boundary() {
+        let plan = github_mutation_plan(GithubMutationPlanRequest {
+            repo: "Yeachan-Heo/clawhip".into(),
+            kind: "merge".into(),
+            target: "pr-256".into(),
+            body: None,
+            label: None,
+            actor: Some("owner".into()),
+            existing_keys: Vec::new(),
+        })
+        .expect("merge plan should build");
+
+        assert_eq!(plan.status, "blocked");
+        assert_eq!(plan.action.risk, "protected");
+        assert!(plan.authority_required);
+        assert!(plan.blocked);
+        assert_eq!(plan.block_reason, Some("authority-required"));
+        assert!(!plan.execution.executed);
+    }
 }
 
 fn bounded_public_string(raw: &str) -> String {

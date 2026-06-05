@@ -497,6 +497,11 @@ pub enum GajaeCommands {
         #[command(subcommand)]
         command: GajaeReceiptCommands,
     },
+    /// Produce public-safe GAJAE mutation-plan artifacts for GitHub actions.
+    MutationPlan {
+        #[command(subcommand)]
+        command: GajaeMutationPlanCommands,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -586,6 +591,37 @@ pub struct GajaeReceiptIngestArgs {
     /// Override the destination channel when sending to the daemon.
     #[arg(long)]
     pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum GajaeMutationPlanCommands {
+    /// Plan a GitHub follow-up action without executing it.
+    Plan(GajaeMutationPlanArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct GajaeMutationPlanArgs {
+    /// GitHub repository in owner/name form.
+    #[arg(long)]
+    pub repo: String,
+    /// Candidate GitHub action kind: comment, label, review-request, close-issue, draft-pr, branch-push, release, retag, or merge.
+    #[arg(long)]
+    pub kind: String,
+    /// Public target identifier, such as issue number, PR number, branch, or tag.
+    #[arg(long)]
+    pub target: String,
+    /// Optional low-risk action body. The plan stores only a bounded digest, never raw text.
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Optional label name for label actions.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Optional public actor/login to include in the plan.
+    #[arg(long)]
+    pub actor: Option<String>,
+    /// Existing idempotency key. Repeat to mark matching plans as duplicates.
+    #[arg(long = "existing-key", action = ArgAction::Append)]
+    pub existing_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

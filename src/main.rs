@@ -38,9 +38,9 @@ use tokio::runtime::Builder;
 
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GajaeCommands,
-    GajaeProfileCommands, GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands,
-    MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, TmuxCommands,
-    UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    GajaeMutationPlanCommands, GajaeProfileCommands, GajaeReceiptCommands, GitCommands,
+    GithubCommands, HooksCommands, MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands,
+    SetupArgs, TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, SetupEdits};
@@ -422,6 +422,21 @@ async fn real_main(cli: Cli) -> Result<()> {
                     } else {
                         println!("{}", serde_json::to_string(&result.event)?);
                     }
+                    Ok(())
+                }
+            },
+            GajaeCommands::MutationPlan { command } => match command {
+                GajaeMutationPlanCommands::Plan(args) => {
+                    let plan = gajae::github_mutation_plan(gajae::GithubMutationPlanRequest {
+                        repo: args.repo,
+                        kind: args.kind,
+                        target: args.target,
+                        body: args.body,
+                        label: args.label,
+                        actor: args.actor,
+                        existing_keys: args.existing_keys,
+                    })?;
+                    println!("{}", serde_json::to_string(&plan)?);
                     Ok(())
                 }
             },
