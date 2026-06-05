@@ -1546,6 +1546,7 @@ mod tests {
             mention: None,
             format: Some(MessageFormat::Alert),
             state_file: None,
+            zero_backlog_suppression_ttl_secs: 60 * 60,
             kind: CronJobKind::CustomMessage {
                 message: "check open PRs".into(),
             },

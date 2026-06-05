@@ -543,17 +543,22 @@ pub struct CronJob {
     pub channel: Option<String>,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
-    /// Optional path to a JSON state file that gates this job's emissions.
+    /// Optional path to a JSON GAJAE receipt/state file that gates this job's emissions.
     ///
-    /// When set, the cron scheduler reads the file before emitting. If the
-    /// file parses as `{"open_issues": 0, "open_prs": 0, ...}` (zero backlog)
-    /// **and** the canonical JSON fingerprint matches the one from the last
-    /// emission for this job, the scheduler suppresses the emission. Any
-    /// delta in the file (including fields beyond the backlog counters) or a
-    /// non-zero backlog causes the job to fire again immediately. Missing or
-    /// malformed state files fail open so existing jobs keep working.
+    /// When set, the cron scheduler reads the file before emitting. Validated
+    /// GAJAE zero-backlog/follow-up receipts with zero open issues, zero open
+    /// PRs, green dev CI, no action-needed sessions, and no holds suppress
+    /// repeated notifications only while the same public-safe key remains within
+    /// `zero_backlog_suppression_ttl_secs`. New public events, non-zero backlog,
+    /// CI failures, stale sessions, holds, missing files, or malformed JSON fail
+    /// open and emit normally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_file: Option<PathBuf>,
+    /// Maximum seconds that a validated zero-backlog GAJAE receipt may suppress
+    /// repeated follow-up notifications with the same public-safe suppression key.
+    /// Set to `0` to disable suppression.
+    #[serde(default = "default_zero_backlog_suppression_ttl_secs")]
+    pub zero_backlog_suppression_ttl_secs: u64,
     #[serde(flatten)]
     pub kind: CronJobKind,
 }
@@ -592,6 +597,9 @@ fn default_remote() -> String {
 }
 fn default_stale_minutes() -> u64 {
     10
+}
+fn default_zero_backlog_suppression_ttl_secs() -> u64 {
+    60 * 60
 }
 fn default_ci_batch_window_secs() -> u64 {
     30
@@ -2186,6 +2194,7 @@ message = " ping "
         assert_eq!(job.channel.as_deref(), Some("ops"));
         assert_eq!(job.mention.as_deref(), Some("<@1>"));
         assert_eq!(job.timezone, "UTC");
+        assert_eq!(job.zero_backlog_suppression_ttl_secs, 60 * 60);
         match &job.kind {
             CronJobKind::CustomMessage { message } => assert_eq!(message, "ping"),
         }
@@ -2214,6 +2223,8 @@ message = " ping "
                         mention: None,
                         format: None,
                         state_file: None,
+                        zero_backlog_suppression_ttl_secs:
+                            default_zero_backlog_suppression_ttl_secs(),
                         kind: CronJobKind::CustomMessage {
                             message: "first".into(),
                         },
@@ -2227,6 +2238,8 @@ message = " ping "
                         mention: None,
                         format: None,
                         state_file: None,
+                        zero_backlog_suppression_ttl_secs:
+                            default_zero_backlog_suppression_ttl_secs(),
                         kind: CronJobKind::CustomMessage {
                             message: "second".into(),
                         },
