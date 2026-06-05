@@ -522,17 +522,15 @@ fn load_profile_from_cwd(explicit_file: Option<&Path>, cwd: &Path) -> Result<Gaj
 }
 
 fn read_bounded_profile(path: &Path, description: &str) -> Result<String> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("failed to read {description} {}", path.display()))?;
+    let file = fs::File::open(path).with_context(|| format!("failed to read {description}"))?;
     let mut bytes = Vec::new();
     file.take((MAX_PROFILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {description} {}", path.display()))?;
+        .with_context(|| format!("failed to read {description}"))?;
     if bytes.len() > MAX_PROFILE_BYTES {
         bail!("{description} exceeds maximum size of {MAX_PROFILE_BYTES} bytes");
     }
-    String::from_utf8(bytes)
-        .with_context(|| format!("{description} {} is not valid UTF-8", path.display()))
+    String::from_utf8(bytes).with_context(|| format!("{description} is not valid UTF-8"))
 }
 
 fn resolve_routes_file(routes_file: &Path, source: &Path, cwd: &Path) -> Result<PathBuf> {
@@ -1074,10 +1072,9 @@ fn check_gajae_help(
             true
         }
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             checks.push(PreflightCheck::fail(
                 "gajae_help",
-                format!("gajae --help failed{}", concise_detail(&stderr)),
+                public_child_failure_detail("gajae --help", &output),
             ));
             false
         }
@@ -1184,9 +1181,9 @@ fn check_profile_and_handlers(
                 ));
             }
         }
-        Err(error) => checks.push(PreflightCheck::fail(
+        Err(_) => checks.push(PreflightCheck::fail(
             "profile",
-            format!("run `clawhip gajae profile install`: {error}"),
+            "profile could not be loaded or parsed; run `clawhip gajae profile install` or pass a readable --file profile",
         )),
     }
 }
@@ -1751,6 +1748,17 @@ fn bounded_public_string(raw: &str) -> String {
         out.push(safe);
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn public_child_failure_detail(command: &str, output: &CommandOutput) -> String {
+    let reason = if !output.stderr.is_empty() {
+        "stderr produced"
+    } else if !output.stdout.is_empty() {
+        "unexpected stdout produced"
+    } else {
+        "no diagnostic output"
+    };
+    format!("{command} failed ({reason}); update GAJAE or check the configured GAJAE binary")
 }
 
 fn concise_detail(stderr: &str) -> String {

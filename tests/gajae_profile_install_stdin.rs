@@ -220,6 +220,96 @@ fn gajae_profile_verify_reports_missing_gajae_public_safely() {
 }
 
 #[test]
+fn gajae_doctor_redacts_failed_help_stderr_from_json_detail() {
+    let temp = TempDir::new().expect("tempdir");
+    let stub = gajae_stub(
+        &temp,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "--help" ]]; then
+  printf '/home/operator/private token secret-token-123\n' >&2
+  exit 64
+fi
+exit 64
+"#,
+    );
+
+    let output = Command::new(clawhip_bin())
+        .args(["gajae", "doctor"])
+        .env("GAJAE_BIN", &stub)
+        .output()
+        .expect("run doctor");
+
+    assert!(!output.status.success());
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json summary");
+    assert_eq!(summary["kind"], "doctor");
+    assert_eq!(summary["conformant"], false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("gajae --help failed"), "stdout={stdout}");
+    assert!(
+        stdout.contains("check the configured GAJAE binary"),
+        "stdout={stdout}"
+    );
+    assert!(!stdout.contains("/home/operator"), "stdout={stdout}");
+    assert!(!stdout.contains("secret-token"), "stdout={stdout}");
+    assert!(!stdout.contains("private token"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("token secret-token-123"),
+        "stdout={stdout}"
+    );
+    assert!(stdout.len() < 1_200, "stdout too long: {}", stdout.len());
+}
+
+#[test]
+fn gajae_profile_verify_redacts_missing_private_file_path() {
+    let temp = TempDir::new().expect("tempdir");
+    let private_profile = temp.path().join("home/operator/secret/profile.yml");
+    let explicit_path = private_profile.to_string_lossy().into_owned();
+    let stub = gajae_stub(
+        &temp,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "--help" ]]; then
+  exit 0
+fi
+if [[ "${2:-}" == "validate" && "${3:-}" == "--help" ]]; then
+  exit 0
+fi
+exit 64
+"#,
+    );
+
+    let output = Command::new(clawhip_bin())
+        .args(["gajae", "profile", "verify", "--file", &explicit_path])
+        .env("GAJAE_BIN", &stub)
+        .output()
+        .expect("run verify");
+
+    assert!(!output.status.success());
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json summary");
+    assert_eq!(summary["kind"], "profile_verify");
+    assert_eq!(summary["conformant"], false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("profile could not be loaded or parsed"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("clawhip gajae profile install"),
+        "stdout={stdout}"
+    );
+    assert!(!stdout.contains("/home/operator"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("home/operator/secret/profile.yml"),
+        "stdout={stdout}"
+    );
+    assert!(!stdout.contains(&explicit_path), "stdout={stdout}");
+    assert!(!stdout.contains("secret-token"), "stdout={stdout}");
+    assert!(!stdout.contains("profile.yml"), "stdout={stdout}");
+    assert!(stdout.len() < 2_000, "stdout too long: {}", stdout.len());
+}
+
+#[test]
 fn gajae_profile_verify_reports_renamed_handler_without_installing() {
     let temp = TempDir::new().expect("tempdir");
     let profile = temp.path().join("profile.yml");
