@@ -45,6 +45,8 @@ pub struct GajaeConfig {
     pub handler_timeout_ms: u64,
     #[serde(default = "default_gajae_handler_max_output_bytes")]
     pub handler_max_output_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_target_channel: Option<String>,
 }
 
 impl Default for GajaeConfig {
@@ -53,6 +55,7 @@ impl Default for GajaeConfig {
             handlers_enabled: false,
             handler_timeout_ms: default_gajae_handler_timeout_ms(),
             handler_max_output_bytes: default_gajae_handler_max_output_bytes(),
+            hold_target_channel: None,
         }
     }
 }
@@ -62,6 +65,7 @@ impl GajaeConfig {
         !self.handlers_enabled
             && self.handler_timeout_ms == default_gajae_handler_timeout_ms()
             && self.handler_max_output_bytes == default_gajae_handler_max_output_bytes()
+            && self.hold_target_channel.is_none()
     }
 }
 

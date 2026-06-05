@@ -520,6 +520,102 @@ impl IncomingEvent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn gajae_release_hold(
+        repo: String,
+        target: String,
+        action: String,
+        version: String,
+        disallowed_action: String,
+        why_autonomous_disallowed: String,
+        actor: Option<String>,
+    ) -> Self {
+        Self::gajae_hold(
+            "gajae.release.hold",
+            repo,
+            target,
+            action,
+            "release".to_string(),
+            Some(version),
+            None,
+            disallowed_action,
+            why_autonomous_disallowed,
+            actor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gajae_merge_hold(
+        repo: String,
+        target: String,
+        action: String,
+        sha: String,
+        disallowed_action: String,
+        why_autonomous_disallowed: String,
+        actor: Option<String>,
+    ) -> Self {
+        Self::gajae_hold(
+            "gajae.merge.hold",
+            repo,
+            target,
+            action,
+            "main-merge".to_string(),
+            None,
+            Some(sha),
+            disallowed_action,
+            why_autonomous_disallowed,
+            actor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gajae_hold(
+        kind: &str,
+        repo: String,
+        target: String,
+        action: String,
+        boundary: String,
+        version: Option<String>,
+        sha: Option<String>,
+        disallowed_action: String,
+        why_autonomous_disallowed: String,
+        actor: Option<String>,
+    ) -> Self {
+        let relevant_ref = version.as_deref().or(sha.as_deref()).unwrap_or_default();
+        let dedupe_key = gajae_hold_dedupe_key(&repo, &target, &action, relevant_ref);
+        let mut payload = Map::new();
+        payload.insert("repo".to_string(), json!(repo));
+        payload.insert("target".to_string(), json!(target.clone()));
+        payload.insert("action".to_string(), json!(action));
+        payload.insert("boundary".to_string(), json!(boundary));
+        payload.insert("disallowed_action".to_string(), json!(disallowed_action));
+        payload.insert(
+            "why_autonomous_disallowed".to_string(),
+            json!(why_autonomous_disallowed),
+        );
+        payload.insert("autonomous_execution_allowed".to_string(), json!(false));
+        payload.insert("held_action_executed".to_string(), json!(false));
+        payload.insert("dedupe_key".to_string(), json!(dedupe_key));
+        if let Some(version) = version {
+            payload.insert("version".to_string(), json!(version));
+        }
+        if let Some(sha) = sha {
+            payload.insert("sha".to_string(), json!(sha));
+        }
+        if let Some(actor) = actor {
+            payload.insert("actor".to_string(), json!(actor));
+        }
+
+        Self {
+            kind: kind.to_string(),
+            channel: Some(target),
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: Value::Object(payload),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn discord_message_create(message: DiscordMessageCreateEvent) -> Self {
         Self {
@@ -1076,6 +1172,16 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
     insert_string_if_missing(object, "event_timestamp", event_timestamp);
     insert_string_if_missing(object, "route_key", route_key);
     insert_string_if_missing(object, "source", source);
+}
+
+fn gajae_hold_dedupe_key(repo: &str, target: &str, action: &str, relevant_ref: &str) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        repo.trim(),
+        target.trim(),
+        action.trim(),
+        relevant_ref.trim()
+    )
 }
 
 fn now_rfc3339() -> String {

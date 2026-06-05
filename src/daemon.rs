@@ -959,6 +959,28 @@ async fn list_tmux(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+fn gajae_hold_target(config: &AppConfig, repo: &str) -> Option<String> {
+    config
+        .routes
+        .iter()
+        .filter(|route| {
+            matches!(
+                route.event.as_str(),
+                "gajae.release.hold" | "gajae.merge.hold" | "gajae.*"
+            )
+        })
+        .find(|route| {
+            route.filter.is_empty()
+                || route
+                    .filter
+                    .get("repo")
+                    .or_else(|| route.filter.get("repo_name"))
+                    .is_some_and(|expected| crate::router::glob_match(expected, repo))
+        })
+        .and_then(|route| route.channel.clone().or_else(|| route.thread.clone()))
+        .or_else(|| config.gajae.hold_target_channel.clone())
+}
+
 async fn post_github(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1022,6 +1044,21 @@ async fn post_github(
                 .pointer("/sender/login")
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
+            if let Some(target) = gajae_hold_target(&state.config, &repo) {
+                return enqueue_accepted_event(
+                    &state,
+                    IncomingEvent::gajae_release_hold(
+                        repo,
+                        target,
+                        action.to_string(),
+                        tag,
+                        format!("publish or retag release {action}"),
+                        "release and retag boundaries require owner/maintainer approval; autonomous execution cannot create, edit, publish, or retag releases".to_string(),
+                        actor,
+                    ),
+                )
+                .await;
+            }
 
             Some(normalize_event(IncomingEvent::github_release(
                 action,
@@ -1055,6 +1092,47 @@ async fn post_github(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let merged = payload
+                .pointer("/pull_request/merged")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let base_ref = payload
+                .pointer("/pull_request/base/ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let merge_sha = payload
+                .pointer("/pull_request/merge_commit_sha")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    payload
+                        .pointer("/pull_request/head/sha")
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or_default()
+                .to_string();
+            let actor = payload
+                .pointer("/sender/login")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            if action == "closed"
+                && merged
+                && matches!(base_ref, "main" | "master")
+                && let Some(target) = gajae_hold_target(&state.config, &repo)
+            {
+                return enqueue_accepted_event(
+                    &state,
+                    IncomingEvent::gajae_merge_hold(
+                        repo,
+                        target,
+                        "merge-to-main".to_string(),
+                        merge_sha,
+                        format!("merge pull request #{number} into {base_ref}"),
+                        "main branch merge boundaries require owner/maintainer approval; autonomous execution cannot merge directly to main".to_string(),
+                        actor,
+                    ),
+                )
+                .await;
+            }
             match action {
                 "opened" => Some(normalize_event(IncomingEvent::github_pr_status_changed(
                     repo,
@@ -1207,6 +1285,46 @@ mod tests {
             },
             rx,
         )
+    }
+
+    fn app_state_with_config(config: AppConfig) -> (AppState, mpsc::Receiver<IncomingEvent>) {
+        let (tx, rx) = mpsc::channel(8);
+        (
+            AppState {
+                config: Arc::new(config),
+                port: 25294,
+                tx,
+                tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+                pending_update: update::new_shared_pending_update(),
+                native_observability: new_shared_native_hook_observability(),
+                cron_state_path: PathBuf::from("cron-state.json"),
+                discord_watch_lock: Arc::new(Mutex::new(())),
+            },
+            rx,
+        )
+    }
+
+    fn hold_config() -> AppConfig {
+        AppConfig {
+            gajae: crate::config::GajaeConfig {
+                hold_target_channel: Some("owner-maintainer".into()),
+                ..crate::config::GajaeConfig::default()
+            },
+            defaults: crate::config::DefaultsConfig {
+                channel: Some("general-zero-backlog".into()),
+                ..crate::config::DefaultsConfig::default()
+            },
+            routes: vec![RouteRule {
+                event: "gajae.*".into(),
+                filter: std::collections::BTreeMap::from([(
+                    "repo".into(),
+                    "Yeachan-Heo/clawhip".into(),
+                )]),
+                channel: Some("owner-maintainer".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        }
     }
 
     fn tmux_registration(session: &str) -> RegisteredTmuxSession {
@@ -1364,6 +1482,116 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let response_json: Value = serde_json::from_slice(&body).unwrap();
         (response_json, rx)
+    }
+
+    #[tokio::test]
+    async fn github_release_retag_routes_to_gajae_hold_without_release_event() {
+        let (state, mut rx) = app_state_with_config(hold_config());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "release".parse().unwrap());
+        let payload = json!({
+            "action": "edited",
+            "repository": {"full_name": "Yeachan-Heo/clawhip"},
+            "release": {
+                "tag_name": "v0.6.9",
+                "name": "clawhip 0.6.9",
+                "prerelease": false,
+                "html_url": "https://github.com/Yeachan-Heo/clawhip/releases/tag/v0.6.9"
+            },
+            "sender": {"login": "maintainer"}
+        });
+
+        let response = post_github(State(state), headers, Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued = rx.recv().await.expect("queued hold");
+
+        assert_eq!(queued.kind, "gajae.release.hold");
+        assert_eq!(queued.channel.as_deref(), Some("owner-maintainer"));
+        assert_ne!(queued.channel.as_deref(), Some("general-zero-backlog"));
+        assert_eq!(queued.payload["repo"], json!("Yeachan-Heo/clawhip"));
+        assert_eq!(queued.payload["target"], json!("owner-maintainer"));
+        assert_eq!(queued.payload["action"], json!("edited"));
+        assert_eq!(queued.payload["version"], json!("v0.6.9"));
+        assert_eq!(
+            queued.payload["dedupe_key"],
+            json!("Yeachan-Heo/clawhip:owner-maintainer:edited:v0.6.9")
+        );
+        assert_eq!(queued.payload["autonomous_execution_allowed"], json!(false));
+        assert_eq!(queued.payload["held_action_executed"], json!(false));
+        assert!(
+            queued.payload["disallowed_action"]
+                .as_str()
+                .unwrap()
+                .contains("release")
+        );
+        assert!(
+            queued.payload["why_autonomous_disallowed"]
+                .as_str()
+                .unwrap()
+                .contains("approval")
+        );
+        assert!(queued.payload.get("raw").is_none());
+    }
+
+    #[tokio::test]
+    async fn github_main_merge_routes_to_gajae_hold_without_merge_event() {
+        let (state, mut rx) = app_state_with_config(hold_config());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+        let payload = json!({
+            "action": "closed",
+            "repository": {"full_name": "Yeachan-Heo/clawhip"},
+            "number": 252,
+            "pull_request": {
+                "number": 252,
+                "title": "approval hold events",
+                "html_url": "https://github.com/Yeachan-Heo/clawhip/pull/252",
+                "merged": true,
+                "merge_commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "base": {"ref": "main"},
+                "head": {"sha": "abcdef0123456789abcdef0123456789abcdef01"}
+            },
+            "sender": {"login": "maintainer"}
+        });
+
+        let response = post_github(State(state), headers, Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued = rx.recv().await.expect("queued hold");
+
+        assert_eq!(queued.kind, "gajae.merge.hold");
+        assert_eq!(queued.channel.as_deref(), Some("owner-maintainer"));
+        assert_eq!(queued.payload["repo"], json!("Yeachan-Heo/clawhip"));
+        assert_eq!(queued.payload["target"], json!("owner-maintainer"));
+        assert_eq!(queued.payload["action"], json!("merge-to-main"));
+        assert_eq!(
+            queued.payload["sha"],
+            json!("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            queued.payload["dedupe_key"],
+            json!(
+                "Yeachan-Heo/clawhip:owner-maintainer:merge-to-main:0123456789abcdef0123456789abcdef01234567"
+            )
+        );
+        assert_eq!(queued.payload["autonomous_execution_allowed"], json!(false));
+        assert_eq!(queued.payload["held_action_executed"], json!(false));
+        assert!(
+            queued.payload["disallowed_action"]
+                .as_str()
+                .unwrap()
+                .contains("merge pull request #252 into main")
+        );
+        assert!(
+            queued.payload["why_autonomous_disallowed"]
+                .as_str()
+                .unwrap()
+                .contains("approval")
+        );
+        assert!(queued.payload.get("raw").is_none());
     }
 
     fn insert_timestamp_at_path(payload: &mut Value, path: &[&str], value: String) {
