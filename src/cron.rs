@@ -291,6 +291,18 @@ fn build_job_event(job: &CronJob, state: Option<&StateEvaluation>) -> IncomingEv
                 "repo_state_zero_backlog".to_string(),
                 json!(state.zero_backlog),
             );
+            payload.insert(
+                "repo_state_observation_source".to_string(),
+                json!(state.observation_source),
+            );
+            payload.insert(
+                "repo_state_observation_confidence".to_string(),
+                json!(state.observation_confidence),
+            );
+            payload.insert(
+                "repo_state_github_api_fallback".to_string(),
+                json!(state.github_api_fallback),
+            );
         }
     }
 
@@ -309,6 +321,16 @@ struct StateEvaluation {
     /// True only for validated GAJAE zero-backlog/follow-up receipts with zero
     /// PRs/issues, green dev CI, no action-needed sessions, and no holds.
     zero_backlog: bool,
+    /// Public-safe label for where this observation came from (e.g.
+    /// `github-api`, `github-api-fallback`, or an operator-provided source).
+    observation_source: String,
+    /// Confidence marker: `validated` for full zero-backlog authority,
+    /// `fallback-unverified` for a degraded API fallback lacking evidence,
+    /// otherwise `reported`.
+    observation_confidence: String,
+    /// True when the receipt signals a GitHub API/rate-limit failure, detected
+    /// separately from an empty backlog.
+    github_api_fallback: bool,
 }
 
 /// Read and evaluate a cron job's `state_file`. Returns `None` when the file
@@ -325,10 +347,15 @@ fn evaluate_state_file(path: &Path) -> Option<StateEvaluation> {
     let canonical = serde_json::to_string(&public_state).ok()?;
     let fingerprint = stable_hash_hex(canonical.as_bytes());
     let suppression_key = format!("gajae-zero-backlog:{fingerprint}");
+    let github_api_fallback = github_api_failed(&value);
+    let zero_backlog = is_validated_zero_backlog_receipt(&value);
     Some(StateEvaluation {
         fingerprint,
         suppression_key,
-        zero_backlog: is_validated_zero_backlog_receipt(&value),
+        observation_source: observation_source(&value, github_api_fallback),
+        observation_confidence: observation_confidence(&value, zero_backlog, github_api_fallback),
+        zero_backlog,
+        github_api_fallback,
     })
 }
 
@@ -348,6 +375,10 @@ fn public_suppression_state(value: &Value) -> BTreeMap<String, Value> {
     insert_public_value(&mut state, value, "approval_hold");
     insert_public_value(&mut state, value, "release_hold");
     insert_public_value(&mut state, value, "new_event_id");
+    insert_public_value(&mut state, value, "github_api_status");
+    insert_public_value(&mut state, value, "github_api");
+    insert_public_value(&mut state, value, "observation_source");
+    insert_public_value(&mut state, value, "fallback_evidence");
     state
 }
 
@@ -385,6 +416,7 @@ fn is_validated_zero_backlog_receipt(value: &Value) -> bool {
         && numeric_field(value, "session_stale_events").unwrap_or(0) == 0
         && !bool_field(value, "approval_hold")
         && !bool_field(value, "release_hold")
+        && fallback_has_authority(value)
 }
 
 fn validated_zero_backlog_family(value: &Value) -> bool {
@@ -420,6 +452,70 @@ fn numeric_field(value: &Value, key: &str) -> Option<u64> {
 
 fn bool_field(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Detect a GitHub API / rate-limit failure from a receipt, separately from an
+/// empty backlog. A degraded observation must never be silently treated like a
+/// healthy zero-backlog confirmation.
+fn github_api_failed(value: &Value) -> bool {
+    let status = value
+        .get("github_api_status")
+        .or_else(|| value.get("github_api"))
+        .and_then(Value::as_str)
+        .map(|status| status.trim().to_ascii_lowercase());
+    matches!(
+        status.as_deref(),
+        Some(
+            "rate_limited"
+                | "rate-limited"
+                | "ratelimited"
+                | "throttled"
+                | "error"
+                | "errored"
+                | "failed"
+                | "failure"
+                | "unavailable"
+                | "degraded"
+        )
+    )
+}
+
+/// Public-safe label for where a follow-up observation came from. Honors an
+/// explicit `observation_source` and otherwise reflects whether the GitHub API
+/// path was healthy or fell back.
+fn observation_source(value: &Value, github_api_fallback: bool) -> String {
+    if let Some(source) = value.get("observation_source").and_then(Value::as_str) {
+        let token = bounded_public_token(source);
+        if !token.is_empty() {
+            return token;
+        }
+    }
+    if github_api_fallback {
+        "github-api-fallback".to_string()
+    } else {
+        "github-api".to_string()
+    }
+}
+
+/// Confidence marker for a follow-up observation. `validated` only when every
+/// zero-backlog authority check passes; a degraded API fallback lacking the
+/// required corroborating evidence is flagged `fallback-unverified` so it is
+/// never mistaken for one.
+fn observation_confidence(value: &Value, zero_backlog: bool, github_api_fallback: bool) -> String {
+    if zero_backlog {
+        "validated".to_string()
+    } else if github_api_fallback && !fallback_has_authority(value) {
+        "fallback-unverified".to_string()
+    } else {
+        "reported".to_string()
+    }
+}
+
+/// A degraded GitHub API fallback may only carry merge/close authority when the
+/// receipt explicitly advertises that the required corroborating evidence was
+/// gathered from a safe source (e.g. confirmed via public repository pages).
+fn fallback_has_authority(value: &Value) -> bool {
+    !github_api_failed(value) || bool_field(value, "fallback_evidence")
 }
 
 fn stable_hash_hex(bytes: &[u8]) -> String {
@@ -1140,6 +1236,90 @@ mod tests {
             compact_eval.fingerprint, pretty_eval.fingerprint,
             "whitespace-only formatting changes must not count as a delta"
         );
+    }
+
+    #[test]
+    fn healthy_receipt_marks_validated_github_api_source() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("repo.json");
+        write_zero_backlog_receipt(&path, None, false).expect("write receipt");
+
+        let eval = evaluate_state_file(&path).expect("evaluation");
+        assert!(eval.zero_backlog, "healthy validated receipt has authority");
+        assert!(!eval.github_api_fallback);
+        assert_eq!(eval.observation_source, "github-api");
+        assert_eq!(eval.observation_confidence, "validated");
+    }
+
+    #[test]
+    fn rate_limited_fallback_loses_zero_backlog_authority() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("repo.json");
+        let value = json!({
+            "family": "runtime-followup-receipt",
+            "status": "validated",
+            "receipt_id": "public-1",
+            "open_issues": 0,
+            "open_prs": 0,
+            "latest_dev_ci": "green",
+            "active_sessions_needing_action": 0,
+            "release_hold": false,
+            "github_api_status": "rate_limited",
+        });
+        fs::write(&path, serde_json::to_string(&value).unwrap()).expect("write receipt");
+
+        let eval = evaluate_state_file(&path).expect("evaluation");
+        assert!(
+            !eval.zero_backlog,
+            "a rate-limited fallback without evidence must not carry merge/close authority"
+        );
+        assert!(eval.github_api_fallback);
+        assert_eq!(eval.observation_source, "github-api-fallback");
+        assert_eq!(eval.observation_confidence, "fallback-unverified");
+    }
+
+    #[test]
+    fn rate_limited_fallback_with_evidence_keeps_authority() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("repo.json");
+        let value = json!({
+            "family": "runtime-followup-receipt",
+            "status": "validated",
+            "receipt_id": "public-1",
+            "open_issues": 0,
+            "open_prs": 0,
+            "latest_dev_ci": "green",
+            "active_sessions_needing_action": 0,
+            "release_hold": false,
+            "github_api_status": "rate_limited",
+            "observation_source": "public-repo-pages",
+            "fallback_evidence": true,
+        });
+        fs::write(&path, serde_json::to_string(&value).unwrap()).expect("write receipt");
+
+        let eval = evaluate_state_file(&path).expect("evaluation");
+        assert!(
+            eval.zero_backlog,
+            "a fallback advertising the required evidence retains authority"
+        );
+        assert!(eval.github_api_fallback);
+        assert_eq!(eval.observation_source, "public-repo-pages");
+        assert_eq!(eval.observation_confidence, "validated");
+    }
+
+    #[test]
+    fn api_fallback_is_distinct_from_empty_backlog() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("repo.json");
+        // No backlog counters at all, but the API failed: the failure is detected
+        // separately from an (absent) empty-backlog claim.
+        fs::write(&path, r#"{"github_api_status":"error"}"#).expect("write receipt");
+
+        let eval = evaluate_state_file(&path).expect("evaluation");
+        assert!(!eval.zero_backlog);
+        assert!(eval.github_api_fallback);
+        assert_eq!(eval.observation_source, "github-api-fallback");
+        assert_eq!(eval.observation_confidence, "fallback-unverified");
     }
 
     #[test]

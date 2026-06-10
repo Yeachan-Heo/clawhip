@@ -556,6 +556,14 @@ pub struct CronJob {
     /// `zero_backlog_suppression_ttl_secs`. New public events, non-zero backlog,
     /// CI failures, stale sessions, holds, missing files, or malformed JSON fail
     /// open and emit normally.
+    ///
+    /// GitHub API/rate-limit failures are detected separately from an empty
+    /// backlog via `github_api_status` (e.g. `rate_limited`, `error`,
+    /// `unavailable`). Such a degraded fallback is marked with an
+    /// `observation_source`/`observation_confidence` pair on the emitted event
+    /// and never counts as zero-backlog merge/close authority unless the receipt
+    /// also sets `fallback_evidence: true` to assert the required corroborating
+    /// evidence was gathered from a safe source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_file: Option<PathBuf>,
     /// Maximum seconds that a validated zero-backlog GAJAE receipt may suppress
