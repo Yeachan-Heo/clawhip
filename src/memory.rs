@@ -963,7 +963,10 @@ fn monitor_repo_identities(config: &AppConfig) -> BTreeSet<RepoIdentity> {
 /// Resolve a repo string to an `owner/name` identity. Strings already shaped as
 /// `owner/name` parse directly; bare repo names are resolved only when exactly one
 /// git monitor advertises a matching `github_repo`. Owners are never guessed.
-fn resolve_repo_identity(raw: &str, monitor_repos: &BTreeSet<RepoIdentity>) -> Option<RepoIdentity> {
+fn resolve_repo_identity(
+    raw: &str,
+    monitor_repos: &BTreeSet<RepoIdentity>,
+) -> Option<RepoIdentity> {
     if let Some(identity) = parse_repo_identity(raw) {
         return Some(identity);
     }
@@ -1179,7 +1182,11 @@ mod tests {
         }
     }
 
-    fn git_monitor(github_repo: &str, channel: Option<&str>, channel_name: Option<&str>) -> GitRepoMonitor {
+    fn git_monitor(
+        github_repo: &str,
+        channel: Option<&str>,
+        channel_name: Option<&str>,
+    ) -> GitRepoMonitor {
         GitRepoMonitor {
             github_repo: Some(github_repo.to_string()),
             channel: channel.map(str::to_string),
@@ -1218,11 +1225,7 @@ mod tests {
         let missing = missing_routed_channel_profiles(&layout, &config).expect("missing");
 
         assert_eq!(missing.len(), 1);
-        assert!(
-            missing[0]
-                .path
-                .ends_with("memory/channels/dev-followup.md")
-        );
+        assert!(missing[0].path.ends_with("memory/channels/dev-followup.md"));
         assert!(!missing[0].exists);
         assert!(missing[0].contents.contains("gajae/clawhip"));
     }
@@ -1232,11 +1235,11 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let layout = test_layout(tempdir.path());
         let mut config = AppConfig::default();
-        config
-            .monitors
-            .git
-            .repos
-            .push(git_monitor("gajae/clawhip", Some("ops"), Some("Ops Alerts")));
+        config.monitors.git.repos.push(git_monitor(
+            "gajae/clawhip",
+            Some("ops"),
+            Some("Ops Alerts"),
+        ));
 
         let missing = missing_routed_channel_profiles(&layout, &config).expect("missing");
 
@@ -1247,7 +1250,8 @@ mod tests {
 
     #[test]
     fn deduplicates_route_and_monitor_for_same_channel_repo() {
-        let mut config = config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
+        let mut config =
+            config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
         config
             .monitors
             .git
