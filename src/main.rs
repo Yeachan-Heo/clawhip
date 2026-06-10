@@ -350,6 +350,9 @@ async fn real_main(cli: Cli) -> Result<()> {
         Commands::Memory { command } => match command {
             MemoryCommands::Init(args) => memory::init(args),
             MemoryCommands::Status(args) => memory::status(args),
+            MemoryCommands::ScaffoldChannels(args) => {
+                memory::scaffold_channels(args, config.as_ref())
+            }
         },
         Commands::Hooks { command } => match command {
             HooksCommands::Install(args) => hooks::install(args),

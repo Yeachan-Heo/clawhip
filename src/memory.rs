@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 
 use crate::Result;
-use crate::cli::{MemoryInitArgs, MemoryStatusArgs};
+use crate::cli::{MemoryInitArgs, MemoryScaffoldChannelsArgs, MemoryStatusArgs};
+use crate::config::AppConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MemoryLayout {
@@ -672,9 +674,376 @@ fn display_relative(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// Public-safe repository identity (`owner/name`) parsed from a config binding.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RepoIdentity {
+    owner: String,
+    name: String,
+}
+
+impl RepoIdentity {
+    fn slug(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+}
+
+/// A deterministic, public-safe channel profile derived from routed repo bindings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelProfile {
+    slug: String,
+    display_name: Option<String>,
+    channel_keys: BTreeSet<String>,
+    repos: BTreeSet<RepoIdentity>,
+}
+
+/// Channel profiles derived from config, with non-fatal diagnostics for bindings
+/// that could not be turned into a public-safe profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelProfilePlan {
+    profiles: Vec<ChannelProfile>,
+    collisions: Vec<String>,
+    unscaffoldable: Vec<String>,
+}
+
+/// A single channel profile proposal resolved against the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelProfileProposal {
+    path: PathBuf,
+    contents: String,
+    exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelScaffoldReport {
+    proposals: Vec<ChannelProfileProposal>,
+    collisions: Vec<String>,
+    unscaffoldable: Vec<String>,
+}
+
+/// Raw, untrusted binding extracted from config before owner/name resolution.
+struct RawChannelBinding {
+    repo_raw: String,
+    channel_key: String,
+    channel_name: Option<String>,
+}
+
+pub fn scaffold_channels(args: MemoryScaffoldChannelsArgs, config: &AppConfig) -> Result<()> {
+    let MemoryScaffoldChannelsArgs {
+        root,
+        project,
+        date,
+        write,
+        force,
+    } = args;
+    let layout = MemoryLayout::build(root, project, None, None, date)?;
+    let report = build_channel_scaffold_report(&layout, config)?;
+
+    println!(
+        "Scanning routed repository channels for channel profiles under {}",
+        layout.channels_dir().display()
+    );
+
+    if report.proposals.is_empty() {
+        println!("No routed repository channels with a resolvable owner/name were found.");
+    }
+
+    let mut written = 0usize;
+    let mut kept = 0usize;
+    let mut proposed = 0usize;
+    let mut present = 0usize;
+
+    for proposal in &report.proposals {
+        let rel = display_relative(&layout.root, &proposal.path);
+        if write {
+            if write_scaffold_file(&proposal.path, &proposal.contents, force)? {
+                written += 1;
+                println!("  wrote {rel}");
+            } else {
+                kept += 1;
+                println!("  kept {rel} (exists; pass --force to overwrite)");
+            }
+        } else if proposal.exists {
+            present += 1;
+            println!("  exists {rel} (durable profile already present)");
+        } else {
+            proposed += 1;
+            println!("  would write {rel}");
+        }
+    }
+
+    for note in &report.collisions {
+        println!("  skipped: {note}");
+    }
+    for note in &report.unscaffoldable {
+        println!("  skipped: {note}");
+    }
+
+    if write {
+        println!("Wrote {written}, kept {kept} existing channel profile(s).");
+    } else {
+        println!(
+            "Proposed {proposed} new and found {present} existing channel profile(s); rerun with --write to create them."
+        );
+    }
+
+    Ok(())
+}
+
+fn build_channel_scaffold_report(
+    layout: &MemoryLayout,
+    config: &AppConfig,
+) -> Result<ChannelScaffoldReport> {
+    let plan = build_channel_profile_plan(config);
+    let mut proposals = Vec::with_capacity(plan.profiles.len());
+    for profile in &plan.profiles {
+        let path = layout.channels_dir().join(format!("{}.md", profile.slug));
+        let contents = render_repo_channel_profile(profile, layout);
+        let exists = path.exists();
+        proposals.push(ChannelProfileProposal {
+            path,
+            contents,
+            exists,
+        });
+    }
+    Ok(ChannelScaffoldReport {
+        proposals,
+        collisions: plan.collisions,
+        unscaffoldable: plan.unscaffoldable,
+    })
+}
+
+/// Channel profiles that are still missing on disk. This is the single canonical
+/// derivation used by the command; future follow-up checks should call it instead
+/// of re-inferring channel/repo mappings from raw routing payloads.
+#[cfg_attr(not(test), allow(dead_code))]
+fn missing_routed_channel_profiles(
+    layout: &MemoryLayout,
+    config: &AppConfig,
+) -> Result<Vec<ChannelProfileProposal>> {
+    let report = build_channel_scaffold_report(layout, config)?;
+    Ok(report
+        .proposals
+        .into_iter()
+        .filter(|proposal| !proposal.exists)
+        .collect())
+}
+
+fn build_channel_profile_plan(config: &AppConfig) -> ChannelProfilePlan {
+    let monitor_repos = monitor_repo_identities(config);
+
+    let mut profiles: BTreeMap<String, ChannelProfile> = BTreeMap::new();
+    let mut collided: BTreeSet<String> = BTreeSet::new();
+    let mut collisions: BTreeSet<String> = BTreeSet::new();
+    let mut unscaffoldable: BTreeSet<String> = BTreeSet::new();
+
+    for binding in collect_raw_bindings(config) {
+        let repo = match resolve_repo_identity(&binding.repo_raw, &monitor_repos) {
+            Some(repo) => repo,
+            None => {
+                unscaffoldable.insert(format!(
+                    "repo '{}' is routed to a channel but has no resolvable owner/name; add an explicit owner/name or a unique matching git monitor github_repo",
+                    binding.repo_raw
+                ));
+                continue;
+            }
+        };
+
+        let display_name = binding
+            .channel_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let basis = display_name
+            .as_deref()
+            .unwrap_or(binding.channel_key.as_str());
+        let slug = match slugify(basis) {
+            Ok(slug) => slug,
+            Err(_) => {
+                unscaffoldable.insert(format!(
+                    "repo '{}' is routed to a channel that cannot be reduced to a stable profile slug",
+                    repo.slug()
+                ));
+                continue;
+            }
+        };
+
+        if collided.contains(&slug) {
+            continue;
+        }
+
+        match profiles.get_mut(&slug) {
+            None => {
+                let mut channel_keys = BTreeSet::new();
+                channel_keys.insert(binding.channel_key.clone());
+                let mut repos = BTreeSet::new();
+                repos.insert(repo);
+                profiles.insert(
+                    slug.clone(),
+                    ChannelProfile {
+                        slug,
+                        display_name,
+                        channel_keys,
+                        repos,
+                    },
+                );
+            }
+            Some(profile) => {
+                if profile.channel_keys.contains(&binding.channel_key) {
+                    profile.repos.insert(repo);
+                    if profile.display_name.is_none() {
+                        profile.display_name = display_name;
+                    }
+                } else {
+                    collided.insert(slug.clone());
+                    collisions.insert(format!(
+                        "channel profile slug '{slug}' maps to multiple distinct channels; set distinct channel_name hints to disambiguate"
+                    ));
+                }
+            }
+        }
+    }
+
+    for slug in &collided {
+        profiles.remove(slug);
+    }
+
+    ChannelProfilePlan {
+        profiles: profiles.into_values().collect(),
+        collisions: collisions.into_iter().collect(),
+        unscaffoldable: unscaffoldable.into_iter().collect(),
+    }
+}
+
+fn collect_raw_bindings(config: &AppConfig) -> Vec<RawChannelBinding> {
+    let mut bindings = Vec::new();
+
+    for route in &config.routes {
+        let Some(repo_raw) = non_empty(route.filter.get("repo").map(String::as_str)) else {
+            continue;
+        };
+        let Some(channel_key) = non_empty(route.channel.as_deref()) else {
+            continue;
+        };
+        bindings.push(RawChannelBinding {
+            repo_raw,
+            channel_key,
+            channel_name: route.channel_name.clone(),
+        });
+    }
+
+    for repo in &config.monitors.git.repos {
+        let Some(repo_raw) = non_empty(repo.github_repo.as_deref()) else {
+            continue;
+        };
+        let Some(channel_key) = non_empty(repo.channel.as_deref()) else {
+            continue;
+        };
+        bindings.push(RawChannelBinding {
+            repo_raw,
+            channel_key,
+            channel_name: repo.channel_name.clone(),
+        });
+    }
+
+    bindings
+}
+
+fn monitor_repo_identities(config: &AppConfig) -> BTreeSet<RepoIdentity> {
+    config
+        .monitors
+        .git
+        .repos
+        .iter()
+        .filter_map(|repo| repo.github_repo.as_deref())
+        .filter_map(parse_repo_identity)
+        .collect()
+}
+
+/// Resolve a repo string to an `owner/name` identity. Strings already shaped as
+/// `owner/name` parse directly; bare repo names are resolved only when exactly one
+/// git monitor advertises a matching `github_repo`. Owners are never guessed.
+fn resolve_repo_identity(raw: &str, monitor_repos: &BTreeSet<RepoIdentity>) -> Option<RepoIdentity> {
+    if let Some(identity) = parse_repo_identity(raw) {
+        return Some(identity);
+    }
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let matches: Vec<&RepoIdentity> = monitor_repos
+        .iter()
+        .filter(|identity| identity.name.eq_ignore_ascii_case(trimmed))
+        .collect();
+    if matches.len() == 1 {
+        Some(matches[0].clone())
+    } else {
+        None
+    }
+}
+
+fn parse_repo_identity(raw: &str) -> Option<RepoIdentity> {
+    let trimmed = raw.trim();
+    let (owner, name) = trimmed.split_once('/')?;
+    let owner = owner.trim();
+    let name = name.trim();
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(RepoIdentity {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn render_repo_channel_profile(profile: &ChannelProfile, layout: &MemoryLayout) -> String {
+    let heading = profile
+        .display_name
+        .clone()
+        .unwrap_or_else(|| "Routed repository channel".to_string());
+
+    let mut repo_lines = String::new();
+    for repo in &profile.repos {
+        repo_lines.push_str(&format!("- Repository: `{}/{}`\n", repo.owner, repo.name));
+    }
+
+    format!(
+        "# {heading}
+
+## Repository profile
+
+{repo_lines}- Default branch policy: follow the repository default branch configured on GitHub; do not assume a protected branch name here.
+- Notification purpose: repository activity and routed follow-up notifications for the repositories above.
+- Follow-up behavior: this file is the durable channel profile. When it exists, reuse it instead of re-inferring onboarding metadata from raw routing payloads.
+
+## Public-safety boundaries
+
+- Do not store bot tokens, GitHub tokens, webhook URLs, mention targets, raw event payloads, or private routing internals here.
+- Keep only public repository identity and operator-safe follow-up notes.
+
+## Related shards
+
+- project state -> `memory/projects/{}.md`
+- daily execution log -> `memory/daily/{}.md`
+- durable rules -> `memory/topics/rules.md`
+",
+        layout.project_slug, layout.today_slug
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GitRepoMonitor, RouteRule};
 
     #[test]
     fn init_creates_memory_scaffold() {
@@ -786,5 +1155,322 @@ mod tests {
     fn normalize_date_slug_rejects_non_iso_dates() {
         let error = normalize_date_slug(Some("03/10/2026".into())).expect_err("invalid date");
         assert!(error.to_string().contains("YYYY-MM-DD"));
+    }
+
+    fn test_layout(root: &Path) -> MemoryLayout {
+        MemoryLayout {
+            root: root.to_path_buf(),
+            project_slug: "clawhip".into(),
+            channel_slug: None,
+            agent_slug: None,
+            today_slug: "2026-03-10".into(),
+        }
+    }
+
+    fn route_with_repo(repo: &str, channel: &str, channel_name: Option<&str>) -> RouteRule {
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), repo.to_string());
+        RouteRule {
+            event: "*".into(),
+            filter,
+            channel: Some(channel.to_string()),
+            channel_name: channel_name.map(str::to_string),
+            ..RouteRule::default()
+        }
+    }
+
+    fn git_monitor(github_repo: &str, channel: Option<&str>, channel_name: Option<&str>) -> GitRepoMonitor {
+        GitRepoMonitor {
+            github_repo: Some(github_repo.to_string()),
+            channel: channel.map(str::to_string),
+            channel_name: channel_name.map(str::to_string),
+            ..GitRepoMonitor::default()
+        }
+    }
+
+    fn config_with_routes(routes: Vec<RouteRule>) -> AppConfig {
+        AppConfig {
+            routes,
+            ..AppConfig::default()
+        }
+    }
+
+    fn scaffold_args(root: &Path, write: bool, force: bool) -> MemoryScaffoldChannelsArgs {
+        MemoryScaffoldChannelsArgs {
+            root: Some(root.to_path_buf()),
+            project: Some("clawhip".into()),
+            date: Some("2026-03-10".into()),
+            write,
+            force,
+        }
+    }
+
+    #[test]
+    fn discovers_missing_profile_from_repo_binding_route() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(tempdir.path());
+        let config = config_with_routes(vec![route_with_repo(
+            "gajae/clawhip",
+            "123",
+            Some("dev-followup"),
+        )]);
+
+        let missing = missing_routed_channel_profiles(&layout, &config).expect("missing");
+
+        assert_eq!(missing.len(), 1);
+        assert!(
+            missing[0]
+                .path
+                .ends_with("memory/channels/dev-followup.md")
+        );
+        assert!(!missing[0].exists);
+        assert!(missing[0].contents.contains("gajae/clawhip"));
+    }
+
+    #[test]
+    fn discovers_missing_profile_from_git_monitor() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(tempdir.path());
+        let mut config = AppConfig::default();
+        config
+            .monitors
+            .git
+            .repos
+            .push(git_monitor("gajae/clawhip", Some("ops"), Some("Ops Alerts")));
+
+        let missing = missing_routed_channel_profiles(&layout, &config).expect("missing");
+
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].path.ends_with("memory/channels/ops-alerts.md"));
+        assert!(missing[0].contents.contains("gajae/clawhip"));
+    }
+
+    #[test]
+    fn deduplicates_route_and_monitor_for_same_channel_repo() {
+        let mut config = config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
+        config
+            .monitors
+            .git
+            .repos
+            .push(git_monitor("gajae/clawhip", Some("123"), Some("dev")));
+
+        let plan = build_channel_profile_plan(&config);
+
+        assert_eq!(plan.profiles.len(), 1);
+        assert_eq!(plan.profiles[0].repos.len(), 1);
+    }
+
+    #[test]
+    fn aggregates_multiple_repos_for_same_channel() {
+        let config = config_with_routes(vec![
+            route_with_repo("gajae/clawhip", "123", Some("dev")),
+            route_with_repo("gajae/other", "123", Some("dev")),
+        ]);
+
+        let plan = build_channel_profile_plan(&config);
+
+        assert_eq!(plan.profiles.len(), 1);
+        assert_eq!(plan.profiles[0].repos.len(), 2);
+        let layout = test_layout(Path::new("/tmp"));
+        let content = render_repo_channel_profile(&plan.profiles[0], &layout);
+        assert!(content.contains("gajae/clawhip"));
+        assert!(content.contains("gajae/other"));
+    }
+
+    #[test]
+    fn rejects_channel_slug_collision_for_different_channel_keys() {
+        let config = config_with_routes(vec![
+            route_with_repo("gajae/a", "111", Some("Dev")),
+            route_with_repo("gajae/b", "222", Some("dev")),
+        ]);
+
+        let plan = build_channel_profile_plan(&config);
+
+        assert!(plan.profiles.is_empty());
+        assert_eq!(plan.collisions.len(), 1);
+    }
+
+    #[test]
+    fn route_repo_without_owner_enriches_from_unique_git_monitor() {
+        let mut config = config_with_routes(vec![route_with_repo("clawhip", "123", Some("dev"))]);
+        config
+            .monitors
+            .git
+            .repos
+            .push(git_monitor("gajae/clawhip", None, None));
+
+        let plan = build_channel_profile_plan(&config);
+
+        assert_eq!(plan.profiles.len(), 1);
+        assert!(plan.profiles[0].repos.contains(&RepoIdentity {
+            owner: "gajae".into(),
+            name: "clawhip".into(),
+        }));
+    }
+
+    #[test]
+    fn route_repo_without_owner_reports_unscaffoldable_without_unique_monitor() {
+        let config = config_with_routes(vec![route_with_repo("clawhip", "123", Some("dev"))]);
+
+        let plan = build_channel_profile_plan(&config);
+
+        assert!(plan.profiles.is_empty());
+        assert_eq!(plan.unscaffoldable.len(), 1);
+    }
+
+    #[test]
+    fn rendered_profile_contains_required_public_fields() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(tempdir.path());
+        let config = config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
+
+        let missing = missing_routed_channel_profiles(&layout, &config).expect("missing");
+        let content = &missing[0].contents;
+
+        assert!(content.contains("gajae/clawhip"));
+        assert!(content.contains("Default branch policy"));
+        assert!(content.contains("Notification purpose"));
+        assert!(content.contains("Follow-up behavior"));
+    }
+
+    #[test]
+    fn rendered_profile_excludes_sensitive_fields() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(tempdir.path());
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), "gajae/clawhip".to_string());
+        let mut config = AppConfig::default();
+        config.providers.discord.bot_token = Some("SECRET-DISCORD-TOKEN".into());
+        config.monitors.github_token = Some("SECRET-GH-TOKEN".into());
+        config.routes.push(RouteRule {
+            event: "*".into(),
+            filter,
+            channel: Some("123456789".into()),
+            channel_name: Some("dev".into()),
+            webhook: Some("https://discord.com/api/webhooks/SECRET".into()),
+            slack_webhook: Some("https://hooks.slack.com/services/SECRET".into()),
+            mention: Some("<@99>".into()),
+            allow_dynamic_tokens: true,
+            template: Some("TEMPLATE-LEAK".into()),
+            ..RouteRule::default()
+        });
+
+        let missing = missing_routed_channel_profiles(&layout, &config).expect("missing");
+        let content = &missing[0].contents;
+
+        for needle in [
+            "SECRET-DISCORD-TOKEN",
+            "SECRET-GH-TOKEN",
+            "webhooks/SECRET",
+            "hooks.slack.com",
+            "<@99>",
+            "TEMPLATE-LEAK",
+            "123456789",
+        ] {
+            assert!(!content.contains(needle), "profile leaked '{needle}'");
+        }
+        assert!(content.contains("gajae/clawhip"));
+    }
+
+    #[test]
+    fn skipped_binding_diagnostics_are_sanitized() {
+        let config = config_with_routes(vec![route_with_repo("clawhip", "987654321", Some("dev"))]);
+
+        let plan = build_channel_profile_plan(&config);
+
+        assert_eq!(plan.unscaffoldable.len(), 1);
+        assert!(!plan.unscaffoldable[0].contains("987654321"));
+        assert!(plan.unscaffoldable[0].contains("clawhip"));
+    }
+
+    #[test]
+    fn dry_run_does_not_write_files() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
+
+        scaffold_channels(scaffold_args(tempdir.path(), false, false), &config).expect("dry run");
+
+        assert!(!tempdir.path().join("memory/channels/dev.md").exists());
+    }
+
+    #[test]
+    fn write_creates_missing_profile() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
+
+        scaffold_channels(scaffold_args(tempdir.path(), true, false), &config).expect("write");
+
+        let path = tempdir.path().join("memory/channels/dev.md");
+        assert!(path.is_file());
+        let content = fs::read_to_string(&path).expect("read profile");
+        assert!(content.contains("gajae/clawhip"));
+    }
+
+    #[test]
+    fn write_is_idempotent_without_force() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
+        let path = tempdir.path().join("memory/channels/dev.md");
+        fs::create_dir_all(path.parent().unwrap()).expect("create channels dir");
+        fs::write(&path, "custom profile").expect("seed profile");
+
+        scaffold_channels(scaffold_args(tempdir.path(), true, false), &config).expect("write");
+
+        assert_eq!(fs::read_to_string(&path).expect("read"), "custom profile");
+    }
+
+    #[test]
+    fn force_overwrites_existing_profile() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
+        let path = tempdir.path().join("memory/channels/dev.md");
+        fs::create_dir_all(path.parent().unwrap()).expect("create channels dir");
+        fs::write(&path, "custom profile").expect("seed profile");
+
+        scaffold_channels(scaffold_args(tempdir.path(), true, true), &config).expect("write");
+
+        let content = fs::read_to_string(&path).expect("read");
+        assert_ne!(content, "custom profile");
+        assert!(content.contains("gajae/clawhip"));
+    }
+
+    #[test]
+    fn missing_routed_channel_profiles_short_circuits_existing_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(tempdir.path());
+        let config = config_with_routes(vec![route_with_repo("gajae/clawhip", "123", Some("dev"))]);
+        let path = layout.channels_dir().join("dev.md");
+        fs::create_dir_all(path.parent().unwrap()).expect("create channels dir");
+        fs::write(&path, "custom profile").expect("seed profile");
+
+        let missing = missing_routed_channel_profiles(&layout, &config).expect("missing");
+
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn existing_profile_is_reported_present_without_leaking_secrets() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(tempdir.path());
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), "gajae/clawhip".to_string());
+        let mut config = AppConfig::default();
+        config.routes.push(RouteRule {
+            event: "*".into(),
+            filter,
+            channel: Some("123".into()),
+            channel_name: Some("dev".into()),
+            mention: Some("<@SECRET-MENTION>".into()),
+            ..RouteRule::default()
+        });
+        let path = layout.channels_dir().join("dev.md");
+        fs::create_dir_all(path.parent().unwrap()).expect("create channels dir");
+        fs::write(&path, "existing").expect("seed profile");
+
+        let report = build_channel_scaffold_report(&layout, &config).expect("report");
+
+        assert_eq!(report.proposals.len(), 1);
+        assert!(report.proposals[0].exists);
+        assert!(!report.proposals[0].contents.contains("SECRET-MENTION"));
     }
 }

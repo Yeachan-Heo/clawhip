@@ -767,6 +767,8 @@ pub enum MemoryCommands {
     Init(MemoryInitArgs),
     /// Inspect whether a filesystem-offloaded memory scaffold is present.
     Status(MemoryStatusArgs),
+    /// Propose or create public-safe channel profiles for routed repository channels.
+    ScaffoldChannels(MemoryScaffoldChannelsArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1810,4 +1812,71 @@ mod tests {
 
         assert!(matches!(command, Some(UpdateCommands::Status)));
     }
+
+    #[test]
+    fn parses_memory_scaffold_channels_default_dry_run() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "memory",
+            "scaffold-channels",
+            "--root",
+            "/tmp/workspace",
+        ]);
+
+        let Commands::Memory { command } = cli.command.expect("memory command") else {
+            panic!("expected memory command");
+        };
+
+        let MemoryCommands::ScaffoldChannels(args) = command else {
+            panic!("expected memory scaffold-channels command");
+        };
+
+        assert_eq!(args.root, Some(PathBuf::from("/tmp/workspace")));
+        assert!(!args.write);
+        assert!(!args.force);
+    }
+
+    #[test]
+    fn parses_memory_scaffold_channels_write_force() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "memory",
+            "scaffold-channels",
+            "--project",
+            "clawhip",
+            "--write",
+            "--force",
+        ]);
+
+        let Commands::Memory { command } = cli.command.expect("memory command") else {
+            panic!("expected memory command");
+        };
+
+        let MemoryCommands::ScaffoldChannels(args) = command else {
+            panic!("expected memory scaffold-channels command");
+        };
+
+        assert_eq!(args.project.as_deref(), Some("clawhip"));
+        assert!(args.write);
+        assert!(args.force);
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct MemoryScaffoldChannelsArgs {
+    /// Root directory where MEMORY.md and memory/ should live.
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+    /// Stable project slug used in related shard links; defaults to the root directory name.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Daily shard name used in related shard links (YYYY-MM-DD).
+    #[arg(long)]
+    pub date: Option<String>,
+    /// Write missing channel profile files instead of only printing proposed actions.
+    #[arg(long, default_value_t = false)]
+    pub write: bool,
+    /// Overwrite existing channel profile files when writing.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
