@@ -207,6 +207,18 @@ impl CronScheduler {
                             scheduled_for.unix_timestamp(),
                         )
                     {
+                        if let Some(suppression) =
+                            self.zero_backlog_suppressions.get(&job.config.id)
+                        {
+                            eprintln!(
+                                "{}",
+                                suppression_notice(
+                                    &job.config.id,
+                                    suppression,
+                                    scheduled_for.unix_timestamp(),
+                                )
+                            );
+                        }
                         continue;
                     }
                     emitter
@@ -445,6 +457,19 @@ fn should_suppress(
         && suppression.is_some_and(|suppression| {
             suppression.key == eval.suppression_key && suppression.expires_at > now
         })
+}
+
+/// Public-safe one-line notice recorded when a zero-backlog follow-up nudge is
+/// intentionally suppressed. It contains only the operator-defined job id, the
+/// deterministic public-safe suppression key, and the remaining lease seconds —
+/// never raw receipts, logs, tokens, or private payloads — so operators can see
+/// the nudge was withheld on purpose, not silently dropped.
+fn suppression_notice(job_id: &str, suppression: &ZeroBacklogSuppression, now: i64) -> String {
+    let remaining = (suppression.expires_at - now).max(0);
+    format!(
+        "clawhip cron '{job_id}' zero-backlog follow-up suppressed (key={}, expires_in={remaining}s); nudge intentionally withheld, not dropped",
+        suppression.key
+    )
 }
 
 fn validate_timezone(job: &CronJob) -> Result<()> {
@@ -827,6 +852,23 @@ mod tests {
         .expect_err("unsupported timezone");
 
         assert!(error.to_string().contains("supports UTC only"));
+    }
+
+    #[test]
+    fn suppression_notice_is_public_safe_and_observable() {
+        let suppression = ZeroBacklogSuppression {
+            key: "gajae-zero-backlog:0123456789abcdef".into(),
+            expires_at: 1_000,
+        };
+        let notice = suppression_notice("dev-followup", &suppression, 400);
+        assert!(notice.contains("dev-followup"));
+        assert!(notice.contains("gajae-zero-backlog:0123456789abcdef"));
+        assert!(notice.contains("expires_in=600s"));
+        assert!(notice.contains("not dropped"));
+
+        // Past-expiry leases clamp to zero rather than reporting negatives.
+        let expired = suppression_notice("dev-followup", &suppression, 5_000);
+        assert!(expired.contains("expires_in=0s"));
     }
 
     #[tokio::test]
