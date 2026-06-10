@@ -23,6 +23,13 @@ const DEFAULT_ROUTES_PATH: &str = ".clawhip/gajae.routes.yml";
 const DEFAULT_RUNTIME_DIR: &str = ".gajae/runtime";
 const PROFILE_FILE_NAME: &str = "clawhip-profile.yml";
 const MAX_PROFILE_BYTES: usize = 256 * 1024;
+/// Family name for the lightweight zero-backlog follow-up checkpoint receipt.
+///
+/// This is a compact public-safe alternative to the full follow-up receipt
+/// families. It is used for routine zero-backlog ticks that find no open
+/// PRs/issues and no action-needed work, and intentionally omits the heavier
+/// CI/session evidence carried by full receipts.
+pub const ZERO_BACKLOG_FOLLOWUP_CHECKPOINT_FAMILY: &str = "zero-backlog-followup-checkpoint";
 const REQUIRED_RECEIPT_FAMILIES: &[&str] = &[
     "runtime-followup-receipt",
     "mutation-plan",
@@ -1614,6 +1621,84 @@ pub struct BoundedBodyDigest {
     pub capped: bool,
 }
 
+/// Inputs for a lightweight zero-backlog follow-up checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZeroBacklogCheckpointRequest {
+    pub repo: String,
+    pub open_issues: u64,
+    pub open_prs: u64,
+    pub action_needed_sessions: u64,
+    pub observation_source: String,
+    pub approval_hold: bool,
+    pub release_hold: bool,
+}
+
+/// Compact, public-safe checkpoint receipt for routine zero-backlog ticks.
+///
+/// It carries only the bounded fields needed to audit a deterministic stop
+/// decision (repository, observed counts, observation source, and public-safety
+/// flags) and never embeds raw logs, tokens, or private payloads. Full receipt
+/// families remain the path for richer transitions, exceptions, or nonzero
+/// backlog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ZeroBacklogCheckpoint {
+    pub family: &'static str,
+    pub schema: &'static str,
+    pub mode: &'static str,
+    pub status: &'static str,
+    pub repo: String,
+    pub open_issues: u64,
+    pub open_prs: u64,
+    pub action_needed_sessions: u64,
+    pub observation_source: String,
+    pub stop_decision: &'static str,
+    pub stop_decision_deterministic: bool,
+    pub approval_hold: bool,
+    pub release_hold: bool,
+    pub action_required: bool,
+    pub public_safe: bool,
+}
+
+/// Build a lightweight zero-backlog follow-up checkpoint from observed counts.
+///
+/// The stop decision is fully deterministic: a clear backlog (zero open
+/// issues/PRs, no action-needed sessions, and no holds) suppresses the routine
+/// follow-up; anything else emits it. The receipt only ever contains bounded
+/// public identifiers and numeric counts.
+pub fn zero_backlog_followup_checkpoint(
+    request: ZeroBacklogCheckpointRequest,
+) -> Result<ZeroBacklogCheckpoint> {
+    let repo = public_identifier(&request.repo, "repo")?;
+    let observation_source = public_identifier(&request.observation_source, "observation-source")?;
+    let clear = request.open_issues == 0
+        && request.open_prs == 0
+        && request.action_needed_sessions == 0
+        && !request.approval_hold
+        && !request.release_hold;
+    let stop_decision = if clear {
+        "suppress-followup"
+    } else {
+        "emit-followup"
+    };
+    Ok(ZeroBacklogCheckpoint {
+        family: ZERO_BACKLOG_FOLLOWUP_CHECKPOINT_FAMILY,
+        schema: "gajae.zero-backlog-followup-checkpoint.v1",
+        mode: "lightweight",
+        status: "validated",
+        repo,
+        open_issues: request.open_issues,
+        open_prs: request.open_prs,
+        action_needed_sessions: request.action_needed_sessions,
+        observation_source,
+        stop_decision,
+        stop_decision_deterministic: true,
+        approval_hold: request.approval_hold,
+        release_hold: request.release_hold,
+        action_required: !clear,
+        public_safe: true,
+    })
+}
+
 pub fn read_receipt_stdin(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut input = Vec::new();
     reader
@@ -1904,6 +1989,7 @@ fn event_kind_for_family(family: &str) -> &'static str {
         "review-verdict-evidence" => "gajae.review.verdict",
         "merge-hold-decision" => "gajae.merge.hold",
         "zero-backlog-checkpoint" => "gajae.backlog.zero",
+        "zero-backlog-followup-checkpoint" => "gajae.backlog.zero",
         family if family.contains("release-hold") => "gajae.release.hold",
         _ => "gajae.receipt.validated",
     }
@@ -2025,6 +2111,84 @@ mod mutation_plan_tests {
         assert!(plan.blocked);
         assert_eq!(plan.block_reason, Some("authority-required"));
         assert!(!plan.execution.executed);
+    }
+
+    #[test]
+    fn zero_backlog_checkpoint_clear_backlog_suppresses_followup() {
+        let checkpoint = zero_backlog_followup_checkpoint(ZeroBacklogCheckpointRequest {
+            repo: "Yeachan-Heo/clawhip".into(),
+            open_issues: 0,
+            open_prs: 0,
+            action_needed_sessions: 0,
+            observation_source: "github-api".into(),
+            approval_hold: false,
+            release_hold: false,
+        })
+        .expect("checkpoint should build");
+
+        assert_eq!(checkpoint.family, "zero-backlog-followup-checkpoint");
+        assert_eq!(checkpoint.mode, "lightweight");
+        assert_eq!(checkpoint.status, "validated");
+        assert_eq!(checkpoint.stop_decision, "suppress-followup");
+        assert!(checkpoint.stop_decision_deterministic);
+        assert!(!checkpoint.action_required);
+        assert!(checkpoint.public_safe);
+
+        let serialized = serde_json::to_string(&checkpoint).expect("serialize");
+        assert!(serialized.contains("\"open_issues\":0"));
+        assert!(serialized.contains("github-api"));
+        assert_eq!(
+            event_kind_for_family(checkpoint.family),
+            "gajae.backlog.zero"
+        );
+    }
+
+    #[test]
+    fn zero_backlog_checkpoint_nonzero_backlog_emits_followup() {
+        let checkpoint = zero_backlog_followup_checkpoint(ZeroBacklogCheckpointRequest {
+            repo: "Yeachan-Heo/clawhip".into(),
+            open_issues: 0,
+            open_prs: 2,
+            action_needed_sessions: 0,
+            observation_source: "github-api".into(),
+            approval_hold: false,
+            release_hold: false,
+        })
+        .expect("checkpoint should build");
+
+        assert_eq!(checkpoint.stop_decision, "emit-followup");
+        assert!(checkpoint.action_required);
+    }
+
+    #[test]
+    fn zero_backlog_checkpoint_holds_force_followup_emission() {
+        let checkpoint = zero_backlog_followup_checkpoint(ZeroBacklogCheckpointRequest {
+            repo: "Yeachan-Heo/clawhip".into(),
+            open_issues: 0,
+            open_prs: 0,
+            action_needed_sessions: 0,
+            observation_source: "github-api".into(),
+            approval_hold: true,
+            release_hold: false,
+        })
+        .expect("checkpoint should build");
+
+        assert_eq!(checkpoint.stop_decision, "emit-followup");
+        assert!(checkpoint.action_required);
+    }
+
+    #[test]
+    fn zero_backlog_checkpoint_rejects_unsafe_source() {
+        let result = zero_backlog_followup_checkpoint(ZeroBacklogCheckpointRequest {
+            repo: "Yeachan-Heo/clawhip".into(),
+            open_issues: 0,
+            open_prs: 0,
+            action_needed_sessions: 0,
+            observation_source: "secret-token-source".into(),
+            approval_hold: false,
+            release_hold: false,
+        });
+        assert!(result.is_err());
     }
 }
 

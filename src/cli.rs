@@ -502,6 +502,11 @@ pub enum GajaeCommands {
         #[command(subcommand)]
         command: GajaeMutationPlanCommands,
     },
+    /// Produce a lightweight public-safe zero-backlog follow-up checkpoint receipt.
+    Checkpoint {
+        #[command(subcommand)]
+        command: GajaeCheckpointCommands,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -622,6 +627,37 @@ pub struct GajaeMutationPlanArgs {
     /// Existing idempotency key. Repeat to mark matching plans as duplicates.
     #[arg(long = "existing-key", action = ArgAction::Append)]
     pub existing_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum GajaeCheckpointCommands {
+    /// Build a compact zero-backlog follow-up checkpoint with a deterministic stop decision.
+    ZeroBacklog(GajaeZeroBacklogCheckpointArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct GajaeZeroBacklogCheckpointArgs {
+    /// GitHub repository in owner/name form.
+    #[arg(long)]
+    pub repo: String,
+    /// Observed count of open issues.
+    #[arg(long, default_value_t = 0)]
+    pub open_issues: u64,
+    /// Observed count of open PRs.
+    #[arg(long, default_value_t = 0)]
+    pub open_prs: u64,
+    /// Observed count of sessions still needing action.
+    #[arg(long, default_value_t = 0)]
+    pub action_needed_sessions: u64,
+    /// Public-safe observation source label, e.g. github-api.
+    #[arg(long, default_value = "github-api")]
+    pub source: String,
+    /// Mark an approval hold as present, which forces follow-up emission.
+    #[arg(long, default_value_t = false)]
+    pub approval_hold: bool,
+    /// Mark a release hold as present, which forces follow-up emission.
+    #[arg(long, default_value_t = false)]
+    pub release_hold: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1558,6 +1594,35 @@ mod tests {
         let CronCommands::Run { id } = command;
 
         assert_eq!(id, "dev-followup");
+    }
+
+    #[test]
+    fn parses_gajae_zero_backlog_checkpoint_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "gajae",
+            "checkpoint",
+            "zero-backlog",
+            "--repo",
+            "Yeachan-Heo/clawhip",
+            "--open-prs",
+            "0",
+            "--source",
+            "github-api",
+        ]);
+
+        let Some(Commands::Gajae {
+            command: GajaeCommands::Checkpoint { command },
+        }) = cli.command
+        else {
+            panic!("expected gajae checkpoint command");
+        };
+        let GajaeCheckpointCommands::ZeroBacklog(args) = command;
+        assert_eq!(args.repo, "Yeachan-Heo/clawhip");
+        assert_eq!(args.open_issues, 0);
+        assert_eq!(args.open_prs, 0);
+        assert_eq!(args.source, "github-api");
+        assert!(!args.approval_hold);
     }
 
     #[test]

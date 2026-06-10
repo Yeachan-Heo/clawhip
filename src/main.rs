@@ -37,10 +37,11 @@ use clap::Parser;
 use tokio::runtime::Builder;
 
 use crate::cli::{
-    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GajaeCommands,
-    GajaeMutationPlanCommands, GajaeProfileCommands, GajaeReceiptCommands, GitCommands,
-    GithubCommands, HooksCommands, MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands,
-    SetupArgs, TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs,
+    GajaeCheckpointCommands, GajaeCommands, GajaeMutationPlanCommands, GajaeProfileCommands,
+    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, MemoryCommands,
+    NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, TmuxCommands, UpdateCommands,
+    VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, SetupEdits};
@@ -440,6 +441,23 @@ async fn real_main(cli: Cli) -> Result<()> {
                         existing_keys: args.existing_keys,
                     })?;
                     println!("{}", serde_json::to_string(&plan)?);
+                    Ok(())
+                }
+            },
+            GajaeCommands::Checkpoint { command } => match command {
+                GajaeCheckpointCommands::ZeroBacklog(args) => {
+                    let checkpoint = gajae::zero_backlog_followup_checkpoint(
+                        gajae::ZeroBacklogCheckpointRequest {
+                            repo: args.repo,
+                            open_issues: args.open_issues,
+                            open_prs: args.open_prs,
+                            action_needed_sessions: args.action_needed_sessions,
+                            observation_source: args.source,
+                            approval_hold: args.approval_hold,
+                            release_hold: args.release_hold,
+                        },
+                    )?;
+                    println!("{}", serde_json::to_string(&checkpoint)?);
                     Ok(())
                 }
             },

@@ -347,6 +347,10 @@ fn public_suppression_state(value: &Value) -> BTreeMap<String, Value> {
     insert_public_value(&mut state, value, "session_stale_events");
     insert_public_value(&mut state, value, "approval_hold");
     insert_public_value(&mut state, value, "release_hold");
+    insert_public_value(&mut state, value, "action_needed_sessions");
+    insert_public_value(&mut state, value, "action_required");
+    insert_public_value(&mut state, value, "observation_source");
+    insert_public_value(&mut state, value, "stop_decision");
     insert_public_value(&mut state, value, "new_event_id");
     state
 }
@@ -375,6 +379,12 @@ fn bounded_public_token(value: &str) -> String {
 }
 
 fn is_validated_zero_backlog_receipt(value: &Value) -> bool {
+    is_full_zero_backlog_receipt(value) || is_lightweight_zero_backlog_checkpoint(value)
+}
+
+/// Full zero-backlog receipt: requires green dev CI and explicit session/hold
+/// evidence in addition to a clear backlog. Used for richer transitions.
+fn is_full_zero_backlog_receipt(value: &Value) -> bool {
     validated_zero_backlog_family(value)
         && receipt_status_validated(value)
         && numeric_field(value, "open_issues") == Some(0)
@@ -385,6 +395,24 @@ fn is_validated_zero_backlog_receipt(value: &Value) -> bool {
         && numeric_field(value, "session_stale_events").unwrap_or(0) == 0
         && !bool_field(value, "approval_hold")
         && !bool_field(value, "release_hold")
+}
+
+/// Lightweight zero-backlog follow-up checkpoint: a compact receipt for routine
+/// ticks. It carries observed counts and a deterministic stop decision but
+/// intentionally omits the full CI/session evidence. Suppression only applies
+/// when the checkpoint itself decided to suppress the follow-up.
+fn is_lightweight_zero_backlog_checkpoint(value: &Value) -> bool {
+    value.get("family").and_then(Value::as_str)
+        == Some(crate::gajae::ZERO_BACKLOG_FOLLOWUP_CHECKPOINT_FAMILY)
+        && receipt_status_validated(value)
+        && numeric_field(value, "open_issues") == Some(0)
+        && numeric_field(value, "open_prs") == Some(0)
+        && numeric_field(value, "action_needed_sessions").unwrap_or(0) == 0
+        && !bool_field(value, "approval_hold")
+        && !bool_field(value, "release_hold")
+        && !bool_field(value, "action_required")
+        && value.get("stop_decision").and_then(Value::as_str) == Some("suppress-followup")
+        && bool_field(value, "stop_decision_deterministic")
 }
 
 fn validated_zero_backlog_family(value: &Value) -> bool {
@@ -1151,6 +1179,74 @@ mod tests {
         assert!(schedule.matches(dt(2026, Month::April, 10, 17, 45, 0)));
         assert!(!schedule.matches(dt(2026, Month::April, 10, 17, 10, 0)));
         assert!(!schedule.matches(dt(2026, Month::April, 11, 9, 0, 0)));
+    }
+
+    fn write_lightweight_checkpoint(path: &Path, open_prs: u64) -> std::io::Result<()> {
+        let checkpoint = crate::gajae::zero_backlog_followup_checkpoint(
+            crate::gajae::ZeroBacklogCheckpointRequest {
+                repo: "Yeachan-Heo/clawhip".into(),
+                open_issues: 0,
+                open_prs,
+                action_needed_sessions: 0,
+                observation_source: "github-api".into(),
+                approval_hold: false,
+                release_hold: false,
+            },
+        )
+        .expect("build checkpoint");
+        fs::write(path, serde_json::to_string(&checkpoint).expect("serialize"))
+    }
+
+    #[tokio::test]
+    async fn lightweight_checkpoint_suppresses_repeated_followups_until_ttl() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("repo.json");
+        write_lightweight_checkpoint(&repo_state, 0).expect("write checkpoint");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state));
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 3))
+            .await
+            .expect("first tick");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 5))
+            .await
+            .expect("second tick suppressed");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 1, "routine follow-up should be silent");
+        assert_eq!(events[0].payload["repo_state_zero_backlog"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn lightweight_checkpoint_with_open_backlog_does_not_suppress() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("repo.json");
+        write_lightweight_checkpoint(&repo_state, 1).expect("write checkpoint");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state));
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 3))
+            .await
+            .expect("first tick");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 5))
+            .await
+            .expect("second tick");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 2, "nonzero backlog must keep emitting");
+        assert_eq!(events[0].payload["repo_state_zero_backlog"], json!(false));
     }
 
     fn sample_config(schedule: &str) -> AppConfig {
