@@ -25,6 +25,7 @@ pub mod event_name {
 
 pub mod reason {
     pub const DAEMON_STARTUP: &str = "daemon_startup";
+    pub const DISCORD_TOKEN_ENV_SHADOW: &str = "discord_token_env_shadow";
     pub const DAEMON_LISTENING: &str = "daemon_listening";
     pub const SOURCE_START: &str = "source_start";
     pub const SOURCE_STOPPED: &str = "source_stopped";

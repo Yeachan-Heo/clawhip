@@ -836,6 +836,30 @@ impl AppConfig {
         }
     }
 
+    /// Returns the name of the environment variable whose Discord token shadows
+    /// a token that is also present in the config file. Returns `None` when env
+    /// does not win or when no config token is set, so a `Some(_)` value always
+    /// means env precedence is silently overriding a configured token.
+    ///
+    /// Only the precedence source is exposed — never the token value itself.
+    pub fn discord_token_env_shadow(&self) -> Option<&'static str> {
+        self.discord_token_env_shadow_with(|name| env::var(name).ok())
+    }
+
+    fn discord_token_env_shadow_with<F>(&self, mut get_env: F) -> Option<&'static str>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let env_var = DISCORD_TOKEN_ENV_VARS
+            .iter()
+            .copied()
+            .find(|name| normalize_secret(get_env(name)).is_some())?;
+        let config_token_present = normalize_secret(self.providers.discord.bot_token.clone())
+            .is_some()
+            || normalize_secret(self.discord.bot_token.clone()).is_some();
+        config_token_present.then_some(env_var)
+    }
+
     pub fn webhook_route_count(&self) -> usize {
         self.routes
             .iter()
@@ -1602,6 +1626,55 @@ mod tests {
             config.effective_token_with(|_| None).as_deref(),
             Some("config-token")
         );
+    }
+
+    #[test]
+    fn discord_token_env_shadow_detected_when_env_overrides_config() {
+        let mut config = AppConfig::default();
+        config.providers.discord.bot_token = Some("config-token".into());
+
+        assert_eq!(
+            config.discord_token_env_shadow_with(|name| {
+                (name == "CLAWHIP_DISCORD_BOT_TOKEN").then(|| "env-token".to_string())
+            }),
+            Some("CLAWHIP_DISCORD_BOT_TOKEN")
+        );
+        assert_eq!(
+            config.discord_token_env_shadow_with(|name| {
+                (name == "DISCORD_TOKEN").then(|| "env-token".to_string())
+            }),
+            Some("DISCORD_TOKEN")
+        );
+    }
+
+    #[test]
+    fn discord_token_env_shadow_uses_legacy_config_token() {
+        let mut config = AppConfig::default();
+        config.discord.bot_token = Some("legacy-config-token".into());
+
+        assert_eq!(
+            config.discord_token_env_shadow_with(|name| {
+                (name == "DISCORD_TOKEN").then(|| "env-token".to_string())
+            }),
+            Some("DISCORD_TOKEN")
+        );
+    }
+
+    #[test]
+    fn discord_token_env_shadow_none_without_conflict() {
+        let mut config = AppConfig::default();
+
+        // No config token: env wins but nothing is shadowed.
+        assert_eq!(
+            config.discord_token_env_shadow_with(|name| {
+                (name == "DISCORD_TOKEN").then(|| "env-token".to_string())
+            }),
+            None
+        );
+
+        // Config token present but no env token: config wins, no shadow.
+        config.providers.discord.bot_token = Some("config-token".into());
+        assert_eq!(config.discord_token_env_shadow_with(|_| None), None);
     }
 
     #[test]

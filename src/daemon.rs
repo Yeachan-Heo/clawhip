@@ -82,6 +82,14 @@ pub async fn run(
         telemetry::reason::DAEMON_STARTUP,
         json!({"version": VERSION, "token_source": token_source}),
     ));
+    if let Some(env_var) = config.discord_token_env_shadow() {
+        let warning = discord_token_shadow_warning(env_var);
+        eprintln!("warning: {warning}");
+        telemetry::emit(daemon_record(
+            telemetry::reason::DISCORD_TOKEN_ENV_SHADOW,
+            json!({"env_var": env_var, "token_source": token_source, "warning": warning}),
+        ));
+    }
 
     let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
     sinks.insert(
@@ -234,6 +242,12 @@ fn daemon_record(reason_code: &str, details: Value) -> serde_json::Map<String, V
     record
 }
 
+fn discord_token_shadow_warning(env_var: &str) -> String {
+    format!(
+        "Discord token from environment variable {env_var} is overriding the token configured in the config file (token_source: env). Unset {env_var} to use the configured token, or remove the config token to silence this notice."
+    )
+}
+
 fn source_lifecycle_record(
     reason_code: &str,
     source_name: &str,
@@ -289,6 +303,7 @@ fn health_payload(
         "ok": true,
         "version": VERSION,
         "token_source": config.discord_token_source(),
+        "token_precedence_warning": config.discord_token_env_shadow().map(discord_token_shadow_warning),
         "webhook_routes_configured": config.has_webhook_routes(),
         "port": port,
         "daemon_base_url": config.daemon.base_url,
@@ -1728,6 +1743,18 @@ mod tests {
         assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
         assert!(payload["native_hooks"]["totals"]["received"].is_number());
+        assert_eq!(payload["token_precedence_warning"], Value::Null);
+    }
+
+    #[test]
+    fn discord_token_shadow_warning_names_env_var_without_leaking_value() {
+        let warning = discord_token_shadow_warning("CLAWHIP_DISCORD_BOT_TOKEN");
+
+        assert!(warning.contains("CLAWHIP_DISCORD_BOT_TOKEN"));
+        assert!(warning.contains("token_source: env"));
+        // The diagnostic must describe precedence only, never the secret value.
+        assert!(!warning.to_lowercase().contains("config-token"));
+        assert!(!warning.to_lowercase().contains("env-token"));
     }
 
     #[tokio::test]
