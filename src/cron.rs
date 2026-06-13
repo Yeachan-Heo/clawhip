@@ -381,6 +381,16 @@ fn public_suppression_state(value: &Value) -> BTreeMap<String, Value> {
     insert_public_value(&mut state, value, "open_prs");
     insert_public_value(&mut state, value, "latest_dev_ci");
     insert_public_value(&mut state, value, "dev_ci");
+    // Branch head / check-summary digests so a real `dev` head change (a new
+    // commit landing with otherwise-identical counts and CI label) alters the
+    // fingerprint and re-emits, instead of being coalesced as an unchanged tick.
+    // Values pass through `bounded_public_token`, so only public-safe identifiers
+    // (e.g. a commit SHA) are retained.
+    insert_public_value(&mut state, value, "dev_head");
+    insert_public_value(&mut state, value, "branch_head");
+    insert_public_value(&mut state, value, "head_sha");
+    insert_public_value(&mut state, value, "dev_check_summary");
+    insert_public_value(&mut state, value, "check_summary");
     insert_public_value(&mut state, value, "active_sessions_needing_action");
     insert_public_value(&mut state, value, "sessions_needing_action");
     insert_public_value(&mut state, value, "session_stale_events");
@@ -1193,6 +1203,95 @@ mod tests {
         let events = emitter.events.lock().expect("events lock");
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].payload["repo_state_zero_backlog"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn branch_head_change_breaks_zero_backlog_suppression_immediately() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let repo_state = dir.path().join("repo.json");
+        fs::write(
+            &repo_state,
+            r#"{"family":"runtime-followup-receipt","status":"validated","open_issues":0,"open_prs":0,"latest_dev_ci":"green","active_sessions_needing_action":0,"dev_head":"aaaaaaaaaaaa"}"#,
+        )
+        .expect("write head-a receipt");
+
+        let config = sample_config_with_state("*/10 * * * *", Some(repo_state.clone()));
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&config, state_path).expect("scheduler");
+        let emitter = RecordingEmitter::default();
+
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 0))
+            .await
+            .expect("tick 1");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 30, 0))
+            .await
+            .expect("tick 2 suppressed");
+
+        // Identical zero-backlog counts and CI label, but a new dev commit landed:
+        // the head digest changed, so this is a real transition and must re-emit.
+        fs::write(
+            &repo_state,
+            r#"{"family":"runtime-followup-receipt","status":"validated","open_issues":0,"open_prs":0,"latest_dev_ci":"green","active_sessions_needing_action":0,"dev_head":"bbbbbbbbbbbb"}"#,
+        )
+        .expect("write head-b receipt");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 40, 0))
+            .await
+            .expect("branch head change re-emits");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(
+            events.len(),
+            2,
+            "first tick + head-change tick emit; the identical middle tick coalesces"
+        );
+        assert_eq!(
+            events[1].payload["repo_state_zero_backlog"],
+            json!(true),
+            "a new dev head is still a valid zero-backlog state, just a fresh transition"
+        );
+        assert_ne!(
+            events[0].payload["repo_state_fingerprint"],
+            events[1].payload["repo_state_fingerprint"],
+            "a branch head change must alter the public-safe key and re-emit"
+        );
+    }
+
+    #[test]
+    fn branch_head_digest_is_part_of_fingerprint_and_public_safe() {
+        let dir = tempdir().expect("tempdir");
+        let head_a = dir.path().join("head-a.json");
+        let head_b = dir.path().join("head-b.json");
+        fs::write(
+            &head_a,
+            r#"{"family":"runtime-followup-receipt","status":"validated","open_issues":0,"open_prs":0,"latest_dev_ci":"green","active_sessions_needing_action":0,"dev_head":"abc123def456","raw_log":"secret-token must not leak"}"#,
+        )
+        .expect("write head-a");
+        fs::write(
+            &head_b,
+            r#"{"family":"runtime-followup-receipt","status":"validated","open_issues":0,"open_prs":0,"latest_dev_ci":"green","active_sessions_needing_action":0,"dev_head":"999fedcba000","raw_log":"secret-token must not leak"}"#,
+        )
+        .expect("write head-b");
+
+        let eval_a = evaluate_state_file(&head_a).expect("eval a");
+        let eval_b = evaluate_state_file(&head_b).expect("eval b");
+        assert!(
+            eval_a.zero_backlog && eval_b.zero_backlog,
+            "both receipts remain valid zero-backlog states"
+        );
+        assert_ne!(
+            eval_a.fingerprint, eval_b.fingerprint,
+            "a branch head change must alter the fingerprint"
+        );
+        assert_ne!(eval_a.suppression_key, eval_b.suppression_key);
+        assert!(
+            !eval_a.fingerprint.contains("secret-token"),
+            "the fingerprint must never leak private receipt content"
+        );
+        assert_eq!(eval_a.fingerprint.len(), 16);
     }
 
     #[tokio::test]

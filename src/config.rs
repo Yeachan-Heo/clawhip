@@ -554,7 +554,8 @@ pub struct CronJob {
     /// PRs, green dev CI, no action-needed sessions, and no holds suppress
     /// repeated notifications only while the same public-safe key remains within
     /// `zero_backlog_suppression_ttl_secs`. New public events, non-zero backlog,
-    /// CI failures, stale sessions, holds, missing files, or malformed JSON fail
+    /// CI failures, branch head or check-summary changes, stale sessions, holds,
+    /// missing files, or malformed JSON fail
     /// open and emit normally.
     ///
     /// GitHub API/rate-limit failures are detected separately from an empty
