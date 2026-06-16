@@ -373,6 +373,10 @@ async fn capture_target_hash(target: &str) -> Result<u64> {
 }
 
 fn build_command_to_send(args: &TmuxNewArgs) -> Option<String> {
+    build_child_command(args).map(|command| retain_after_child_exit(&command))
+}
+
+fn build_child_command(args: &TmuxNewArgs) -> Option<String> {
     if args.command.is_empty() {
         return None;
     }
@@ -386,6 +390,13 @@ fn build_command_to_send(args: &TmuxNewArgs) -> Option<String> {
         Some(shell) => format!("{} -c {}", shell_escape(shell), shell_escape(&joined)),
         None => joined,
     })
+}
+
+fn retain_after_child_exit(command: &str) -> String {
+    format!(
+        "( {} ); clawhip_status=$?; printf '\\n[clawhip] command exited with status %s\\n' \"$clawhip_status\"; printf '[clawhip] retaining tmux pane for inspection. Type exit to close.\\n'; exec \"${{SHELL:-/bin/sh}}\"",
+        command
+    )
 }
 
 fn shell_join(parts: &[String]) -> String {
@@ -527,7 +538,7 @@ mod tests {
         };
 
         assert_eq!(
-            build_command_to_send(&args).as_deref(),
+            build_child_command(&args).as_deref(),
             Some("zsh -c 'source ~/.zshrc && omx --madmax'")
         );
     }
@@ -553,7 +564,7 @@ mod tests {
         };
 
         assert_eq!(
-            build_command_to_send(&args).as_deref(),
+            build_child_command(&args).as_deref(),
             Some("/bin/zsh -c 'source ~/.zshrc && omx --madmax'")
         );
     }
@@ -579,9 +590,39 @@ mod tests {
         };
 
         assert_eq!(
-            build_command_to_send(&args).as_deref(),
+            build_child_command(&args).as_deref(),
             Some("source ~/.zshrc && omx --madmax")
         );
+    }
+
+    #[test]
+    fn build_command_to_send_retains_shell_after_child_exit() {
+        let args = TmuxNewArgs {
+            session: "dev".into(),
+            window_name: None,
+            cwd: None,
+            channel: None,
+            mention: None,
+            keywords: Vec::new(),
+            stale_minutes: 10,
+            format: None,
+            attach: false,
+            follow: false,
+            retry_enter: true,
+            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
+            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
+            shell: None,
+            command: vec!["false".into()],
+        };
+
+        let command = build_command_to_send(&args).expect("wrapped command");
+
+        assert!(command.starts_with("( false ); clawhip_status=$?;"));
+        assert!(command.contains("[clawhip] command exited with status %s"));
+        assert!(
+            command.contains("[clawhip] retaining tmux pane for inspection. Type exit to close.")
+        );
+        assert!(command.ends_with("exec \"${SHELL:-/bin/sh}\""));
     }
 
     #[test]
