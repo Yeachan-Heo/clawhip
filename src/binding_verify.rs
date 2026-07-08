@@ -540,6 +540,9 @@ fn is_setup_repo_route(route: &crate::config::RouteRule) -> bool {
 }
 
 fn setup_monitor_repo_identity(monitor: &crate::config::GitRepoMonitor) -> Option<String> {
+    if !monitor.setup_owned {
+        return None;
+    }
     if monitor
         .channel
         .as_deref()
@@ -1085,6 +1088,36 @@ mod tests {
         assert_eq!(config.routes[0].channel_name.as_deref(), Some("new-name"));
     }
 
+    #[test]
+    fn apply_owner_qualified_binding_does_not_steal_different_github_repo_by_basename() {
+        let mut config = AppConfig::default();
+        config.monitors.git.repos.push(GitRepoMonitor {
+            path: "/work/owner1-repo".into(),
+            name: Some("repo".into()),
+            github_repo: Some("owner1/repo".into()),
+            channel: Some("old".into()),
+            channel_name: Some("old-dev".into()),
+            setup_owned: true,
+            ..GitRepoMonitor::default()
+        });
+
+        config
+            .apply_repo_channel_binding("owner2/repo", "new", Some("new-dev"), "/work/owner2-repo")
+            .unwrap();
+
+        assert_eq!(config.monitors.git.repos.len(), 2);
+        let old = &config.monitors.git.repos[0];
+        assert_eq!(old.path, "/work/owner1-repo");
+        assert_eq!(old.github_repo.as_deref(), Some("owner1/repo"));
+        assert_eq!(old.channel.as_deref(), Some("old"));
+        let new = &config.monitors.git.repos[1];
+        assert_eq!(new.path, "/work/owner2-repo");
+        assert_eq!(new.name.as_deref(), Some("repo"));
+        assert_eq!(new.github_repo.as_deref(), Some("owner2/repo"));
+        assert_eq!(new.channel.as_deref(), Some("new"));
+        assert!(new.setup_owned);
+    }
+
     fn setup_route(repo: &str, channel: &str, channel_name: Option<&str>) -> RouteRule {
         let mut filter = BTreeMap::new();
         filter.insert("repo".to_string(), repo.to_string());
@@ -1108,6 +1141,7 @@ mod tests {
             name: name.map(ToOwned::to_owned),
             channel: channel.map(ToOwned::to_owned),
             channel_name: channel_name.map(ToOwned::to_owned),
+            setup_owned: true,
             ..GitRepoMonitor::default()
         }
     }
@@ -1222,6 +1256,32 @@ mod tests {
 
         assert!(audit.ok);
         assert!(audit.findings.is_empty());
+    }
+
+    #[test]
+    fn drift_audit_ignores_manual_github_monitor_with_route_like_metadata() {
+        let config = config_with_route_and_monitors(
+            setup_route("owner/repo", "456", Some("ops")),
+            vec![GitRepoMonitor {
+                path: "/manual/repo".to_string(),
+                name: Some("repo".to_string()),
+                github_repo: Some("owner/repo".to_string()),
+                channel: Some("123".to_string()),
+                channel_name: Some("dev".to_string()),
+                ..GitRepoMonitor::default()
+            }],
+        );
+
+        let audit = audit_route_monitor_drift(&config);
+
+        assert!(
+            !audit
+                .findings
+                .iter()
+                .any(|finding| finding.code == "repo_identity_mismatch"
+                    || finding.monitor_indices == vec![0]),
+            "manual monitor must not be audited as setup-owned: {audit:?}"
+        );
     }
 
     #[test]

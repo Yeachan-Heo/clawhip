@@ -598,13 +598,9 @@ fn existing_setup_monitor_checkout_path(config: &AppConfig, repo: &str) -> Resul
         .repos
         .iter()
         .filter(|monitor| {
-            let identity_matches = monitor.github_repo.as_deref() == Some(repo)
-                || (monitor.github_repo.is_none() && monitor.name.as_deref() == Some(repo));
-            identity_matches
-                && monitor
-                    .channel_name
-                    .as_deref()
-                    .is_some_and(|name| !name.trim().is_empty())
+            monitor.setup_owned
+                && (monitor.github_repo.as_deref() == Some(repo)
+                    || (monitor.github_repo.is_none() && monitor.name.as_deref() == Some(repo)))
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {

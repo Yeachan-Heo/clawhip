@@ -345,6 +345,11 @@ pub struct GitRepoMonitor {
     /// Human-readable channel name hint for binding verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_name: Option<String>,
+    /// Marks git monitors created and owned by `clawhip setup --bind`.
+    /// Manual monitors default to false so binding drift audits do not infer
+    /// ownership from repo/channel metadata alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub setup_owned: bool,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
 }
@@ -362,6 +367,7 @@ impl Default for GitRepoMonitor {
             emit_pr_status: false,
             channel: None,
             channel_name: None,
+            setup_owned: false,
             mention: None,
             format: None,
         }
@@ -1353,10 +1359,7 @@ impl AppConfig {
             return Err(format!("manual_route_conflict for repo '{repo}'").into());
         }
 
-        let setup_route_pair = route_matches.first().and_then(|index| {
-            let route = &self.routes[*index];
-            Some((route.channel.as_deref()?, route.channel_name.as_deref()?))
-        });
+        let requested_owner_repo = github_repo.as_deref();
         if self.monitors.git.repos.iter().any(|monitor| {
             monitor.channel.as_deref() == Some(channel_id.as_str())
                 && monitor.github_repo.is_none()
@@ -1372,12 +1375,21 @@ impl AppConfig {
             .iter()
             .enumerate()
             .filter(|(_, monitor)| {
-                monitor.path.trim() == checkout_path
-                    || monitor.name.as_deref() == Some(monitor_name.as_str())
-                    || (github_repo.is_some() && monitor.github_repo.as_ref() == github_repo.as_ref())
+                let path_matches = monitor.path.trim() == checkout_path;
+                let github_repo_matches = requested_owner_repo
+                    .is_some_and(|repo| monitor.github_repo.as_deref() == Some(repo));
+                let name_matches = monitor.name.as_deref() == Some(monitor_name.as_str())
+                    && requested_owner_repo.is_none_or(|repo| {
+                        monitor
+                            .github_repo
+                            .as_deref()
+                            .is_none_or(|existing| existing.trim().is_empty() || existing == repo)
+                    });
+
+                path_matches || github_repo_matches || name_matches
             })
             .map(|(index, monitor)| {
-                if is_setup_owned_git_monitor(monitor, channel_name.as_deref(), setup_route_pair) {
+                if is_setup_owned_git_monitor(monitor) {
                     Ok(index)
                 } else if monitor.channel.as_deref() == Some(channel_id.as_str())
                     && monitor.github_repo.is_none()
@@ -1437,6 +1449,7 @@ impl AppConfig {
                 monitor.github_repo = github_repo;
                 monitor.channel = Some(channel_id);
                 monitor.channel_name = channel_name;
+                monitor.setup_owned = true;
             }
             [] => self.monitors.git.repos.push(GitRepoMonitor {
                 path: checkout_path,
@@ -1444,6 +1457,7 @@ impl AppConfig {
                 github_repo,
                 channel: Some(channel_id),
                 channel_name,
+                setup_owned: true,
                 ..GitRepoMonitor::default()
             }),
             _ => unreachable!(),
@@ -1706,40 +1720,17 @@ fn is_repo_binding_route(route: &RouteRule, repo: &str) -> bool {
         && route.format.is_none()
 }
 
-fn normalized_channel_name(value: &str) -> String {
-    value.trim().trim_start_matches('#').to_ascii_lowercase()
-}
-
-fn names_match(left: &str, right: &str) -> bool {
-    normalized_channel_name(left) == normalized_channel_name(right)
-}
-
 fn is_owner_repo(repo: &str) -> bool {
     let mut parts = repo.split('/');
     matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty())
 }
 
-fn is_setup_owned_git_monitor(
-    monitor: &GitRepoMonitor,
-    channel_name: Option<&str>,
-    setup_route_pair: Option<(&str, &str)>,
-) -> bool {
-    if let (Some(monitor_name), Some(channel_name)) =
-        (monitor.channel_name.as_deref(), channel_name)
-        && names_match(monitor_name, channel_name)
-    {
-        return true;
-    }
+fn is_setup_owned_git_monitor(monitor: &GitRepoMonitor) -> bool {
+    monitor.setup_owned
+}
 
-    if let (Some((route_channel, route_name)), Some(monitor_channel), Some(monitor_name)) = (
-        setup_route_pair,
-        monitor.channel.as_deref(),
-        monitor.channel_name.as_deref(),
-    ) {
-        return monitor_channel == route_channel && names_match(monitor_name, route_name);
-    }
-
-    false
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn sha256_first8(bytes: &[u8]) -> String {
@@ -2880,6 +2871,7 @@ name = "general"
                         emit_pr_status: true,
                         channel: Some("old".into()),
                         channel_name: Some("#DEV".into()),
+                        setup_owned: true,
                         mention: Some("<@1>".into()),
                         format: Some(MessageFormat::Raw),
                     }],
