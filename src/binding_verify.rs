@@ -1202,6 +1202,54 @@ mod tests {
     }
 
     #[test]
+    fn drift_audit_ignores_manual_github_monitor_without_setup_route() {
+        let config = AppConfig {
+            monitors: MonitorConfig {
+                git: GitMonitorConfig {
+                    repos: vec![GitRepoMonitor {
+                        path: "/work/repo".to_string(),
+                        name: Some("repo".to_string()),
+                        github_repo: Some("owner/repo".to_string()),
+                        ..GitRepoMonitor::default()
+                    }],
+                },
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let audit = audit_route_monitor_drift(&config);
+
+        assert!(audit.ok);
+        assert!(audit.findings.is_empty());
+    }
+
+    #[test]
+    fn drift_audit_allows_branch_specific_manual_route_override() {
+        let mut manual_filter = BTreeMap::new();
+        manual_filter.insert("repo".to_string(), "clawhip".to_string());
+        manual_filter.insert("branch".to_string(), "main".to_string());
+        let config = config_with_routes(vec![
+            setup_route("clawhip", "123", Some("dev")),
+            RouteRule {
+                event: "git.push".to_string(),
+                filter: manual_filter,
+                channel: Some("456".to_string()),
+                ..RouteRule::default()
+            },
+        ]);
+
+        let audit = audit_route_monitor_drift(&config);
+
+        assert!(
+            !audit
+                .findings
+                .iter()
+                .any(|finding| finding.code == "manual_route_conflict")
+        );
+    }
+
+    #[test]
     fn drift_audit_redacts_checkout_label_and_json_shape() {
         let tempdir = tempfile::tempdir().unwrap();
         let checkout = tempdir.path().join("secret-checkout");
