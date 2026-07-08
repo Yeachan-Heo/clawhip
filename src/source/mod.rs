@@ -11,7 +11,9 @@ pub mod workspace;
 pub use git::GitSource;
 pub use github::GitHubSource;
 pub use tmux::{
-    RegisteredTmuxSession, SharedTmuxRegistry, TmuxSource, list_active_tmux_registrations,
+    RegisteredTmuxSession, SharedTmuxRegistry, TmuxSource, default_registry_state_path,
+    inspect_tmux_registry_state, list_active_tmux_registrations, load_tmux_registry_state,
+    register_runtime_tmux_registration, remove_tmux_registrations, tmux_registry_diagnostics,
 };
 pub use workspace::WorkspaceSource;
 

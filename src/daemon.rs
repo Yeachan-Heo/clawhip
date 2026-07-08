@@ -34,7 +34,9 @@ use crate::router::Router;
 use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
-    WorkspaceSource, list_active_tmux_registrations,
+    WorkspaceSource, default_registry_state_path, inspect_tmux_registry_state,
+    list_active_tmux_registrations, load_tmux_registry_state, register_runtime_tmux_registration,
+    remove_tmux_registrations, tmux_registry_diagnostics,
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
@@ -101,6 +103,8 @@ pub async fn run(
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let tmux_registry_state_path = default_registry_state_path(&cron_state_path);
+    load_tmux_registry_state(&tmux_registry_state_path, &tmux_registry).await;
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
     let native_observability = new_shared_native_hook_observability();
 
@@ -124,7 +128,11 @@ pub async fn run(
     spawn_source(GitSource::new(config.clone()), tx.clone());
     spawn_source(GitHubSource::new(config.clone()), tx.clone());
     spawn_source(
-        TmuxSource::new(config.clone(), tmux_registry.clone()),
+        TmuxSource::new(
+            config.clone(),
+            tmux_registry.clone(),
+            tmux_registry_state_path.clone(),
+        ),
         tx.clone(),
     );
     spawn_source(WorkspaceSource::new(config.clone()), tx.clone());
@@ -285,11 +293,15 @@ fn event_record(
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.tmux_registry.read().await.len();
     let native_hooks = snapshot_shared(&state.native_observability);
+    let registry_state =
+        inspect_tmux_registry_state(&default_registry_state_path(&state.cron_state_path)).await;
+    let tmux = tmux_registry_diagnostics(&state.tmux_registry, registry_state).await;
     Json(health_payload(
         state.config.as_ref(),
         state.port,
         registered,
         native_hooks,
+        json!(tmux),
     ))
 }
 
@@ -298,6 +310,7 @@ fn health_payload(
     port: u16,
     registered_tmux_sessions: usize,
     native_hooks: Value,
+    tmux: Value,
 ) -> Value {
     json!({
         "ok": true,
@@ -312,6 +325,7 @@ fn health_payload(
         "configured_workspace_monitors": config.monitors.workspace.len(),
         "configured_cron_jobs": config.cron.jobs.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
+        "tmux": tmux,
         "native_hooks": native_hooks,
     })
 }
@@ -908,10 +922,17 @@ async fn expire_terminal_tmux_registration(state: &AppState, event: &IncomingEve
         return;
     }
 
-    let mut registry = state.tmux_registry.write().await;
-    for session in candidates {
-        if registry.remove(&session).is_some() {
-            telemetry::emit(tmux_terminal_expiry_record(&session));
+    let registry_state_path = default_registry_state_path(&state.cron_state_path);
+    match remove_tmux_registrations(&state.tmux_registry, &registry_state_path, &candidates).await {
+        Ok(removed) => {
+            if removed > 0 {
+                for session in candidates {
+                    telemetry::emit(tmux_terminal_expiry_record(&session));
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("clawhip tmux registry expiry save failed: {error}");
         }
     }
 }
@@ -951,20 +972,36 @@ async fn register_tmux(
     State(state): State<AppState>,
     Json(registration): Json<RegisteredTmuxSession>,
 ) -> impl IntoResponse {
-    state
-        .tmux_registry
-        .write()
-        .await
-        .insert(registration.session.clone(), registration.clone());
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"ok": true, "session": registration.session})),
+    let session = registration.session.clone();
+    let registry_state_path = default_registry_state_path(&state.cron_state_path);
+    match register_runtime_tmux_registration(
+        &state.tmux_registry,
+        &registry_state_path,
+        registration,
     )
-        .into_response()
+    .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"ok": true, "session": session})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_tmux(State(state): State<AppState>) -> impl IntoResponse {
-    match list_active_tmux_registrations(state.config.as_ref(), &state.tmux_registry).await {
+    match list_active_tmux_registrations(
+        state.config.as_ref(),
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+    )
+    .await
+    {
         Ok(registrations) => (StatusCode::OK, Json(json!(registrations))).into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1636,6 +1673,7 @@ mod tests {
             .write()
             .await
             .insert("still-active".into(), tmux_registration("still-active"));
+        let dir = tempdir().expect("tempdir");
         let state = AppState {
             config: Arc::new(AppConfig::default()),
             port: 25294,
@@ -1643,7 +1681,7 @@ mod tests {
             tmux_registry: registry.clone(),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
-            cron_state_path: PathBuf::from("cron-state.json"),
+            cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
@@ -1732,6 +1770,7 @@ mod tests {
             25294,
             3,
             snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
         );
 
         assert_eq!(payload["ok"], Value::Bool(true));
@@ -2603,7 +2642,7 @@ mod tests {
                     pid: 4242,
                     name: Some("codex".into()),
                 }),
-                active_wrapper_monitor: true,
+                active_wrapper_monitor: false,
             },
         );
         let state = AppState {
