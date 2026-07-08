@@ -415,8 +415,10 @@ pub fn audit_route_monitor_drift(config: &AppConfig) -> BindingDriftAudit {
 
     for (index, route) in config.routes.iter().enumerate() {
         if !is_setup_repo_route(route)
+            && route.event == "*"
             && route.effective_sink() == "discord"
             && route.channel.is_some()
+            && route.filter.len() == 1
             && route.filter.contains_key("repo")
         {
             let repo = route.filter.get("repo").cloned().unwrap_or_default();
@@ -481,7 +483,7 @@ fn setup_repo_routes(config: &AppConfig) -> Vec<SetupRoute> {
 fn setup_git_monitors(config: &AppConfig) -> Vec<SetupMonitor> {
     let mut identity_counts: BTreeMap<String, usize> = BTreeMap::new();
     for monitor in &config.monitors.git.repos {
-        if let Some(repo) = monitor_repo_identity(monitor) {
+        if let Some(repo) = setup_monitor_repo_identity(monitor) {
             *identity_counts.entry(repo).or_default() += 1;
         }
     }
@@ -493,7 +495,7 @@ fn setup_git_monitors(config: &AppConfig) -> Vec<SetupMonitor> {
         .iter()
         .enumerate()
         .map(|(index, monitor)| {
-            let repo = monitor_repo_identity(monitor);
+            let repo = setup_monitor_repo_identity(monitor);
             let indices_len = repo
                 .as_ref()
                 .and_then(|repo| identity_counts.get(repo))
@@ -535,6 +537,22 @@ fn is_setup_repo_route(route: &crate::config::RouteRule) -> bool {
         && route.gajae.is_none()
         && !route.allow_dynamic_tokens
         && route.format.is_none()
+}
+
+fn setup_monitor_repo_identity(monitor: &crate::config::GitRepoMonitor) -> Option<String> {
+    if monitor
+        .channel
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        || monitor
+            .channel_name
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return None;
+    }
+
+    monitor_repo_identity(monitor)
 }
 
 fn monitor_repo_identity(monitor: &crate::config::GitRepoMonitor) -> Option<String> {
@@ -1115,6 +1133,24 @@ mod tests {
         assert_eq!(audit.findings[0].code, "missing_git_monitor");
         assert_eq!(audit.findings[0].repo, "clawhip");
         assert_eq!(audit.findings[0].route_channel_id.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn drift_audit_ignores_manual_git_monitor_without_route_binding() {
+        let config = AppConfig {
+            monitors: MonitorConfig {
+                git: GitMonitorConfig {
+                    repos: vec![git_monitor("/tmp", Some("manual"), None, None)],
+                },
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let audit = audit_route_monitor_drift(&config);
+
+        assert!(audit.ok);
+        assert!(audit.findings.is_empty());
     }
 
     #[test]

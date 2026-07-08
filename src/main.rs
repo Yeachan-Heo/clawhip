@@ -576,22 +576,19 @@ fn resolve_bind_checkout_path(
     explicit: &std::collections::HashMap<String, String>,
     bind_count: usize,
     config: &AppConfig,
-) -> Result<String> {
+) -> Result<Option<String>> {
     if let Some(path) = explicit.get(repo) {
-        return Ok(path.clone());
+        return Ok(Some(path.clone()));
     }
     if let Some(path) = existing_setup_monitor_checkout_path(config, repo)? {
-        return Ok(path);
+        return Ok(Some(path));
     }
     if bind_count == 1
         && let Some(path) = infer_cwd_checkout_path(repo)?
     {
-        return Ok(path);
+        return Ok(Some(path));
     }
-    Err(format!(
-        "bind {repo}: checkout path could not be resolved; pass --bind-checkout {repo}=PATH"
-    )
-    .into())
+    Ok(None)
 }
 
 fn existing_setup_monitor_checkout_path(config: &AppConfig, repo: &str) -> Result<Option<String>> {
@@ -706,15 +703,10 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
     }
 
     // Process --bind entries: resolve each channel against Discord and write a
-    // repo binding route plus setup-owned git monitor metadata.
+    // route binding. Git monitor onboarding is conditional: it is added or
+    // updated only when a checkout is explicit, already known, or safely inferred.
+    let mut monitored_bind_repos = std::collections::HashSet::new();
     if !binds.is_empty() {
-        let checkout_paths = binds
-            .iter()
-            .map(|(repo, _)| {
-                resolve_bind_checkout_path(repo, &checkout_map, binds.len(), &editable)
-                    .map(|path| (repo.clone(), path))
-            })
-            .collect::<Result<std::collections::HashMap<_, _>>>()?;
         let client = DiscordClient::from_config(Arc::new(editable.clone()))?;
 
         for (repo, channel_id) in &binds {
@@ -733,16 +725,24 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
                         }
                     }
 
-                    let checkout_path = checkout_paths.get(repo).ok_or_else(|| {
-                        format!("bind {repo}: internal checkout path resolution failed")
-                    })?;
+                    let checkout_path =
+                        resolve_bind_checkout_path(repo, &checkout_map, binds.len(), &editable)?;
                     println!("bind: {repo} -> {channel_id} (#{live_name})");
-                    editable.apply_repo_channel_binding(
-                        repo,
-                        channel_id,
-                        name.as_deref(),
-                        checkout_path,
-                    )?;
+                    if let Some(checkout_path) = checkout_path.as_deref() {
+                        editable.apply_repo_channel_binding(
+                            repo,
+                            channel_id,
+                            name.as_deref(),
+                            checkout_path,
+                        )?;
+                        monitored_bind_repos.insert(repo.as_str());
+                    } else {
+                        editable.apply_repo_channel_route_binding(
+                            repo,
+                            channel_id,
+                            name.as_deref(),
+                        )?;
+                    }
                 }
                 binding_verify::ChannelLookup::NotFound => {
                     return Err(
@@ -773,11 +773,8 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
     editable.validate()?;
 
     let drift_audit = binding_verify::audit_route_monitor_drift(&editable);
-    if !binds.is_empty() {
-        let bind_repos = binds
-            .iter()
-            .map(|(repo, _)| repo.as_str())
-            .collect::<std::collections::HashSet<_>>();
+    if !monitored_bind_repos.is_empty() {
+        let bind_repos = monitored_bind_repos;
         let affected_errors = drift_audit
             .findings
             .iter()
@@ -807,6 +804,16 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
     Ok(())
 }
 
+fn verify_bindings_json(
+    audit: &binding_verify::BindingAudit,
+    drift_audit: &binding_verify::BindingDriftAudit,
+) -> serde_json::Value {
+    serde_json::json!({
+        "verdicts": &audit.verdicts,
+        "drift_audit": drift_audit,
+    })
+}
+
 async fn run_verify_bindings(config: Arc<AppConfig>, args: VerifyBindingsArgs) -> Result<()> {
     let client = DiscordClient::from_config(config.clone())?;
     let audit = binding_verify::verify(&client, &config).await;
@@ -815,10 +822,7 @@ async fn run_verify_bindings(config: Arc<AppConfig>, args: VerifyBindingsArgs) -
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "channel_audit": audit,
-                "drift_audit": drift_audit,
-            }))?
+            serde_json::to_string_pretty(&verify_bindings_json(&audit, &drift_audit))?
         );
     } else {
         print!("{audit}");
@@ -921,8 +925,9 @@ fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> S
 mod tests {
     use super::{
         format_tmux_list, parse_bind_checkout_overrides, parse_bind_overrides,
-        parse_expect_name_overrides, validate_bind_checkout_repos,
+        parse_expect_name_overrides, validate_bind_checkout_repos, verify_bindings_json,
     };
+    use crate::binding_verify::{BindingAudit, BindingDriftAudit};
     use crate::events::RoutingMetadata;
     use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
 
@@ -1072,6 +1077,21 @@ mod tests {
         let checkout_map = parse_bind_checkout_overrides(&["clawhip=/work/clawhip".to_string()])
             .expect("valid checkout");
         validate_bind_checkout_repos(&checkout_map, &binds).expect("matching repo is valid");
+    }
+
+    #[test]
+    fn verify_bindings_json_preserves_top_level_verdicts() {
+        let audit = BindingAudit { verdicts: vec![] };
+        let drift = BindingDriftAudit {
+            ok: true,
+            findings: vec![],
+        };
+
+        let json = verify_bindings_json(&audit, &drift);
+
+        assert!(json.get("verdicts").is_some());
+        assert!(json.get("drift_audit").is_some());
+        assert!(json.get("channel_audit").is_none());
     }
 
     #[test]

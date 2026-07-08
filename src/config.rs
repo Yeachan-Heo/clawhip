@@ -1244,6 +1244,75 @@ impl AppConfig {
         }
     }
 
+    pub fn apply_repo_channel_route_binding(
+        &mut self,
+        repo: &str,
+        channel_id: &str,
+        channel_name: Option<&str>,
+    ) -> Result<()> {
+        let repo = normalize_text(Some(repo.to_string()))
+            .ok_or_else(|| "repo binding requires a non-empty repo name".to_string())?;
+        let channel_id = normalize_text(Some(channel_id.to_string()))
+            .ok_or_else(|| "repo binding requires a non-empty channel id".to_string())?;
+        let channel_name = channel_name.and_then(|value| normalize_text(Some(value.to_string())));
+
+        let route_matches = self
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| is_repo_binding_route(route, &repo))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if route_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned routes found for repo '{repo}'; clean up duplicates before updating binding"
+            )
+            .into());
+        }
+        if self.routes.iter().any(|route| {
+            !is_repo_binding_route(route, &repo)
+                && route.event == "*"
+                && route.effective_sink() == "discord"
+                && route.filter.len() == 1
+                && route.filter.get("repo").is_some_and(|value| value == &repo)
+        }) {
+            return Err(format!("manual_route_conflict for repo '{repo}'").into());
+        }
+
+        match route_matches.as_slice() {
+            [index] => {
+                let route = &mut self.routes[*index];
+                route.channel = Some(channel_id);
+                route.thread = None;
+                route.channel_name = channel_name;
+                route.webhook = None;
+            }
+            [] => {
+                let mut filter = BTreeMap::new();
+                filter.insert("repo".to_string(), repo);
+                self.routes.push(RouteRule {
+                    event: "*".to_string(),
+                    filter,
+                    sink: default_sink_name(),
+                    channel: Some(channel_id),
+                    thread: None,
+                    channel_name,
+                    webhook: None,
+                    slack_webhook: None,
+                    local_path: None,
+                    mention: None,
+                    allow_dynamic_tokens: false,
+                    format: None,
+                    template: None,
+                    gajae: None,
+                });
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(())
+    }
+
     pub fn apply_repo_channel_binding(
         &mut self,
         repo: &str,
@@ -2718,6 +2787,46 @@ name = "general"
         assert!(toml.contains("[discord_watch]"));
         assert!(toml.contains("pending_mentions_threshold = 7"));
         assert!(toml.contains("doctrine_template = \"Sweep <#{channel_id}>\""));
+    }
+
+    #[test]
+    fn repo_channel_route_binding_keeps_legacy_bind_route_only() {
+        let mut config = AppConfig::default();
+
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].channel.as_deref(), Some("123"));
+        assert_eq!(config.routes[0].channel_name.as_deref(), Some("dev"));
+        assert!(config.monitors.git.repos.is_empty());
+    }
+
+    #[test]
+    fn repo_channel_binding_allows_branch_specific_manual_route() {
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), "owner/repo".to_string());
+        filter.insert("branch".to_string(), "main".to_string());
+        let mut config = AppConfig {
+            routes: vec![RouteRule {
+                event: "git.push".into(),
+                filter,
+                channel: Some("manual".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 2);
+        assert!(config.monitors.git.repos.is_empty());
     }
 
     #[test]
