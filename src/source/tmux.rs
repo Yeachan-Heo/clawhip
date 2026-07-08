@@ -469,10 +469,11 @@ pub async fn register_runtime_tmux_registration(
 ) -> Result<usize> {
     registration.registration_source =
         normalize_runtime_registration_source(registration.registration_source);
-    let mut next = registry.read().await.clone();
+    let mut write = registry.write().await;
+    let mut next = write.clone();
     next.insert(registration.session.clone(), registration);
     let durable_count = save_durable_tmux_registry(path, &next).await?;
-    *registry.write().await = next;
+    *write = next;
     Ok(durable_count)
 }
 
@@ -481,7 +482,8 @@ pub async fn remove_tmux_registrations(
     path: &Path,
     sessions: &[String],
 ) -> Result<usize> {
-    let mut next = registry.read().await.clone();
+    let mut write = registry.write().await;
+    let mut next = write.clone();
     let mut removed = 0;
     for session in sessions {
         if next.remove(session).is_some() {
@@ -490,7 +492,7 @@ pub async fn remove_tmux_registrations(
     }
     if removed > 0 {
         save_durable_tmux_registry(path, &next).await?;
-        *registry.write().await = next;
+        *write = next;
     }
     Ok(removed)
 }
@@ -1657,6 +1659,36 @@ PR created #7",
             RegistrationSource::CliWatch
         );
         assert!(!loaded.contains_key("config"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_runtime_registrations_preserve_all_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux-watch-registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut first = registration(vec!["panic"]);
+        first.session = "runtime-a".into();
+        first.registration_source = RegistrationSource::CliWatch;
+        let mut second = registration(vec!["warn"]);
+        second.session = "runtime-b".into();
+        second.registration_source = RegistrationSource::CliNew;
+
+        let first_register = register_runtime_tmux_registration(&registry, &path, first);
+        let second_register = register_runtime_tmux_registration(&registry, &path, second);
+        let (first_count, second_count) = tokio::join!(first_register, second_register);
+        first_count.unwrap();
+        second_count.unwrap();
+
+        let snapshot = registry.read().await;
+        assert!(snapshot.contains_key("runtime-a"));
+        assert!(snapshot.contains_key("runtime-b"));
+        drop(snapshot);
+
+        let loaded: BTreeMap<String, RegisteredTmuxSession> =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert!(loaded.contains_key("runtime-a"));
+        assert!(loaded.contains_key("runtime-b"));
     }
 
     #[tokio::test]
