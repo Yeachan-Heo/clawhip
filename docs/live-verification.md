@@ -105,6 +105,15 @@ Operational flow:
 6. Inspect `clawhip tmux list` to confirm exactly which watch registrations exist.
 7. If alert text disagrees with pane reality, treat it as monitor noise and debug registration overlap / stale math before assuming session failure.
 
+Restart persistence smoke:
+
+1. Start the daemon and register a runtime watch with `clawhip tmux watch <session> --keyword <word>` or the wrapper path.
+2. Confirm `clawhip tmux list` shows the session and `tmux-watch-registry.json` exists beside the cron state file.
+3. Restart the daemon without killing the tmux session.
+4. Confirm `clawhip tmux list` still shows the watch and `/health` includes `tmux.registry_state.status` as `loaded` with a nonzero durable runtime count.
+5. Emit the watched keyword in the tmux pane and confirm routed Discord delivery.
+6. Kill the tmux session or send a terminal session event, then confirm the watch disappears and the registry file no longer rehydrates it after another restart.
+
 ## Helper script
 
 A helper script is included:

@@ -276,7 +276,12 @@ async fn real_main(cli: Cli) -> Result<()> {
             TmuxCommands::List => {
                 let client = DaemonClient::from_config(config.as_ref());
                 let registrations = client.list_tmux().await?;
-                render_tmux_list(&registrations);
+                let health = if registrations.is_empty() {
+                    client.health().await.ok()
+                } else {
+                    None
+                };
+                render_tmux_list(&registrations, health.as_ref());
                 Ok(())
             }
         },
@@ -667,13 +672,25 @@ fn run_explain(config: &AppConfig, args: ExplainArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
-    print!("{}", format_tmux_list(registrations));
+fn render_tmux_list(
+    registrations: &[crate::source::RegisteredTmuxSession],
+    health: Option<&serde_json::Value>,
+) {
+    print!("{}", format_tmux_list_with_health(registrations, health));
 }
 
+#[cfg(test)]
 fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> String {
+    format_tmux_list_with_health(registrations, None)
+}
+
+fn format_tmux_list_with_health(
+    registrations: &[crate::source::RegisteredTmuxSession],
+    health: Option<&serde_json::Value>,
+) -> String {
     if registrations.is_empty() {
-        return "No active tmux watches found\n".to_string();
+        let detail = tmux_empty_list_detail(health);
+        return format!("No active tmux watches found{detail}\n");
     }
 
     let mut output =
@@ -708,6 +725,42 @@ fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> S
     }
 
     output
+}
+
+fn tmux_empty_list_detail(health: Option<&serde_json::Value>) -> String {
+    let Some(tmux) = health.and_then(|health| health.get("tmux")) else {
+        return String::new();
+    };
+    let registry_state = tmux.get("registry_state");
+    if registry_state
+        .and_then(|state| state.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("ignored-invalid")
+    {
+        let path = registry_state
+            .and_then(|state| state.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("tmux-watch-registry.json");
+        return format!("; ignored invalid registry state at {path}");
+    }
+    if let Some(error) = tmux
+        .get("live_probe")
+        .and_then(|probe| probe.get("error"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return format!("; live tmux probe failed: {error}");
+    }
+    let live_count = tmux
+        .get("live_probe")
+        .and_then(|probe| probe.get("count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if live_count > 0 {
+        return format!(
+            "; {live_count} live tmux session(s) exist but no clawhip watch routes are registered"
+        );
+    }
+    String::new()
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,40 @@ use crate::source::Source;
 use crate::telemetry;
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmuxRegistryDiagnostics {
+    pub registered_count: usize,
+    pub durable_runtime_count: usize,
+    pub config_projected_count: usize,
+    pub live_probe: TmuxLiveProbeDiagnostics,
+    pub registry_state: TmuxRegistryStateDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmuxLiveProbeDiagnostics {
+    pub ok: bool,
+    pub count: usize,
+    pub sample: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmuxRegistryStateDiagnostics {
+    pub path: PathBuf,
+    pub status: TmuxRegistryStateStatus,
+    pub loaded: usize,
+    pub ignored: usize,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TmuxRegistryStateStatus {
+    Missing,
+    Loaded,
+    IgnoredInvalid,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -93,11 +128,20 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
 pub struct TmuxSource {
     config: Arc<AppConfig>,
     registry: SharedTmuxRegistry,
+    registry_state_path: PathBuf,
 }
 
 impl TmuxSource {
-    pub fn new(config: Arc<AppConfig>, registry: SharedTmuxRegistry) -> Self {
-        Self { config, registry }
+    pub fn new(
+        config: Arc<AppConfig>,
+        registry: SharedTmuxRegistry,
+        registry_state_path: PathBuf,
+    ) -> Self {
+        Self {
+            config,
+            registry,
+            registry_state_path,
+        }
     }
 }
 
@@ -120,7 +164,14 @@ impl Source for TmuxSource {
                 .await;
                 continue;
             }
-            poll_tmux(self.config.as_ref(), &self.registry, &tx, &mut state).await?;
+            poll_tmux(
+                self.config.as_ref(),
+                &self.registry,
+                &self.registry_state_path,
+                &tx,
+                &mut state,
+            )
+            .await?;
             sleep(Duration::from_secs(
                 self.config.monitors.poll_interval_secs.max(1),
             ))
@@ -281,13 +332,227 @@ pub async fn monitor_registered_session(
     Ok(())
 }
 
+pub fn default_registry_state_path(cron_state_path: &Path) -> PathBuf {
+    cron_state_path.with_file_name("tmux-watch-registry.json")
+}
+
+pub fn normalize_runtime_registration_source(source: RegistrationSource) -> RegistrationSource {
+    match source {
+        RegistrationSource::ConfigMonitor => RegistrationSource::CliWatch,
+        RegistrationSource::CliWatch | RegistrationSource::CliNew => source,
+    }
+}
+
+fn durable_runtime_entries(
+    registry: &HashMap<String, RegisteredTmuxSession>,
+) -> BTreeMap<String, RegisteredTmuxSession> {
+    registry
+        .iter()
+        .filter(|(_, registration)| {
+            registration.registration_source != RegistrationSource::ConfigMonitor
+        })
+        .map(|(session, registration)| (session.clone(), registration.clone()))
+        .collect()
+}
+
+async fn save_durable_tmux_registry(
+    path: &Path,
+    registry: &HashMap<String, RegisteredTmuxSession>,
+) -> Result<usize> {
+    let durable = durable_runtime_entries(registry);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let content = serde_json::to_vec_pretty(&durable)?;
+    let tmp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp_path, content).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(durable.len())
+}
+
+pub async fn load_tmux_registry_state(
+    path: &Path,
+    registry: &SharedTmuxRegistry,
+) -> TmuxRegistryStateDiagnostics {
+    match tokio::fs::read(path).await {
+        Ok(content) => {
+            match serde_json::from_slice::<BTreeMap<String, RegisteredTmuxSession>>(&content) {
+                Ok(loaded) => {
+                    let mut write = registry.write().await;
+                    for (session, mut registration) in loaded {
+                        registration.registration_source =
+                            normalize_runtime_registration_source(registration.registration_source);
+                        write.insert(session, registration);
+                    }
+                    TmuxRegistryStateDiagnostics {
+                        path: path.to_path_buf(),
+                        status: TmuxRegistryStateStatus::Loaded,
+                        loaded: durable_runtime_entries(&write).len(),
+                        ignored: 0,
+                        last_error: None,
+                    }
+                }
+                Err(error) => TmuxRegistryStateDiagnostics {
+                    path: path.to_path_buf(),
+                    status: TmuxRegistryStateStatus::IgnoredInvalid,
+                    loaded: 0,
+                    ignored: 1,
+                    last_error: Some(error.to_string()),
+                },
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            TmuxRegistryStateDiagnostics {
+                path: path.to_path_buf(),
+                status: TmuxRegistryStateStatus::Missing,
+                loaded: 0,
+                ignored: 0,
+                last_error: None,
+            }
+        }
+        Err(error) => TmuxRegistryStateDiagnostics {
+            path: path.to_path_buf(),
+            status: TmuxRegistryStateStatus::IgnoredInvalid,
+            loaded: 0,
+            ignored: 1,
+            last_error: Some(error.to_string()),
+        },
+    }
+}
+
+pub async fn inspect_tmux_registry_state(path: &Path) -> TmuxRegistryStateDiagnostics {
+    match tokio::fs::read(path).await {
+        Ok(content) => {
+            match serde_json::from_slice::<BTreeMap<String, RegisteredTmuxSession>>(&content) {
+                Ok(loaded) => TmuxRegistryStateDiagnostics {
+                    path: path.to_path_buf(),
+                    status: TmuxRegistryStateStatus::Loaded,
+                    loaded: loaded.len(),
+                    ignored: 0,
+                    last_error: None,
+                },
+                Err(error) => TmuxRegistryStateDiagnostics {
+                    path: path.to_path_buf(),
+                    status: TmuxRegistryStateStatus::IgnoredInvalid,
+                    loaded: 0,
+                    ignored: 1,
+                    last_error: Some(error.to_string()),
+                },
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            TmuxRegistryStateDiagnostics {
+                path: path.to_path_buf(),
+                status: TmuxRegistryStateStatus::Missing,
+                loaded: 0,
+                ignored: 0,
+                last_error: None,
+            }
+        }
+        Err(error) => TmuxRegistryStateDiagnostics {
+            path: path.to_path_buf(),
+            status: TmuxRegistryStateStatus::IgnoredInvalid,
+            loaded: 0,
+            ignored: 1,
+            last_error: Some(error.to_string()),
+        },
+    }
+}
+
+pub async fn register_runtime_tmux_registration(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    mut registration: RegisteredTmuxSession,
+) -> Result<usize> {
+    registration.registration_source =
+        normalize_runtime_registration_source(registration.registration_source);
+    let mut write = registry.write().await;
+    let mut next = write.clone();
+    next.insert(registration.session.clone(), registration);
+    let durable_count = save_durable_tmux_registry(path, &next).await?;
+    *write = next;
+    Ok(durable_count)
+}
+
+pub async fn remove_tmux_registrations(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    sessions: &[String],
+) -> Result<usize> {
+    let mut write = registry.write().await;
+    let mut next = write.clone();
+    let mut removed = 0;
+    for session in sessions {
+        if next.remove(session).is_some() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        save_durable_tmux_registry(path, &next).await?;
+        *write = next;
+    }
+    Ok(removed)
+}
+
+pub async fn tmux_registry_diagnostics(
+    registry: &SharedTmuxRegistry,
+    registry_state: TmuxRegistryStateDiagnostics,
+) -> TmuxRegistryDiagnostics {
+    let snapshot = registry.read().await;
+    let registered_count = snapshot.len();
+    let durable_runtime_count = durable_runtime_entries(&snapshot).len();
+    let config_projected_count = registered_count.saturating_sub(durable_runtime_count);
+    drop(snapshot);
+
+    let live_probe = match list_tmux_sessions().await {
+        Ok(sessions) => {
+            let mut sample = sessions.iter().take(5).cloned().collect::<Vec<_>>();
+            sample.sort();
+            TmuxLiveProbeDiagnostics {
+                ok: true,
+                count: sessions.len(),
+                sample,
+                error: None,
+            }
+        }
+        Err(error) => TmuxLiveProbeDiagnostics {
+            ok: false,
+            count: 0,
+            sample: Vec::new(),
+            error: Some(error.to_string()),
+        },
+    };
+
+    TmuxRegistryDiagnostics {
+        registered_count,
+        durable_runtime_count,
+        config_projected_count,
+        live_probe,
+        registry_state,
+    }
+}
+
 pub async fn list_active_tmux_registrations(
     config: &AppConfig,
     registry: &SharedTmuxRegistry,
+    registry_state_path: &Path,
 ) -> Result<Vec<RegisteredTmuxSession>> {
     match list_tmux_sessions().await {
         Ok(available_sessions) => {
             sync_active_config_registrations(config, registry, &available_sessions).await;
+            let stale_sessions = registry
+                .read()
+                .await
+                .iter()
+                .filter(|(session, registration)| {
+                    registration.active_wrapper_monitor && !available_sessions.contains(*session)
+                })
+                .map(|(session, _)| session.clone())
+                .collect::<Vec<_>>();
+            remove_tmux_registrations(registry, registry_state_path, &stale_sessions).await?;
         }
         Err(error) => {
             telemetry::emit(source_record(
@@ -307,6 +572,7 @@ pub async fn list_active_tmux_registrations(
 async fn poll_tmux(
     config: &AppConfig,
     registry: &SharedTmuxRegistry,
+    registry_state_path: &Path,
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut TmuxMonitorState,
 ) -> Result<()> {
@@ -344,11 +610,6 @@ async fn poll_tmux(
     let mut sessions_to_unregister = Vec::new();
 
     for (session_name, registration) in &sessions {
-        if registration.active_wrapper_monitor {
-            state.pending_keyword_hits.remove(session_name);
-            continue;
-        }
-
         let now = Instant::now();
 
         match session_exists(session_name).await {
@@ -378,6 +639,11 @@ async fn poll_tmux(
                 continue;
             }
             Ok(true) => {}
+        }
+
+        if registration.active_wrapper_monitor {
+            state.pending_keyword_hits.remove(session_name);
+            continue;
         }
 
         flush_session_pending_keyword_hits(
@@ -493,10 +759,7 @@ async fn poll_tmux(
     state.panes.retain(|key, _| active_panes.contains(key));
 
     if !sessions_to_unregister.is_empty() {
-        let mut write = registry.write().await;
-        for session in sessions_to_unregister {
-            write.remove(&session);
-        }
+        remove_tmux_registrations(registry, registry_state_path, &sessions_to_unregister).await?;
     }
 
     state
@@ -1359,6 +1622,108 @@ PR created #7",
         ));
         assert!(registration.parent_process.is_none());
         assert!(!registration.registered_at.is_empty());
+    }
+
+    #[test]
+    fn default_registry_state_path_sits_beside_cron_state() {
+        let path = default_registry_state_path(Path::new("/tmp/clawhip/cron-state.json"));
+        assert_eq!(path, PathBuf::from("/tmp/clawhip/tmux-watch-registry.json"));
+    }
+
+    #[tokio::test]
+    async fn runtime_registry_persistence_filters_config_entries_and_normalizes_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux-watch-registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut runtime = registration(vec!["panic"]);
+        runtime.session = "runtime".into();
+        runtime.registration_source = RegistrationSource::ConfigMonitor;
+        register_runtime_tmux_registration(&registry, &path, runtime)
+            .await
+            .unwrap();
+
+        let mut config = registration(vec!["warn"]);
+        config.session = "config".into();
+        config.registration_source = RegistrationSource::ConfigMonitor;
+        registry.write().await.insert("config".into(), config);
+
+        let snapshot = registry.read().await.clone();
+        save_durable_tmux_registry(&path, &snapshot).await.unwrap();
+        let loaded: BTreeMap<String, RegisteredTmuxSession> =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded["runtime"].registration_source,
+            RegistrationSource::CliWatch
+        );
+        assert!(!loaded.contains_key("config"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_runtime_registrations_preserve_all_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux-watch-registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut first = registration(vec!["panic"]);
+        first.session = "runtime-a".into();
+        first.registration_source = RegistrationSource::CliWatch;
+        let mut second = registration(vec!["warn"]);
+        second.session = "runtime-b".into();
+        second.registration_source = RegistrationSource::CliNew;
+
+        let first_register = register_runtime_tmux_registration(&registry, &path, first);
+        let second_register = register_runtime_tmux_registration(&registry, &path, second);
+        let (first_count, second_count) = tokio::join!(first_register, second_register);
+        first_count.unwrap();
+        second_count.unwrap();
+
+        let snapshot = registry.read().await;
+        assert!(snapshot.contains_key("runtime-a"));
+        assert!(snapshot.contains_key("runtime-b"));
+        drop(snapshot);
+
+        let loaded: BTreeMap<String, RegisteredTmuxSession> =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert!(loaded.contains_key("runtime-a"));
+        assert!(loaded.contains_key("runtime-b"));
+    }
+
+    #[tokio::test]
+    async fn failed_register_save_leaves_registry_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("missing-parent")
+            .join("tmux-watch-registry.json");
+        tokio::fs::write(dir.path().join("missing-parent"), b"not a directory")
+            .await
+            .unwrap();
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut runtime = registration(vec!["panic"]);
+        runtime.session = "runtime".into();
+        runtime.registration_source = RegistrationSource::CliWatch;
+
+        let result = register_runtime_tmux_registration(&registry, &path, runtime).await;
+
+        assert!(result.is_err());
+        assert!(registry.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_registry_state_is_ignored_fail_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux-watch-registry.json");
+        tokio::fs::write(&path, b"not json").await.unwrap();
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let diagnostics = load_tmux_registry_state(&path, &registry).await;
+
+        assert_eq!(diagnostics.status, TmuxRegistryStateStatus::IgnoredInvalid);
+        assert_eq!(diagnostics.ignored, 1);
+        assert!(registry.read().await.is_empty());
     }
 
     #[tokio::test]
