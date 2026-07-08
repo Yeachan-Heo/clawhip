@@ -251,19 +251,16 @@ pub fn audit_route_monitor_drift(config: &AppConfig) -> BindingDriftAudit {
 
     for route in &routes {
         if route.indices.len() > 1 {
-            findings.push(finding(
-                "error",
-                "duplicate_setup_route",
-                &route.repo,
-                route.indices.clone(),
-                Vec::new(),
-                route.channel.clone(),
-                None,
-                route.channel_name.clone(),
-                None,
-                None,
-                format!("repo '{}' has multiple setup-owned routes", route.repo),
-            ));
+            findings.push(finding(FindingParams {
+                severity: "error",
+                code: "duplicate_setup_route",
+                repo: &route.repo,
+                route_indices: route.indices.clone(),
+                route_channel_id: route.channel.clone(),
+                route_channel_name: route.channel_name.clone(),
+                message: format!("repo '{}' has multiple setup-owned routes", route.repo),
+                ..FindingParams::default()
+            }));
         }
 
         let matching: Vec<&SetupMonitor> = monitors
@@ -271,154 +268,148 @@ pub fn audit_route_monitor_drift(config: &AppConfig) -> BindingDriftAudit {
             .filter(|monitor| monitor.repo.as_deref() == Some(route.repo.as_str()))
             .collect();
         if matching.is_empty() {
-            findings.push(finding(
-                "error",
-                "missing_git_monitor",
-                &route.repo,
-                route.indices.clone(),
-                Vec::new(),
-                route.channel.clone(),
-                None,
-                route.channel_name.clone(),
-                None,
-                None,
-                format!(
+            findings.push(finding(FindingParams {
+                severity: "error",
+                code: "missing_git_monitor",
+                repo: &route.repo,
+                route_indices: route.indices.clone(),
+                route_channel_id: route.channel.clone(),
+                route_channel_name: route.channel_name.clone(),
+                message: format!(
                     "repo '{}' has a setup-owned route but no setup-owned git monitor",
                     route.repo
                 ),
-            ));
+                ..FindingParams::default()
+            }));
         }
 
         for monitor in matching {
             if route.channel.as_deref() != monitor.channel.as_deref() {
-                findings.push(finding(
-                    "error",
-                    "channel_mismatch",
-                    &route.repo,
-                    route.indices.clone(),
-                    vec![monitor.index],
-                    route.channel.clone(),
-                    monitor.channel.clone(),
-                    route.channel_name.clone(),
-                    monitor.channel_name.clone(),
-                    Some(checkout_label(&monitor.path)),
-                    format!(
+                findings.push(finding(FindingParams {
+                    severity: "error",
+                    code: "channel_mismatch",
+                    repo: &route.repo,
+                    route_indices: route.indices.clone(),
+                    monitor_indices: vec![monitor.index],
+                    route_channel_id: route.channel.clone(),
+                    monitor_channel_id: monitor.channel.clone(),
+                    route_channel_name: route.channel_name.clone(),
+                    monitor_channel_name: monitor.channel_name.clone(),
+                    checkout_label: Some(checkout_label(&monitor.path)),
+                    message: format!(
                         "repo '{}' route and git monitor target different channels",
                         route.repo
                     ),
-                ));
+                }));
             }
             if route.channel_name != monitor.channel_name {
-                findings.push(finding(
-                    "error",
-                    "channel_name_mismatch",
-                    &route.repo,
-                    route.indices.clone(),
-                    vec![monitor.index],
-                    route.channel.clone(),
-                    monitor.channel.clone(),
-                    route.channel_name.clone(),
-                    monitor.channel_name.clone(),
-                    Some(checkout_label(&monitor.path)),
-                    format!(
+                findings.push(finding(FindingParams {
+                    severity: "error",
+                    code: "channel_name_mismatch",
+                    repo: &route.repo,
+                    route_indices: route.indices.clone(),
+                    monitor_indices: vec![monitor.index],
+                    route_channel_id: route.channel.clone(),
+                    monitor_channel_id: monitor.channel.clone(),
+                    route_channel_name: route.channel_name.clone(),
+                    monitor_channel_name: monitor.channel_name.clone(),
+                    checkout_label: Some(checkout_label(&monitor.path)),
+                    message: format!(
                         "repo '{}' route and git monitor have different channel_name hints",
                         route.repo
                     ),
-                ));
+                }));
             }
             if !Path::new(&monitor.path).exists() {
-                findings.push(finding(
-                    "error",
-                    "checkout_missing",
-                    &route.repo,
-                    route.indices.clone(),
-                    vec![monitor.index],
-                    route.channel.clone(),
-                    monitor.channel.clone(),
-                    route.channel_name.clone(),
-                    monitor.channel_name.clone(),
-                    Some(checkout_label(&monitor.path)),
-                    format!("repo '{}' git monitor checkout is missing", route.repo),
-                ));
+                findings.push(finding(FindingParams {
+                    severity: "error",
+                    code: "checkout_missing",
+                    repo: &route.repo,
+                    route_indices: route.indices.clone(),
+                    monitor_indices: vec![monitor.index],
+                    route_channel_id: route.channel.clone(),
+                    monitor_channel_id: monitor.channel.clone(),
+                    route_channel_name: route.channel_name.clone(),
+                    monitor_channel_name: monitor.channel_name.clone(),
+                    checkout_label: Some(checkout_label(&monitor.path)),
+                    message: format!("repo '{}' git monitor checkout is missing", route.repo),
+                }));
             } else if !looks_like_git_worktree(&monitor.path) {
-                findings.push(finding(
-                    "error",
-                    "checkout_not_git_worktree",
-                    &route.repo,
-                    route.indices.clone(),
-                    vec![monitor.index],
-                    route.channel.clone(),
-                    monitor.channel.clone(),
-                    route.channel_name.clone(),
-                    monitor.channel_name.clone(),
-                    Some(checkout_label(&monitor.path)),
-                    format!(
+                findings.push(finding(FindingParams {
+                    severity: "error",
+                    code: "checkout_not_git_worktree",
+                    repo: &route.repo,
+                    route_indices: route.indices.clone(),
+                    monitor_indices: vec![monitor.index],
+                    route_channel_id: route.channel.clone(),
+                    monitor_channel_id: monitor.channel.clone(),
+                    route_channel_name: route.channel_name.clone(),
+                    monitor_channel_name: monitor.channel_name.clone(),
+                    checkout_label: Some(checkout_label(&monitor.path)),
+                    message: format!(
                         "repo '{}' git monitor checkout is not a git worktree",
                         route.repo
                     ),
-                ));
+                }));
             }
         }
 
         for monitor in monitors.iter().filter(|monitor| monitor.repo.is_none()) {
             if route.channel.is_some() && route.channel == monitor.channel {
-                findings.push(finding(
-                    "error",
-                    "manual_monitor_conflict",
-                    &route.repo,
-                    route.indices.clone(),
-                    vec![monitor.index],
-                    route.channel.clone(),
-                    monitor.channel.clone(),
-                    route.channel_name.clone(),
-                    monitor.channel_name.clone(),
-                    Some(checkout_label(&monitor.path)),
-                    format!(
+                findings.push(finding(FindingParams {
+                    severity: "error",
+                    code: "manual_monitor_conflict",
+                    repo: &route.repo,
+                    route_indices: route.indices.clone(),
+                    monitor_indices: vec![monitor.index],
+                    route_channel_id: route.channel.clone(),
+                    monitor_channel_id: monitor.channel.clone(),
+                    route_channel_name: route.channel_name.clone(),
+                    monitor_channel_name: monitor.channel_name.clone(),
+                    checkout_label: Some(checkout_label(&monitor.path)),
+                    message: format!(
                         "repo '{}' route shares a channel with a manual channel-only git monitor",
                         route.repo
                     ),
-                ));
+                }));
             }
         }
     }
 
     for monitor in &monitors {
         if monitor.indices_len > 1 {
-            findings.push(finding(
-                "error",
-                "duplicate_setup_monitor",
-                monitor.repo.as_deref().unwrap_or("<manual>"),
-                Vec::new(),
-                vec![monitor.index],
-                None,
-                monitor.channel.clone(),
-                None,
-                monitor.channel_name.clone(),
-                Some(checkout_label(&monitor.path)),
-                "multiple setup-owned git monitors share the same repo identity".to_string(),
-            ));
+            findings.push(finding(FindingParams {
+                severity: "error",
+                code: "duplicate_setup_monitor",
+                repo: monitor.repo.as_deref().unwrap_or("<manual>"),
+                monitor_indices: vec![monitor.index],
+                monitor_channel_id: monitor.channel.clone(),
+                monitor_channel_name: monitor.channel_name.clone(),
+                checkout_label: Some(checkout_label(&monitor.path)),
+                message: "multiple setup-owned git monitors share the same repo identity"
+                    .to_string(),
+                ..FindingParams::default()
+            }));
         }
     }
 
     for monitor in monitors.iter().filter(|monitor| monitor.repo.is_some()) {
         let repo = monitor.repo.as_ref().unwrap();
         if !routes.iter().any(|route| route.repo == *repo) {
-            findings.push(finding(
-                "error",
-                "repo_identity_mismatch",
+            findings.push(finding(FindingParams {
+                severity: "error",
+                code: "repo_identity_mismatch",
                 repo,
-                Vec::new(),
-                vec![monitor.index],
-                None,
-                monitor.channel.clone(),
-                None,
-                monitor.channel_name.clone(),
-                Some(checkout_label(&monitor.path)),
-                format!(
+                monitor_indices: vec![monitor.index],
+                monitor_channel_id: monitor.channel.clone(),
+                monitor_channel_name: monitor.channel_name.clone(),
+                checkout_label: Some(checkout_label(&monitor.path)),
+                message: format!(
                     "git monitor repo '{}' has no matching setup-owned route",
                     repo
                 ),
-            ));
+                ..FindingParams::default()
+            }));
         }
     }
 
@@ -426,23 +417,20 @@ pub fn audit_route_monitor_drift(config: &AppConfig) -> BindingDriftAudit {
         if !is_setup_repo_route(route)
             && route.effective_sink() == "discord"
             && route.channel.is_some()
-            && route.filter.get("repo").is_some()
+            && route.filter.contains_key("repo")
         {
             let repo = route.filter.get("repo").cloned().unwrap_or_default();
             if routes.iter().any(|setup| setup.repo == repo) {
-                findings.push(finding(
-                    "error",
-                    "manual_route_conflict",
-                    &repo,
-                    vec![index],
-                    Vec::new(),
-                    route.channel.clone(),
-                    None,
-                    route.channel_name.clone(),
-                    None,
-                    None,
-                    format!("repo '{}' has a manual wildcard Discord route", repo),
-                ));
+                findings.push(finding(FindingParams {
+                    severity: "error",
+                    code: "manual_route_conflict",
+                    repo: &repo,
+                    route_indices: vec![index],
+                    route_channel_id: route.channel.clone(),
+                    route_channel_name: route.channel_name.clone(),
+                    message: format!("repo '{}' has a manual wildcard Discord route", repo),
+                    ..FindingParams::default()
+                }));
             }
         }
     }
@@ -597,10 +585,11 @@ fn stable_hash32(value: &str) -> u32 {
     hash
 }
 
-fn finding(
-    severity: &str,
-    code: &str,
-    repo: &str,
+#[derive(Default)]
+struct FindingParams<'a> {
+    severity: &'a str,
+    code: &'a str,
+    repo: &'a str,
     route_indices: Vec<usize>,
     monitor_indices: Vec<usize>,
     route_channel_id: Option<String>,
@@ -609,19 +598,21 @@ fn finding(
     monitor_channel_name: Option<String>,
     checkout_label: Option<String>,
     message: String,
-) -> BindingDriftFinding {
+}
+
+fn finding(params: FindingParams<'_>) -> BindingDriftFinding {
     BindingDriftFinding {
-        severity: severity.to_string(),
-        code: code.to_string(),
-        repo: repo.to_string(),
-        route_indices,
-        monitor_indices,
-        route_channel_id,
-        monitor_channel_id,
-        route_channel_name,
-        monitor_channel_name,
-        checkout_label,
-        message,
+        severity: params.severity.to_string(),
+        code: params.code.to_string(),
+        repo: params.repo.to_string(),
+        route_indices: params.route_indices,
+        monitor_indices: params.monitor_indices,
+        route_channel_id: params.route_channel_id,
+        monitor_channel_id: params.monitor_channel_id,
+        route_channel_name: params.route_channel_name,
+        monitor_channel_name: params.monitor_channel_name,
+        checkout_label: params.checkout_label,
+        message: params.message,
     }
 }
 

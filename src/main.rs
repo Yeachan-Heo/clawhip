@@ -583,10 +583,10 @@ fn resolve_bind_checkout_path(
     if let Some(path) = existing_setup_monitor_checkout_path(config, repo)? {
         return Ok(path);
     }
-    if bind_count == 1 {
-        if let Some(path) = infer_cwd_checkout_path(repo)? {
-            return Ok(path);
-        }
+    if bind_count == 1
+        && let Some(path) = infer_cwd_checkout_path(repo)?
+    {
+        return Ok(path);
     }
     Err(format!(
         "bind {repo}: checkout path could not be resolved; pass --bind-checkout {repo}=PATH"

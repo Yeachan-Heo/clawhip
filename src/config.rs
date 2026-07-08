@@ -1657,10 +1657,9 @@ fn is_setup_owned_git_monitor(
 ) -> bool {
     if let (Some(monitor_name), Some(channel_name)) =
         (monitor.channel_name.as_deref(), channel_name)
+        && names_match(monitor_name, channel_name)
     {
-        if names_match(monitor_name, channel_name) {
-            return true;
-        }
+        return true;
     }
 
     if let (Some((route_channel, route_name)), Some(monitor_channel), Some(monitor_name)) = (
