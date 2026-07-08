@@ -4,7 +4,9 @@
 //! Discord API to confirm each channel exists and (optionally) that the live
 //! name matches the operator's `channel_name` hint.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -218,6 +220,411 @@ impl BindingAudit {
     }
 }
 
+/// Aggregate route↔git-monitor drift result for setup-owned repo bindings.
+#[derive(Debug, Clone, Serialize)]
+pub struct BindingDriftAudit {
+    pub ok: bool,
+    pub findings: Vec<BindingDriftFinding>,
+}
+
+/// A public-safe route↔git-monitor drift finding.
+#[derive(Debug, Clone, Serialize)]
+pub struct BindingDriftFinding {
+    pub severity: String,
+    pub code: String,
+    pub repo: String,
+    pub route_indices: Vec<usize>,
+    pub monitor_indices: Vec<usize>,
+    pub route_channel_id: Option<String>,
+    pub monitor_channel_id: Option<String>,
+    pub route_channel_name: Option<String>,
+    pub monitor_channel_name: Option<String>,
+    pub checkout_label: Option<String>,
+    pub message: String,
+}
+
+/// Audit setup-owned repo routes and git monitors for local config drift.
+pub fn audit_route_monitor_drift(config: &AppConfig) -> BindingDriftAudit {
+    let mut findings = Vec::new();
+    let routes = setup_repo_routes(config);
+    let monitors = setup_git_monitors(config);
+
+    for route in &routes {
+        if route.indices.len() > 1 {
+            findings.push(finding(
+                "error",
+                "duplicate_setup_route",
+                &route.repo,
+                route.indices.clone(),
+                Vec::new(),
+                route.channel.clone(),
+                None,
+                route.channel_name.clone(),
+                None,
+                None,
+                format!("repo '{}' has multiple setup-owned routes", route.repo),
+            ));
+        }
+
+        let matching: Vec<&SetupMonitor> = monitors
+            .iter()
+            .filter(|monitor| monitor.repo.as_deref() == Some(route.repo.as_str()))
+            .collect();
+        if matching.is_empty() {
+            findings.push(finding(
+                "error",
+                "missing_git_monitor",
+                &route.repo,
+                route.indices.clone(),
+                Vec::new(),
+                route.channel.clone(),
+                None,
+                route.channel_name.clone(),
+                None,
+                None,
+                format!(
+                    "repo '{}' has a setup-owned route but no setup-owned git monitor",
+                    route.repo
+                ),
+            ));
+        }
+
+        for monitor in matching {
+            if route.channel.as_deref() != monitor.channel.as_deref() {
+                findings.push(finding(
+                    "error",
+                    "channel_mismatch",
+                    &route.repo,
+                    route.indices.clone(),
+                    vec![monitor.index],
+                    route.channel.clone(),
+                    monitor.channel.clone(),
+                    route.channel_name.clone(),
+                    monitor.channel_name.clone(),
+                    Some(checkout_label(&monitor.path)),
+                    format!(
+                        "repo '{}' route and git monitor target different channels",
+                        route.repo
+                    ),
+                ));
+            }
+            if route.channel_name != monitor.channel_name {
+                findings.push(finding(
+                    "error",
+                    "channel_name_mismatch",
+                    &route.repo,
+                    route.indices.clone(),
+                    vec![monitor.index],
+                    route.channel.clone(),
+                    monitor.channel.clone(),
+                    route.channel_name.clone(),
+                    monitor.channel_name.clone(),
+                    Some(checkout_label(&monitor.path)),
+                    format!(
+                        "repo '{}' route and git monitor have different channel_name hints",
+                        route.repo
+                    ),
+                ));
+            }
+            if !Path::new(&monitor.path).exists() {
+                findings.push(finding(
+                    "error",
+                    "checkout_missing",
+                    &route.repo,
+                    route.indices.clone(),
+                    vec![monitor.index],
+                    route.channel.clone(),
+                    monitor.channel.clone(),
+                    route.channel_name.clone(),
+                    monitor.channel_name.clone(),
+                    Some(checkout_label(&monitor.path)),
+                    format!("repo '{}' git monitor checkout is missing", route.repo),
+                ));
+            } else if !looks_like_git_worktree(&monitor.path) {
+                findings.push(finding(
+                    "error",
+                    "checkout_not_git_worktree",
+                    &route.repo,
+                    route.indices.clone(),
+                    vec![monitor.index],
+                    route.channel.clone(),
+                    monitor.channel.clone(),
+                    route.channel_name.clone(),
+                    monitor.channel_name.clone(),
+                    Some(checkout_label(&monitor.path)),
+                    format!(
+                        "repo '{}' git monitor checkout is not a git worktree",
+                        route.repo
+                    ),
+                ));
+            }
+        }
+
+        for monitor in monitors.iter().filter(|monitor| monitor.repo.is_none()) {
+            if route.channel.is_some() && route.channel == monitor.channel {
+                findings.push(finding(
+                    "error",
+                    "manual_monitor_conflict",
+                    &route.repo,
+                    route.indices.clone(),
+                    vec![monitor.index],
+                    route.channel.clone(),
+                    monitor.channel.clone(),
+                    route.channel_name.clone(),
+                    monitor.channel_name.clone(),
+                    Some(checkout_label(&monitor.path)),
+                    format!(
+                        "repo '{}' route shares a channel with a manual channel-only git monitor",
+                        route.repo
+                    ),
+                ));
+            }
+        }
+    }
+
+    for monitor in &monitors {
+        if monitor.indices_len > 1 {
+            findings.push(finding(
+                "error",
+                "duplicate_setup_monitor",
+                monitor.repo.as_deref().unwrap_or("<manual>"),
+                Vec::new(),
+                vec![monitor.index],
+                None,
+                monitor.channel.clone(),
+                None,
+                monitor.channel_name.clone(),
+                Some(checkout_label(&monitor.path)),
+                "multiple setup-owned git monitors share the same repo identity".to_string(),
+            ));
+        }
+    }
+
+    for monitor in monitors.iter().filter(|monitor| monitor.repo.is_some()) {
+        let repo = monitor.repo.as_ref().unwrap();
+        if !routes.iter().any(|route| route.repo == *repo) {
+            findings.push(finding(
+                "error",
+                "repo_identity_mismatch",
+                repo,
+                Vec::new(),
+                vec![monitor.index],
+                None,
+                monitor.channel.clone(),
+                None,
+                monitor.channel_name.clone(),
+                Some(checkout_label(&monitor.path)),
+                format!(
+                    "git monitor repo '{}' has no matching setup-owned route",
+                    repo
+                ),
+            ));
+        }
+    }
+
+    for (index, route) in config.routes.iter().enumerate() {
+        if !is_setup_repo_route(route)
+            && route.effective_sink() == "discord"
+            && route.channel.is_some()
+            && route.filter.get("repo").is_some()
+        {
+            let repo = route.filter.get("repo").cloned().unwrap_or_default();
+            if routes.iter().any(|setup| setup.repo == repo) {
+                findings.push(finding(
+                    "error",
+                    "manual_route_conflict",
+                    &repo,
+                    vec![index],
+                    Vec::new(),
+                    route.channel.clone(),
+                    None,
+                    route.channel_name.clone(),
+                    None,
+                    None,
+                    format!("repo '{}' has a manual wildcard Discord route", repo),
+                ));
+            }
+        }
+    }
+
+    BindingDriftAudit {
+        ok: findings.is_empty(),
+        findings,
+    }
+}
+
+#[derive(Debug)]
+struct SetupRoute {
+    repo: String,
+    indices: Vec<usize>,
+    channel: Option<String>,
+    channel_name: Option<String>,
+}
+
+#[derive(Debug)]
+struct SetupMonitor {
+    repo: Option<String>,
+    index: usize,
+    indices_len: usize,
+    path: String,
+    channel: Option<String>,
+    channel_name: Option<String>,
+}
+
+fn setup_repo_routes(config: &AppConfig) -> Vec<SetupRoute> {
+    let mut by_repo: BTreeMap<String, SetupRoute> = BTreeMap::new();
+    for (index, route) in config.routes.iter().enumerate() {
+        if is_setup_repo_route(route) {
+            let repo = route.filter.get("repo").cloned().unwrap_or_default();
+            by_repo
+                .entry(repo.clone())
+                .and_modify(|entry| entry.indices.push(index))
+                .or_insert_with(|| SetupRoute {
+                    repo,
+                    indices: vec![index],
+                    channel: route.channel.clone(),
+                    channel_name: route.channel_name.clone(),
+                });
+        }
+    }
+    by_repo.into_values().collect()
+}
+
+fn setup_git_monitors(config: &AppConfig) -> Vec<SetupMonitor> {
+    let mut identity_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for monitor in &config.monitors.git.repos {
+        if let Some(repo) = monitor_repo_identity(monitor) {
+            *identity_counts.entry(repo).or_default() += 1;
+        }
+    }
+
+    config
+        .monitors
+        .git
+        .repos
+        .iter()
+        .enumerate()
+        .map(|(index, monitor)| {
+            let repo = monitor_repo_identity(monitor);
+            let indices_len = repo
+                .as_ref()
+                .and_then(|repo| identity_counts.get(repo))
+                .copied()
+                .unwrap_or(1);
+            SetupMonitor {
+                repo,
+                index,
+                indices_len,
+                path: monitor.path.clone(),
+                channel: monitor.channel.clone(),
+                channel_name: monitor.channel_name.clone(),
+            }
+        })
+        .collect()
+}
+
+fn is_setup_repo_route(route: &crate::config::RouteRule) -> bool {
+    route.event == "*"
+        && route.sink.trim() == "discord"
+        && route.effective_sink() == "discord"
+        && route.filter.len() == 1
+        && route
+            .filter
+            .get("repo")
+            .map(|repo| !repo.trim().is_empty())
+            .unwrap_or(false)
+        && route
+            .channel
+            .as_deref()
+            .map(|channel| !channel.trim().is_empty())
+            .unwrap_or(false)
+        && route.thread.is_none()
+        && route.webhook.is_none()
+        && route.slack_webhook.is_none()
+        && route.local_path.is_none()
+        && route.mention.is_none()
+        && route.template.is_none()
+        && route.gajae.is_none()
+        && !route.allow_dynamic_tokens
+        && route.format.is_none()
+}
+
+fn monitor_repo_identity(monitor: &crate::config::GitRepoMonitor) -> Option<String> {
+    monitor
+        .github_repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            monitor
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn looks_like_git_worktree(path: &str) -> bool {
+    let path = Path::new(path);
+    path.join(".git").exists()
+        || path
+            .parent()
+            .map(|parent| parent.join(".git").exists())
+            .unwrap_or(false)
+}
+
+fn checkout_label(path: &str) -> String {
+    let path = Path::new(path);
+    let basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkout");
+    format!(
+        "{}#{:08x}",
+        basename,
+        stable_hash32(path.to_string_lossy().as_ref())
+    )
+}
+
+fn stable_hash32(value: &str) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in value.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+fn finding(
+    severity: &str,
+    code: &str,
+    repo: &str,
+    route_indices: Vec<usize>,
+    monitor_indices: Vec<usize>,
+    route_channel_id: Option<String>,
+    monitor_channel_id: Option<String>,
+    route_channel_name: Option<String>,
+    monitor_channel_name: Option<String>,
+    checkout_label: Option<String>,
+    message: String,
+) -> BindingDriftFinding {
+    BindingDriftFinding {
+        severity: severity.to_string(),
+        code: code.to_string(),
+        repo: repo.to_string(),
+        route_indices,
+        monitor_indices,
+        route_channel_id,
+        monitor_channel_id,
+        route_channel_name,
+        monitor_channel_name,
+        checkout_label,
+        message,
+    }
+}
+
 /// Resolve a lookup result into a verdict given the expected-name hint.
 fn resolve_verdict(lookup: ChannelLookup, expected: &Option<String>) -> VerdictKind {
     match lookup {
@@ -325,6 +732,35 @@ impl fmt::Display for BindingAudit {
             )?;
         }
 
+        Ok(())
+    }
+}
+
+impl fmt::Display for BindingDriftAudit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Route/monitor drift:")?;
+        if self.findings.is_empty() {
+            writeln!(f, "[  ok] no route/monitor drift found")?;
+            return Ok(());
+        }
+        for finding in &self.findings {
+            let route = finding
+                .route_indices
+                .first()
+                .map(|index| (index + 1).to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let monitor = finding
+                .monitor_indices
+                .first()
+                .map(|index| (index + 1).to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let checkout = finding.checkout_label.as_deref().unwrap_or("-");
+            writeln!(
+                f,
+                "[FAIL] {} repo={} route={} monitor={} checkout={} {}",
+                finding.code, finding.repo, route, monitor, checkout, finding.message
+            )?;
+        }
         Ok(())
     }
 }
@@ -612,10 +1048,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_repo_binding_creates_route() {
+    fn apply_repo_channel_binding_creates_route_and_monitor() {
         let mut config = AppConfig::default();
         config
-            .apply_repo_binding("clawhip", "123456", Some("clawhip-dev"))
+            .apply_repo_channel_binding("clawhip", "123456", Some("clawhip-dev"), "/work/clawhip")
             .unwrap();
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.routes[0].channel.as_deref(), Some("123456"));
@@ -627,16 +1063,151 @@ mod tests {
     }
 
     #[test]
-    fn apply_repo_binding_updates_existing() {
+    fn apply_repo_channel_binding_updates_existing() {
         let mut config = AppConfig::default();
         config
-            .apply_repo_binding("clawhip", "111", Some("old-name"))
+            .apply_repo_channel_binding("clawhip", "111", Some("old-name"), "/work/clawhip")
             .unwrap();
         config
-            .apply_repo_binding("clawhip", "222", Some("new-name"))
+            .apply_repo_channel_binding("clawhip", "222", Some("new-name"), "/work/clawhip")
             .unwrap();
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.routes[0].channel.as_deref(), Some("222"));
         assert_eq!(config.routes[0].channel_name.as_deref(), Some("new-name"));
+    }
+
+    fn setup_route(repo: &str, channel: &str, channel_name: Option<&str>) -> RouteRule {
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), repo.to_string());
+        RouteRule {
+            event: "*".to_string(),
+            filter,
+            channel: Some(channel.to_string()),
+            channel_name: channel_name.map(ToOwned::to_owned),
+            ..RouteRule::default()
+        }
+    }
+
+    fn git_monitor(
+        path: &str,
+        name: Option<&str>,
+        channel: Option<&str>,
+        channel_name: Option<&str>,
+    ) -> GitRepoMonitor {
+        GitRepoMonitor {
+            path: path.to_string(),
+            name: name.map(ToOwned::to_owned),
+            channel: channel.map(ToOwned::to_owned),
+            channel_name: channel_name.map(ToOwned::to_owned),
+            ..GitRepoMonitor::default()
+        }
+    }
+
+    fn config_with_route_and_monitors(route: RouteRule, repos: Vec<GitRepoMonitor>) -> AppConfig {
+        AppConfig {
+            routes: vec![route],
+            monitors: MonitorConfig {
+                git: GitMonitorConfig { repos },
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn drift_audit_detects_missing_monitor() {
+        let config = config_with_routes(vec![setup_route("clawhip", "123", Some("dev"))]);
+
+        let audit = audit_route_monitor_drift(&config);
+
+        assert!(!audit.ok);
+        assert_eq!(audit.findings[0].code, "missing_git_monitor");
+        assert_eq!(audit.findings[0].repo, "clawhip");
+        assert_eq!(audit.findings[0].route_channel_id.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn drift_audit_detects_channel_mismatch() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tempdir.path().join(".git")).unwrap();
+        let config = config_with_route_and_monitors(
+            setup_route("clawhip", "123", Some("dev")),
+            vec![git_monitor(
+                tempdir.path().to_str().unwrap(),
+                Some("clawhip"),
+                Some("456"),
+                Some("dev"),
+            )],
+        );
+
+        let audit = audit_route_monitor_drift(&config);
+
+        assert!(
+            audit
+                .findings
+                .iter()
+                .any(|finding| finding.code == "channel_mismatch")
+        );
+    }
+
+    #[test]
+    fn drift_audit_detects_manual_channel_only_monitor_conflict() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tempdir.path().join(".git")).unwrap();
+        let config = config_with_route_and_monitors(
+            setup_route("clawhip", "123", Some("dev")),
+            vec![git_monitor(
+                tempdir.path().to_str().unwrap(),
+                None,
+                Some("123"),
+                Some("dev"),
+            )],
+        );
+
+        let audit = audit_route_monitor_drift(&config);
+
+        assert!(
+            audit
+                .findings
+                .iter()
+                .any(|finding| finding.code == "manual_monitor_conflict")
+        );
+    }
+
+    #[test]
+    fn drift_audit_redacts_checkout_label_and_json_shape() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let checkout = tempdir.path().join("secret-checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let raw_path = checkout.to_str().unwrap();
+        let config = config_with_route_and_monitors(
+            setup_route("clawhip", "123", Some("dev")),
+            vec![git_monitor(
+                raw_path,
+                Some("clawhip"),
+                Some("123"),
+                Some("dev"),
+            )],
+        );
+
+        let audit = audit_route_monitor_drift(&config);
+        let finding = audit
+            .findings
+            .iter()
+            .find(|finding| finding.code == "checkout_not_git_worktree")
+            .unwrap();
+        let label = finding.checkout_label.as_ref().unwrap();
+        let json = serde_json::to_string(&audit).unwrap();
+        let text = audit.to_string();
+
+        assert!(label.starts_with("secret-checkout#"));
+        assert_eq!(label.len(), "secret-checkout#".len() + 8);
+        assert!(json.contains("\"ok\":"));
+        assert!(json.contains("\"findings\":"));
+        assert!(json.contains("\"checkout_label\":"));
+        assert!(!json.contains(raw_path));
+        assert!(!text.contains(raw_path));
+        assert!(text.contains("Route/monitor drift:"));
+        assert!(text.contains("[FAIL]"));
     }
 }

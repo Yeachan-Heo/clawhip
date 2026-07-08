@@ -237,6 +237,10 @@ pub struct SetupArgs {
     /// resolved (missing, forbidden, or no bot token). Repeatable.
     #[arg(long = "bind", value_name = "REPO=CHANNEL_ID")]
     pub bind: Vec<String>,
+    /// Bind a repo to a checkout path for setup-owned git monitoring. Format: `repo=path`.
+    /// Repeatable. Every repo named here must also be present in `--bind`.
+    #[arg(long = "bind-checkout", value_name = "REPO=PATH")]
+    pub bind_checkout: Vec<String>,
     /// When combined with `--bind`, refuse unless the live channel name
     /// matches the expected name. Format: `repo=expected_name`. Repeatable.
     #[arg(long = "expect-name", value_name = "REPO=NAME")]
@@ -1210,6 +1214,24 @@ mod tests {
         assert_eq!(args.bind[1], "oh-my-codex=1480171106324189335");
         assert_eq!(args.expect_name.len(), 1);
         assert_eq!(args.expect_name[0], "clawhip=clawhip-dev");
+        assert!(args.bind_checkout.is_empty());
+    }
+
+    #[test]
+    fn parses_setup_bind_checkout_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "setup",
+            "--bind",
+            "clawhip=1480171113253175356",
+            "--bind-checkout",
+            "clawhip=/work/clawhip",
+        ]);
+        let Commands::Setup(args) = cli.command.expect("setup command") else {
+            panic!("expected Setup");
+        };
+        assert_eq!(args.bind, vec!["clawhip=1480171113253175356"]);
+        assert_eq!(args.bind_checkout, vec!["clawhip=/work/clawhip"]);
     }
 
     #[test]
@@ -1340,6 +1362,7 @@ mod tests {
         assert!(help.contains("Advanced routes and monitors still require manual config editing"));
         assert!(help.contains("--default-format <DEFAULT_FORMAT>"));
         assert!(help.contains("--daemon-base-url <DAEMON_BASE_URL>"));
+        assert!(help.contains("--bind-checkout <REPO=PATH>"));
     }
 
     #[test]
