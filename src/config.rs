@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -6,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use time::{Duration as TimeDuration, OffsetDateTime, PrimitiveDateTime, format_description};
 
 use crate::Result;
 use crate::events::MessageFormat;
@@ -343,6 +345,11 @@ pub struct GitRepoMonitor {
     /// Human-readable channel name hint for binding verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_name: Option<String>,
+    /// Marks git monitors created and owned by `clawhip setup --bind`.
+    /// Manual monitors default to false so binding drift audits do not infer
+    /// ownership from repo/channel metadata alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub setup_owned: bool,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
 }
@@ -360,6 +367,7 @@ impl Default for GitRepoMonitor {
             emit_pr_status: false,
             channel: None,
             channel_name: None,
+            setup_owned: false,
             mention: None,
             format: None,
         }
@@ -797,11 +805,53 @@ impl AppConfig {
         Ok(toml::to_string_pretty(self)?)
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save_with_backup(&self, path: &Path) -> Result<()> {
+        let serialized = self.to_pretty_toml()?;
+        let new_bytes = serialized.as_bytes();
+        let old_bytes = if path.exists() {
+            Some(fs::read(path)?)
+        } else {
+            None
+        };
+
+        if old_bytes.as_deref() == Some(new_bytes) {
+            return Ok(());
+        }
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, self.to_pretty_toml()?)?;
+
+        let backup_context = if let Some(old_bytes) = old_bytes.as_deref() {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let backups_dir = parent.join(".clawhip-config-backups");
+            fs::create_dir_all(&backups_dir)?;
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| "config path must have a UTF-8 filename".to_string())?;
+            let timestamp = utc_backup_timestamp(OffsetDateTime::now_utc())?;
+            let backup_path = backups_dir.join(format!(
+                "{filename}.{timestamp}.{}.bak",
+                sha256_first8(old_bytes)
+            ));
+            fs::write(&backup_path, old_bytes)?;
+            Some((backups_dir, filename.to_string()))
+        } else {
+            None
+        };
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "config path must have a UTF-8 filename".to_string())?;
+        let temp_path = parent.join(format!(".{filename}.tmp.{}", std::process::id()));
+        fs::write(&temp_path, new_bytes)?;
+        fs::rename(temp_path, path)?;
+        if let Some((backups_dir, filename)) = backup_context {
+            cleanup_config_backups(&backups_dir, &filename, OffsetDateTime::now_utc())?;
+        }
         Ok(())
     }
 
@@ -1200,23 +1250,7 @@ impl AppConfig {
         }
     }
 
-    /// Scaffold or update a repo→channel route with a binding-verify hint.
-    ///
-    /// Creates a `[[routes]]` entry shaped as:
-    ///
-    /// ```toml
-    /// [[routes]]
-    /// event = "*"
-    /// filter = { repo = "<repo>" }
-    /// sink = "discord"
-    /// channel = "<channel_id>"
-    /// channel_name = "<live_name>"  # hint, used by verify-bindings
-    /// ```
-    ///
-    /// If an existing route matches the exact `(event="*", filter={repo=...},
-    /// sink="discord")` shape, its channel and channel_name are updated in place
-    /// instead of appending a duplicate.
-    pub fn apply_repo_binding(
+    pub fn apply_repo_channel_route_binding(
         &mut self,
         repo: &str,
         channel_id: &str,
@@ -1228,19 +1262,38 @@ impl AppConfig {
             .ok_or_else(|| "repo binding requires a non-empty channel id".to_string())?;
         let channel_name = channel_name.and_then(|value| normalize_text(Some(value.to_string())));
 
-        let existing = self
+        let route_matches = self
             .routes
-            .iter_mut()
-            .find(|route| is_repo_binding_route(route, &repo));
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| is_repo_binding_route(route, &repo))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if route_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned routes found for repo '{repo}'; clean up duplicates before updating binding"
+            )
+            .into());
+        }
+        if self.routes.iter().any(|route| {
+            !is_repo_binding_route(route, &repo)
+                && route.event == "*"
+                && route.effective_sink() == "discord"
+                && route.filter.len() == 1
+                && route.filter.get("repo").is_some_and(|value| value == &repo)
+        }) {
+            return Err(format!("manual_route_conflict for repo '{repo}'").into());
+        }
 
-        match existing {
-            Some(route) => {
+        match route_matches.as_slice() {
+            [index] => {
+                let route = &mut self.routes[*index];
                 route.channel = Some(channel_id);
                 route.thread = None;
                 route.channel_name = channel_name;
                 route.webhook = None;
             }
-            None => {
+            [] => {
                 let mut filter = BTreeMap::new();
                 filter.insert("repo".to_string(), repo);
                 self.routes.push(RouteRule {
@@ -1260,7 +1313,156 @@ impl AppConfig {
                     gajae: None,
                 });
             }
+            _ => unreachable!(),
         }
+
+        Ok(())
+    }
+
+    pub fn apply_repo_channel_binding(
+        &mut self,
+        repo: &str,
+        channel_id: &str,
+        channel_name: Option<&str>,
+        checkout_path: &str,
+    ) -> Result<()> {
+        let repo = normalize_text(Some(repo.to_string()))
+            .ok_or_else(|| "repo binding requires a non-empty repo name".to_string())?;
+        let channel_id = normalize_text(Some(channel_id.to_string()))
+            .ok_or_else(|| "repo binding requires a non-empty channel id".to_string())?;
+        let channel_name = channel_name.and_then(|value| normalize_text(Some(value.to_string())));
+        let checkout_path = normalize_text(Some(checkout_path.to_string()))
+            .ok_or_else(|| "repo binding requires a non-empty checkout path".to_string())?;
+        let monitor_name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+        let github_repo = is_owner_repo(&repo).then_some(repo.clone());
+
+        let route_matches = self
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| is_repo_binding_route(route, &repo))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if route_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned routes found for repo '{repo}'; clean up duplicates before updating binding"
+            )
+            .into());
+        }
+        if self.routes.iter().any(|route| {
+            !is_repo_binding_route(route, &repo)
+                && route.event == "*"
+                && route.effective_sink() == "discord"
+                && route.filter.len() == 1
+                && route.filter.get("repo").is_some_and(|value| value == &repo)
+        }) {
+            return Err(format!("manual_route_conflict for repo '{repo}'").into());
+        }
+
+        let requested_owner_repo = github_repo.as_deref();
+        if self.monitors.git.repos.iter().any(|monitor| {
+            monitor.channel.as_deref() == Some(channel_id.as_str())
+                && monitor.github_repo.is_none()
+                && monitor.name.as_deref() != Some(monitor_name.as_str())
+        }) {
+            return Err("manual_monitor_conflict".into());
+        }
+
+        let monitor_matches = self
+            .monitors
+            .git
+            .repos
+            .iter()
+            .enumerate()
+            .filter(|(_, monitor)| {
+                let path_matches = monitor.path.trim() == checkout_path;
+                let github_repo_matches = requested_owner_repo
+                    .is_some_and(|repo| monitor.github_repo.as_deref() == Some(repo));
+                let name_matches = monitor.name.as_deref() == Some(monitor_name.as_str())
+                    && requested_owner_repo.is_none_or(|repo| {
+                        monitor
+                            .github_repo
+                            .as_deref()
+                            .is_none_or(|existing| existing.trim().is_empty() || existing == repo)
+                    });
+
+                path_matches || github_repo_matches || name_matches
+            })
+            .map(|(index, monitor)| {
+                if is_setup_owned_git_monitor(monitor) {
+                    Ok(index)
+                } else if monitor.channel.as_deref() == Some(channel_id.as_str())
+                    && monitor.github_repo.is_none()
+                {
+                    Err("manual_monitor_conflict".to_string())
+                } else {
+                    Err(format!(
+                        "git monitor conflict for repo '{repo}'; existing monitor is not setup-owned"
+                    ))
+                }
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|message| -> Box<dyn std::error::Error + Send + Sync> { message.into() })?;
+        if monitor_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned git monitors found for repo '{repo}'; clean up duplicates before updating binding"
+            )
+            .into());
+        }
+
+        match route_matches.as_slice() {
+            [index] => {
+                let route = &mut self.routes[*index];
+                route.channel = Some(channel_id.clone());
+                route.thread = None;
+                route.channel_name = channel_name.clone();
+                route.webhook = None;
+            }
+            [] => {
+                let mut filter = BTreeMap::new();
+                filter.insert("repo".to_string(), repo.clone());
+                self.routes.push(RouteRule {
+                    event: "*".to_string(),
+                    filter,
+                    sink: default_sink_name(),
+                    channel: Some(channel_id.clone()),
+                    thread: None,
+                    channel_name: channel_name.clone(),
+                    webhook: None,
+                    slack_webhook: None,
+                    local_path: None,
+                    mention: None,
+                    allow_dynamic_tokens: false,
+                    format: None,
+                    template: None,
+                    gajae: None,
+                });
+            }
+            _ => unreachable!(),
+        }
+
+        match monitor_matches.as_slice() {
+            [index] => {
+                let monitor = &mut self.monitors.git.repos[*index];
+                monitor.path = checkout_path;
+                monitor.name = Some(monitor_name);
+                monitor.github_repo = github_repo;
+                monitor.channel = Some(channel_id);
+                monitor.channel_name = channel_name;
+                monitor.setup_owned = true;
+            }
+            [] => self.monitors.git.repos.push(GitRepoMonitor {
+                path: checkout_path,
+                name: Some(monitor_name),
+                github_repo,
+                channel: Some(channel_id),
+                channel_name,
+                setup_owned: true,
+                ..GitRepoMonitor::default()
+            }),
+            _ => unreachable!(),
+        }
+
         Ok(())
     }
 
@@ -1327,7 +1529,7 @@ impl AppConfig {
                     self.scaffold_webhook_quickstart(webhook)?;
                 }
                 "6" => {
-                    self.save(path)?;
+                    self.save_with_backup(path)?;
                     println!("Saved {}", path.display());
                     break;
                 }
@@ -1500,13 +1702,84 @@ impl AppConfig {
 fn is_repo_binding_route(route: &RouteRule, repo: &str) -> bool {
     route.event == "*"
         && route.sink.trim() == "discord"
-        && route.slack_webhook.is_none()
+        && route.effective_sink() == "discord"
         && route.filter.len() == 1
+        && route.filter.get("repo").is_some_and(|value| value == repo)
         && route
-            .filter
-            .get("repo")
-            .map(|value| value == repo)
-            .unwrap_or(false)
+            .channel
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && route.thread.is_none()
+        && route.webhook.is_none()
+        && route.slack_webhook.is_none()
+        && route.local_path.is_none()
+        && route.mention.is_none()
+        && route.template.is_none()
+        && route.gajae.is_none()
+        && !route.allow_dynamic_tokens
+        && route.format.is_none()
+}
+
+fn is_owner_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty())
+}
+
+fn is_setup_owned_git_monitor(monitor: &GitRepoMonitor) -> bool {
+    monitor.setup_owned
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn sha256_first8(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")[..8].to_string()
+}
+
+fn utc_backup_timestamp(now: OffsetDateTime) -> Result<String> {
+    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z")?;
+    Ok(now.format(&format)?)
+}
+
+fn cleanup_config_backups(backups_dir: &Path, filename: &str, now: OffsetDateTime) -> Result<()> {
+    let prefix = format!("{filename}.");
+    let cutoff = now - TimeDuration::days(30);
+    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z")?;
+    let mut backups = Vec::new();
+
+    for entry in fs::read_dir(backups_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&prefix) || !name.ends_with(".bak") {
+            continue;
+        }
+        let rest = &name[prefix.len()..name.len() - 4];
+        let Some((timestamp, hash)) = rest.split_once('.') else {
+            continue;
+        };
+        if hash.len() != 8 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(created_at) =
+            PrimitiveDateTime::parse(timestamp, &format).map(|value| value.assume_utc())
+        else {
+            continue;
+        };
+        backups.push((created_at, entry.path()));
+    }
+
+    backups.sort_by_key(|(created_at, _)| *created_at);
+    let keep_from = backups.len().saturating_sub(10);
+    for (index, (created_at, path)) in backups.into_iter().enumerate() {
+        if index < keep_from && created_at < cutoff {
+            fs::remove_file(path)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn is_canonical_quickstart_route(route: &RouteRule) -> bool {
@@ -2505,5 +2778,205 @@ name = "general"
         assert!(toml.contains("[discord_watch]"));
         assert!(toml.contains("pending_mentions_threshold = 7"));
         assert!(toml.contains("doctrine_template = \"Sweep <#{channel_id}>\""));
+    }
+
+    #[test]
+    fn repo_channel_route_binding_keeps_legacy_bind_route_only() {
+        let mut config = AppConfig::default();
+
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].channel.as_deref(), Some("123"));
+        assert_eq!(config.routes[0].channel_name.as_deref(), Some("dev"));
+        assert!(config.monitors.git.repos.is_empty());
+    }
+
+    #[test]
+    fn repo_channel_binding_allows_branch_specific_manual_route() {
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), "owner/repo".to_string());
+        filter.insert("branch".to_string(), "main".to_string());
+        let mut config = AppConfig {
+            routes: vec![RouteRule {
+                event: "git.push".into(),
+                filter,
+                channel: Some("manual".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 2);
+        assert!(config.monitors.git.repos.is_empty());
+    }
+
+    #[test]
+    fn repo_channel_binding_create_is_idempotent_and_adds_monitor() {
+        let mut config = AppConfig::default();
+
+        config
+            .apply_repo_channel_binding("owner/repo", "123", Some("#dev"), "/work/repo")
+            .unwrap();
+        config
+            .apply_repo_channel_binding("owner/repo", "123", Some("dev"), "/work/repo")
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(
+            config.routes[0].filter.get("repo").map(String::as_str),
+            Some("owner/repo")
+        );
+        assert_eq!(config.routes[0].channel.as_deref(), Some("123"));
+        assert_eq!(config.routes[0].channel_name.as_deref(), Some("dev"));
+        assert_eq!(config.monitors.git.repos.len(), 1);
+        let monitor = &config.monitors.git.repos[0];
+        assert_eq!(monitor.path, "/work/repo");
+        assert_eq!(monitor.name.as_deref(), Some("repo"));
+        assert_eq!(monitor.github_repo.as_deref(), Some("owner/repo"));
+        assert_eq!(monitor.channel.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn repo_channel_binding_updates_setup_owned_monitor_and_preserves_options() {
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), "owner/repo".to_string());
+        let mut config = AppConfig {
+            routes: vec![RouteRule {
+                event: "*".into(),
+                filter,
+                channel: Some("old".into()),
+                channel_name: Some("dev".into()),
+                ..RouteRule::default()
+            }],
+            monitors: MonitorConfig {
+                git: GitMonitorConfig {
+                    repos: vec![GitRepoMonitor {
+                        path: "/old/repo".into(),
+                        name: Some("repo".into()),
+                        remote: "upstream".into(),
+                        github_repo: Some("owner/repo".into()),
+                        emit_commits: false,
+                        emit_branch_changes: false,
+                        emit_issue_opened: false,
+                        emit_pr_status: true,
+                        channel: Some("old".into()),
+                        channel_name: Some("#DEV".into()),
+                        setup_owned: true,
+                        mention: Some("<@1>".into()),
+                        format: Some(MessageFormat::Raw),
+                    }],
+                },
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        config
+            .apply_repo_channel_binding("owner/repo", "new", Some("dev"), "/new/repo")
+            .unwrap();
+
+        assert_eq!(config.routes[0].channel.as_deref(), Some("new"));
+        let monitor = &config.monitors.git.repos[0];
+        assert_eq!(monitor.path, "/new/repo");
+        assert_eq!(monitor.remote, "upstream");
+        assert!(!monitor.emit_commits);
+        assert!(!monitor.emit_branch_changes);
+        assert!(!monitor.emit_issue_opened);
+        assert!(monitor.emit_pr_status);
+        assert_eq!(monitor.mention.as_deref(), Some("<@1>"));
+        assert_eq!(monitor.format, Some(MessageFormat::Raw));
+        assert_eq!(monitor.channel.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn repo_channel_binding_manual_monitor_conflict_does_not_mutate() {
+        let mut config = AppConfig {
+            monitors: MonitorConfig {
+                git: GitMonitorConfig {
+                    repos: vec![GitRepoMonitor {
+                        path: "/manual".into(),
+                        name: Some("manual".into()),
+                        channel: Some("123".into()),
+                        channel_name: None,
+                        ..GitRepoMonitor::default()
+                    }],
+                },
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let before = config.to_pretty_toml().unwrap();
+
+        let error = config
+            .apply_repo_channel_binding("owner/repo", "123", Some("dev"), "/work/repo")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("manual_monitor_conflict"));
+        assert_eq!(config.to_pretty_toml().unwrap(), before);
+    }
+
+    #[test]
+    fn save_with_backup_skips_new_and_identical_then_backs_up_changed_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = AppConfig::default();
+
+        config.save_with_backup(&path).unwrap();
+        assert!(!dir.path().join(".clawhip-config-backups").exists());
+        config.save_with_backup(&path).unwrap();
+        assert!(!dir.path().join(".clawhip-config-backups").exists());
+
+        config.defaults.channel = Some("alerts".into());
+        config.save_with_backup(&path).unwrap();
+
+        let backups = fs::read_dir(dir.path().join(".clawhip-config-backups"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(backups.len(), 1);
+        let backup = fs::read_to_string(backups[0].path()).unwrap();
+        assert!(!backup.contains("alerts"));
+    }
+
+    #[test]
+    fn backup_retention_removes_old_backups_but_keeps_newest_ten() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups_dir = dir.path().join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+        for index in 0..12 {
+            let created_at = now - TimeDuration::days(45 - index);
+            let name = format!(
+                "config.toml.{}.0000000{:x}.bak",
+                utc_backup_timestamp(created_at).unwrap(),
+                index
+            );
+            fs::write(backups_dir.join(name), "old").unwrap();
+        }
+        let recent_name = format!(
+            "config.toml.{}.abcdef12.bak",
+            utc_backup_timestamp(now - TimeDuration::days(5)).unwrap()
+        );
+        fs::write(backups_dir.join(recent_name), "recent").unwrap();
+
+        cleanup_config_backups(&backups_dir, "config.toml", now).unwrap();
+
+        let remaining = fs::read_dir(&backups_dir)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining.len(), 10);
     }
 }

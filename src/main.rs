@@ -514,6 +514,169 @@ fn parse_expect_name_overrides(
     Ok(map)
 }
 
+fn parse_bind_overrides(entries: &[String]) -> Result<Vec<(String, String)>> {
+    let mut repos = std::collections::HashSet::new();
+    let mut binds = Vec::new();
+    for entry in entries {
+        let (repo, channel_id) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("--bind must be REPO=CHANNEL_ID, got '{entry}'"))?;
+        let repo = repo.trim();
+        let channel_id = channel_id.trim();
+        if repo.is_empty() {
+            return Err(format!("--bind '{entry}' has an empty repo name").into());
+        }
+        if channel_id.is_empty() {
+            return Err(format!("--bind '{entry}' has an empty channel id").into());
+        }
+        if !repos.insert(repo.to_string()) {
+            return Err(format!("--bind has duplicate entries for repo '{repo}'").into());
+        }
+        binds.push((repo.to_string(), channel_id.to_string()));
+    }
+    Ok(binds)
+}
+
+fn parse_bind_checkout_overrides(
+    entries: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for entry in entries {
+        let (repo, path) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("--bind-checkout must be REPO=PATH, got '{entry}'"))?;
+        let repo = repo.trim();
+        let path = path.trim();
+        if repo.is_empty() {
+            return Err(format!("--bind-checkout '{entry}' has an empty repo name").into());
+        }
+        if path.is_empty() {
+            return Err(format!("--bind-checkout '{entry}' has an empty checkout path").into());
+        }
+        if map.insert(repo.to_string(), path.to_string()).is_some() {
+            return Err(format!("--bind-checkout has duplicate entries for repo '{repo}'").into());
+        }
+    }
+    Ok(map)
+}
+
+fn validate_bind_checkout_repos(
+    checkout_map: &std::collections::HashMap<String, String>,
+    binds: &[(String, String)],
+) -> Result<()> {
+    let bind_repos: std::collections::HashSet<&str> =
+        binds.iter().map(|(repo, _)| repo.as_str()).collect();
+    for repo in checkout_map.keys() {
+        if !bind_repos.contains(repo.as_str()) {
+            return Err(
+                format!("--bind-checkout repo '{repo}' must also be present in --bind").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_bind_checkout_path(
+    repo: &str,
+    explicit: &std::collections::HashMap<String, String>,
+    bind_count: usize,
+    config: &AppConfig,
+) -> Result<Option<String>> {
+    if let Some(path) = explicit.get(repo) {
+        return Ok(Some(path.clone()));
+    }
+    if let Some(path) = existing_setup_monitor_checkout_path(config, repo)? {
+        return Ok(Some(path));
+    }
+    if bind_count == 1
+        && let Some(path) = infer_cwd_checkout_path(repo)?
+    {
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+fn existing_setup_monitor_checkout_path(config: &AppConfig, repo: &str) -> Result<Option<String>> {
+    let matches = config
+        .monitors
+        .git
+        .repos
+        .iter()
+        .filter(|monitor| {
+            monitor.setup_owned
+                && (monitor.github_repo.as_deref() == Some(repo)
+                    || (monitor.github_repo.is_none() && monitor.name.as_deref() == Some(repo)))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [monitor] => Ok(Some(monitor.path.clone())),
+        _ => Err(format!(
+            "bind {repo}: multiple setup-owned git monitors already exist; pass --bind-checkout {repo}=PATH after cleanup"
+        )
+        .into()),
+    }
+}
+
+fn infer_cwd_checkout_path(repo: &str) -> Result<Option<String>> {
+    let cwd = std::env::current_dir()?;
+    let inside = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&cwd)
+        .output();
+    let Ok(inside) = inside else {
+        return Ok(None);
+    };
+    if !inside.status.success() || String::from_utf8_lossy(&inside.stdout).trim() != "true" {
+        return Ok(None);
+    }
+
+    let top_level = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&cwd)
+        .output()?;
+    if !top_level.status.success() {
+        return Ok(None);
+    }
+
+    let remote = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(&cwd)
+        .output()?;
+    if !remote.status.success() {
+        return Ok(None);
+    }
+    let remote = String::from_utf8_lossy(&remote.stdout);
+    if remote_repo_identity(remote.trim()).as_deref() != Some(repo) {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        String::from_utf8_lossy(&top_level.stdout)
+            .trim()
+            .to_string(),
+    ))
+}
+
+fn remote_repo_identity(remote: &str) -> Option<String> {
+    let mut value = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    if let Some((_, path)) = value.rsplit_once(':') {
+        if !path.contains('/') && value.contains("://") {
+            return None;
+        }
+        value = path;
+    } else if let Some((_, path)) = value.split_once("://") {
+        value = path.split_once('/').map(|(_, rest)| rest)?;
+    }
+    let mut parts = value.rsplit('/');
+    let repo = parts.next()?.trim();
+    let owner = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
 async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()> {
     let mut editable = AppConfig::load_or_default(config_path)?;
 
@@ -525,8 +688,13 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
         daemon_base_url: args.daemon_base_url,
     };
 
+    let binds = parse_bind_overrides(&args.bind)?;
+    let checkout_map = parse_bind_checkout_overrides(&args.bind_checkout)?;
+    validate_bind_checkout_repos(&checkout_map, &binds)?;
+    let expect_map = parse_expect_name_overrides(&args.expect_name)?;
+
     // Must have at least one meaningful action.
-    if standard_edits.is_empty() && args.bind.is_empty() && !args.verify_bindings {
+    if standard_edits.is_empty() && binds.is_empty() && !args.verify_bindings {
         return Err("setup requires at least one non-empty setup flag".into());
     }
 
@@ -536,22 +704,13 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
     }
 
     // Process --bind entries: resolve each channel against Discord and write a
-    // repo binding route with a channel_name hint.
-    if !args.bind.is_empty() {
+    // route binding. Git monitor onboarding is conditional: it is added or
+    // updated only when a checkout is explicit, already known, or safely inferred.
+    let mut monitored_bind_repos = std::collections::HashSet::new();
+    if !binds.is_empty() {
         let client = DiscordClient::from_config(Arc::new(editable.clone()))?;
 
-        // Collect expected-name overrides (repo -> name). Hard-fails on
-        // malformed input so a typo like `--expect-name clawhip` cannot
-        // silently bypass the name-match guard.
-        let expect_map = parse_expect_name_overrides(&args.expect_name)?;
-
-        for entry in &args.bind {
-            let (repo, channel_id) = entry
-                .split_once('=')
-                .ok_or_else(|| format!("--bind must be REPO=CHANNEL_ID, got '{entry}'"))?;
-            let repo = repo.trim();
-            let channel_id = channel_id.trim();
-
+        for (repo, channel_id) in &binds {
             let lookup = client.lookup_channel(channel_id).await;
             match &lookup {
                 binding_verify::ChannelLookup::Found { name, .. } => {
@@ -567,8 +726,24 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
                         }
                     }
 
+                    let checkout_path =
+                        resolve_bind_checkout_path(repo, &checkout_map, binds.len(), &editable)?;
                     println!("bind: {repo} -> {channel_id} (#{live_name})");
-                    editable.apply_repo_binding(repo, channel_id, name.as_deref())?;
+                    if let Some(checkout_path) = checkout_path.as_deref() {
+                        editable.apply_repo_channel_binding(
+                            repo,
+                            channel_id,
+                            name.as_deref(),
+                            checkout_path,
+                        )?;
+                        monitored_bind_repos.insert(repo.as_str());
+                    } else {
+                        editable.apply_repo_channel_route_binding(
+                            repo,
+                            channel_id,
+                            name.as_deref(),
+                        )?;
+                    }
                 }
                 binding_verify::ChannelLookup::NotFound => {
                     return Err(
@@ -598,32 +773,64 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
 
     editable.validate()?;
 
+    let drift_audit = binding_verify::audit_route_monitor_drift(&editable);
+    if !monitored_bind_repos.is_empty() {
+        let bind_repos = monitored_bind_repos;
+        let affected_errors = drift_audit
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.severity == "error" && bind_repos.contains(finding.repo.as_str())
+            })
+            .collect::<Vec<_>>();
+        if !affected_errors.is_empty() {
+            eprint!("{drift_audit}");
+            return Err("setup aborted: route/monitor drift check failed for bound repo(s)".into());
+        }
+    }
+
     // Optional full binding audit before saving.
     if args.verify_bindings {
         let client = DiscordClient::from_config(Arc::new(editable.clone()))?;
         let audit = binding_verify::verify(&client, &editable).await;
         print!("{audit}");
-        if !audit.all_ok() {
+        print!("{drift_audit}");
+        if !audit.all_ok() || !drift_audit.ok {
             return Err("setup aborted: binding verification failed (see above)".into());
         }
     }
 
-    editable.save(config_path)?;
+    editable.save_with_backup(config_path)?;
     println!("Saved {}", config_path.display());
     Ok(())
+}
+
+fn verify_bindings_json(
+    audit: &binding_verify::BindingAudit,
+    drift_audit: &binding_verify::BindingDriftAudit,
+) -> serde_json::Value {
+    serde_json::json!({
+        "verdicts": &audit.verdicts,
+        "drift_audit": drift_audit,
+    })
 }
 
 async fn run_verify_bindings(config: Arc<AppConfig>, args: VerifyBindingsArgs) -> Result<()> {
     let client = DiscordClient::from_config(config.clone())?;
     let audit = binding_verify::verify(&client, &config).await;
+    let drift_audit = binding_verify::audit_route_monitor_drift(&config);
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&audit)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&verify_bindings_json(&audit, &drift_audit))?
+        );
     } else {
         print!("{audit}");
+        print!("{drift_audit}");
     }
 
-    if !audit.all_ok() {
+    if !audit.all_ok() || !drift_audit.ok {
         std::process::exit(1);
     }
     Ok(())
@@ -765,7 +972,11 @@ fn tmux_empty_list_detail(health: Option<&serde_json::Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_tmux_list, parse_expect_name_overrides};
+    use super::{
+        format_tmux_list, parse_bind_checkout_overrides, parse_bind_overrides,
+        parse_expect_name_overrides, validate_bind_checkout_repos, verify_bindings_json,
+    };
+    use crate::binding_verify::{BindingAudit, BindingDriftAudit};
     use crate::events::RoutingMetadata;
     use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
 
@@ -850,6 +1061,86 @@ mod tests {
     fn parse_expect_name_overrides_accepts_empty_input() {
         let map = parse_expect_name_overrides(&[]).expect("empty input is fine");
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_bind_checkout_overrides_accepts_well_formed_entries() {
+        let entries = vec![
+            "clawhip=/work/clawhip".to_string(),
+            "oh-my-codex=../omx".to_string(),
+        ];
+        let map = parse_bind_checkout_overrides(&entries).expect("valid entries");
+        assert_eq!(
+            map.get("clawhip").map(String::as_str),
+            Some("/work/clawhip")
+        );
+        assert_eq!(map.get("oh-my-codex").map(String::as_str), Some("../omx"));
+    }
+
+    #[test]
+    fn parse_bind_checkout_overrides_rejects_duplicate_repo() {
+        let entries = vec![
+            "clawhip=/work/clawhip".to_string(),
+            "clawhip=/tmp/clawhip".to_string(),
+        ];
+        let error = parse_bind_checkout_overrides(&entries).expect_err("duplicate repo must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate entries for repo 'clawhip'")
+        );
+    }
+
+    #[test]
+    fn parse_bind_checkout_overrides_rejects_malformed_or_empty_parts() {
+        let missing_equals = parse_bind_checkout_overrides(&["clawhip".to_string()])
+            .expect_err("missing equals must fail");
+        assert!(missing_equals.to_string().contains("REPO=PATH"));
+
+        let empty_repo = parse_bind_checkout_overrides(&["=/work/clawhip".to_string()])
+            .expect_err("empty repo must fail");
+        assert!(empty_repo.to_string().contains("empty repo name"));
+
+        let empty_path = parse_bind_checkout_overrides(&["clawhip=   ".to_string()])
+            .expect_err("empty path must fail");
+        assert!(empty_path.to_string().contains("empty checkout path"));
+    }
+
+    #[test]
+    fn bind_checkout_repos_must_also_be_bound() {
+        let binds = parse_bind_overrides(&["clawhip=123".to_string()]).expect("valid bind");
+        let checkout_map = parse_bind_checkout_overrides(&["oh-my-codex=/work/omx".to_string()])
+            .expect("valid checkout");
+        let error = validate_bind_checkout_repos(&checkout_map, &binds)
+            .expect_err("unmatched checkout repo must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("repo 'oh-my-codex' must also be present in --bind")
+        );
+    }
+
+    #[test]
+    fn bind_checkout_repos_accept_matching_bind() {
+        let binds = parse_bind_overrides(&["clawhip=123".to_string()]).expect("valid bind");
+        let checkout_map = parse_bind_checkout_overrides(&["clawhip=/work/clawhip".to_string()])
+            .expect("valid checkout");
+        validate_bind_checkout_repos(&checkout_map, &binds).expect("matching repo is valid");
+    }
+
+    #[test]
+    fn verify_bindings_json_preserves_top_level_verdicts() {
+        let audit = BindingAudit { verdicts: vec![] };
+        let drift = BindingDriftAudit {
+            ok: true,
+            findings: vec![],
+        };
+
+        let json = verify_bindings_json(&audit, &drift);
+
+        assert!(json.get("verdicts").is_some());
+        assert!(json.get("drift_audit").is_some());
+        assert!(json.get("channel_audit").is_none());
     }
 
     #[test]
