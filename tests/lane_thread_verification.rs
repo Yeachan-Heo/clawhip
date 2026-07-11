@@ -296,6 +296,7 @@ case "$1" in
   set-option) key="$4"; value="$5"; test "$key" = "@clawhip_lane_generation" && test -f "$S/fail_generation_set" && exit 1; printf '%s' "$value" > "$S/${{key#@}}"; test "$key" = "@clawhip_lane_generation" && test -f "$S/mismatch_generation" && printf 'different-generation' > "$S/${{key#@}}" ;;
   show-options) key="$5"; safe="${{key#@}}"; test -f "$S/unreadable_$safe" && exit 1; file="$S/$safe"; if test -f "$file"; then printf '%s\n' "$(cat "$file")"; else echo 'invalid option' >&2; exit 1; fi ;;
   send-keys) test "${{4:-}}" = "-l" || printf '1' >> "$S/sends" ;;
+  attach-session) printf '%s\n' "$3" >> "$S/attach_targets"; if test -f "$S/fail_attach_session"; then echo 'fixture-attach-failed' >&2; exit 1; fi ;;
   display-message) printf 'lane\t%%1\t1\tcodex\t/tmp\n' ;;
   kill-session) rm -f "$S/live" ;;
   list-sessions) test -f "$S/live" && test -f "$S/session" && cat "$S/session" ;;
@@ -546,6 +547,14 @@ fn calls_after(state: &Path, baseline: &str) -> String {
 
 fn command_count(calls: &str, command: &str) -> usize {
     calls.lines().filter(|call| *call == command).count()
+}
+
+fn last_command_position(calls: &str, command: &str) -> Option<usize> {
+    calls
+        .lines()
+        .enumerate()
+        .filter_map(|(index, call)| (call == command).then_some(index))
+        .last()
 }
 
 fn count(path: &Path, name: &str) -> usize {
@@ -862,7 +871,7 @@ fn timeout_and_malformed_kickoffs_have_one_post_and_no_command_effect() {
                 "--thread",
                 "123456789012345678",
                 "--kickoff",
-                "redacted",
+                "private-kickoff-body",
                 "--json",
                 "--",
                 "worker",
@@ -875,7 +884,7 @@ fn timeout_and_malformed_kickoffs_have_one_post_and_no_command_effect() {
         } else {
             "malformed-success"
         }));
-        assert!(!rendered.contains("redacted"));
+        assert!(!rendered.contains("private-kickoff-body"));
         assert_eq!(discord.count("POST"), 1);
         assert_eq!(count(&state, "sends"), 0);
     }
@@ -1531,4 +1540,317 @@ fn response_loss_reconciles_each_lane_mutation_without_duplicate_effects() {
         assert_eq!(proxy.path_count("/api/lane/delivery"), 1);
         assert_eq!(proxy.path_count("/api/lane/evidence"), 2);
     }
+}
+
+#[test]
+#[serial]
+fn command_lane_name_collision_has_no_unowned_tmux_effects() {
+    let temp = TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let config_path = temp.path().join("config.toml");
+    let state = temp.path().join("tmux");
+    let tmux = temp.path().join("tmux.sh");
+    fs::create_dir_all(&home).expect("home");
+    fake_tmux(&tmux, &state);
+    write_file(&state.join("session"), "owned-lane");
+    write_file(&state.join("live"), "1");
+    write_file(&state.join("fail_new_session"), "1");
+    let discord = MockDiscord::start("success");
+    let port = free_port();
+    config(&config_path, port);
+    let _daemon = start(&config_path, &home, &tmux, &discord, port);
+    let baseline = fs::read_to_string(state.join("calls")).unwrap_or_default();
+
+    let output = lane_command(
+        &config_path,
+        &home,
+        &tmux,
+        &discord,
+        &[
+            "tmux",
+            "new",
+            "--session",
+            "owned-lane",
+            "--thread",
+            "1",
+            "--json",
+            "--",
+            "worker",
+        ],
+    );
+    failed(&output);
+    let json: Value = serde_json::from_slice(&output.stdout).expect("collision json");
+    assert_eq!(
+        json["durable_launch_state"],
+        "launch-failed-no-worker-effect"
+    );
+    assert_eq!(json["exit_category"], "session-create-failed");
+    assert_eq!(
+        json["thread_id"],
+        "discord:thread:redacted:af63ac4c86019afc"
+    );
+    assert!(!text(&output).contains("\"thread_id\":\"1\""));
+    assert_eq!(
+        fs::read_to_string(state.join("session")).expect("session"),
+        "owned-lane"
+    );
+    assert!(state.join("live").is_file());
+    for marker in [
+        "clawhip_lane_generation",
+        "clawhip_lane_launch_operation",
+        "clawhip_lane_command_submitted",
+    ] {
+        assert!(!state.join(marker).exists(), "unexpected marker {marker}");
+    }
+    let calls = calls_after(&state, &baseline);
+    assert_eq!(command_count(&calls, "new-session"), 1);
+    assert!(calls.lines().all(|call| !matches!(
+        call,
+        "set-option" | "show-options" | "send-keys" | "kill-session" | "attach-session"
+    )));
+    assert_eq!(count(&state, "sends"), 0);
+    assert_eq!(discord.count("POST"), 0);
+}
+
+#[test]
+#[serial]
+fn lane_launch_json_uses_canonical_safe_thread_target() {
+    let temp = TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let config_path = temp.path().join("config.toml");
+    let state = temp.path().join("tmux");
+    let tmux = temp.path().join("tmux.sh");
+    fs::create_dir_all(&home).expect("home");
+    fake_tmux(&tmux, &state);
+    let discord = MockDiscord::start("success");
+    let port = free_port();
+    config(&config_path, port);
+    let _daemon = start(&config_path, &home, &tmux, &discord, port);
+    let output = lane_command(
+        &config_path,
+        &home,
+        &tmux,
+        &discord,
+        &[
+            "tmux",
+            "new",
+            "--session",
+            "safe-json",
+            "--thread",
+            "1",
+            "--json",
+        ],
+    );
+    successful(&output);
+    let json: Value = serde_json::from_slice(&output.stdout).expect("launch json");
+    assert_eq!(
+        json["thread_id"],
+        "discord:thread:redacted:af63ac4c86019afc"
+    );
+    assert_ne!(json["thread_id"], "1");
+    assert!(!text(&output).contains("\"thread_id\":\"1\""));
+}
+
+#[test]
+#[serial]
+fn lane_attach_is_exact_once_after_fresh_retained_success_and_never_failure() {
+    let temp = TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let config_path = temp.path().join("config.toml");
+    let state = temp.path().join("tmux");
+    let tmux = temp.path().join("tmux.sh");
+    fs::create_dir_all(&home).expect("home");
+    fake_tmux(&tmux, &state);
+    let discord = MockDiscord::start("success");
+    let port = free_port();
+    config(&config_path, port);
+    let _daemon = start(&config_path, &home, &tmux, &discord, port);
+    let fresh = lane_command(
+        &config_path,
+        &home,
+        &tmux,
+        &discord,
+        &[
+            "tmux",
+            "new",
+            "--session",
+            "fresh-attach",
+            "--thread",
+            "1",
+            "--json",
+            "--attach",
+            "--",
+            "worker",
+        ],
+    );
+    successful(&fresh);
+    let fresh_json: Value = serde_json::from_slice(&fresh.stdout).expect("fresh json");
+    assert_eq!(fresh_json["durable_launch_state"], "launched");
+    assert_eq!(count(&state, "sends"), 1);
+    assert_eq!(count(&state, "attach_targets"), 1);
+    assert_eq!(
+        fs::read_to_string(state.join("attach_targets"))
+            .expect("target")
+            .trim(),
+        "fresh-attach"
+    );
+    let calls = fs::read_to_string(state.join("calls")).expect("calls");
+    assert!(
+        last_command_position(&calls, "attach-session")
+            > last_command_position(&calls, "send-keys")
+    );
+
+    let session = "retained-attach";
+    let generation_id = "generation-retained";
+    let kickoff_operation_id = "kickoff-retained";
+    let launch_operation_id = "launch-retained";
+    let executor_id = "executor-retained";
+    write_file(&state.join("session"), session);
+    write_file(&state.join("live"), "1");
+    write_file(&state.join("clawhip_lane_generation"), generation_id);
+    write_file(
+        &state.join("clawhip_lane_launch_operation"),
+        launch_operation_id,
+    );
+    write_file(
+        &state.join("clawhip_lane_command_submitted"),
+        launch_operation_id,
+    );
+    let registered = http_json_value(
+        port,
+        "POST",
+        "/api/lane/register",
+        json!({
+            "registration": {"session":session,"channel":null,"mention":null,"keywords":[],"keyword_window_secs":30,"stale_minutes":10,"format":null,"active_wrapper_monitor":false},
+            "generation_id":generation_id,"kickoff_operation_id":kickoff_operation_id,"launch_operation_id":launch_operation_id,"executor_id":executor_id,"worker_effect_kind":"command-submission","thread_id":"1","expect_absent_or_retired":true
+        }),
+    );
+    let claimed = http_json_value(
+        port,
+        "POST",
+        "/api/lane/claim",
+        json!({
+            "session":session,"generation_id":generation_id,"executor_id":executor_id,"expected_revision":registered["snapshot"]["revision"]
+        }),
+    );
+    let seeded = http_json_value(
+        port,
+        "POST",
+        "/api/lane/evidence",
+        json!({
+            "session":session,"generation_id":generation_id,"launch_operation_id":launch_operation_id,"expected_revision":claimed["revision"],"launch_state":"identity-verified","failure_category":null,"executor_id":executor_id,"worker_effect_kind":"command-submission"
+        }),
+    );
+    assert_eq!(seeded["durable_launch_state"], "identity-verified");
+    let send_baseline = count(&state, "sends");
+    let attach_baseline = count(&state, "attach_targets");
+    let retained = lane_command(
+        &config_path,
+        &home,
+        &tmux,
+        &discord,
+        &[
+            "tmux",
+            "new",
+            "--session",
+            session,
+            "--thread",
+            "1",
+            "--json",
+            "--attach",
+            "--",
+            "worker",
+        ],
+    );
+    successful(&retained);
+    let retained_json: Value = serde_json::from_slice(&retained.stdout).expect("retained json");
+    assert_eq!(retained_json["durable_launch_state"], "launched");
+    assert_eq!(count(&state, "sends"), send_baseline);
+    assert_eq!(count(&state, "attach_targets"), attach_baseline + 1);
+    assert_eq!(
+        fs::read_to_string(state.join("attach_targets"))
+            .expect("targets")
+            .lines()
+            .last(),
+        Some(session)
+    );
+
+    write_file(&state.join("fail_new_session"), "1");
+    let attach_before_failure = count(&state, "attach_targets");
+    let failed_launch = lane_command(
+        &config_path,
+        &home,
+        &tmux,
+        &discord,
+        &[
+            "tmux",
+            "new",
+            "--session",
+            "failed-attach",
+            "--thread",
+            "1",
+            "--json",
+            "--attach",
+            "--",
+            "worker",
+        ],
+    );
+    failed(&failed_launch);
+    assert_eq!(count(&state, "attach_targets"), attach_before_failure);
+}
+
+#[test]
+#[serial]
+fn lane_attach_helper_failure_is_propagated_after_successful_launch() {
+    let temp = TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let config_path = temp.path().join("config.toml");
+    let state = temp.path().join("tmux");
+    let tmux = temp.path().join("tmux.sh");
+    fs::create_dir_all(&home).expect("home");
+    fake_tmux(&tmux, &state);
+    write_file(&state.join("fail_attach_session"), "1");
+    let discord = MockDiscord::start("success");
+    let port = free_port();
+    config(&config_path, port);
+    let _daemon = start(&config_path, &home, &tmux, &discord, port);
+    let output = lane_command(
+        &config_path,
+        &home,
+        &tmux,
+        &discord,
+        &[
+            "tmux",
+            "new",
+            "--session",
+            "attach-error",
+            "--thread",
+            "1",
+            "--json",
+            "--attach",
+            "--",
+            "worker",
+        ],
+    );
+    failed(&output);
+    assert!(text(&output).contains("fixture-attach-failed"));
+    assert!(!text(&output).contains("\"thread_id\":\"1\""));
+    assert_eq!(count(&state, "attach_targets"), 1);
+    assert_eq!(
+        fs::read_to_string(state.join("attach_targets"))
+            .expect("target")
+            .trim(),
+        "attach-error"
+    );
+    assert_eq!(count(&state, "sends"), 1);
+    assert_eq!(
+        registry(&config_path)["attach-error"]["lane"]["launch_state"],
+        "launched"
+    );
+    let calls = fs::read_to_string(state.join("calls")).expect("calls");
+    assert_eq!(command_count(&calls, "attach-session"), 1);
+    assert!(
+        last_command_position(&calls, "attach-session")
+            > last_command_position(&calls, "send-keys")
+    );
 }

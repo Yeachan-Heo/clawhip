@@ -14,6 +14,9 @@ use crate::config::AppConfig;
 use crate::discord::{DiscordClient, DiscordLaneDisposition};
 use crate::events::RoutingMetadata;
 use crate::router::resolve_tmux_session_channel_with_metadata;
+use crate::sink::SinkTarget;
+use crate::telemetry;
+
 use crate::source::tmux::{
     BoundedCategory, LaneDeliveryMutation, LaneEvidence, LaneEvidenceMutation, LaneLaunchState,
     LaneRegistrationInput, LaneVisibility, LaneWorkflow, ParentProcessInfo, RegisteredTmuxSession,
@@ -23,7 +26,13 @@ use crate::source::tmux::{
 
 pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
     if args.thread.is_some() {
-        return launch_lane_session(args, config).await;
+        let requested_session = args.session.clone();
+        let attach = args.attach;
+        launch_lane_session(args, config).await?;
+        if attach {
+            attach_session(&requested_session).await?;
+        }
+        return Ok(());
     }
 
     launch_session(&args).await?;
@@ -438,40 +447,51 @@ fn durable_launch_state_name(state: LaneLaunchState) -> &'static str {
     }
 }
 
+fn lane_result_json(
+    snapshot: &crate::source::tmux::LaneSnapshot,
+    overlay: &LaneInspectionResult,
+    thread: Option<&str>,
+) -> serde_json::Value {
+    let mut result = serde_json::json!({
+        "session": snapshot.session,
+        "worker_effect_kind": snapshot.worker_effect_kind,
+        "generation_id": snapshot.generation_id,
+        "kickoff_operation_id": snapshot.kickoff_operation_id,
+        "launch_operation_id": snapshot.launch_operation_id,
+        "executor_id": snapshot.executor_id,
+        "durable_launch_state": durable_launch_state_name(snapshot.durable_launch_state),
+        "derived_status": overlay.derived_status,
+        "observation_reason": overlay.observation_reason,
+        "worker_started": overlay.worker_started,
+        "evidence_commit": overlay.evidence_commit,
+        "repair_needed": overlay.repair_needed,
+        "healthy": overlay.healthy,
+        "exit_category": overlay.exit_category,
+    });
+    if let Some(thread) = thread {
+        result["thread_id"] = serde_json::json!(telemetry::safe_target_id(
+            &SinkTarget::DiscordThread(thread.to_owned()),
+        ));
+        result["kickoff_message_id"] = serde_json::json!(snapshot.kickoff_message_id);
+        result["kickoff_delivered_at"] = serde_json::json!(snapshot.kickoff_delivered_at);
+        result["watch_registered"] = serde_json::json!(true);
+        result["visibility"] = serde_json::json!(snapshot.visibility);
+        result["workflow"] = serde_json::json!(snapshot.workflow);
+        result["runtime"] = serde_json::json!(overlay.runtime);
+    }
+    result
+}
+
 fn emit_lane_result(
     args: &TmuxNewArgs,
     snapshot: &crate::source::tmux::LaneSnapshot,
     overlay: &LaneInspectionResult,
 ) {
     if args.json {
-        println!("{}", {
-            let mut result = serde_json::json!({
-                "session": snapshot.session,
-                "worker_effect_kind": snapshot.worker_effect_kind,
-                "generation_id": snapshot.generation_id,
-                "kickoff_operation_id": snapshot.kickoff_operation_id,
-                "launch_operation_id": snapshot.launch_operation_id,
-                "executor_id": snapshot.executor_id,
-                "durable_launch_state": durable_launch_state_name(snapshot.durable_launch_state),
-                "derived_status": overlay.derived_status,
-                "observation_reason": overlay.observation_reason,
-                "worker_started": overlay.worker_started,
-                "evidence_commit": overlay.evidence_commit,
-                "repair_needed": overlay.repair_needed,
-                "healthy": overlay.healthy,
-                "exit_category": overlay.exit_category,
-            });
-            if args.thread.is_some() {
-                result["thread_id"] = serde_json::json!(args.thread);
-                result["kickoff_message_id"] = serde_json::json!(snapshot.kickoff_message_id);
-                result["kickoff_delivered_at"] = serde_json::json!(snapshot.kickoff_delivered_at);
-                result["watch_registered"] = serde_json::json!(true);
-                result["visibility"] = serde_json::json!(snapshot.visibility);
-                result["workflow"] = serde_json::json!(snapshot.workflow);
-                result["runtime"] = serde_json::json!(overlay.runtime);
-            }
-            result
-        });
+        println!(
+            "{}",
+            lane_result_json(snapshot, overlay, args.thread.as_deref())
+        );
     } else {
         let worker = match overlay.worker_started {
             Some(true) => "yes",
@@ -875,23 +895,28 @@ async fn launch_lane_session(args: TmuxNewArgs, config: &AppConfig) -> Result<()
             emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
             return Err("lane tmux session creation failed".into());
         }
-        DetachedSessionOutcome::PossiblyExecuted
-            if matches!(
+        DetachedSessionOutcome::PossiblyExecuted => {
+            let (state, category, error) = if matches!(
                 snapshot.worker_effect_kind,
-                WorkerEffectKind::SessionCreation
-            ) =>
-        {
-            let terminal = transition_lane(
-                &client,
-                &snapshot,
-                LaneLaunchState::SessionCreationAmbiguous,
-                Some("owner-aborted-before-r2"),
-            )
-            .await?;
+                WorkerEffectKind::CommandSubmission
+            ) {
+                (
+                    LaneLaunchState::NoWorkerEffect,
+                    "session-create-failed",
+                    "lane tmux session creation failed",
+                )
+            } else {
+                (
+                    LaneLaunchState::SessionCreationAmbiguous,
+                    "owner-aborted-before-r2",
+                    "lane tmux session creation outcome is ambiguous",
+                )
+            };
+            let terminal = transition_lane(&client, &snapshot, state, Some(category)).await?;
             emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
-            return Err("lane tmux session creation outcome is ambiguous".into());
+            return Err(error.into());
         }
-        DetachedSessionOutcome::PossiblyExecuted | DetachedSessionOutcome::Created => {}
+        DetachedSessionOutcome::Created => {}
     }
     let identity_category = match write_lane_identity_markers(
         &args.session,
@@ -2312,29 +2337,13 @@ mod tests {
         );
     }
     #[test]
-    fn launch_json_extension_is_privacy_safe_and_complete() {
-        let value = serde_json::json!({
-            "thread_id": "thread-1",
-            "kickoff_message_id": "message-1",
-            "kickoff_delivered_at": "2026-07-11T00:00:00Z",
-            "watch_registered": true,
-            "visibility": "visible",
-            "workflow": "active",
-            "runtime": "live",
-        });
-        for field in [
-            "thread_id",
-            "kickoff_message_id",
-            "kickoff_delivered_at",
-            "watch_registered",
-            "visibility",
-            "workflow",
-            "runtime",
-        ] {
-            assert!(value.get(field).is_some(), "missing {field}");
-        }
-        let serialized = value.to_string();
-        assert!(!serialized.contains("token"));
-        assert!(!serialized.contains("message body"));
+    fn lane_result_json_delegates_thread_id_to_canonical_safe_target() {
+        let snapshot = response_loss_snapshot(LaneLaunchState::Launched, None);
+        let result = lane_result_json(&snapshot, &overlay_from_snapshot(&snapshot), Some("1"));
+
+        assert_eq!(
+            result["thread_id"],
+            telemetry::safe_target_id(&SinkTarget::DiscordThread("1".into()))
+        );
     }
 }
