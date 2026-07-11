@@ -30,7 +30,7 @@ pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
         let attach = args.attach;
         launch_lane_session(args, config).await?;
         if attach {
-            attach_session(&requested_session).await?;
+            attach_lane_session(&requested_session).await?;
         }
         return Ok(());
     }
@@ -660,6 +660,21 @@ async fn finalize_existing_lane(args: &TmuxNewArgs, client: &DaemonClient) -> Re
         snapshot.durable_launch_state,
         LaneLaunchState::IdentityVerified
     ) {
+        if snapshot.durable_launch_state == LaneLaunchState::Launched && args.attach {
+            match inspect_lane_markers(&args.session, &snapshot).await {
+                LaneInspection::Exact => {}
+                LaneInspection::CommandTerminal(category) => {
+                    let overlay = r2_overlay(WorkerEffectKind::CommandSubmission, category, false);
+                    emit_lane_result(args, &snapshot, &overlay);
+                    return Err("retained lane ownership proof is not exact".into());
+                }
+                LaneInspection::Observed(reason, conflict) => {
+                    let overlay = r2_overlay(snapshot.worker_effect_kind, reason, conflict);
+                    emit_lane_result(args, &snapshot, &overlay);
+                    return Err("retained lane ownership proof is not exact".into());
+                }
+            }
+        }
         let overlay = overlay_from_snapshot(&snapshot);
         emit_lane_result(args, &snapshot, &overlay);
         return if snapshot.worker_started == Some(true) {
@@ -895,26 +910,32 @@ async fn launch_lane_session(args: TmuxNewArgs, config: &AppConfig) -> Result<()
             emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
             return Err("lane tmux session creation failed".into());
         }
-        DetachedSessionOutcome::PossiblyExecuted => {
-            let (state, category, error) = if matches!(
+        DetachedSessionOutcome::DefinitiveFailure => {
+            let (state, category) = if matches!(
                 snapshot.worker_effect_kind,
                 WorkerEffectKind::CommandSubmission
             ) {
-                (
-                    LaneLaunchState::NoWorkerEffect,
-                    "session-create-failed",
-                    "lane tmux session creation failed",
-                )
+                (LaneLaunchState::NoWorkerEffect, "session-create-failed")
             } else {
                 (
                     LaneLaunchState::SessionCreationAmbiguous,
                     "owner-aborted-before-r2",
-                    "lane tmux session creation outcome is ambiguous",
                 )
             };
             let terminal = transition_lane(&client, &snapshot, state, Some(category)).await?;
             emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
-            return Err(error.into());
+            return Err("lane tmux session creation failed".into());
+        }
+        DetachedSessionOutcome::PossiblyExecuted => {
+            let terminal = transition_lane(
+                &client,
+                &snapshot,
+                LaneLaunchState::SessionCreationAmbiguous,
+                Some("owner-aborted-before-r2"),
+            )
+            .await?;
+            emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
+            return Err("lane tmux session creation outcome is ambiguous".into());
         }
         DetachedSessionOutcome::Created => {}
     }
@@ -931,21 +952,13 @@ async fn launch_lane_session(args: TmuxNewArgs, config: &AppConfig) -> Result<()
         IdentityProof::Mismatch => Some("identity-marker-mismatch"),
     };
     if let Some(category) = identity_category {
-        let state = if matches!(
-            snapshot.worker_effect_kind,
-            WorkerEffectKind::CommandSubmission
-        ) {
-            LaneLaunchState::NoWorkerEffect
-        } else {
-            LaneLaunchState::SessionCreationAmbiguous
-        };
-        let terminal = transition_lane(&client, &snapshot, state, Some(category)).await?;
-        if matches!(
-            snapshot.worker_effect_kind,
-            WorkerEffectKind::CommandSubmission
-        ) {
-            cleanup_command_r1_session(&args.session).await;
-        }
+        let terminal = transition_lane(
+            &client,
+            &snapshot,
+            LaneLaunchState::SessionCreationAmbiguous,
+            Some(category),
+        )
+        .await?;
         emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
         return Err("lane tmux identity marker proof failed".into());
     }
@@ -974,24 +987,10 @@ async fn launch_lane_session(args: TmuxNewArgs, config: &AppConfig) -> Result<()
                     && detail.snapshot.durable_launch_state == LaneLaunchState::Claimed
                     && detail.snapshot.revision == snapshot.revision =>
             {
-                let state = if matches!(
-                    snapshot.worker_effect_kind,
-                    WorkerEffectKind::CommandSubmission
-                ) {
-                    LaneLaunchState::NoWorkerEffect
-                } else {
-                    LaneLaunchState::SessionCreationAmbiguous
-                };
-                if matches!(
-                    snapshot.worker_effect_kind,
-                    WorkerEffectKind::CommandSubmission
-                ) {
-                    cleanup_command_r1_session(&args.session).await;
-                }
                 let terminal = transition_lane(
                     &client,
                     &detail.snapshot,
-                    state,
+                    LaneLaunchState::SessionCreationAmbiguous,
                     Some("r1-to-r2-persistence-failed-after-create"),
                 )
                 .await?;
@@ -1322,18 +1321,22 @@ fn session_uncommitted(
     Err("lane session creation proof is not exact".into())
 }
 
-async fn cleanup_command_r1_session(session: &str) {
-    let _ = Command::new(tmux_bin())
-        .args(["kill-session", "-t", session])
-        .output()
-        .await;
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetachedSessionOutcome {
     Created,
+    DefinitiveFailure,
     PossiblyExecuted,
     PreExecutionFailure,
+}
+
+fn detached_session_outcome_from_wait(
+    result: std::io::Result<std::process::ExitStatus>,
+) -> DetachedSessionOutcome {
+    match result {
+        Ok(status) if status.success() => DetachedSessionOutcome::Created,
+        Ok(_) => DetachedSessionOutcome::DefinitiveFailure,
+        Err(_) => DetachedSessionOutcome::PossiblyExecuted,
+    }
 }
 
 async fn create_detached_lane_session(args: &TmuxNewArgs) -> DetachedSessionOutcome {
@@ -1353,10 +1356,7 @@ async fn create_detached_lane_session(args: &TmuxNewArgs) -> DetachedSessionOutc
         Ok(child) => child,
         Err(_) => return DetachedSessionOutcome::PreExecutionFailure,
     };
-    match child.wait_with_output().await {
-        Ok(output) if output.status.success() => DetachedSessionOutcome::Created,
-        Ok(_) | Err(_) => DetachedSessionOutcome::PossiblyExecuted,
-    }
+    detached_session_outcome_from_wait(child.wait_with_output().await.map(|output| output.status))
 }
 
 async fn submit_lane_command_once(session: &str, command: &str) -> Result<()> {
@@ -1504,17 +1504,21 @@ fn tmux_stderr(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
 }
 
+async fn attach_lane_session(session: &str) -> Result<()> {
+    attach_session(&format!("={session}")).await
+}
+
 async fn attach_session(session: &str) -> Result<()> {
-    let output = Command::new(tmux_bin())
+    let status = Command::new(tmux_bin())
         .arg("attach-session")
         .arg("-t")
         .arg(session)
-        .output()
+        .status()
         .await?;
-    if output.status.success() {
+    if status.success() {
         Ok(())
     } else {
-        Err(tmux_stderr(&output.stderr).into())
+        Err(format!("tmux attach session '{session}' failed").into())
     }
 }
 
@@ -2268,9 +2272,22 @@ mod tests {
     }
 
     #[test]
+    fn detached_session_wait_classifies_result_loss_as_ambiguous() {
+        let result = Err(std::io::Error::other("wait result lost"));
+        assert_eq!(
+            detached_session_outcome_from_wait(result),
+            DetachedSessionOutcome::PossiblyExecuted
+        );
+    }
+
+    #[test]
     fn typed_effect_outcomes_keep_post_spawn_ambiguity_distinct() {
         assert_ne!(
             DetachedSessionOutcome::PreExecutionFailure,
+            DetachedSessionOutcome::PossiblyExecuted
+        );
+        assert_ne!(
+            DetachedSessionOutcome::DefinitiveFailure,
             DetachedSessionOutcome::PossiblyExecuted
         );
         assert_ne!(

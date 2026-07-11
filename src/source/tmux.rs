@@ -524,13 +524,7 @@ fn terminal_category_is_valid(
         ) | (
             WorkerEffectKind::CommandSubmission,
             LaneLaunchState::NoWorkerEffect,
-            Some(
-                "session-create-failed"
-                    | "identity-marker-set-failed"
-                    | "identity-marker-read-failed"
-                    | "identity-marker-mismatch"
-                    | "r1-to-r2-persistence-failed-after-create",
-            ),
+            Some("session-create-failed"),
         ) | (
             WorkerEffectKind::CommandSubmission,
             LaneLaunchState::CommandSubmitAmbiguous,
@@ -542,7 +536,7 @@ fn terminal_category_is_valid(
                     | "submitted-marker-mismatch",
             ),
         ) | (
-            WorkerEffectKind::SessionCreation,
+            _,
             LaneLaunchState::SessionCreationAmbiguous,
             Some(
                 "identity-marker-set-failed"
@@ -2559,6 +2553,99 @@ mod tests {
             LaneLaunchState::NoWorkerEffect,
             Some(&category)
         ));
+        assert!(!terminal_category_is_valid(
+            WorkerEffectKind::CommandSubmission,
+            LaneLaunchState::NoWorkerEffect,
+            Some(&BoundedCategory::new("identity-marker-mismatch"))
+        ));
+    }
+
+    #[test]
+    fn command_session_creation_ambiguity_has_valid_terminal_categories_and_snapshot() {
+        for category in [
+            "owner-aborted-before-r2",
+            "identity-marker-set-failed",
+            "identity-marker-read-failed",
+            "identity-marker-mismatch",
+            "r1-to-r2-persistence-failed-after-create",
+        ] {
+            assert!(terminal_category_is_valid(
+                WorkerEffectKind::CommandSubmission,
+                LaneLaunchState::SessionCreationAmbiguous,
+                Some(&BoundedCategory::new(category)),
+            ));
+        }
+
+        let lane = LaneEvidence {
+            lane_version: 1,
+            generation_id: "g".into(),
+            kickoff_operation_id: "k".into(),
+            launch_operation_id: "l".into(),
+            executor_id: "e".into(),
+            worker_effect_kind: WorkerEffectKind::CommandSubmission,
+            launch_state: LaneLaunchState::SessionCreationAmbiguous,
+            workflow: LaneWorkflow::Active,
+            revision: 0,
+            quiesced: false,
+            thread_id: None,
+            kickoff_message_id: None,
+            kickoff_delivered_at: None,
+            visibility: None,
+            verification: None,
+            last_failure: Some(BoundedCategory::new("identity-marker-mismatch")),
+            latest_update_message_id: None,
+            latest_update_kind: None,
+            latest_update_delivered_at: None,
+            delivery_retry_count: 0,
+            delivery_disposition: None,
+        };
+        let snapshot = lane_snapshot("lane", &lane, None);
+        assert_eq!(
+            snapshot.derived_status.as_deref(),
+            Some("session-creation-ambiguous-blocked")
+        );
+        assert_eq!(
+            snapshot.exit_category.as_ref().map(BoundedCategory::as_str),
+            Some("identity-marker-mismatch")
+        );
+        assert_eq!(snapshot.worker_started, None);
+    }
+
+    #[tokio::test]
+    async fn command_session_creation_ambiguity_transition_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        register_lane_registration(&registry, &path, lane_input("lane", "g"))
+            .await
+            .unwrap();
+        let claimed = claim_lane(&registry, &path, "lane", "g", "e", 0)
+            .await
+            .unwrap();
+        let snapshot = update_lane_evidence(
+            &registry,
+            &path,
+            LaneEvidenceMutation {
+                session: "lane".into(),
+                expected_revision: claimed.revision,
+                generation_id: "g".into(),
+                launch_operation_id: "l".into(),
+                launch_state: LaneLaunchState::SessionCreationAmbiguous,
+                failure_category: Some(BoundedCategory::new("identity-marker-mismatch")),
+                executor_id: "e".into(),
+                worker_effect_kind: WorkerEffectKind::CommandSubmission,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot.durable_launch_state,
+            LaneLaunchState::SessionCreationAmbiguous
+        );
+        assert_eq!(
+            snapshot.exit_category.as_ref().map(BoundedCategory::as_str),
+            Some("identity-marker-mismatch")
+        );
     }
 
     #[tokio::test]
@@ -2632,6 +2719,12 @@ mod tests {
     #[test]
     fn committed_terminal_snapshots_serialize_exact_categories_and_null_worker() {
         for (state, kind, category, status) in [
+            (
+                LaneLaunchState::SessionCreationAmbiguous,
+                WorkerEffectKind::CommandSubmission,
+                "identity-marker-mismatch",
+                "session-creation-ambiguous-blocked",
+            ),
             (
                 LaneLaunchState::SessionCreationAmbiguous,
                 WorkerEffectKind::SessionCreation,

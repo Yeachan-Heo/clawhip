@@ -296,7 +296,7 @@ case "$1" in
   set-option) key="$4"; value="$5"; test "$key" = "@clawhip_lane_generation" && test -f "$S/fail_generation_set" && exit 1; printf '%s' "$value" > "$S/${{key#@}}"; test "$key" = "@clawhip_lane_generation" && test -f "$S/mismatch_generation" && printf 'different-generation' > "$S/${{key#@}}" ;;
   show-options) key="$5"; safe="${{key#@}}"; test -f "$S/unreadable_$safe" && exit 1; file="$S/$safe"; if test -f "$file"; then printf '%s\n' "$(cat "$file")"; else echo 'invalid option' >&2; exit 1; fi ;;
   send-keys) test "${{4:-}}" = "-l" || printf '1' >> "$S/sends" ;;
-  attach-session) printf '%s\n' "$3" >> "$S/attach_targets"; if test -f "$S/fail_attach_session"; then echo 'fixture-attach-failed' >&2; exit 1; fi ;;
+  attach-session) expected="$(cat "$S/session")"; if test -f "$S/prefix_collision" && test "$3" != "=$expected"; then echo 'fixture-prefix-collision' >&2; exit 1; fi; if test -f "$S/require_attach_tty"; then test -t 0 && test -t 1 && test -t 2 || {{ echo 'fixture-attach-not-a-tty' >&2; exit 1; }}; printf '0 1 2\n' >> "$S/attach_ttys"; fi; echo 'fixture-attach-stdio' >&2; printf '%s\n' "$3" >> "$S/attach_targets"; if test -f "$S/fail_attach_session"; then echo 'fixture-attach-failed' >&2; exit 1; fi ;;
   display-message) printf 'lane\t%%1\t1\tcodex\t/tmp\n' ;;
   kill-session) rm -f "$S/live" ;;
   list-sessions) test -f "$S/live" && test -f "$S/session" && cat "$S/session" ;;
@@ -305,6 +305,11 @@ esac
 "#
         ),
     );
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn config(path: &Path, port: u16) {
@@ -1283,8 +1288,7 @@ fn session_creation_new_session_failure_is_ambiguous_without_command_submission(
 
 #[test]
 #[serial]
-fn post_spawn_generation_identity_faults_are_durable_and_command_cleanup_differs_from_session_retention()
- {
+fn post_spawn_generation_identity_faults_are_durable_and_retain_sessions_for_both_effect_kinds() {
     for (flag, category) in [
         ("fail_generation_set", "identity-marker-mismatch"),
         (
@@ -1314,6 +1318,7 @@ fn post_spawn_generation_identity_faults_are_durable_and_command_cleanup_differs
                 "--thread",
                 "123456789012345678",
                 "--json",
+                "--attach",
             ];
             if command {
                 args.extend(["--", "worker"]);
@@ -1324,18 +1329,17 @@ fn post_spawn_generation_identity_faults_are_durable_and_command_cleanup_differs
             assert_eq!(json["exit_category"], category);
             assert_eq!(
                 json["durable_launch_state"],
-                if command {
-                    "launch-failed-no-worker-effect"
-                } else {
-                    "blocked-session-creation-ambiguous"
-                }
+                "blocked-session-creation-ambiguous"
             );
+            assert_eq!(json["worker_started"], Value::Null);
             assert_eq!(count(&state, "sends"), 0);
-            assert_eq!(
+            assert_eq!(count(&state, "attach_targets"), 0);
+            assert!(
                 state.join("live").is_file(),
-                !command,
-                "command cleanup removes R1 session while session effect is retained"
+                "marker proof failures retain the created session for quarantine"
             );
+            let calls = fs::read_to_string(state.join("calls")).expect("calls");
+            assert_eq!(command_count(&calls, "kill-session"), 0);
         }
     }
 }
@@ -1653,7 +1657,7 @@ fn lane_launch_json_uses_canonical_safe_thread_target() {
 
 #[test]
 #[serial]
-fn lane_attach_is_exact_once_after_fresh_retained_success_and_never_failure() {
+fn lane_attach_uses_exact_target_and_rejects_unproven_retained_ownership() {
     let temp = TempDir::new().expect("temp");
     let home = temp.path().join("home");
     let config_path = temp.path().join("config.toml");
@@ -1692,7 +1696,11 @@ fn lane_attach_is_exact_once_after_fresh_retained_success_and_never_failure() {
         fs::read_to_string(state.join("attach_targets"))
             .expect("target")
             .trim(),
-        "fresh-attach"
+        "=fresh-attach"
+    );
+    assert!(
+        String::from_utf8_lossy(&fresh.stderr).contains("fixture-attach-stdio"),
+        "attach-session must inherit the wrapper stderr"
     );
     let calls = fs::read_to_string(state.join("calls")).expect("calls");
     assert!(
@@ -1744,6 +1752,7 @@ fn lane_attach_is_exact_once_after_fresh_retained_success_and_never_failure() {
     assert_eq!(seeded["durable_launch_state"], "identity-verified");
     let send_baseline = count(&state, "sends");
     let attach_baseline = count(&state, "attach_targets");
+    write_file(&state.join("prefix_collision"), "1");
     let retained = lane_command(
         &config_path,
         &home,
@@ -1772,8 +1781,64 @@ fn lane_attach_is_exact_once_after_fresh_retained_success_and_never_failure() {
             .expect("targets")
             .lines()
             .last(),
-        Some(session)
+        Some("=retained-attach")
     );
+
+    write_file(&state.join("clawhip_lane_generation"), "stale-generation");
+    let attach_before_unproven_retained = count(&state, "attach_targets");
+    let unproven_retained = lane_command(
+        &config_path,
+        &home,
+        &tmux,
+        &discord,
+        &[
+            "tmux",
+            "new",
+            "--session",
+            session,
+            "--thread",
+            "1",
+            "--json",
+            "--attach",
+            "--",
+            "worker",
+        ],
+    );
+    failed(&unproven_retained);
+    let unproven_json: Value =
+        serde_json::from_slice(&unproven_retained.stdout).expect("unproven retained json");
+    assert_eq!(unproven_json["derived_status"], "identity-conflict");
+    assert_eq!(
+        count(&state, "attach_targets"),
+        attach_before_unproven_retained
+    );
+    assert_eq!(count(&state, "sends"), send_baseline);
+
+    fs::remove_file(state.join("clawhip_lane_generation")).expect("remove stale marker");
+    let missing_marker = lane_command(
+        &config_path,
+        &home,
+        &tmux,
+        &discord,
+        &[
+            "tmux",
+            "new",
+            "--session",
+            session,
+            "--thread",
+            "1",
+            "--json",
+            "--attach",
+            "--",
+            "worker",
+        ],
+    );
+    failed(&missing_marker);
+    assert_eq!(
+        count(&state, "attach_targets"),
+        attach_before_unproven_retained
+    );
+    assert_eq!(count(&state, "sends"), send_baseline);
 
     write_file(&state.join("fail_new_session"), "1");
     let attach_before_failure = count(&state, "attach_targets");
@@ -1840,7 +1905,7 @@ fn lane_attach_helper_failure_is_propagated_after_successful_launch() {
         fs::read_to_string(state.join("attach_targets"))
             .expect("target")
             .trim(),
-        "attach-error"
+        "=attach-error"
     );
     assert_eq!(count(&state, "sends"), 1);
     assert_eq!(
@@ -1853,4 +1918,70 @@ fn lane_attach_helper_failure_is_propagated_after_successful_launch() {
         last_command_position(&calls, "attach-session")
             > last_command_position(&calls, "send-keys")
     );
+}
+
+// Linux-only: util-linux `script` allocates the real PTY needed to verify inherited stdio.
+#[cfg(target_os = "linux")]
+#[test]
+#[serial]
+fn linux_pty_attach_inherits_all_stdio_and_preserves_lane_targeting() {
+    let temp = TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let config_path = temp.path().join("config.toml");
+    let state = temp.path().join("tmux");
+    let tmux = temp.path().join("tmux.sh");
+    fs::create_dir_all(&home).expect("home");
+    fake_tmux(&tmux, &state);
+    write_file(&state.join("require_attach_tty"), "1");
+    let discord = MockDiscord::start("success");
+    let port = free_port();
+    config(&config_path, port);
+    let _daemon = start(&config_path, &home, &tmux, &discord, port);
+
+    let run_under_pty = |args: &[&str]| {
+        let mut words = vec![
+            bin().to_owned(),
+            "--config".to_owned(),
+            config_path.display().to_string(),
+        ];
+        words.extend(args.iter().map(|arg| (*arg).to_owned()));
+        let command_line = words
+            .iter()
+            .map(|word| shell_quote(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        output(
+            Command::new("script")
+                .args(["-qefc", command_line.as_str(), "/dev/null"])
+                .env("HOME", &home)
+                .env("CLAWHIP_TMUX_BIN", &tmux)
+                .env("CLAWHIP_DISCORD_API_BASE", discord.api_base()),
+        )
+    };
+
+    let lane = run_under_pty(&[
+        "tmux",
+        "new",
+        "--session",
+        "pty-lane",
+        "--thread",
+        "1",
+        "--attach",
+        "--",
+        "worker",
+    ]);
+    successful(&lane);
+    let legacy = run_under_pty(&["tmux", "new", "--session", "pty-legacy", "--attach"]);
+    successful(&legacy);
+
+    assert_eq!(
+        fs::read_to_string(state.join("attach_targets")).expect("attach targets"),
+        "=pty-lane\npty-legacy\n"
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("attach_ttys")).expect("attach tty evidence"),
+        "0 1 2\n0 1 2\n"
+    );
+    let calls = fs::read_to_string(state.join("calls")).expect("calls");
+    assert_eq!(command_count(&calls, "attach-session"), 2);
 }
