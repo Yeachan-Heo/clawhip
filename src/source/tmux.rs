@@ -23,6 +23,7 @@ use crate::source::Source;
 use crate::telemetry;
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
+static REGISTRY_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmuxRegistryDiagnostics {
@@ -104,6 +105,604 @@ pub struct RegisteredTmuxSession {
     pub parent_process: Option<ParentProcessInfo>,
     #[serde(default)]
     pub active_wrapper_monitor: bool,
+    #[serde(skip)]
+    pub(crate) lane: Option<LaneEvidence>,
+}
+
+/// Private, durable lane evidence. It is deliberately excluded from legacy
+/// registration serialization and `/api/tmux` projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneEvidence {
+    pub lane_version: u8,
+    pub generation_id: String,
+    pub kickoff_operation_id: String,
+    pub launch_operation_id: String,
+    pub executor_id: String,
+    pub worker_effect_kind: WorkerEffectKind,
+    pub launch_state: LaneLaunchState,
+    #[serde(default)]
+    pub workflow: LaneWorkflow,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub quiesced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff_delivered_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<LaneVisibility>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<LaneVerification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<BoundedCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_update_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_update_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_update_delivered_at: Option<String>,
+    #[serde(default)]
+    pub delivery_retry_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_disposition: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkerEffectKind {
+    CommandSubmission,
+    SessionCreation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaneLaunchState {
+    Ready,
+    Claimed,
+    IdentityVerified,
+    Launched,
+    NoWorkerEffect,
+    CommandSubmitAmbiguous,
+    SessionCreationAmbiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaneWorkflow {
+    #[default]
+    Active,
+    NeedsReview,
+    NeedsQa,
+    PrOpen,
+    AwaitingCi,
+    AwaitingHuman,
+    Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaneVisibility {
+    Unverified,
+    Visible,
+    Unreachable,
+    DeliveryFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneVerification {
+    pub checked_at: String,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<BoundedReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BoundedReason(String);
+impl BoundedReason {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into().chars().take(96).collect())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BoundedCategory(String);
+impl BoundedCategory {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into().chars().take(96).collect())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// On-disk migration wrapper. Old maps deserialize through `deserialize_stored_registry`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredTmuxRegistration {
+    pub registration: RegisteredTmuxSession,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneSnapshot {
+    pub session: String,
+    pub generation_id: String,
+    pub kickoff_operation_id: String,
+    pub launch_operation_id: String,
+    pub executor_id: String,
+    pub worker_effect_kind: WorkerEffectKind,
+    pub durable_launch_state: LaneLaunchState,
+    pub derived_status: Option<String>,
+    pub observation_reason: Option<BoundedReason>,
+    pub worker_started: Option<bool>,
+    pub evidence_commit: bool,
+    pub repair_needed: bool,
+    pub healthy: bool,
+    pub exit_category: Option<BoundedCategory>,
+    pub workflow: LaneWorkflow,
+    pub visibility: Option<LaneVisibility>,
+    pub revision: u64,
+    #[serde(default)]
+    pub kickoff_message_id: Option<String>,
+    #[serde(default)]
+    pub kickoff_delivered_at: Option<String>,
+    #[serde(default)]
+    pub latest_update_message_id: Option<String>,
+    #[serde(default)]
+    pub latest_update_kind: Option<String>,
+    #[serde(default)]
+    pub latest_update_delivered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneDetail {
+    pub snapshot: LaneSnapshot,
+    pub thread_id: Option<String>,
+    pub kickoff_message_id: Option<String>,
+    pub kickoff_delivered_at: Option<String>,
+    pub verification: Option<LaneVerification>,
+    pub latest_update_message_id: Option<String>,
+    pub latest_update_kind: Option<String>,
+    pub latest_update_delivered_at: Option<String>,
+    pub last_error: Option<BoundedCategory>,
+    pub quiesced: bool,
+}
+
+fn lane_detail(session: &str, lane: &LaneEvidence, runtime_live: Option<bool>) -> LaneDetail {
+    LaneDetail {
+        snapshot: lane_snapshot(session, lane, runtime_live),
+        thread_id: lane.thread_id.clone(),
+        kickoff_message_id: lane.kickoff_message_id.clone(),
+        kickoff_delivered_at: lane.kickoff_delivered_at.clone(),
+        verification: lane.verification.clone(),
+        latest_update_message_id: lane.latest_update_message_id.clone(),
+        latest_update_kind: lane.latest_update_kind.clone(),
+        latest_update_delivered_at: lane.latest_update_delivered_at.clone(),
+        last_error: lane.last_failure.clone(),
+        quiesced: lane.quiesced,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum StoredRegistryValue {
+    Wrapped(Box<StoredTmuxRegistration>),
+    Legacy(Box<RegisteredTmuxSession>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneEvidenceMutation {
+    pub session: String,
+    pub expected_revision: u64,
+    pub generation_id: String,
+    pub launch_operation_id: String,
+    pub launch_state: LaneLaunchState,
+    #[serde(default)]
+    pub failure_category: Option<BoundedCategory>,
+    pub executor_id: String,
+    pub worker_effect_kind: WorkerEffectKind,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneVerificationMutation {
+    pub session: String,
+    pub expected_revision: u64,
+    pub checked_at: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub reason: Option<BoundedReason>,
+    pub visibility: LaneVisibility,
+    pub generation_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneDeliveryMutation {
+    pub session: String,
+    pub expected_revision: u64,
+    #[serde(default)]
+    pub workflow: Option<LaneWorkflow>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub delivered_at: Option<String>,
+    pub visibility: LaneVisibility,
+    #[serde(default)]
+    pub error_category: Option<BoundedCategory>,
+    #[serde(default)]
+    pub disposition: Option<String>,
+    pub generation_id: String,
+    #[serde(default)]
+    pub initial_kickoff: bool,
+    #[serde(default)]
+    pub kickoff_operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneRegistrationInput {
+    pub registration: RegisteredTmuxSession,
+    pub generation_id: String,
+    pub kickoff_operation_id: String,
+    pub launch_operation_id: String,
+    pub executor_id: String,
+    pub worker_effect_kind: WorkerEffectKind,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    pub expect_absent_or_retired: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneWorkflowMutation {
+    pub session: String,
+    pub generation_id: String,
+    pub expected_revision: u64,
+    pub workflow: LaneWorkflow,
+    #[serde(default)]
+    pub quiesced: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneRetirementMutation {
+    pub session: String,
+    pub generation_id: String,
+    pub expected_revision: u64,
+}
+
+fn lane_of(registration: &RegisteredTmuxSession) -> Option<&LaneEvidence> {
+    registration.lane.as_ref()
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+fn valid_discord_id(value: &str) -> bool {
+    (1..=20).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+fn valid_session(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+fn valid_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 64 && value.is_ascii()
+}
+fn valid_delivery(input: &LaneDeliveryMutation) -> bool {
+    let error_ok = matches!(
+        (
+            input.disposition.as_deref(),
+            input.error_category.as_ref().map(BoundedCategory::as_str),
+        ),
+        (Some("accepted"), None)
+            | (
+                Some("definitive-failure"),
+                Some(
+                    "payload-too-large"
+                        | "bad-request"
+                        | "unauthorized"
+                        | "forbidden"
+                        | "not-found"
+                        | "rate-limited"
+                        | "archived-or-not-writable"
+                        | "transport",
+                ),
+            )
+            | (
+                Some("ambiguous-acceptance"),
+                Some(
+                    "timeout"
+                        | "transport"
+                        | "malformed-success"
+                        | "empty-message-id"
+                        | "missing-message-id",
+                ),
+            )
+    );
+    let kind_ok = input.kind.as_deref().is_none_or(|value| {
+        matches!(
+            value,
+            "kickoff" | "progress" | "blocked" | "pr-open" | "handoff"
+        )
+    });
+    let disposition_ok = match input.disposition.as_deref() {
+        Some("accepted") => {
+            input.message_id.is_some()
+                && input.delivered_at.is_some()
+                && input.visibility == LaneVisibility::Visible
+                && input.error_category.is_none()
+        }
+        Some("definitive-failure") => {
+            input.message_id.is_none()
+                && input.delivered_at.is_none()
+                && input.visibility == LaneVisibility::DeliveryFailed
+                && input.error_category.is_some()
+        }
+        Some("ambiguous-acceptance") => {
+            input.message_id.is_none()
+                && input.delivered_at.is_none()
+                && input.visibility == LaneVisibility::Unverified
+                && input.error_category.is_some()
+        }
+        _ => false,
+    };
+    input.message_id.as_deref().is_none_or(valid_discord_id)
+        && input.delivered_at.as_deref().is_none_or(valid_text)
+        && kind_ok
+        && error_ok
+        && disposition_ok
+}
+fn valid_verification(input: &LaneVerificationMutation) -> bool {
+    let discord_error = |reason: &str| {
+        matches!(
+            reason,
+            "payload-too-large"
+                | "bad-request"
+                | "unauthorized"
+                | "forbidden"
+                | "not-found"
+                | "rate-limited"
+                | "archived-or-not-writable"
+                | "timeout"
+                | "transport"
+                | "malformed-success"
+                | "empty-message-id"
+                | "missing-message-id"
+        )
+    };
+    let reason = input.reason.as_ref().map(BoundedReason::as_str);
+    let reason_ok = reason.is_none_or(|reason| {
+        discord_error(reason)
+            || matches!(
+                reason,
+                "thread-target-missing"
+                    | "kickoff-missing"
+                    | "kickoff-receipt-missing"
+                    | "no-message-observed"
+                    | "unreachable"
+            )
+    });
+    valid_text(&input.checked_at)
+        && reason_ok
+        && match input.outcome.as_str() {
+            "kickoff-visible" => reason.is_none(),
+            "kickoff-missing" => reason == Some("kickoff-missing"),
+            "message-observed-unverified" => reason == Some("kickoff-receipt-missing"),
+            "unverified" => reason.is_some_and(|reason| {
+                reason == "thread-target-missing"
+                    || reason == "no-message-observed"
+                    || discord_error(reason)
+            }),
+            "unreachable" => {
+                reason.is_some_and(|reason| reason == "unreachable" || discord_error(reason))
+            }
+            _ => false,
+        }
+}
+fn terminal_category_is_valid(
+    kind: WorkerEffectKind,
+    state: LaneLaunchState,
+    category: Option<&BoundedCategory>,
+) -> bool {
+    matches!(
+        (kind, state, category.map(BoundedCategory::as_str)),
+        (
+            _,
+            LaneLaunchState::Ready
+                | LaneLaunchState::Claimed
+                | LaneLaunchState::IdentityVerified
+                | LaneLaunchState::Launched,
+            None,
+        ) | (
+            WorkerEffectKind::CommandSubmission,
+            LaneLaunchState::NoWorkerEffect,
+            Some(
+                "session-create-failed"
+                    | "identity-marker-set-failed"
+                    | "identity-marker-read-failed"
+                    | "identity-marker-mismatch"
+                    | "r1-to-r2-persistence-failed-after-create",
+            ),
+        ) | (
+            WorkerEffectKind::CommandSubmission,
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some(
+                "submission-attempt-error"
+                    | "submitted-marker-set-failed"
+                    | "submitted-marker-read-failed"
+                    | "submitted-marker-missing"
+                    | "submitted-marker-mismatch",
+            ),
+        ) | (
+            WorkerEffectKind::SessionCreation,
+            LaneLaunchState::SessionCreationAmbiguous,
+            Some(
+                "identity-marker-set-failed"
+                    | "identity-marker-read-failed"
+                    | "identity-marker-mismatch"
+                    | "r1-to-r2-persistence-failed-after-create"
+                    | "owner-aborted-before-r2",
+            ),
+        )
+    )
+}
+
+fn lane_snapshot(session: &str, lane: &LaneEvidence, runtime_live: Option<bool>) -> LaneSnapshot {
+    let (
+        derived_status,
+        observation_reason,
+        worker_started,
+        evidence_commit,
+        repair_needed,
+        healthy,
+        exit_category,
+    ) = match lane.launch_state {
+        LaneLaunchState::Launched => {
+            let healthy = lane.workflow == LaneWorkflow::Active
+                && runtime_live == Some(true)
+                && lane.visibility == Some(LaneVisibility::Visible);
+            let status = match (runtime_live, lane.workflow) {
+                (Some(false), LaneWorkflow::Active) => Some("tmux-missing".into()),
+                (
+                    Some(false),
+                    LaneWorkflow::NeedsReview
+                    | LaneWorkflow::NeedsQa
+                    | LaneWorkflow::PrOpen
+                    | LaneWorkflow::AwaitingCi
+                    | LaneWorkflow::AwaitingHuman,
+                ) => Some("workflow-handoff".into()),
+                _ => None,
+            };
+            (status, None, Some(true), true, false, healthy, None)
+        }
+        LaneLaunchState::CommandSubmitAmbiguous => {
+            let category = lane
+                .last_failure
+                .clone()
+                .unwrap_or_else(|| BoundedCategory::new("submission-attempt-error"));
+            (
+                Some("command-submit-ambiguous-blocked".into()),
+                Some(BoundedReason::new(category.as_str())),
+                None,
+                true,
+                false,
+                false,
+                Some(category),
+            )
+        }
+        LaneLaunchState::SessionCreationAmbiguous => {
+            let category = lane
+                .last_failure
+                .clone()
+                .unwrap_or_else(|| BoundedCategory::new("owner-aborted-before-r2"));
+            (
+                Some("session-creation-ambiguous-blocked".into()),
+                Some(BoundedReason::new(category.as_str())),
+                None,
+                true,
+                false,
+                false,
+                Some(category),
+            )
+        }
+        LaneLaunchState::IdentityVerified => {
+            let reason = lane
+                .last_failure
+                .clone()
+                .unwrap_or_else(|| BoundedCategory::new("session-liveness-unavailable"));
+            let status = if reason.as_str() == "identity-mismatch" {
+                "identity-conflict"
+            } else if lane.worker_effect_kind == WorkerEffectKind::CommandSubmission {
+                "launch-commit-ambiguous"
+            } else {
+                "session-creation-effect-uncommitted"
+            };
+            (
+                Some(status.into()),
+                Some(BoundedReason::new(reason.as_str())),
+                None,
+                false,
+                true,
+                false,
+                Some(reason),
+            )
+        }
+        LaneLaunchState::NoWorkerEffect => {
+            let category = lane
+                .last_failure
+                .clone()
+                .unwrap_or_else(|| BoundedCategory::new("launch-failed-no-worker-effect"));
+            (
+                Some("launch-failed-no-worker-effect".into()),
+                Some(BoundedReason::new(category.as_str())),
+                None,
+                true,
+                false,
+                false,
+                Some(category),
+            )
+        }
+        LaneLaunchState::Ready => {
+            if let Some(category) = lane.last_failure.clone() {
+                let status = match lane.delivery_disposition.as_deref() {
+                    Some("ambiguous-acceptance") => "kickoff-ambiguous",
+                    Some("definitive-failure") => "kickoff-failed",
+                    _ => "pending",
+                };
+                (
+                    Some(status.into()),
+                    Some(BoundedReason::new(category.as_str())),
+                    None,
+                    true,
+                    true,
+                    false,
+                    Some(category),
+                )
+            } else {
+                (Some("pending".into()), None, None, false, true, false, None)
+            }
+        }
+        LaneLaunchState::Claimed => {
+            let status = if lane.worker_effect_kind == WorkerEffectKind::CommandSubmission {
+                "command-execution-claim-stranded"
+            } else {
+                "session-creation-effect-uncommitted"
+            };
+            (Some(status.into()), None, None, false, true, false, None)
+        }
+    };
+    LaneSnapshot {
+        session: session.into(),
+        generation_id: lane.generation_id.clone(),
+        kickoff_operation_id: lane.kickoff_operation_id.clone(),
+        launch_operation_id: lane.launch_operation_id.clone(),
+        executor_id: lane.executor_id.clone(),
+        worker_effect_kind: lane.worker_effect_kind,
+        durable_launch_state: lane.launch_state,
+        derived_status,
+        observation_reason,
+        worker_started,
+        evidence_commit,
+        repair_needed,
+        healthy,
+        exit_category,
+        workflow: lane.workflow,
+        visibility: lane.visibility,
+        revision: lane.revision,
+        kickoff_message_id: lane.kickoff_message_id.clone(),
+        kickoff_delivered_at: lane.kickoff_delivered_at.clone(),
+        latest_update_message_id: lane.latest_update_message_id.clone(),
+        latest_update_kind: lane.latest_update_kind.clone(),
+        latest_update_delivered_at: lane.latest_update_delivered_at.clone(),
+    }
 }
 
 impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
@@ -121,6 +720,7 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
             active_wrapper_monitor: false,
+            lane: None,
         }
     }
 }
@@ -345,13 +945,21 @@ pub fn normalize_runtime_registration_source(source: RegistrationSource) -> Regi
 
 fn durable_runtime_entries(
     registry: &HashMap<String, RegisteredTmuxSession>,
-) -> BTreeMap<String, RegisteredTmuxSession> {
+) -> BTreeMap<String, StoredTmuxRegistration> {
     registry
         .iter()
         .filter(|(_, registration)| {
             registration.registration_source != RegistrationSource::ConfigMonitor
         })
-        .map(|(session, registration)| (session.clone(), registration.clone()))
+        .map(|(session, registration)| {
+            (
+                session.clone(),
+                StoredTmuxRegistration {
+                    registration: registration.clone(),
+                    lane: registration.lane.clone(),
+                },
+            )
+        })
         .collect()
 }
 
@@ -379,10 +987,18 @@ pub async fn load_tmux_registry_state(
 ) -> TmuxRegistryStateDiagnostics {
     match tokio::fs::read(path).await {
         Ok(content) => {
-            match serde_json::from_slice::<BTreeMap<String, RegisteredTmuxSession>>(&content) {
+            match serde_json::from_slice::<BTreeMap<String, StoredRegistryValue>>(&content) {
                 Ok(loaded) => {
                     let mut write = registry.write().await;
-                    for (session, mut registration) in loaded {
+                    for (session, stored) in loaded {
+                        let mut registration = match stored {
+                            StoredRegistryValue::Wrapped(stored) => {
+                                let mut registration = stored.registration;
+                                registration.lane = stored.lane;
+                                registration
+                            }
+                            StoredRegistryValue::Legacy(registration) => *registration,
+                        };
                         registration.registration_source =
                             normalize_runtime_registration_source(registration.registration_source);
                         write.insert(session, registration);
@@ -426,7 +1042,7 @@ pub async fn load_tmux_registry_state(
 pub async fn inspect_tmux_registry_state(path: &Path) -> TmuxRegistryStateDiagnostics {
     match tokio::fs::read(path).await {
         Ok(content) => {
-            match serde_json::from_slice::<BTreeMap<String, RegisteredTmuxSession>>(&content) {
+            match serde_json::from_slice::<BTreeMap<String, StoredRegistryValue>>(&content) {
                 Ok(loaded) => TmuxRegistryStateDiagnostics {
                     path: path.to_path_buf(),
                     status: TmuxRegistryStateStatus::Loaded,
@@ -469,11 +1085,18 @@ pub async fn register_runtime_tmux_registration(
 ) -> Result<usize> {
     registration.registration_source =
         normalize_runtime_registration_source(registration.registration_source);
-    let mut write = registry.write().await;
-    let mut next = write.clone();
+    let _mutation = REGISTRY_MUTATION_LOCK.lock().await;
+    let mut next = registry.read().await.clone();
+    if next
+        .get(&registration.session)
+        .and_then(lane_of)
+        .is_some_and(|lane| lane.workflow != LaneWorkflow::Retired)
+    {
+        return Err("lane session is retained until explicit quiesced retirement".into());
+    }
     next.insert(registration.session.clone(), registration);
     let durable_count = save_durable_tmux_registry(path, &next).await?;
-    *write = next;
+    *registry.write().await = next;
     Ok(durable_count)
 }
 
@@ -482,19 +1105,538 @@ pub async fn remove_tmux_registrations(
     path: &Path,
     sessions: &[String],
 ) -> Result<usize> {
-    let mut write = registry.write().await;
-    let mut next = write.clone();
+    let _mutation = REGISTRY_MUTATION_LOCK.lock().await;
+    let mut next = registry.read().await.clone();
     let mut removed = 0;
     for session in sessions {
-        if next.remove(session).is_some() {
+        let removable = next.get(session).is_none_or(|registration| {
+            registration
+                .lane
+                .as_ref()
+                .is_none_or(|lane| lane.workflow == LaneWorkflow::Retired)
+        });
+        if removable && next.remove(session).is_some() {
             removed += 1;
         }
     }
     if removed > 0 {
         save_durable_tmux_registry(path, &next).await?;
-        *write = next;
+        *registry.write().await = next;
     }
     Ok(removed)
+}
+
+pub async fn lane_detail_for_session(
+    registry: &SharedTmuxRegistry,
+    session: &str,
+) -> Result<LaneDetail> {
+    let runtime_live = None;
+    let registration = registry
+        .read()
+        .await
+        .get(session)
+        .cloned()
+        .ok_or("lane session not found")?;
+    let lane = registration
+        .lane
+        .as_ref()
+        .ok_or("session has no lane evidence")?;
+    Ok(lane_detail(session, lane, runtime_live))
+}
+pub async fn register_lane_registration(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    input: LaneRegistrationInput,
+) -> Result<LaneDetail> {
+    if !input.expect_absent_or_retired
+        || !valid_session(&input.registration.session)
+        || !valid_id(&input.generation_id)
+        || !valid_id(&input.kickoff_operation_id)
+        || !valid_id(&input.launch_operation_id)
+        || !valid_id(&input.executor_id)
+        || input
+            .thread_id
+            .as_deref()
+            .is_some_and(|value| !valid_discord_id(value))
+    {
+        return Err("invalid lane registration input".into());
+    }
+    let mut registration = input.registration;
+    if registration.lane.is_some() {
+        return Err("lane registration input must not contain evidence".into());
+    }
+    let session = registration.session.clone();
+    registration.registration_source =
+        normalize_runtime_registration_source(registration.registration_source);
+    let _mutation = REGISTRY_MUTATION_LOCK.lock().await;
+    let mut next = registry.read().await.clone();
+    if let Some(existing) = next.get(&session) {
+        if let Some(lane) = existing.lane.as_ref().filter(|lane| {
+            lane.launch_state == LaneLaunchState::Ready
+                && lane.revision == 0
+                && lane.workflow == LaneWorkflow::Active
+                && lane.generation_id == input.generation_id
+                && lane.kickoff_operation_id == input.kickoff_operation_id
+                && lane.launch_operation_id == input.launch_operation_id
+                && lane.executor_id == input.executor_id
+                && lane.worker_effect_kind == input.worker_effect_kind
+                && lane.thread_id == input.thread_id
+        }) {
+            let mut public_existing = existing.clone();
+            public_existing.lane = None;
+            if serde_json::to_value(&public_existing).ok()
+                == serde_json::to_value(&registration).ok()
+            {
+                return Ok(lane_detail(&session, lane, None));
+            }
+        }
+        if existing
+            .lane
+            .as_ref()
+            .is_none_or(|lane| lane.workflow != LaneWorkflow::Retired)
+        {
+            return Err("lane registration conflicts with existing session".into());
+        }
+    }
+    registration.lane = Some(LaneEvidence {
+        lane_version: 1,
+        generation_id: input.generation_id,
+        kickoff_operation_id: input.kickoff_operation_id,
+        launch_operation_id: input.launch_operation_id,
+        executor_id: input.executor_id,
+        worker_effect_kind: input.worker_effect_kind,
+        launch_state: LaneLaunchState::Ready,
+        workflow: LaneWorkflow::Active,
+        revision: 0,
+        quiesced: false,
+        thread_id: input.thread_id,
+        kickoff_message_id: None,
+        kickoff_delivered_at: None,
+        visibility: Some(LaneVisibility::Unverified),
+        verification: None,
+        last_failure: None,
+        latest_update_message_id: None,
+        latest_update_kind: None,
+        latest_update_delivered_at: None,
+        delivery_retry_count: 0,
+        delivery_disposition: None,
+    });
+    next.insert(session.clone(), registration);
+    save_durable_tmux_registry(path, &next).await?;
+    *registry.write().await = next;
+    drop(_mutation);
+    lane_detail_for_session(registry, &session).await
+}
+pub async fn record_lane_verification(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    input: LaneVerificationMutation,
+) -> Result<LaneSnapshot> {
+    {
+        let snapshot = registry.read().await;
+        let lane = snapshot
+            .get(&input.session)
+            .and_then(|registration| registration.lane.as_ref())
+            .ok_or("lane session not found")?;
+        if lane.revision == input.expected_revision.saturating_add(1)
+            && lane.generation_id == input.generation_id
+            && lane.visibility == Some(input.visibility)
+            && lane.verification.as_ref().is_some_and(|value| {
+                value.checked_at == input.checked_at
+                    && value.outcome == input.outcome
+                    && value.reason == input.reason
+            })
+        {
+            return Ok(lane_snapshot(&input.session, lane, None));
+        }
+    }
+    if !valid_verification(&input) || !valid_id(&input.generation_id) {
+        return Err("invalid lane verification input".into());
+    }
+    mutate_lane(
+        registry,
+        path,
+        &input.session,
+        input.expected_revision,
+        |lane| {
+            if lane.generation_id != input.generation_id || lane.workflow == LaneWorkflow::Retired {
+                return Err("lane generation conflict or retired".into());
+            }
+            lane.verification = Some(LaneVerification {
+                checked_at: input.checked_at,
+                outcome: input.outcome,
+                reason: input.reason,
+            });
+            lane.visibility = Some(input.visibility);
+            Ok(())
+        },
+    )
+    .await
+}
+pub async fn record_lane_delivery(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    input: LaneDeliveryMutation,
+) -> Result<LaneSnapshot> {
+    if !valid_delivery(&input)
+        || !valid_id(&input.generation_id)
+        || (input.initial_kickoff
+            && input
+                .kickoff_operation_id
+                .as_deref()
+                .is_none_or(|value| !valid_id(value)))
+    {
+        return Err("invalid lane delivery input".into());
+    }
+    if input.initial_kickoff {
+        let snapshot = registry.read().await;
+        let lane = snapshot
+            .get(&input.session)
+            .and_then(|registration| registration.lane.as_ref())
+            .ok_or("lane session not found")?;
+        if lane.revision == input.expected_revision.saturating_add(1)
+            && lane.generation_id == input.generation_id
+            && lane.launch_state == LaneLaunchState::Ready
+            && input.kind.as_deref() == Some("kickoff")
+            && input.kickoff_operation_id.as_deref() == Some(lane.kickoff_operation_id.as_str())
+            && lane.kickoff_message_id == input.message_id
+            && lane.kickoff_delivered_at == input.delivered_at
+            && lane.last_failure == input.error_category
+            && lane.delivery_disposition == input.disposition
+            && lane.visibility == Some(input.visibility)
+            && input.workflow.is_none()
+        {
+            return Ok(lane_snapshot(&input.session, lane, None));
+        }
+    }
+    if !input.initial_kickoff {
+        let snapshot = registry.read().await;
+        let lane = snapshot
+            .get(&input.session)
+            .and_then(|registration| registration.lane.as_ref())
+            .ok_or("lane session not found")?;
+        if lane.revision == input.expected_revision.saturating_add(1)
+            && lane.generation_id == input.generation_id
+            && lane.latest_update_message_id == input.message_id
+            && lane.latest_update_kind == input.kind
+            && lane.latest_update_delivered_at == input.delivered_at
+            && lane.visibility == Some(input.visibility)
+            && lane.last_failure == input.error_category
+            && lane.delivery_disposition == input.disposition
+            && input
+                .workflow
+                .is_none_or(|workflow| lane.workflow == workflow)
+        {
+            return Ok(lane_snapshot(&input.session, lane, None));
+        }
+    }
+    mutate_lane(
+        registry,
+        path,
+        &input.session,
+        input.expected_revision,
+        |lane| {
+            if lane.generation_id != input.generation_id
+                || (lane.workflow == LaneWorkflow::Retired
+                    && input.workflow != Some(LaneWorkflow::Retired))
+            {
+                return Err("lane generation conflict or retired".into());
+            }
+            if let Some(workflow) = input.workflow {
+                lane.workflow = workflow;
+            }
+            if input.initial_kickoff {
+                if input.kind.as_deref() != Some("kickoff")
+                    || input.kickoff_operation_id.as_deref()
+                        != Some(lane.kickoff_operation_id.as_str())
+                    || lane.launch_state != LaneLaunchState::Ready
+                    || lane.kickoff_message_id.is_some()
+                    || lane.delivery_disposition.is_some()
+                {
+                    return Err("initial kickoff fact conflict".into());
+                }
+                lane.kickoff_message_id = input.message_id;
+                lane.kickoff_delivered_at = input.delivered_at;
+            } else {
+                lane.latest_update_message_id = input.message_id;
+                lane.latest_update_kind = input.kind;
+                lane.latest_update_delivered_at = input.delivered_at;
+            }
+            lane.visibility = Some(input.visibility);
+            lane.last_failure = input.error_category;
+            lane.delivery_disposition = input.disposition;
+            lane.delivery_retry_count = lane.delivery_retry_count.saturating_add(1);
+            Ok(())
+        },
+    )
+    .await
+}
+pub async fn retire_lane_if_absent(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    input: LaneRetirementMutation,
+) -> Result<LaneSnapshot> {
+    if !valid_id(&input.generation_id) {
+        return Err("invalid lane retirement generation".into());
+    }
+    {
+        let snapshot = registry.read().await;
+        let lane = snapshot
+            .get(&input.session)
+            .and_then(|registration| registration.lane.as_ref())
+            .ok_or("lane session not found")?;
+        if lane.revision == input.expected_revision.saturating_add(1)
+            && lane.generation_id == input.generation_id
+            && lane.workflow == LaneWorkflow::Retired
+            && lane.quiesced
+        {
+            return Ok(lane_snapshot(&input.session, lane, None));
+        }
+    }
+    if session_exists(&input.session).await? {
+        return Err("lane runtime remains active".into());
+    }
+    mutate_lane(
+        registry,
+        path,
+        &input.session,
+        input.expected_revision,
+        |lane| {
+            if lane.generation_id != input.generation_id {
+                return Err("lane generation conflict".into());
+            }
+            if lane.workflow == LaneWorkflow::Retired && lane.quiesced {
+                return Ok(());
+            }
+            lane.workflow = LaneWorkflow::Retired;
+            lane.quiesced = true;
+            Ok(())
+        },
+    )
+    .await
+}
+
+pub async fn list_lane_snapshots(
+    registry: &SharedTmuxRegistry,
+    session: Option<&str>,
+) -> Vec<LaneSnapshot> {
+    let runtime = list_tmux_sessions().await.ok();
+    registry
+        .read()
+        .await
+        .iter()
+        .filter(|(name, registration)| {
+            session.is_none_or(|requested| requested == name.as_str())
+                && registration.lane.is_some()
+        })
+        .filter_map(|(name, registration)| {
+            registration.lane.as_ref().map(|lane| {
+                lane_snapshot(
+                    name,
+                    lane,
+                    runtime.as_ref().map(|sessions| sessions.contains(name)),
+                )
+            })
+        })
+        .collect()
+}
+
+pub async fn claim_lane(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    session: &str,
+    generation_id: &str,
+    executor_id: &str,
+    expected_revision: u64,
+) -> Result<LaneSnapshot> {
+    if !valid_id(generation_id) || !valid_id(executor_id) {
+        return Err("invalid lane claim identity".into());
+    }
+    {
+        let snapshot = registry.read().await;
+        let lane = snapshot
+            .get(session)
+            .and_then(|registration| registration.lane.as_ref())
+            .ok_or("lane session not found")?;
+        if lane.workflow == LaneWorkflow::Retired {
+            return Err("lane claim conflicts with retired workflow".into());
+        }
+        if lane.revision == expected_revision.saturating_add(1)
+            && lane.generation_id == generation_id
+            && lane.executor_id == executor_id
+            && lane.launch_state == LaneLaunchState::Claimed
+        {
+            return Ok(lane_snapshot(session, lane, None));
+        }
+    }
+    mutate_lane(registry, path, session, expected_revision, |lane| {
+        if lane.generation_id != generation_id || lane.executor_id != executor_id {
+            return Err("lane claim identity conflict".into());
+        }
+        if lane.workflow == LaneWorkflow::Retired {
+            return Err("lane claim conflicts with retired workflow".into());
+        }
+        if lane.launch_state == LaneLaunchState::Ready {
+            lane.launch_state = LaneLaunchState::Claimed;
+        }
+        if lane.launch_state != LaneLaunchState::Claimed {
+            return Err("lane claim conflicts with durable state".into());
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub async fn update_lane_evidence(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    input: LaneEvidenceMutation,
+) -> Result<LaneSnapshot> {
+    if !valid_id(&input.generation_id)
+        || !valid_id(&input.launch_operation_id)
+        || !valid_id(&input.executor_id)
+    {
+        return Err("invalid lane evidence identity".into());
+    }
+    {
+        let snapshot = registry.read().await;
+        let existing = snapshot
+            .get(&input.session)
+            .and_then(|registration| registration.lane.as_ref())
+            .ok_or("lane session not found")?;
+        if (existing.revision == input.expected_revision
+            || existing.revision == input.expected_revision.saturating_add(1))
+            && existing.generation_id == input.generation_id
+            && existing.launch_operation_id == input.launch_operation_id
+            && existing.executor_id == input.executor_id
+            && existing.worker_effect_kind == input.worker_effect_kind
+            && existing.launch_state == input.launch_state
+            && existing.last_failure == input.failure_category
+        {
+            return Ok(lane_snapshot(&input.session, existing, None));
+        }
+    }
+    mutate_lane(
+        registry,
+        path,
+        &input.session,
+        input.expected_revision,
+        |lane| {
+            if lane.generation_id != input.generation_id
+                || lane.launch_operation_id != input.launch_operation_id
+                || lane.executor_id != input.executor_id
+                || lane.worker_effect_kind != input.worker_effect_kind
+                || lane.workflow == LaneWorkflow::Retired
+            {
+                return Err("lane immutable identity conflict or retired".into());
+            }
+            if !terminal_category_is_valid(
+                lane.worker_effect_kind,
+                input.launch_state,
+                input.failure_category.as_ref(),
+            ) {
+                return Err("invalid terminal category for worker effect kind".into());
+            }
+            let valid = lane.launch_state == input.launch_state
+                || matches!(
+                    (lane.launch_state, input.launch_state),
+                    (LaneLaunchState::Claimed, LaneLaunchState::IdentityVerified)
+                        | (LaneLaunchState::IdentityVerified, LaneLaunchState::Launched)
+                        | (
+                            LaneLaunchState::Claimed,
+                            LaneLaunchState::NoWorkerEffect
+                                | LaneLaunchState::CommandSubmitAmbiguous
+                                | LaneLaunchState::SessionCreationAmbiguous
+                        )
+                        | (
+                            LaneLaunchState::IdentityVerified,
+                            LaneLaunchState::NoWorkerEffect
+                                | LaneLaunchState::CommandSubmitAmbiguous
+                                | LaneLaunchState::SessionCreationAmbiguous
+                        )
+                );
+            if !valid {
+                return Err("invalid lane launch transition".into());
+            }
+            lane.launch_state = input.launch_state;
+            lane.last_failure = input.failure_category;
+            Ok(())
+        },
+    )
+    .await
+}
+
+pub async fn update_lane_workflow(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    input: LaneWorkflowMutation,
+) -> Result<LaneSnapshot> {
+    if !valid_id(&input.generation_id) {
+        return Err("invalid lane workflow generation".into());
+    }
+    {
+        let snapshot = registry.read().await;
+        let lane = snapshot
+            .get(&input.session)
+            .and_then(|registration| registration.lane.as_ref())
+            .ok_or("lane session not found")?;
+        if lane.revision == input.expected_revision.saturating_add(1)
+            && lane.generation_id == input.generation_id
+            && lane.workflow == input.workflow
+            && lane.quiesced == input.quiesced
+        {
+            return Ok(lane_snapshot(&input.session, lane, None));
+        }
+    }
+    mutate_lane(
+        registry,
+        path,
+        &input.session,
+        input.expected_revision,
+        |lane| {
+            if lane.generation_id != input.generation_id || lane.workflow == LaneWorkflow::Retired {
+                return Err("lane generation conflict or retired".into());
+            }
+            if input.workflow == LaneWorkflow::Retired {
+                return Err("use daemon retirement endpoint".into());
+            }
+            lane.workflow = input.workflow;
+            lane.quiesced = input.quiesced;
+            Ok(())
+        },
+    )
+    .await
+}
+
+async fn mutate_lane<F>(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    session: &str,
+    expected_revision: u64,
+    mutate: F,
+) -> Result<LaneSnapshot>
+where
+    F: FnOnce(&mut LaneEvidence) -> Result<()>,
+{
+    let _mutation = REGISTRY_MUTATION_LOCK.lock().await;
+    let mut next = registry.read().await.clone();
+    let registration = next.get_mut(session).ok_or("lane session not found")?;
+    let lane = registration
+        .lane
+        .as_mut()
+        .ok_or("session has no lane evidence")?;
+    if lane.revision != expected_revision {
+        return Err("lane revision conflict".into());
+    }
+    mutate(lane)?;
+    lane.revision = lane
+        .revision
+        .checked_add(1)
+        .ok_or("lane revision exhausted")?;
+    let snapshot = lane_snapshot(session, lane, None);
+    save_durable_tmux_registry(path, &next).await?;
+    *registry.write().await = next;
+    Ok(snapshot)
 }
 
 pub async fn tmux_registry_diagnostics(
@@ -836,6 +1978,13 @@ fn merge_active_config_registrations(
     for (session, mut registration) in active_config {
         if let Some(existing) = registry.get(&session) {
             if existing.active_wrapper_monitor {
+                continue;
+            }
+            if existing
+                .lane
+                .as_ref()
+                .is_some_and(|lane| lane.workflow != LaneWorkflow::Retired)
+            {
                 continue;
             }
             if existing.registration_source == RegistrationSource::ConfigMonitor {
@@ -1298,7 +2447,505 @@ mod tests {
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
             active_wrapper_monitor: false,
+            lane: None,
         }
+    }
+
+    fn lane_input(session: &str, generation_id: &str) -> LaneRegistrationInput {
+        let mut registration = registration(Vec::new());
+        registration.session = session.into();
+        LaneRegistrationInput {
+            registration,
+            generation_id: generation_id.into(),
+            kickoff_operation_id: "k".into(),
+            launch_operation_id: "l".into(),
+            executor_id: "e".into(),
+            worker_effect_kind: WorkerEffectKind::CommandSubmission,
+            thread_id: Some("12345678901234567890".into()),
+            expect_absent_or_retired: true,
+        }
+    }
+
+    #[test]
+    fn verification_reason_outcome_pairs_are_sanitized() {
+        let input = |outcome: &str, reason: Option<&str>| LaneVerificationMutation {
+            session: "lane".into(),
+            expected_revision: 0,
+            checked_at: "2026-07-11T00:00:00Z".into(),
+            outcome: outcome.into(),
+            reason: reason.map(BoundedReason::new),
+            visibility: LaneVisibility::Unverified,
+            generation_id: "g".into(),
+        };
+        assert!(valid_verification(&input(
+            "unverified",
+            Some("unauthorized")
+        )));
+        assert!(valid_verification(&input("unverified", Some("timeout"))));
+        assert!(valid_verification(&input("unreachable", Some("forbidden"))));
+        assert!(valid_verification(&input(
+            "message-observed-unverified",
+            Some("kickoff-receipt-missing")
+        )));
+        assert!(!valid_verification(&input(
+            "unverified",
+            Some("private-target:secret")
+        )));
+    }
+
+    #[test]
+    fn delivery_categories_are_partitioned_by_disposition() {
+        let input = |disposition: Option<&str>, category: Option<&str>| LaneDeliveryMutation {
+            session: "lane".into(),
+            expected_revision: 0,
+            generation_id: "g".into(),
+            workflow: None,
+            message_id: None,
+            kind: Some("progress".into()),
+            delivered_at: None,
+            visibility: LaneVisibility::DeliveryFailed,
+            error_category: category.map(BoundedCategory::new),
+            disposition: disposition.map(str::to_owned),
+            initial_kickoff: false,
+            kickoff_operation_id: None,
+        };
+        assert!(valid_delivery(&input(
+            Some("definitive-failure"),
+            Some("forbidden")
+        )));
+        assert!(valid_delivery(&input(
+            Some("definitive-failure"),
+            Some("transport")
+        )));
+        let mut ambiguous = input(Some("ambiguous-acceptance"), Some("timeout"));
+        ambiguous.visibility = LaneVisibility::Unverified;
+        assert!(valid_delivery(&ambiguous));
+        assert!(!valid_delivery(&input(
+            Some("definitive-failure"),
+            Some("timeout")
+        )));
+        ambiguous.error_category = Some(BoundedCategory::new("forbidden"));
+        assert!(!valid_delivery(&ambiguous));
+        assert!(!valid_delivery(&input(None, None)));
+        let mut initial_empty = input(None, None);
+        initial_empty.initial_kickoff = true;
+        initial_empty.kind = Some("kickoff".into());
+        initial_empty.kickoff_operation_id = Some("k".into());
+        assert!(!valid_delivery(&initial_empty));
+    }
+
+    #[test]
+    fn success_and_pending_launch_states_reject_categories() {
+        let category = BoundedCategory::new("arbitrary");
+        for state in [
+            LaneLaunchState::Ready,
+            LaneLaunchState::Claimed,
+            LaneLaunchState::IdentityVerified,
+            LaneLaunchState::Launched,
+        ] {
+            assert!(terminal_category_is_valid(
+                WorkerEffectKind::CommandSubmission,
+                state,
+                None
+            ));
+            assert!(!terminal_category_is_valid(
+                WorkerEffectKind::CommandSubmission,
+                state,
+                Some(&category)
+            ));
+        }
+        assert!(!terminal_category_is_valid(
+            WorkerEffectKind::SessionCreation,
+            LaneLaunchState::NoWorkerEffect,
+            Some(&category)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lane_registration_constructs_canonical_r0_and_rejects_legacy_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let detail = register_lane_registration(&registry, &path, lane_input("r0", "g0"))
+            .await
+            .unwrap();
+        assert_eq!(detail.snapshot.durable_launch_state, LaneLaunchState::Ready);
+        assert_eq!(detail.snapshot.revision, 0);
+        assert_eq!(detail.snapshot.workflow, LaneWorkflow::Active);
+        assert_eq!(detail.snapshot.visibility, Some(LaneVisibility::Unverified));
+        assert_eq!(detail.kickoff_message_id, None);
+        registry
+            .write()
+            .await
+            .insert("legacy".into(), registration(Vec::new()));
+        assert!(
+            register_lane_registration(&registry, &path, lane_input("legacy", "g1"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ready_kickoff_failure_snapshot_retains_canonical_reason_and_json_null_worker() {
+        let mut registration = registration(Vec::new());
+        registration.lane = Some(LaneEvidence {
+            lane_version: 1,
+            generation_id: "g".into(),
+            kickoff_operation_id: "k".into(),
+            launch_operation_id: "l".into(),
+            executor_id: "e".into(),
+            worker_effect_kind: WorkerEffectKind::CommandSubmission,
+            launch_state: LaneLaunchState::Ready,
+            workflow: LaneWorkflow::Active,
+            revision: 0,
+            quiesced: false,
+            thread_id: Some("thread".into()),
+            kickoff_message_id: None,
+            kickoff_delivered_at: None,
+            visibility: Some(LaneVisibility::DeliveryFailed),
+            verification: None,
+            last_failure: Some(BoundedCategory::new("missing-message-id")),
+            latest_update_message_id: None,
+            latest_update_kind: None,
+            latest_update_delivered_at: None,
+            delivery_retry_count: 1,
+            delivery_disposition: Some("definitive-failure".into()),
+        });
+        let snapshot = lane_snapshot("lane", registration.lane.as_ref().unwrap(), None);
+        assert_eq!(snapshot.derived_status.as_deref(), Some("kickoff-failed"));
+        assert_eq!(
+            snapshot
+                .observation_reason
+                .as_ref()
+                .map(BoundedReason::as_str),
+            Some("missing-message-id")
+        );
+        assert_eq!(
+            snapshot.exit_category.as_ref().map(BoundedCategory::as_str),
+            Some("missing-message-id")
+        );
+        assert_eq!(snapshot.worker_started, None);
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["worker_started"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn committed_terminal_snapshots_serialize_exact_categories_and_null_worker() {
+        for (state, kind, category, status) in [
+            (
+                LaneLaunchState::SessionCreationAmbiguous,
+                WorkerEffectKind::SessionCreation,
+                "owner-aborted-before-r2",
+                "session-creation-ambiguous-blocked",
+            ),
+            (
+                LaneLaunchState::NoWorkerEffect,
+                WorkerEffectKind::CommandSubmission,
+                "launch-failed-no-worker-effect",
+                "launch-failed-no-worker-effect",
+            ),
+        ] {
+            let lane = LaneEvidence {
+                lane_version: 1,
+                generation_id: "g".into(),
+                kickoff_operation_id: "k".into(),
+                launch_operation_id: "l".into(),
+                executor_id: "e".into(),
+                worker_effect_kind: kind,
+                launch_state: state,
+                workflow: LaneWorkflow::Active,
+                revision: 0,
+                quiesced: false,
+                thread_id: None,
+                kickoff_message_id: None,
+                kickoff_delivered_at: None,
+                visibility: None,
+                verification: None,
+                last_failure: Some(BoundedCategory::new(category)),
+                latest_update_message_id: None,
+                latest_update_kind: None,
+                latest_update_delivered_at: None,
+                delivery_retry_count: 0,
+                delivery_disposition: None,
+            };
+            let value = serde_json::to_value(lane_snapshot("lane", &lane, None)).unwrap();
+            assert_eq!(value["derived_status"], status);
+            assert_eq!(value["observation_reason"], category);
+            assert_eq!(value["exit_category"], category);
+            assert_eq!(value["worker_started"], serde_json::Value::Null);
+            assert_eq!(value["evidence_commit"], true);
+            assert_eq!(value["repair_needed"], false);
+            assert_eq!(value["healthy"], false);
+        }
+    }
+
+    #[test]
+    fn ready_kickoff_ambiguity_snapshot_retains_canonical_reason() {
+        let mut registration = registration(Vec::new());
+        registration.lane = Some(LaneEvidence {
+            lane_version: 1,
+            generation_id: "g".into(),
+            kickoff_operation_id: "k".into(),
+            launch_operation_id: "l".into(),
+            executor_id: "e".into(),
+            worker_effect_kind: WorkerEffectKind::CommandSubmission,
+            launch_state: LaneLaunchState::Ready,
+            workflow: LaneWorkflow::Active,
+            revision: 0,
+            quiesced: false,
+            thread_id: Some("thread".into()),
+            kickoff_message_id: None,
+            kickoff_delivered_at: None,
+            visibility: Some(LaneVisibility::Unreachable),
+            verification: None,
+            last_failure: Some(BoundedCategory::new("transport-failed")),
+            latest_update_message_id: None,
+            latest_update_kind: None,
+            latest_update_delivered_at: None,
+            delivery_retry_count: 1,
+            delivery_disposition: Some("ambiguous-acceptance".into()),
+        });
+        let snapshot = lane_snapshot("lane", registration.lane.as_ref().unwrap(), None);
+        assert_eq!(
+            snapshot.derived_status.as_deref(),
+            Some("kickoff-ambiguous")
+        );
+        assert_eq!(
+            snapshot
+                .observation_reason
+                .as_ref()
+                .map(BoundedReason::as_str),
+            Some("transport-failed")
+        );
+        assert!(snapshot.evidence_commit && snapshot.repair_needed && !snapshot.healthy);
+    }
+
+    #[tokio::test]
+    async fn lane_detail_is_registry_only_and_reports_unknown_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        register_lane_registration(
+            &registry,
+            &dir.path().join("registry.json"),
+            lane_input("no-tmux-probe", "g"),
+        )
+        .await
+        .unwrap();
+        let detail = lane_detail_for_session(&registry, "no-tmux-probe")
+            .await
+            .unwrap();
+        assert!(!detail.snapshot.healthy);
+        assert_eq!(detail.snapshot.derived_status.as_deref(), Some("pending"));
+    }
+
+    #[tokio::test]
+    async fn retired_lane_replaces_but_generation_fences_and_retired_writes_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        register_lane_registration(&registry, &path, lane_input("lane", "old"))
+            .await
+            .unwrap();
+        registry
+            .write()
+            .await
+            .get_mut("lane")
+            .unwrap()
+            .lane
+            .as_mut()
+            .unwrap()
+            .workflow = LaneWorkflow::Retired;
+        assert_eq!(
+            register_lane_registration(&registry, &path, lane_input("lane", "new"))
+                .await
+                .unwrap()
+                .snapshot
+                .generation_id,
+            "new"
+        );
+        assert!(
+            record_lane_verification(
+                &registry,
+                &path,
+                LaneVerificationMutation {
+                    session: "lane".into(),
+                    expected_revision: 0,
+                    generation_id: "old".into(),
+                    checked_at: "now".into(),
+                    outcome: "visible".into(),
+                    reason: None,
+                    visibility: LaneVisibility::Visible
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            update_lane_workflow(
+                &registry,
+                &path,
+                LaneWorkflowMutation {
+                    session: "lane".into(),
+                    generation_id: "old".into(),
+                    expected_revision: 0,
+                    workflow: LaneWorkflow::NeedsReview,
+                    quiesced: false
+                }
+            )
+            .await
+            .is_err()
+        );
+        registry
+            .write()
+            .await
+            .get_mut("lane")
+            .unwrap()
+            .lane
+            .as_mut()
+            .unwrap()
+            .workflow = LaneWorkflow::Retired;
+        assert!(
+            record_lane_delivery(
+                &registry,
+                &path,
+                LaneDeliveryMutation {
+                    session: "lane".into(),
+                    expected_revision: 0,
+                    generation_id: "new".into(),
+                    workflow: None,
+                    message_id: None,
+                    kind: None,
+                    delivered_at: None,
+                    visibility: LaneVisibility::Unverified,
+                    error_category: None,
+                    disposition: None,
+                    initial_kickoff: false,
+                    kickoff_operation_id: None,
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            record_lane_delivery(
+                &registry,
+                &path,
+                LaneDeliveryMutation {
+                    session: "lane".into(),
+                    expected_revision: 0,
+                    generation_id: "new".into(),
+                    workflow: Some(LaneWorkflow::Retired),
+                    message_id: Some("12345678901234567890".into()),
+                    kind: Some("progress".into()),
+                    delivered_at: Some("2026-07-11T00:00:00Z".into()),
+                    visibility: LaneVisibility::Visible,
+                    error_category: None,
+                    disposition: Some("accepted".into()),
+                    initial_kickoff: false,
+                    kickoff_operation_id: None,
+                }
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_response_loss_replay_and_retired_claim_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        register_lane_registration(&registry, &path, lane_input("lane", "g"))
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_lane(&registry, &path, "lane", "g", "e", 0)
+                .await
+                .unwrap()
+                .revision,
+            1
+        );
+        assert_eq!(
+            claim_lane(&registry, &path, "lane", "g", "e", 0)
+                .await
+                .unwrap()
+                .revision,
+            1
+        );
+        registry
+            .write()
+            .await
+            .get_mut("lane")
+            .unwrap()
+            .lane
+            .as_mut()
+            .unwrap()
+            .workflow = LaneWorkflow::Retired;
+        assert!(
+            claim_lane(&registry, &path, "lane", "g", "e", 1)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn evidence_replay_is_idempotent_and_immutable_facts_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        register_lane_registration(&registry, &path, lane_input("lane", "g"))
+            .await
+            .unwrap();
+        let replay = LaneEvidenceMutation {
+            session: "lane".into(),
+            expected_revision: 0,
+            generation_id: "g".into(),
+            launch_operation_id: "l".into(),
+            launch_state: LaneLaunchState::Ready,
+            failure_category: None,
+            executor_id: "e".into(),
+            worker_effect_kind: WorkerEffectKind::CommandSubmission,
+        };
+        assert_eq!(
+            update_lane_evidence(&registry, &path, replay.clone())
+                .await
+                .unwrap()
+                .revision,
+            0
+        );
+        let claimed = claim_lane(&registry, &path, "lane", "g", "e", 0)
+            .await
+            .unwrap();
+        let transition = LaneEvidenceMutation {
+            expected_revision: claimed.revision,
+            launch_state: LaneLaunchState::IdentityVerified,
+            ..replay.clone()
+        };
+        assert_eq!(
+            update_lane_evidence(&registry, &path, transition.clone())
+                .await
+                .unwrap()
+                .revision,
+            2
+        );
+        assert_eq!(
+            update_lane_evidence(&registry, &path, transition)
+                .await
+                .unwrap()
+                .revision,
+            2
+        );
+        assert!(
+            update_lane_evidence(
+                &registry,
+                &path,
+                LaneEvidenceMutation {
+                    executor_id: "other".into(),
+                    ..replay
+                }
+            )
+            .await
+            .is_err()
+        );
     }
 
     fn keyword_hit(keyword: &str, line: &str) -> KeywordHit {
@@ -1479,6 +3126,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             ),
             (
@@ -1499,6 +3147,7 @@ PR created #7",
                         name: Some("codex".into()),
                     }),
                     active_wrapper_monitor: true,
+                    lane: None,
                 },
             ),
             (
@@ -1516,6 +3165,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             ),
         ]);
@@ -1537,6 +3187,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             )]),
         );
@@ -1568,6 +3219,7 @@ PR created #7",
                     name: Some("codex".into()),
                 }),
                 active_wrapper_monitor: true,
+                lane: None,
             },
         )]);
 
@@ -1588,6 +3240,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             )]),
         );
@@ -1650,14 +3303,15 @@ PR created #7",
 
         let snapshot = registry.read().await.clone();
         save_durable_tmux_registry(&path, &snapshot).await.unwrap();
-        let loaded: BTreeMap<String, RegisteredTmuxSession> =
+        let loaded: BTreeMap<String, StoredTmuxRegistration> =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(
-            loaded["runtime"].registration_source,
+            loaded["runtime"].registration.registration_source,
             RegistrationSource::CliWatch
         );
+        assert!(loaded["runtime"].lane.is_none());
         assert!(!loaded.contains_key("config"));
     }
 
@@ -1685,10 +3339,12 @@ PR created #7",
         assert!(snapshot.contains_key("runtime-b"));
         drop(snapshot);
 
-        let loaded: BTreeMap<String, RegisteredTmuxSession> =
+        let loaded: BTreeMap<String, StoredTmuxRegistration> =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
         assert!(loaded.contains_key("runtime-a"));
         assert!(loaded.contains_key("runtime-b"));
+        assert!(loaded["runtime-a"].lane.is_none());
+        assert!(loaded["runtime-b"].lane.is_none());
     }
 
     #[tokio::test]
@@ -2011,6 +3667,7 @@ error: failed";
                 registration_source: RegistrationSource::ConfigMonitor,
                 parent_process: None,
                 active_wrapper_monitor: false,
+                lane: None,
             }],
             Some(&available_sessions),
         );
@@ -2041,6 +3698,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
                 RegisteredTmuxSession {
                     session: "omx-*".into(),
@@ -2055,6 +3713,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             ],
             Some(&available_sessions),
@@ -2083,6 +3742,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
@@ -2097,6 +3757,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             ],
             None,
@@ -2124,6 +3785,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
                 RegisteredTmuxSession {
                     session: "rcc-api".into(),
@@ -2138,6 +3800,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             ],
             Some(&available_sessions),
@@ -2165,6 +3828,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
@@ -2179,6 +3843,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             ],
             Some(&available_sessions),
@@ -2211,6 +3876,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
                 RegisteredTmuxSession {
                     session: "abc*".into(),
@@ -2225,6 +3891,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    lane: None,
                 },
             ],
             Some(&available_sessions),
