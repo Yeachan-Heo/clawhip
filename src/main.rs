@@ -15,6 +15,7 @@ mod gajae;
 mod gateway_allowlist;
 mod hooks;
 mod keyword_window;
+mod lane;
 mod lifecycle;
 mod memory;
 mod native_hooks;
@@ -29,6 +30,7 @@ mod slack;
 mod source;
 mod telemetry;
 mod tmux_wrapper;
+
 mod update;
 
 use std::sync::Arc;
@@ -39,10 +41,11 @@ use tokio::runtime::Builder;
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs,
     GajaeCheckpointCommands, GajaeCommands, GajaeMutationPlanCommands, GajaeProfileCommands,
-    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, MemoryCommands,
+    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, MemoryCommands,
     NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, TmuxCommands, UpdateCommands,
     VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
+
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, SetupEdits};
 use crate::discord::DiscordClient;
@@ -243,6 +246,19 @@ async fn real_main(cli: Cli) -> Result<()> {
             remove_systemd,
             remove_config,
         } => lifecycle::uninstall(remove_systemd, remove_config),
+        Commands::Lane { command } => match command {
+            LaneCommands::Status { session, json } => lane::status(config, session, json).await,
+            LaneCommands::VerifyThread { session, json } => {
+                lane::verify_thread(config, session, json).await
+            }
+            LaneCommands::Update {
+                session,
+                message,
+                kind,
+                workflow,
+                json,
+            } => lane::update(config, session, message, kind, workflow, json).await,
+        },
         Commands::Tmux { command } => match command {
             TmuxCommands::Keyword {
                 session,
@@ -1161,6 +1177,7 @@ mod tests {
                 name: Some("codex".into()),
             }),
             active_wrapper_monitor: true,
+            lane: None,
         }]);
 
         assert!(output.contains(

@@ -1,11 +1,14 @@
+use std::fmt;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use serde_json::json;
+use time::OffsetDateTime;
 
 use crate::Result;
 use crate::binding_verify::ChannelLookup;
@@ -51,9 +54,114 @@ struct DiscordRateLimitBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct DiscordErrorBody {
+    code: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DiscordChannelBody {
     #[serde(default)]
     name: Option<String>,
+}
+
+const LANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCORD_MAX_CONTENT_SCALARS: usize = 2_000;
+
+/// Source of the timestamp on a lane delivery receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordLaneTimestampSource {
+    Discord,
+    Local,
+}
+
+/// Durable evidence returned after Discord accepts a lane message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordLaneReceipt {
+    pub message_id: String,
+    pub timestamp: OffsetDateTime,
+    pub timestamp_source: DiscordLaneTimestampSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordLaneErrorCategory {
+    ContentTooLong,
+    BadRequest,
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    RateLimited,
+    ArchivedOrNotWritable,
+    Timeout,
+    Transport,
+    MalformedSuccess,
+    EmptyMessageId,
+    MissingMessageId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordLaneRetry {
+    Never,
+    After(Duration),
+    Bounded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordLaneDisposition {
+    DefinitiveFailure,
+    AmbiguousAcceptance,
+}
+
+/// A sanitized delivery error. It never contains a Discord response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordLaneError {
+    pub category: DiscordLaneErrorCategory,
+    pub status: Option<u16>,
+    pub retry: DiscordLaneRetry,
+    pub disposition: DiscordLaneDisposition,
+}
+
+impl fmt::Display for DiscordLaneError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Discord lane delivery {:?}", self.category)
+    }
+}
+
+impl std::error::Error for DiscordLaneError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordThreadReachability {
+    Reachable,
+    Unreachable(DiscordLaneErrorCategory),
+    Unknown(DiscordLaneErrorCategory),
+}
+
+/// A content-free message observation for a read probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordThreadMessageProbe {
+    pub message_id: String,
+    pub timestamp: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscordThreadMessageFetch {
+    Found(DiscordThreadMessageProbe),
+    NotFound,
+    Unavailable(DiscordLaneErrorCategory),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscordThreadMessageList {
+    Empty,
+    One(DiscordThreadMessageProbe),
+    Unavailable(DiscordLaneErrorCategory),
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordMessageBody {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 impl DiscordClient {
@@ -213,6 +321,208 @@ impl DiscordClient {
         let error = format!("Discord delivery exhausted retries for {safe_target}");
         self.record_dlq(target, message, MAX_ATTEMPTS, error.clone());
         Err(error.into())
+    }
+
+    /// Sends exactly one POST to a Discord thread and returns content-free acceptance evidence.
+    /// This lane-only path has isolated circuit/rate-limit state, never retries a dispatched POST,
+    /// and never writes the generic DLQ.
+    pub async fn send_thread_with_receipt(
+        &self,
+        thread_id: &str,
+        content: &str,
+    ) -> std::result::Result<DiscordLaneReceipt, DiscordLaneError> {
+        if !is_discord_snowflake(thread_id) {
+            return Err(lane_error(
+                DiscordLaneErrorCategory::BadRequest,
+                None,
+                DiscordLaneRetry::Never,
+                DiscordLaneDisposition::DefinitiveFailure,
+            ));
+        }
+        if content.chars().count() > DISCORD_MAX_CONTENT_SCALARS {
+            return Err(lane_error(
+                DiscordLaneErrorCategory::ContentTooLong,
+                None,
+                DiscordLaneRetry::Never,
+                DiscordLaneDisposition::DefinitiveFailure,
+            ));
+        }
+        let Some(client) = self.bot_client.as_ref() else {
+            return Err(lane_error(
+                DiscordLaneErrorCategory::Unauthorized,
+                None,
+                DiscordLaneRetry::Never,
+                DiscordLaneDisposition::DefinitiveFailure,
+            ));
+        };
+        let key = format!("discord:lane-thread:{thread_id}");
+        let (allowed, _) = self.allow_request(&key);
+        if !allowed {
+            return Err(lane_error(
+                DiscordLaneErrorCategory::Transport,
+                None,
+                DiscordLaneRetry::Bounded,
+                DiscordLaneDisposition::DefinitiveFailure,
+            ));
+        }
+
+        let delay = self.rate_limit_delay(&key);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let Some(url) = discord_lane_url(&self.api_base, &["channels", thread_id, "messages"])
+        else {
+            return Err(lane_error(
+                DiscordLaneErrorCategory::Transport,
+                None,
+                DiscordLaneRetry::Never,
+                DiscordLaneDisposition::DefinitiveFailure,
+            ));
+        };
+        let response = match client
+            .post(url)
+            .timeout(LANE_REQUEST_TIMEOUT)
+            .json(&json!({ "content": content }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.record_failure(&key);
+                return Err(lane_error(
+                    request_error_category(&error),
+                    None,
+                    DiscordLaneRetry::Bounded,
+                    DiscordLaneDisposition::AmbiguousAcceptance,
+                ));
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let error = lane_http_error_from_body(status, &body);
+            self.record_failure(&key);
+            return Err(error);
+        }
+        match response.json::<DiscordMessageBody>().await {
+            Ok(body) => match receipt_from_message_body(body) {
+                Ok(receipt) => {
+                    self.record_success(&key);
+                    Ok(receipt)
+                }
+                Err(mut error) => {
+                    self.record_failure(&key);
+                    error.status = Some(status.as_u16());
+                    Err(error)
+                }
+            },
+            Err(_) => {
+                self.record_failure(&key);
+                Err(lane_error(
+                    DiscordLaneErrorCategory::MalformedSuccess,
+                    Some(status.as_u16()),
+                    DiscordLaneRetry::Bounded,
+                    DiscordLaneDisposition::AmbiguousAcceptance,
+                ))
+            }
+        }
+    }
+
+    /// Checks thread reachability without changing delivery circuit, limiter, telemetry, or DLQ state.
+    pub async fn probe_thread_reachability(&self, thread_id: &str) -> DiscordThreadReachability {
+        if !is_discord_snowflake(thread_id) {
+            return DiscordThreadReachability::Unknown(DiscordLaneErrorCategory::BadRequest);
+        }
+        let Some(client) = self.bot_client.as_ref() else {
+            return DiscordThreadReachability::Unreachable(DiscordLaneErrorCategory::Unauthorized);
+        };
+        let Some(url) = discord_lane_url(&self.api_base, &["channels", thread_id]) else {
+            return DiscordThreadReachability::Unknown(DiscordLaneErrorCategory::Transport);
+        };
+        match client.get(url).timeout(LANE_REQUEST_TIMEOUT).send().await {
+            Ok(response) if response.status().is_success() => DiscordThreadReachability::Reachable,
+            Ok(response) => match lane_http_error(response.status(), None).category {
+                DiscordLaneErrorCategory::Unauthorized
+                | DiscordLaneErrorCategory::Forbidden
+                | DiscordLaneErrorCategory::NotFound => DiscordThreadReachability::Unreachable(
+                    lane_http_error(response.status(), None).category,
+                ),
+                category => DiscordThreadReachability::Unknown(category),
+            },
+            Err(error) => DiscordThreadReachability::Unknown(request_error_category(&error)),
+        }
+    }
+
+    /// Fetches one exact message and exposes only its ID and optional timestamp.
+    pub async fn fetch_thread_message(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> DiscordThreadMessageFetch {
+        if !is_discord_snowflake(thread_id) || !is_discord_snowflake(message_id) {
+            return DiscordThreadMessageFetch::Unavailable(DiscordLaneErrorCategory::BadRequest);
+        }
+        let Some(client) = self.bot_client.as_ref() else {
+            return DiscordThreadMessageFetch::Unavailable(DiscordLaneErrorCategory::Unauthorized);
+        };
+        let Some(url) = discord_lane_url(
+            &self.api_base,
+            &["channels", thread_id, "messages", message_id],
+        ) else {
+            return DiscordThreadMessageFetch::Unavailable(DiscordLaneErrorCategory::Transport);
+        };
+        match client.get(url).timeout(LANE_REQUEST_TIMEOUT).send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<DiscordMessageBody>()
+                .await
+                .ok()
+                .and_then(probe_from_message_body)
+                .map(DiscordThreadMessageFetch::Found)
+                .unwrap_or(DiscordThreadMessageFetch::Unavailable(
+                    DiscordLaneErrorCategory::MalformedSuccess,
+                )),
+            Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                DiscordThreadMessageFetch::NotFound
+            }
+            Ok(response) => DiscordThreadMessageFetch::Unavailable(
+                lane_http_error(response.status(), None).category,
+            ),
+            Err(error) => DiscordThreadMessageFetch::Unavailable(request_error_category(&error)),
+        }
+    }
+
+    /// Lists at most one thread message and never exposes message body or channel metadata.
+    pub async fn list_thread_messages(&self, thread_id: &str) -> DiscordThreadMessageList {
+        if !is_discord_snowflake(thread_id) {
+            return DiscordThreadMessageList::Unavailable(DiscordLaneErrorCategory::BadRequest);
+        }
+        let Some(client) = self.bot_client.as_ref() else {
+            return DiscordThreadMessageList::Unavailable(DiscordLaneErrorCategory::Unauthorized);
+        };
+        let Some(mut url) = discord_lane_url(&self.api_base, &["channels", thread_id, "messages"])
+        else {
+            return DiscordThreadMessageList::Unavailable(DiscordLaneErrorCategory::Transport);
+        };
+        url.query_pairs_mut().append_pair("limit", "1");
+        match client.get(url).timeout(LANE_REQUEST_TIMEOUT).send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<Vec<DiscordMessageBody>>()
+                .await
+                .ok()
+                .and_then(|mut messages| match messages.len() {
+                    0 => Some(DiscordThreadMessageList::Empty),
+                    1 => probe_from_message_body(messages.remove(0))
+                        .map(DiscordThreadMessageList::One),
+                    _ => None,
+                })
+                .unwrap_or(DiscordThreadMessageList::Unavailable(
+                    DiscordLaneErrorCategory::MalformedSuccess,
+                )),
+            Ok(response) => DiscordThreadMessageList::Unavailable(
+                lane_http_error(response.status(), None).category,
+            ),
+            Err(error) => DiscordThreadMessageList::Unavailable(request_error_category(&error)),
+        }
     }
 
     /// Look up a Discord channel by ID using the bot API.
@@ -506,6 +816,140 @@ impl DiscordClient {
             .entries()
             .to_vec()
     }
+}
+
+fn lane_error(
+    category: DiscordLaneErrorCategory,
+    status: Option<u16>,
+    retry: DiscordLaneRetry,
+    disposition: DiscordLaneDisposition,
+) -> DiscordLaneError {
+    DiscordLaneError {
+        category,
+        status,
+        retry,
+        disposition,
+    }
+}
+
+fn lane_http_error(status: StatusCode, retry_after: Option<Duration>) -> DiscordLaneError {
+    let category = match status {
+        StatusCode::BAD_REQUEST => DiscordLaneErrorCategory::BadRequest,
+        StatusCode::UNAUTHORIZED => DiscordLaneErrorCategory::Unauthorized,
+        StatusCode::FORBIDDEN => DiscordLaneErrorCategory::Forbidden,
+        StatusCode::NOT_FOUND => DiscordLaneErrorCategory::NotFound,
+        StatusCode::TOO_MANY_REQUESTS => DiscordLaneErrorCategory::RateLimited,
+        _ => DiscordLaneErrorCategory::Transport,
+    };
+    let retry = match status {
+        StatusCode::TOO_MANY_REQUESTS => {
+            retry_after.map_or(DiscordLaneRetry::Bounded, DiscordLaneRetry::After)
+        }
+        status if status.is_server_error() => DiscordLaneRetry::Bounded,
+        _ => DiscordLaneRetry::Never,
+    };
+    lane_error(
+        category,
+        Some(status.as_u16()),
+        retry,
+        DiscordLaneDisposition::DefinitiveFailure,
+    )
+}
+
+fn lane_http_error_from_body(status: StatusCode, body: &str) -> DiscordLaneError {
+    let mut error = lane_http_error(status, parse_retry_after(status, body));
+    if matches!(status, StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN)
+        && serde_json::from_str::<DiscordErrorBody>(body)
+            .ok()
+            .and_then(|parsed| parsed.code)
+            == Some(50_083)
+    {
+        error.category = DiscordLaneErrorCategory::ArchivedOrNotWritable;
+    }
+    error
+}
+
+fn request_error_category(error: &reqwest::Error) -> DiscordLaneErrorCategory {
+    if error.is_timeout() {
+        DiscordLaneErrorCategory::Timeout
+    } else {
+        DiscordLaneErrorCategory::Transport
+    }
+}
+
+fn is_discord_snowflake(value: &str) -> bool {
+    (1..=20).contains(&value.len()) && value.as_bytes().iter().all(u8::is_ascii_digit)
+}
+
+fn discord_lane_url(api_base: &str, segments: &[&str]) -> Option<Url> {
+    let mut url = Url::parse(api_base).ok()?;
+    {
+        let mut path = url.path_segments_mut().ok()?;
+        path.pop_if_empty();
+        for segment in segments {
+            path.push(segment);
+        }
+    }
+    Some(url)
+}
+
+fn parse_discord_timestamp(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+}
+
+fn receipt_from_message_body(
+    body: DiscordMessageBody,
+) -> std::result::Result<DiscordLaneReceipt, DiscordLaneError> {
+    let Some(message_id) = body.id else {
+        return Err(lane_error(
+            DiscordLaneErrorCategory::MissingMessageId,
+            None,
+            DiscordLaneRetry::Never,
+            DiscordLaneDisposition::AmbiguousAcceptance,
+        ));
+    };
+    if message_id.trim().is_empty() {
+        return Err(lane_error(
+            DiscordLaneErrorCategory::EmptyMessageId,
+            None,
+            DiscordLaneRetry::Never,
+            DiscordLaneDisposition::AmbiguousAcceptance,
+        ));
+    }
+    if !is_discord_snowflake(&message_id) {
+        return Err(lane_error(
+            DiscordLaneErrorCategory::MalformedSuccess,
+            None,
+            DiscordLaneRetry::Never,
+            DiscordLaneDisposition::AmbiguousAcceptance,
+        ));
+    }
+    let (timestamp, timestamp_source) = match body.timestamp.as_deref() {
+        Some(value) => parse_discord_timestamp(value)
+            .map(|timestamp| (timestamp, DiscordLaneTimestampSource::Discord))
+            .ok_or_else(|| {
+                lane_error(
+                    DiscordLaneErrorCategory::MalformedSuccess,
+                    None,
+                    DiscordLaneRetry::Never,
+                    DiscordLaneDisposition::AmbiguousAcceptance,
+                )
+            })?,
+        None => (OffsetDateTime::now_utc(), DiscordLaneTimestampSource::Local),
+    };
+    Ok(DiscordLaneReceipt {
+        message_id,
+        timestamp,
+        timestamp_source,
+    })
+}
+
+fn probe_from_message_body(body: DiscordMessageBody) -> Option<DiscordThreadMessageProbe> {
+    let message_id = body.id?;
+    is_discord_snowflake(&message_id).then(|| DiscordThreadMessageProbe {
+        message_id,
+        timestamp: body.timestamp.as_deref().and_then(parse_discord_timestamp),
+    })
 }
 
 fn parse_retry_after(status: StatusCode, body: &str) -> Option<Duration> {
@@ -966,5 +1410,338 @@ mod tests {
         assert_eq!(dlq[0].correlation_id.as_deref(), Some("corr-214"));
         assert_eq!(dlq[0].content_bytes, Some(4));
         assert!(dlq[0].payload_bytes.is_some());
+    }
+
+    #[test]
+    fn lane_receipt_requires_nonempty_id_and_tracks_timestamp_source() {
+        let receipt = receipt_from_message_body(DiscordMessageBody {
+            id: Some("12345678901234567890".into()),
+            timestamp: None,
+        })
+        .unwrap();
+        assert_eq!(receipt.message_id, "12345678901234567890");
+        assert_eq!(receipt.timestamp_source, DiscordLaneTimestampSource::Local);
+
+        let missing = receipt_from_message_body(DiscordMessageBody {
+            id: None,
+            timestamp: None,
+        })
+        .unwrap_err();
+        assert_eq!(missing.category, DiscordLaneErrorCategory::MissingMessageId);
+        assert_eq!(
+            missing.disposition,
+            DiscordLaneDisposition::AmbiguousAcceptance
+        );
+
+        let empty = receipt_from_message_body(DiscordMessageBody {
+            id: Some(" ".into()),
+            timestamp: None,
+        })
+        .unwrap_err();
+        assert_eq!(empty.category, DiscordLaneErrorCategory::EmptyMessageId);
+        let invalid = receipt_from_message_body(DiscordMessageBody {
+            id: Some("message-1".into()),
+            timestamp: None,
+        })
+        .unwrap_err();
+        assert_eq!(invalid.category, DiscordLaneErrorCategory::MalformedSuccess);
+        assert_eq!(
+            invalid.disposition,
+            DiscordLaneDisposition::AmbiguousAcceptance
+        );
+    }
+
+    #[test]
+    fn lane_http_errors_are_typed_and_retry_is_bounded() {
+        let rate_limited =
+            lane_http_error(StatusCode::TOO_MANY_REQUESTS, Some(Duration::from_secs(1)));
+        assert_eq!(rate_limited.category, DiscordLaneErrorCategory::RateLimited);
+        assert_eq!(
+            rate_limited.retry,
+            DiscordLaneRetry::After(Duration::from_secs(1))
+        );
+        assert_eq!(
+            rate_limited.disposition,
+            DiscordLaneDisposition::DefinitiveFailure
+        );
+        assert_eq!(
+            lane_http_error(StatusCode::BAD_REQUEST, None).category,
+            DiscordLaneErrorCategory::BadRequest
+        );
+        assert_eq!(
+            lane_http_error_from_body(StatusCode::BAD_REQUEST, r#"{"code":50083}"#).category,
+            DiscordLaneErrorCategory::ArchivedOrNotWritable
+        );
+        assert_eq!(
+            lane_http_error(StatusCode::INTERNAL_SERVER_ERROR, None).retry,
+            DiscordLaneRetry::Bounded
+        );
+    }
+
+    #[test]
+    fn lane_circuits_are_isolated_per_thread_key() {
+        let client = DiscordClient::from_config(Arc::new(AppConfig::default())).unwrap();
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            client.record_failure("discord:lane-thread:thread-a");
+        }
+        assert!(!client.allow_request("discord:lane-thread:thread-a").0);
+        assert!(client.allow_request("discord:lane-thread:thread-b").0);
+    }
+
+    #[test]
+    fn lane_content_limit_uses_unicode_scalars() {
+        assert_eq!("🦀".chars().count(), 1);
+        assert!(
+            "🦀".repeat(DISCORD_MAX_CONTENT_SCALARS).chars().count() <= DISCORD_MAX_CONTENT_SCALARS
+        );
+        assert!(
+            "🦀".repeat(DISCORD_MAX_CONTENT_SCALARS + 1).chars().count()
+                > DISCORD_MAX_CONTENT_SCALARS
+        );
+    }
+
+    #[test]
+    fn lane_errors_never_include_response_sentinel() {
+        let sentinel = "private-thread-body-sentinel";
+        let error = lane_error(
+            DiscordLaneErrorCategory::Forbidden,
+            Some(403),
+            DiscordLaneRetry::Never,
+            DiscordLaneDisposition::DefinitiveFailure,
+        );
+        assert!(!error.to_string().contains(sentinel));
+        assert!(!format!("{error:?}").contains(sentinel));
+    }
+
+    #[tokio::test]
+    async fn lane_read_probes_are_content_free_and_do_not_touch_delivery_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once(
+            listener,
+            "HTTP/1.1 200 OK",
+            r#"[{"id":"12345678901234567890","timestamp":"2026-07-10T00:00:00Z","content":"private-thread-body-sentinel"}]"#,
+        ));
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let result = client.list_thread_messages("12345678901234567890").await;
+        server.await.unwrap();
+        assert!(
+            matches!(result, DiscordThreadMessageList::One(DiscordThreadMessageProbe { ref message_id, .. }) if message_id == "12345678901234567890")
+        );
+        assert!(client.dlq_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lane_exact_fetch_distinguishes_found_and_missing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once(
+            listener,
+            "HTTP/1.1 404 Not Found",
+            r#"{"message":"private-thread-body-sentinel"}"#,
+        ));
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        assert!(matches!(
+            client
+                .fetch_thread_message("12345678901234567890", "12345678901234567890")
+                .await,
+            DiscordThreadMessageFetch::NotFound
+        ));
+        server.await.unwrap();
+        assert!(client.dlq_entries().is_empty());
+    }
+
+    async fn serve_once_and_assert_no_second(
+        listener: tokio::net::TcpListener,
+        status_line: &'static str,
+        body: &'static str,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0_u8; 4096];
+        let _ = stream.read(&mut buffer).await.unwrap();
+        let response = format!(
+            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "lane delivery retried a dispatched POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_post_429_is_single_attempt_and_definitive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once_and_assert_no_second(
+            listener,
+            "HTTP/1.1 429 Too Many Requests",
+            r#"{"retry_after":0.01,"message":"private-thread-body-sentinel"}"#,
+        ));
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let error = client
+            .send_thread_with_receipt("12345678901234567890", "message")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.category, DiscordLaneErrorCategory::RateLimited);
+        assert_eq!(error.disposition, DiscordLaneDisposition::DefinitiveFailure);
+        assert!(matches!(error.retry, DiscordLaneRetry::After(_)));
+        assert!(client.dlq_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lane_post_5xx_is_single_attempt_and_definitive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once_and_assert_no_second(
+            listener,
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"message":"private-thread-body-sentinel"}"#,
+        ));
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let error = client
+            .send_thread_with_receipt("12345678901234567890", "message")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.status, Some(500));
+        assert_eq!(error.retry, DiscordLaneRetry::Bounded);
+        assert_eq!(error.disposition, DiscordLaneDisposition::DefinitiveFailure);
+    }
+
+    #[tokio::test]
+    async fn lane_malformed_success_is_single_attempt_and_ambiguous() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once_and_assert_no_second(
+            listener,
+            "HTTP/1.1 200 OK",
+            r#"{"id":"","content":"private-thread-body-sentinel"}"#,
+        ));
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let error = client
+            .send_thread_with_receipt("12345678901234567890", "message")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.category, DiscordLaneErrorCategory::EmptyMessageId);
+        assert_eq!(
+            error.disposition,
+            DiscordLaneDisposition::AmbiguousAcceptance
+        );
+        assert_eq!(error.status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn lane_transport_failure_is_ambiguous_and_never_enters_dlq() {
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", "http://127.0.0.1:1".into())
+                .unwrap();
+        let error = client
+            .send_thread_with_receipt("12345678901234567890", "message")
+            .await
+            .unwrap_err();
+        assert_eq!(error.category, DiscordLaneErrorCategory::Transport);
+        assert_eq!(
+            error.disposition,
+            DiscordLaneDisposition::AmbiguousAcceptance
+        );
+        assert_eq!(error.retry, DiscordLaneRetry::Bounded);
+        assert!(client.dlq_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lane_timeout_is_single_attempt_and_ambiguous() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 4096];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            tokio::time::sleep(LANE_REQUEST_TIMEOUT + Duration::from_millis(50)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "lane delivery retried a timed-out POST"
+            );
+        });
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let error = client
+            .send_thread_with_receipt("12345678901234567890", "message")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.category, DiscordLaneErrorCategory::Timeout);
+        assert_eq!(
+            error.disposition,
+            DiscordLaneDisposition::AmbiguousAcceptance
+        );
+        assert_eq!(error.retry, DiscordLaneRetry::Bounded);
+        assert!(client.dlq_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lane_rejects_unsafe_snowflakes_without_http_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        for invalid in ["/", "?", "#", "../1", "123456789012345678901", "１２３"] {
+            let error = client
+                .send_thread_with_receipt(invalid, "message")
+                .await
+                .unwrap_err();
+            assert_eq!(error.category, DiscordLaneErrorCategory::BadRequest);
+            assert_eq!(error.disposition, DiscordLaneDisposition::DefinitiveFailure);
+            assert!(matches!(
+                client
+                    .fetch_thread_message("12345678901234567890", invalid)
+                    .await,
+                DiscordThreadMessageFetch::Unavailable(DiscordLaneErrorCategory::BadRequest)
+            ));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lane_numeric_snowflakes_preserve_endpoint_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once_capture(
+            listener,
+            "HTTP/1.1 200 OK",
+            r#"{"id":"12345678901234567890"}"#,
+        ));
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        client
+            .send_thread_with_receipt("12345678901234567890", "message")
+            .await
+            .unwrap();
+        assert!(
+            server
+                .await
+                .unwrap()
+                .starts_with("POST /channels/12345678901234567890/messages ")
+        );
     }
 }

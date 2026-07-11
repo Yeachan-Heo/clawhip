@@ -85,6 +85,16 @@ pub enum Commands {
         #[command(subcommand)]
         command: AgentCommands,
     },
+    /// Inspect and update retained Discord-thread lane evidence through the local daemon.
+    #[command(
+        about = "Inspect, verify, and update retained Discord-thread lane evidence",
+        long_about = "Inspect, verify, and update retained Discord-thread lane evidence. Lane commands resolve targets only from daemon-owned retained records and never accept raw Discord thread IDs."
+    )]
+    Lane {
+        #[command(subcommand)]
+        command: LaneCommands,
+    },
+
     /// Send tmux-related events to the local daemon or launch/register tmux sessions.
     Tmux {
         #[command(subcommand)]
@@ -699,6 +709,79 @@ pub enum UpdateCommands {
     /// Show the current pending-update status from the daemon.
     Status,
 }
+#[derive(Debug, Clone, Subcommand)]
+pub enum LaneCommands {
+    /// List retained lane snapshots with daemon-owned evidence and local best-effort tmux/marker observation.
+    #[command(
+        about = "List retained lane status",
+        long_about = "List retained lane status by combining daemon-owned lane evidence with local best-effort tmux liveness and R2 marker observation. Routine output redacts Discord targets."
+    )]
+    Status {
+        /// Limit status to one retained lane session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Emit explicit JSON nulls for absent lane fields.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe a stored thread target without changing workflow or sending a message.
+    #[command(
+        name = "verify-thread",
+        about = "Verify stored Discord thread evidence",
+        long_about = "Verify the stored Discord thread target for a retained session. A stored kickoff receipt is fetched exactly; otherwise at most one message is observed. Empty history remains unverified."
+    )]
+    VerifyThread {
+        /// Retained lane session whose stored thread target will be probed.
+        #[arg(long)]
+        session: String,
+        /// Emit explicit JSON nulls for absent verification fields.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deliver a bounded lifecycle update to a stored thread target.
+    #[command(
+        about = "Send a lifecycle update to a stored Discord thread",
+        long_about = "Send a lifecycle update only to the stored target for a retained session. An explicit workflow change is persisted before delivery; failed delivery does not revert it."
+    )]
+    Update {
+        /// Retained lane session whose stored thread target receives the update.
+        #[arg(long)]
+        session: String,
+        /// Lifecycle message to deliver; limited to 2,000 Unicode scalar values.
+        #[arg(long)]
+        message: String,
+        /// Audit and delivery label for the lifecycle message.
+        #[arg(long, value_enum)]
+        kind: LaneUpdateKind,
+        /// Optional durable workflow transition to persist before delivery.
+        #[arg(long, value_enum)]
+        workflow: Option<LaneWorkflowArg>,
+        /// Emit explicit JSON nulls for absent receipt and verification fields.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LaneUpdateKind {
+    Kickoff,
+    Progress,
+    Blocked,
+    PrOpen,
+    Handoff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LaneWorkflowArg {
+    Active,
+    NeedsReview,
+    NeedsQa,
+    PrOpen,
+    AwaitingCi,
+    AwaitingHuman,
+    Retired,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TmuxCommands {
     Keyword {
@@ -779,6 +862,16 @@ pub struct TmuxNewArgs {
     pub retry_enter_delay_ms: u64,
     #[arg(long)]
     pub shell: Option<String>,
+    /// Optional stored Discord thread target for the lane-aware launch path.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Initial Discord message; requires --thread and is limited to 2,000 Unicode scalar values.
+    #[arg(long, requires = "thread")]
+    pub kickoff: Option<String>,
+    /// Emit lane launch evidence as JSON without changing legacy non-lane output.
+    #[arg(long)]
+    pub json: bool,
+
     #[arg(last = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
@@ -1947,6 +2040,119 @@ mod tests {
         assert_eq!(args.project.as_deref(), Some("clawhip"));
         assert!(args.write);
         assert!(args.force);
+    }
+    #[test]
+    fn parses_lane_update_with_optional_workflow() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "lane",
+            "update",
+            "--session",
+            "issue-285",
+            "--message",
+            "handoff ready",
+            "--kind",
+            "handoff",
+            "--workflow",
+            "awaiting-human",
+            "--json",
+        ]);
+
+        let Commands::Lane {
+            command:
+                LaneCommands::Update {
+                    session,
+                    message,
+                    kind,
+                    workflow,
+                    json,
+                },
+        } = cli.command.expect("lane command")
+        else {
+            panic!("expected lane update command");
+        };
+        assert_eq!(session, "issue-285");
+        assert_eq!(message, "handoff ready");
+        assert_eq!(kind, LaneUpdateKind::Handoff);
+        assert_eq!(workflow, Some(LaneWorkflowArg::AwaitingHuman));
+        assert!(json);
+    }
+
+    #[test]
+    fn lane_commands_require_their_contractual_arguments() {
+        assert!(Cli::try_parse_from(["clawhip", "lane", "verify-thread"]).is_err());
+        assert!(
+            Cli::try_parse_from(["clawhip", "lane", "update", "--session", "issue-285"]).is_err()
+        );
+    }
+
+    #[test]
+    fn lane_help_describes_all_subcommands() {
+        let mut root = Cli::command();
+        let lane = root.find_subcommand_mut("lane").expect("lane command");
+        let lane_help = lane.render_long_help().to_string();
+        assert!(lane_help.contains("status"));
+        assert!(lane_help.contains("verify-thread"));
+        assert!(lane_help.contains("update"));
+
+        let status = lane
+            .find_subcommand_mut("status")
+            .expect("lane status command");
+        let status_help = status.render_long_help().to_string();
+        assert!(status_help.contains("daemon-owned lane evidence"));
+        assert!(status_help.contains("local best-effort tmux liveness"));
+        assert!(status_help.contains("R2 marker observation"));
+    }
+    #[test]
+    fn parses_lane_aware_tmux_new_flags_without_changing_legacy_defaults() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "tmux",
+            "new",
+            "--session",
+            "issue-285",
+            "--thread",
+            "123",
+            "--kickoff",
+            "Starting work",
+            "--json",
+        ]);
+        let Commands::Tmux {
+            command: TmuxCommands::New(args),
+        } = cli.command.expect("tmux command")
+        else {
+            panic!("expected tmux new command");
+        };
+        assert_eq!(args.thread.as_deref(), Some("123"));
+        assert_eq!(args.kickoff.as_deref(), Some("Starting work"));
+        assert!(args.json);
+
+        let legacy = Cli::parse_from(["clawhip", "tmux", "new", "--session", "legacy"]);
+        let Commands::Tmux {
+            command: TmuxCommands::New(args),
+        } = legacy.command.expect("legacy tmux command")
+        else {
+            panic!("expected tmux new command");
+        };
+        assert_eq!(args.thread, None);
+        assert_eq!(args.kickoff, None);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn tmux_new_kickoff_requires_thread() {
+        assert!(
+            Cli::try_parse_from([
+                "clawhip",
+                "tmux",
+                "new",
+                "--session",
+                "issue-285",
+                "--kickoff",
+                "Starting work",
+            ])
+            .is_err()
+        );
     }
 }
 

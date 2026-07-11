@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -32,6 +32,13 @@ use crate::native_observability::{
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
+use crate::source::tmux::{
+    BoundedCategory, BoundedReason, LaneDeliveryMutation, LaneEvidenceMutation, LaneLaunchState,
+    LaneRegistrationInput, LaneRetirementMutation, LaneVerificationMutation, LaneVisibility,
+    LaneWorkflow, LaneWorkflowMutation, claim_lane, lane_detail_for_session, list_lane_snapshots,
+    record_lane_delivery, record_lane_verification, register_lane_registration,
+    retire_lane_if_absent, update_lane_evidence, update_lane_workflow,
+};
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
     WorkspaceSource, default_registry_state_path, inspect_tmux_registry_state,
@@ -164,7 +171,19 @@ pub async fn run(
         .route("/github", post(post_github))
         .route("/api/update/status", get(update_status))
         .route("/api/update/approve", post(approve_update))
-        .route("/api/update/dismiss", post(dismiss_update));
+        .route("/api/update/dismiss", post(dismiss_update))
+        .route("/api/lane", get(list_lanes))
+        .route("/api/lane/claim", post(claim_lane_handler))
+        .route("/api/lane/evidence", post(update_lane_evidence_handler))
+        .route("/api/lane/workflow", post(update_lane_workflow_handler))
+        .route("/api/lane/detail/{session}", get(lane_detail_handler))
+        .route("/api/lane/register", post(register_lane_handler))
+        .route(
+            "/api/lane/verification",
+            post(record_lane_verification_handler),
+        )
+        .route("/api/lane/delivery", post(record_lane_delivery_handler))
+        .route("/api/lane/retire", post(retire_lane_handler));
     let port = port_override.unwrap_or(config.daemon.port);
 
     let app = app.with_state(AppState {
@@ -188,7 +207,11 @@ pub async fn run(
         telemetry::reason::DAEMON_LISTENING,
         json!({"version": VERSION, "addr": local_addr.to_string(), "token_source": token_source}),
     ));
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1011,6 +1034,299 @@ async fn list_tmux(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct LaneClaimDto {
+    session: String,
+    generation_id: String,
+    executor_id: String,
+    expected_revision: u64,
+}
+#[derive(serde::Deserialize)]
+struct LaneEvidenceDto {
+    session: String,
+    generation_id: String,
+    launch_operation_id: String,
+    expected_revision: u64,
+    launch_state: LaneLaunchState,
+    #[serde(default)]
+    failure_category: Option<String>,
+    executor_id: String,
+    worker_effect_kind: crate::source::tmux::WorkerEffectKind,
+}
+#[derive(serde::Deserialize)]
+struct LaneWorkflowDto {
+    session: String,
+    expected_revision: u64,
+    workflow: LaneWorkflow,
+    #[serde(default)]
+    quiesced: bool,
+    generation_id: String,
+}
+
+struct LoopbackLanePeer;
+impl<S: Send + Sync> FromRequestParts<S> for LoopbackLanePeer {
+    type Rejection = (StatusCode, Json<Value>);
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|peer| peer.0);
+        if peer.is_some_and(|peer| {
+            peer.ip().is_loopback() || peer.ip().to_string().starts_with("::ffff:127.")
+        }) {
+            Ok(Self)
+        } else {
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"ok": false, "error": "lane endpoints require a loopback peer"})),
+            ))
+        }
+    }
+}
+fn lane_error(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    let message = error.to_string();
+    if message == "lane runtime remains active" {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                json!({"ok": false, "error_code": "runtime-active", "error": "lane runtime remains active; quiesce it before retirement"}),
+            ),
+        );
+    }
+    let status = if message.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("conflict")
+        || message.contains("revision")
+        || message.contains("transition")
+        || message.contains("retained")
+        || message.contains("active")
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(json!({"ok": false, "error": "lane request rejected"})),
+    )
+}
+
+async fn list_lanes(_peer: LoopbackLanePeer, State(state): State<AppState>) -> impl IntoResponse {
+    Json(list_lane_snapshots(&state.tmux_registry, None).await).into_response()
+}
+async fn claim_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneClaimDto>,
+) -> impl IntoResponse {
+    let path = default_registry_state_path(&state.cron_state_path);
+    match claim_lane(
+        &state.tmux_registry,
+        &path,
+        &request.session,
+        &request.generation_id,
+        &request.executor_id,
+        request.expected_revision,
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn update_lane_evidence_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneEvidenceDto>,
+) -> impl IntoResponse {
+    let path = default_registry_state_path(&state.cron_state_path);
+    match update_lane_evidence(
+        &state.tmux_registry,
+        &path,
+        LaneEvidenceMutation {
+            session: request.session,
+            expected_revision: request.expected_revision,
+            generation_id: request.generation_id,
+            launch_operation_id: request.launch_operation_id,
+            launch_state: request.launch_state,
+            executor_id: request.executor_id,
+            worker_effect_kind: request.worker_effect_kind,
+            failure_category: request.failure_category.map(BoundedCategory::new),
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn update_lane_workflow_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneWorkflowDto>,
+) -> impl IntoResponse {
+    let path = default_registry_state_path(&state.cron_state_path);
+    match update_lane_workflow(
+        &state.tmux_registry,
+        &path,
+        LaneWorkflowMutation {
+            session: request.session,
+            generation_id: request.generation_id,
+            expected_revision: request.expected_revision,
+            workflow: request.workflow,
+            quiesced: request.quiesced,
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LaneVerificationDto {
+    session: String,
+    expected_revision: u64,
+    checked_at: String,
+    outcome: String,
+    #[serde(default)]
+    reason: Option<String>,
+    visibility: LaneVisibility,
+    generation_id: String,
+}
+#[derive(serde::Deserialize)]
+struct LaneDeliveryDto {
+    session: String,
+    expected_revision: u64,
+    #[serde(default)]
+    workflow: Option<LaneWorkflow>,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    delivered_at: Option<String>,
+    visibility: LaneVisibility,
+    #[serde(default)]
+    error_category: Option<String>,
+    #[serde(default)]
+    disposition: Option<String>,
+    generation_id: String,
+    #[serde(default)]
+    initial_kickoff: bool,
+    #[serde(default)]
+    kickoff_operation_id: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct LaneRetireDto {
+    session: String,
+    generation_id: String,
+    expected_revision: u64,
+}
+async fn lane_detail_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(session): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match lane_detail_for_session(&state.tmux_registry, &session).await {
+        Ok(detail) => Json(detail).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn register_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(input): Json<LaneRegistrationInput>,
+) -> impl IntoResponse {
+    match register_lane_registration(
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+        input,
+    )
+    .await
+    {
+        Ok(detail) => Json(detail).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn record_lane_verification_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneVerificationDto>,
+) -> impl IntoResponse {
+    match record_lane_verification(
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+        LaneVerificationMutation {
+            session: request.session,
+            expected_revision: request.expected_revision,
+            checked_at: request.checked_at,
+            outcome: request.outcome,
+            reason: request.reason.map(BoundedReason::new),
+            visibility: request.visibility,
+            generation_id: request.generation_id,
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn record_lane_delivery_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneDeliveryDto>,
+) -> impl IntoResponse {
+    match record_lane_delivery(
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+        LaneDeliveryMutation {
+            session: request.session,
+            expected_revision: request.expected_revision,
+            workflow: request.workflow,
+            message_id: request.message_id,
+            kind: request.kind,
+            delivered_at: request.delivered_at,
+            visibility: request.visibility,
+            error_category: request.error_category.map(BoundedCategory::new),
+            disposition: request.disposition,
+            generation_id: request.generation_id,
+            initial_kickoff: request.initial_kickoff,
+            kickoff_operation_id: request.kickoff_operation_id,
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn retire_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneRetireDto>,
+) -> impl IntoResponse {
+    match retire_lane_if_absent(
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+        LaneRetirementMutation {
+            session: request.session,
+            generation_id: request.generation_id,
+            expected_revision: request.expected_revision,
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+
 fn gajae_hold_target(config: &AppConfig, repo: &str) -> Option<String> {
     config
         .routes
@@ -1339,6 +1655,54 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn loopback_lane_peer_accepts_loopbacks_and_rejects_remote_or_missing_peer() {
+        for address in ["127.0.0.1:1", "[::1]:1", "[::ffff:127.0.0.1]:1"] {
+            let mut parts = axum::http::Request::new(()).into_parts().0;
+            parts
+                .extensions
+                .insert(ConnectInfo(address.parse::<SocketAddr>().unwrap()));
+            assert!(
+                LoopbackLanePeer::from_request_parts(&mut parts, &())
+                    .await
+                    .is_ok()
+            );
+        }
+        let mut remote = axum::http::Request::new(()).into_parts().0;
+        remote
+            .extensions
+            .insert(ConnectInfo("192.0.2.1:1".parse::<SocketAddr>().unwrap()));
+        assert!(
+            LoopbackLanePeer::from_request_parts(&mut remote, &())
+                .await
+                .is_err()
+        );
+        let mut missing = axum::http::Request::new(()).into_parts().0;
+        assert!(
+            LoopbackLanePeer::from_request_parts(&mut missing, &())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bare_lane_registration_payload_matches_client_wire_schema() {
+        let input = LaneRegistrationInput {
+            registration: tmux_registration("lane"),
+            generation_id: "g".into(),
+            kickoff_operation_id: "k".into(),
+            launch_operation_id: "l".into(),
+            executor_id: "e".into(),
+            worker_effect_kind: crate::source::tmux::WorkerEffectKind::CommandSubmission,
+            thread_id: None,
+            expect_absent_or_retired: true,
+        };
+        let parsed: LaneRegistrationInput =
+            serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+        assert_eq!(parsed.generation_id, "g");
+        assert_eq!(parsed.registration.session, "lane");
+    }
+
     fn app_state_with_config(config: AppConfig) -> (AppState, mpsc::Receiver<IncomingEvent>) {
         let (tx, rx) = mpsc::channel(8);
         (
@@ -1396,6 +1760,7 @@ mod tests {
                 name: Some("codex".into()),
             }),
             active_wrapper_monitor: true,
+            lane: None,
         }
     }
 
@@ -2643,6 +3008,7 @@ mod tests {
                     name: Some("codex".into()),
                 }),
                 active_wrapper_monitor: false,
+                lane: None,
             },
         );
         let state = AppState {
