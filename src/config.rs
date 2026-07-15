@@ -37,6 +37,128 @@ pub struct AppConfig {
     pub update: crate::update::UpdateConfig,
     #[serde(default, skip_serializing_if = "GajaeConfig::is_empty")]
     pub gajae: GajaeConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<SubscriptionConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionConfig {
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub kind: String,
+    pub endpoint_env: String,
+    #[serde(default = "default_subscription_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+    #[serde(default = "default_subscription_max_json_depth")]
+    pub max_json_depth: usize,
+    pub filter: SubscriptionFilterConfig,
+    pub projection: BTreeMap<String, String>,
+    pub adapter: SubscriptionAdapterConfig,
+    #[serde(default)]
+    pub reconnect: SubscriptionReconnectConfig,
+    #[serde(default)]
+    pub routing: SubscriptionRoutingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionFilterConfig {
+    pub discriminator_pointer: String,
+    pub discriminator_equals: String,
+    #[serde(default)]
+    pub predicates: Vec<SubscriptionPredicateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionPredicateConfig {
+    pub pointer: String,
+    pub equals: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionAdapterConfig {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_subscription_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_subscription_stdin_bytes")]
+    pub max_stdin_bytes: usize,
+    #[serde(default = "default_subscription_stdout_bytes")]
+    pub max_stdout_bytes: usize,
+    #[serde(default = "default_subscription_stderr_bytes")]
+    pub max_stderr_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionReconnectConfig {
+    #[serde(default = "default_subscription_initial_delay_ms")]
+    pub initial_delay_ms: u64,
+    #[serde(default = "default_subscription_max_delay_ms")]
+    pub max_delay_ms: u64,
+    #[serde(default = "default_subscription_max_attempts")]
+    pub max_attempts: u64,
+}
+impl Default for SubscriptionReconnectConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_ms: default_subscription_initial_delay_ms(),
+            max_delay_ms: default_subscription_max_delay_ms(),
+            max_attempts: default_subscription_max_attempts(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionRoutingConfig {
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub repo_name: Option<String>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+fn default_subscription_max_frame_bytes() -> usize {
+    65_536
+}
+fn default_subscription_max_json_depth() -> usize {
+    16
+}
+fn default_subscription_timeout_ms() -> u64 {
+    5_000
+}
+fn default_subscription_stdin_bytes() -> usize {
+    16_384
+}
+fn default_subscription_stdout_bytes() -> usize {
+    16_384
+}
+fn default_subscription_stderr_bytes() -> usize {
+    4_096
+}
+fn default_subscription_initial_delay_ms() -> u64 {
+    250
+}
+fn default_subscription_max_delay_ms() -> u64 {
+    5_000
+}
+fn default_subscription_max_attempts() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -968,9 +1090,76 @@ impl AppConfig {
                 .any(|route| route.event.trim() == "*" && route.filter.is_empty())
     }
 
+    fn validate_subscription_config(subscription: &SubscriptionConfig) -> Result<()> {
+        let name = &subscription.name;
+        let valid_name = !name.is_empty()
+            && name == name.trim()
+            && name.len() <= 63
+            && name.as_bytes()[0].is_ascii_lowercase()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if !valid_name || subscription.kind != "websocket" {
+            return Err("invalid_subscription_config".into());
+        }
+        let endpoint = &subscription.endpoint_env;
+        if endpoint.is_empty()
+            || endpoint.len() > 128
+            || (!endpoint.as_bytes()[0].is_ascii_uppercase() && endpoint.as_bytes()[0] != b'_')
+            || !endpoint
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err("invalid_subscription_config".into());
+        }
+        if !(1024..=1_048_576).contains(&subscription.max_frame_bytes)
+            || !(1..=16).contains(&subscription.max_json_depth)
+            || subscription.filter.discriminator_equals.is_empty()
+            || subscription.filter.discriminator_equals.len() > 128
+            || subscription.filter.predicates.len() > 8
+            || !(1..=16).contains(&subscription.projection.len())
+        {
+            return Err("invalid_subscription_config".into());
+        }
+        if !subscription.adapter.program.starts_with('/')
+            || subscription.adapter.program.len() > 4096
+            || subscription.adapter.args.len() > 16
+            || subscription.adapter.args.iter().any(|arg| arg.len() > 256)
+            || !(100..=30_000).contains(&subscription.adapter.timeout_ms)
+            || !(1..=65_536).contains(&subscription.adapter.max_stdin_bytes)
+            || !(1..=65_536).contains(&subscription.adapter.max_stdout_bytes)
+            || !(1..=16_384).contains(&subscription.adapter.max_stderr_bytes)
+            || !(1..=10).contains(&subscription.reconnect.max_attempts)
+            || !(10..=5_000).contains(&subscription.reconnect.initial_delay_ms)
+            || subscription.reconnect.max_delay_ms < subscription.reconnect.initial_delay_ms
+            || subscription.reconnect.max_delay_ms > 30_000
+        {
+            return Err("invalid_subscription_config".into());
+        }
+        if subscription.enabled
+            && !crate::source::subscription::is_regular_executable(&subscription.adapter.program)
+        {
+            return Err("invalid_subscription_config".into());
+        }
+        crate::source::subscription::validate_projection_policy(subscription)?;
+        crate::source::subscription::validate_filter_policy(subscription)?;
+
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.dispatch.ci_batch_window_secs == 0 {
             return Err("dispatch.ci_batch_window_secs must be at least 1".into());
+        }
+        if self.subscriptions.len() > 32 {
+            return Err("invalid_subscription_config".into());
+        }
+        let mut subscription_names = std::collections::BTreeSet::new();
+        for subscription in &self.subscriptions {
+            Self::validate_subscription_config(subscription)?;
+            if !subscription_names.insert(subscription.name.trim().to_ascii_lowercase()) {
+                return Err("invalid_subscription_config".into());
+            }
         }
         if self.cron.poll_interval_secs == 0 {
             return Err("cron.poll_interval_secs must be at least 1".into());
@@ -2978,5 +3167,114 @@ name = "general"
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(remaining.len(), 10);
+    }
+}
+
+#[cfg(test)]
+mod subscription_config_tests {
+    use super::AppConfig;
+
+    #[test]
+    fn rejects_unknown_subscription_and_endpoint_fields() {
+        let config = r#"
+[[subscriptions]]
+name = "gjc-workflow-gate"
+enabled = false
+kind = "websocket"
+endpoint_env = "GJC_WS_URL"
+endpoint = "wss://secret.invalid"
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+[subscriptions.adapter]
+program = "/bin/true"
+"#;
+        assert!(toml::from_str::<AppConfig>(config).is_err());
+    }
+
+    #[test]
+    fn rejects_subscription_names_with_surrounding_whitespace() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[[subscriptions]]
+name = " workflow-gate "
+enabled = false
+kind = "websocket"
+endpoint_env = "WORKFLOW_GATE_URL"
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+[subscriptions.adapter]
+program = "/bin/true"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "invalid_subscription_config"
+        );
+    }
+
+    #[test]
+    fn documented_workflow_gate_and_question_subscriptions_parse_and_validate() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[providers.discord]
+token = "fixture-token"
+[[subscriptions]]
+name = "gjc-workflow-gate"
+enabled = false
+kind = "websocket"
+endpoint_env = "GJC_WORKFLOW_GATE_WS"
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+[[subscriptions.filter.predicates]]
+pointer = "/gate/state"
+equals = "ready"
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+gate_state = "/gate/state"
+[subscriptions.adapter]
+program = "/bin/true"
+[subscriptions.routing]
+tool = "gjc"
+project = "my-project"
+
+[[subscriptions]]
+name = "gjc-question"
+enabled = false
+kind = "websocket"
+endpoint_env = "GJC_QUESTION_WS"
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "question"
+[subscriptions.projection]
+question_id = "/question/id"
+summary = "/question/summary"
+[subscriptions.adapter]
+program = "/bin/true"
+
+[[routes]]
+event = "workflow.gate"
+sink = "discord"
+channel = "WORKFLOW_GATE_CHANNEL_ID"
+format = "alert"
+
+[[routes]]
+event = "workflow.question"
+sink = "discord"
+channel = "QUESTIONS_CHANNEL_ID"
+format = "compact"
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
     }
 }

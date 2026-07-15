@@ -54,6 +54,11 @@ pub enum Commands {
     },
     /// Check daemon health/status.
     Status,
+    /// Inspect, validate, and control daemon-owned websocket subscriptions through the local daemon.
+    Subscribe {
+        #[command(subcommand)]
+        command: SubscribeCommands,
+    },
     #[command(
         about = "Scaffold common setup presets without editing advanced routes or monitors",
         long_about = "Scaffold the bounded quickstart preset catalog.\n\nAdvanced routes and monitors still require manual config editing or the bounded clawhip config editor."
@@ -343,6 +348,20 @@ fn normalize_emit_key(key: &str) -> &str {
 
 fn parse_emit_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SubscribeCommands {
+    /// Validate configured subscriptions without exposing endpoint environment details.
+    Validate,
+    /// List public-safe subscription lifecycle snapshots from the local daemon.
+    List,
+    /// Show one public-safe subscription lifecycle snapshot.
+    Status { name: String },
+    /// Request the configured subscription worker be running.
+    Start { name: String },
+    /// Request the configured subscription worker stop.
+    Stop { name: String },
 }
 
 #[derive(Debug, Subcommand)]

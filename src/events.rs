@@ -762,6 +762,50 @@ impl IncomingEvent {
         self
     }
 
+    /// Constructs a route-neutral event after a subscription adapter has passed its restricted output checks.
+    pub fn subscription(
+        kind: String,
+        payload: Value,
+        routing: &RoutingMetadata,
+        name: &str,
+    ) -> Self {
+        let mut event = Self {
+            kind,
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload,
+        };
+        if let Some(object) = event.payload.as_object_mut() {
+            object.insert("event_id".to_string(), json!(Uuid::new_v4().to_string()));
+            object.insert(
+                "correlation_id".to_string(),
+                json!(Uuid::new_v4().to_string()),
+            );
+            object.insert(
+                "first_seen_at".to_string(),
+                json!(
+                    OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_default()
+                ),
+            );
+            object.insert("contract_event".to_string(), json!(event.kind.clone()));
+            object.insert("subscription_name".to_string(), json!(name));
+            object.insert("subscription_transport".to_string(), json!("websocket"));
+            object.insert(
+                "subscription_received_at".to_string(),
+                json!(
+                    OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        event.with_routing_metadata(routing)
+    }
+
     pub fn canonical_kind(&self) -> &str {
         match self.kind.as_str() {
             "issue-opened" => "github.issue-opened",
