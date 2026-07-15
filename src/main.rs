@@ -42,8 +42,8 @@ use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs,
     GajaeCheckpointCommands, GajaeCommands, GajaeMutationPlanCommands, GajaeProfileCommands,
     GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, MemoryCommands,
-    NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, TmuxCommands, UpdateCommands,
-    VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands, TmuxCommands,
+    UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
 
 use crate::client::DaemonClient;
@@ -88,9 +88,15 @@ fn prepare_event(event: IncomingEvent) -> Result<IncomingEvent> {
     Ok(event)
 }
 
+fn load_config_for_cli(config_path: &std::path::Path) -> Result<Arc<AppConfig>> {
+    AppConfig::load_or_default(config_path)
+        .map(Arc::new)
+        .map_err(|_| "config_invalid".into())
+}
+
 async fn real_main(cli: Cli) -> Result<()> {
     let config_path = cli.config_path();
-    let config = Arc::new(AppConfig::load_or_default(&config_path)?);
+    let config = load_config_for_cli(&config_path)?;
     let cron_state_path = crate::cron::default_state_path(&config_path);
 
     match cli.command.unwrap_or(Commands::Start {
@@ -102,6 +108,32 @@ async fn real_main(cli: Cli) -> Result<()> {
             let client = DaemonClient::from_config(config.as_ref());
             let health = client.health().await?;
             println!("{}", serde_json::to_string_pretty(&health)?);
+            Ok(())
+        }
+        Commands::Subscribe { command } => {
+            let client = DaemonClient::from_config(config.as_ref());
+            match command {
+                SubscribeCommands::Validate => {
+                    config.validate()?;
+                    println!("Subscription configuration is valid.");
+                }
+                SubscribeCommands::List => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.list_subscriptions().await?)?
+                ),
+                SubscribeCommands::Status { name } => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.subscription_status(&name).await?)?
+                ),
+                SubscribeCommands::Start { name } => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.start_subscription(&name).await?)?
+                ),
+                SubscribeCommands::Stop { name } => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.stop_subscription(&name).await?)?
+                ),
+            }
             Ok(())
         }
         Commands::Deliver(args) => crate::hooks::prompt_deliver::run(args).await,
@@ -331,7 +363,7 @@ async fn real_main(cli: Cli) -> Result<()> {
         },
         Commands::Config { command } => match command.unwrap_or(ConfigCommand::Interactive) {
             ConfigCommand::Interactive => {
-                let mut editable = AppConfig::load_or_default(&config_path)?;
+                let mut editable = (*load_config_for_cli(&config_path)?).clone();
                 editable.run_interactive_editor(&config_path)
             }
             ConfigCommand::Show => {
@@ -694,7 +726,7 @@ fn remote_repo_identity(remote: &str) -> Option<String> {
 }
 
 async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()> {
-    let mut editable = AppConfig::load_or_default(config_path)?;
+    let mut editable = (*load_config_for_cli(config_path)?).clone();
 
     let standard_edits = SetupEdits {
         webhook: args.webhook,
@@ -989,13 +1021,45 @@ fn tmux_empty_list_detail(health: Option<&serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_tmux_list, parse_bind_checkout_overrides, parse_bind_overrides,
+        format_tmux_list, load_config_for_cli, parse_bind_checkout_overrides, parse_bind_overrides,
         parse_expect_name_overrides, validate_bind_checkout_repos, verify_bindings_json,
     };
     use crate::binding_verify::{BindingAudit, BindingDriftAudit};
     use crate::events::RoutingMetadata;
     use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
+    use std::fs;
 
+    #[test]
+    fn cli_config_errors_are_bounded_without_source_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"[[subscriptions]]
+name = "safe-subscription"
+enabled = false
+kind = "websocket"
+endpoint_env = "SAFE_ENDPOINT"
+endpoint = "wss://private.invalid?token=secret-token"
+
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+
+[subscriptions.adapter]
+program = "/bin/true"
+"#,
+        )
+        .unwrap();
+
+        let error = load_config_for_cli(&path).unwrap_err().to_string();
+        assert_eq!(error, "config_invalid");
+        assert!(!error.contains("secret-token"));
+        assert!(!error.contains("private.invalid"));
+    }
     #[test]
     fn parse_expect_name_overrides_accepts_well_formed_entries() {
         let entries = vec![

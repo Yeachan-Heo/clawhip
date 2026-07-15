@@ -104,6 +104,9 @@ impl Router {
         let mut deliveries = Vec::with_capacity(matched_routes.len().max(1));
 
         if matched_routes.is_empty() {
+            if is_subscription_event(event) {
+                return Err("no configured route for subscription event".into());
+            }
             deliveries.push(self.resolve_delivery(event, None, None)?);
         } else {
             for route in matched_routes {
@@ -314,9 +317,13 @@ impl Router {
                 .collect();
 
         let deliveries = if ordered_matched_indices.is_empty() {
-            match self.resolve_delivery(event, None, None) {
-                Ok(d) => vec![delivery_explanation(&d, None)],
-                Err(_) => vec![],
+            if is_subscription_event(event) {
+                vec![]
+            } else {
+                match self.resolve_delivery(event, None, None) {
+                    Ok(d) => vec![delivery_explanation(&d, None)],
+                    Err(_) => vec![],
+                }
             }
         } else {
             ordered_matched_indices
@@ -492,6 +499,14 @@ fn delivery_explanation(
         template: delivery.template.clone(),
         matched_route_index,
     }
+}
+
+fn is_subscription_event(event: &IncomingEvent) -> bool {
+    event
+        .payload
+        .get("subscription_transport")
+        .and_then(serde_json::Value::as_str)
+        == Some("websocket")
 }
 
 fn route_candidates(kind: &str) -> Vec<&str> {
@@ -2684,5 +2699,68 @@ mod tests {
             assert!(rendered.contains("discord:thread:redacted:"));
             assert!(!rendered.contains(raw_thread_id));
         }
+    }
+
+    #[tokio::test]
+    async fn subscription_routing_metadata_selects_configured_route_without_delivery_controls() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "workflow.gate".into(),
+                sink: "discord".into(),
+                filter: [("project".to_string(), "clawhip".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("workflow-gates".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let event = IncomingEvent::subscription(
+            "workflow.gate".into(),
+            json!({"gate": "ready"}),
+            &RoutingMetadata {
+                project: Some("clawhip".into()),
+                ..RoutingMetadata::default()
+            },
+            "workflow-gate",
+        );
+
+        assert!(event.channel.is_none());
+        assert!(event.mention.is_none());
+        assert!(event.format.is_none());
+        assert!(event.template.is_none());
+
+        let delivery = Router::new(Arc::new(config))
+            .preview_delivery(&event)
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("workflow-gates".into())
+        );
+        assert_eq!(delivery.trace.result, RouteTraceResult::Matched);
+    }
+
+    #[tokio::test]
+    async fn subscription_without_matching_route_does_not_use_default_channel() {
+        let config = AppConfig {
+            defaults: crate::config::DefaultsConfig {
+                channel: Some("default-channel".into()),
+                ..crate::config::DefaultsConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let event = IncomingEvent::subscription(
+            "workflow.gate".into(),
+            json!({"gate": "ready"}),
+            &RoutingMetadata::default(),
+            "workflow-gate",
+        );
+        let error = Router::new(Arc::new(config))
+            .resolve(&event)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "no configured route for subscription event");
     }
 }

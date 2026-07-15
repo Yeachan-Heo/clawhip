@@ -3,6 +3,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::Result;
+use crate::daemon::LOCAL_CONTROL_HEADER;
+
 use crate::config::AppConfig;
 use crate::events::IncomingEvent;
 use crate::source::tmux::RegisteredTmuxSession;
@@ -15,6 +17,46 @@ use crate::source::tmux::{
 pub struct DaemonClient {
     http: reqwest::Client,
     base_url: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SubscriptionStatus {
+    pub schema: String,
+    pub name: String,
+    pub enabled: bool,
+    pub state: String,
+    pub desired_running: bool,
+    pub started_at: Option<String>,
+    pub last_connected_at: Option<String>,
+    pub last_event_enqueued_at: Option<String>,
+    pub last_state_transition_at: String,
+    pub connection_attempts_total: u64,
+    pub connection_failures_total: u64,
+    pub reconnects_total: u64,
+    pub frames_received_total: u64,
+    pub frames_rejected_total: u64,
+    pub frames_matched_total: u64,
+    pub adapters_started_total: u64,
+    pub adapters_rejected_total: u64,
+    pub events_enqueued_total: u64,
+    pub last_reason_code: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SubscriptionListResponse {
+    pub schema: String,
+    pub subscriptions: Vec<SubscriptionStatus>,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SubscriptionDetailResponse {
+    pub schema: String,
+    pub subscription: SubscriptionStatus,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SubscriptionActionResponse {
+    pub ok: bool,
+    pub name: String,
+    pub reason: String,
 }
 
 impl DaemonClient {
@@ -91,6 +133,7 @@ impl DaemonClient {
         let response = self
             .http
             .post(format!("{}/api/update/{action}", self.base_url))
+            .header(LOCAL_CONTROL_HEADER, "1")
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -107,6 +150,7 @@ impl DaemonClient {
         let response = self
             .http
             .post(format!("{}{}", self.base_url, path))
+            .header(LOCAL_CONTROL_HEADER, "1")
             .json(payload)
             .send()
             .await?;
@@ -179,6 +223,34 @@ impl DaemonClient {
         }
     }
 
+    pub async fn list_subscriptions(&self) -> Result<SubscriptionListResponse> {
+        self.private_get_json("/api/subscriptions").await
+    }
+
+    pub async fn subscription_status(&self, name: &str) -> Result<SubscriptionDetailResponse> {
+        self.private_get_json(&format!(
+            "/api/subscriptions/{}",
+            subscription_path_name(name)
+        ))
+        .await
+    }
+
+    pub async fn start_subscription(&self, name: &str) -> Result<SubscriptionActionResponse> {
+        self.private_post_typed(
+            &format!("/api/subscriptions/{}/start", subscription_path_name(name)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn stop_subscription(&self, name: &str) -> Result<SubscriptionActionResponse> {
+        self.private_post_typed(
+            &format!("/api/subscriptions/{}/stop", subscription_path_name(name)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let response = self
             .http
@@ -213,6 +285,7 @@ impl DaemonClient {
         let response = self
             .http
             .post(format!("{}{}", self.base_url, path))
+            .header(LOCAL_CONTROL_HEADER, "1")
             .json(payload)
             .send()
             .await?;
@@ -254,6 +327,17 @@ impl DaemonClient {
     }
 }
 
+fn subscription_path_name(name: &str) -> String {
+    name.bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,7 +345,8 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use tokio::time::{Duration, timeout};
 
     #[test]
@@ -293,7 +378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_lane_requests_do_not_follow_redirects() {
+    async fn private_subscription_requests_do_not_follow_redirects() {
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_address = target.local_addr().unwrap();
         let target_hits = Arc::new(AtomicUsize::new(0));
@@ -322,9 +407,50 @@ mod tests {
                 .unwrap(),
             base_url: format!("http://{redirector_address}"),
         };
-        assert!(client.lane_detail("safe-session").await.is_err());
+        assert!(client.subscription_status("safe-session").await.is_err());
         redirect_task.await.unwrap();
         target_task.await.unwrap();
         assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn subscription_path_name_escapes_unsafe_text() {
+        assert_eq!(subscription_path_name("a/b?c#d"), "a%2Fb%3Fc%23d");
+    }
+
+    #[tokio::test]
+    async fn subscription_requests_reject_remote_daemons() {
+        let client = DaemonClient {
+            http: reqwest::Client::new(),
+            base_url: "http://example.com".into(),
+        };
+        assert!(client.subscription_status("safe").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_client_sends_the_fixed_local_control_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4_096];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.starts_with("POST /api/subscriptions/safe/start HTTP/1.1"));
+            assert!(request.contains("x-clawhip-local-control: 1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 44\r\nConnection: close\r\n\r\n{\"ok\":true,\"name\":\"safe\",\"reason\":\"started\"}",
+                )
+                .await
+                .unwrap();
+        });
+        let client = DaemonClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+        };
+        let response = client.start_subscription("safe").await.unwrap();
+        assert_eq!(response.reason, "started");
+        server.await.unwrap();
     }
 }

@@ -958,3 +958,81 @@ clawhip includes a [`geobench`](https://github.com/NomaDamas/geobench) product s
 
 - Spec: [`geobench/clawhip.yaml`](geobench/clawhip.yaml)
 - Runbook: [`docs/geobench.md`](docs/geobench.md)
+
+## Websocket subscriptions
+
+Subscriptions are daemon-owned, guarded local ingress for a configured websocket event stream. Keep endpoint credentials outside the TOML file: the configuration names an environment variable, and `clawhip subscribe`, health, and API responses never print that name, its value, the endpoint URL, adapter arguments, adapter stderr, frames, or adapter output.
+
+Set the endpoint only in the daemon environment, then keep the subscription policy and route ownership in `~/.clawhip/config.toml`:
+
+```bash
+export GJC_WORKFLOW_GATE_WS='wss://localhost:9443/gjc-events'
+clawhip subscribe validate
+clawhip start
+```
+
+```toml
+[[subscriptions]]
+name = "gjc-workflow-gate"
+enabled = true
+kind = "websocket"
+endpoint_env = "GJC_WORKFLOW_GATE_WS"
+
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+
+[[subscriptions.filter.predicates]]
+pointer = "/gate/state"
+equals = "ready"
+
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+gate_state = "/gate/state"
+
+[subscriptions.adapter]
+program = "/absolute/path/to/gjc-workflow-gate-adapter"
+args = []
+
+[subscriptions.routing]
+tool = "gjc"
+project = "my-project"
+
+[[routes]]
+event = "workflow.gate"
+sink = "discord"
+channel = "WORKFLOW_GATE_CHANNEL_ID"
+format = "alert"
+```
+
+A separate `question` subscription remains explicit and route-owned; it must not share a workflow-gate filter or silently inherit its channel:
+
+```toml
+[[subscriptions]]
+name = "gjc-question"
+enabled = true
+kind = "websocket"
+endpoint_env = "GJC_QUESTION_WS"
+
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "question"
+
+[subscriptions.projection]
+question_id = "/question/id"
+summary = "/question/summary"
+
+[subscriptions.adapter]
+program = "/absolute/path/to/gjc-question-adapter"
+args = []
+
+[[routes]]
+event = "workflow.question"
+sink = "discord"
+channel = "QUESTIONS_CHANNEL_ID"
+format = "compact"
+```
+
+Use `clawhip subscribe list`, `clawhip subscribe status <name>`, `clawhip subscribe start <name>`, and `clawhip subscribe stop <name>` only against a loopback daemon. The daemon also enforces the loopback peer and numeric loopback `Host` checks. `start` and `stop` additionally require the fixed `x-clawhip-local-control: 1` request header (sent automatically by `clawhip`) and reject non-loopback `Origin` headers; this is a local browser-CSRF and DNS-rebinding guard, not a credential. Redirects are not followed. `start` and `stop` are idempotent and return a reason code. Enabled subscriptions reconnect with their configured bounded backoff; daemon shutdown cancels workers and waits a bounded time before aborting remaining work.
+
+Adapters receive only the selected projection on stdin and must emit exactly one bounded JSON object with `type` and object `payload` on stdout. They run with a cleared environment; do not depend on inherited credentials or emit logs on stdout. Route channels belong in `[[routes]]`, not in subscription frames or adapter output.
