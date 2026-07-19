@@ -10,6 +10,7 @@
 </p>
 
 > **⭐ Optional support:** the interactive repo-local install paths (`./install.sh` and `clawhip install` from a clone) can offer to star this repo after a successful install when `gh` is installed and authenticated. Skip it with `--skip-star-prompt` or `CLAWHIP_SKIP_STAR_PROMPT=1`.
+> **Community:** Join the clawhip Discord at https://discord.gg/jq6jnSGABY.
 
 **gajae-claw (clawhip) is the control plane for agents:** route events from GitHub, Discord, tmux, and other tools to the right human or agent, record what happened, and separate automatic actions from approval-required actions.
 
