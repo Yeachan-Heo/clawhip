@@ -9,7 +9,10 @@ pub mod subscription;
 pub mod tmux;
 pub mod workspace;
 
-pub use git::GitSource;
+pub use git::{
+    GitMonitorLifecycleCounts, GitSource, SharedGitMonitorDiagnostics,
+    new_shared_git_monitor_diagnostics, snapshot_git_monitor_diagnostics,
+};
 pub use github::GitHubSource;
 pub use subscription::{SubscriptionSnapshot, SubscriptionState, SubscriptionWorker};
 pub use tmux::{
