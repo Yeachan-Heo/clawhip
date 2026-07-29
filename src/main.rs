@@ -1240,6 +1240,7 @@ program = "/bin/true"
                 pid: 4242,
                 name: Some("codex".into()),
             }),
+            registration_generation: 0,
             active_wrapper_monitor: true,
             lane: None,
         }]);
