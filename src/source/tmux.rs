@@ -1030,6 +1030,12 @@ pub async fn load_tmux_registry_state(
                         };
                         registration.registration_source =
                             normalize_runtime_registration_source(registration.registration_source);
+                        // Legacy or pre-generation entries (generation 0) are
+                        // re-minted so a stale cleanup candidate from before
+                        // the restart cannot match them.
+                        if registration.registration_generation == 0 {
+                            registration.registration_generation = mint_registration_generation();
+                        }
                         max_loaded_generation =
                             max_loaded_generation.max(registration.registration_generation);
                         write.insert(session, registration);
@@ -1782,20 +1788,18 @@ pub async fn list_active_tmux_registrations(
     match list_tmux_sessions().await {
         Ok(available_sessions) => {
             sync_active_config_registrations(config, registry, &available_sessions).await;
-            let stale_sessions = registry
-                .read()
-                .await
+            // Capture a single atomic snapshot of the registry after config
+            // reconciliation so the generation captured for each candidate
+            // matches the liveness observation.
+            let snapshot = registry.read().await;
+            let stale_sessions: Vec<String> = snapshot
                 .iter()
                 .filter(|(session, registration)| {
                     registration.active_wrapper_monitor && !available_sessions.contains(*session)
                 })
                 .map(|(session, _)| session.clone())
-                .collect::<Vec<_>>();
-            remove_tmux_registrations(registry, registry_state_path, &stale_sessions).await?;
-
-            let orphaned_candidates = registry
-                .read()
-                .await
+                .collect();
+            let orphaned_candidates: Vec<AbsentRegistrationCandidate> = snapshot
                 .iter()
                 .filter(|(session, registration)| {
                     !available_sessions.contains(*session)
@@ -1807,7 +1811,9 @@ pub async fn list_active_tmux_registrations(
                     session: session.clone(),
                     registration_generation: registration.registration_generation,
                 })
-                .collect::<Vec<_>>();
+                .collect();
+            drop(snapshot);
+            remove_tmux_registrations(registry, registry_state_path, &stale_sessions).await?;
             prune_absent_dynamic_registrations(registry, registry_state_path, &orphaned_candidates)
                 .await?;
         }

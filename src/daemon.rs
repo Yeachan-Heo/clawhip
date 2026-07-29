@@ -3670,9 +3670,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Safety: set_var is safe in single-threaded test context; the env
-        // var is read back by the same test before any other thread can
-        // observe it.
+        // Safety: set_var/remove_var are safe in single-threaded test context.
+        let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
         unsafe {
             std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
         }
@@ -3733,6 +3732,13 @@ mod tests {
             registrations[0]["parent_process"]["name"],
             Value::from("codex")
         );
+        // Safety: single-threaded test context; restore prior env state.
+        unsafe {
+            match &prior_tmux_bin {
+                Some(v) => std::env::set_var("CLAWHIP_TMUX_BIN", v),
+                None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+            }
+        }
         let _ = tokio::fs::remove_file(&stub).await;
     }
 
