@@ -31,11 +31,13 @@ use crate::source::tmux::{
     retire_lane_if_absent, update_lane_evidence, update_lane_workflow,
 };
 use crate::source::{
-    GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source,
-    SubscriptionSnapshot, SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
+    GitHubSource, GitMonitorLifecycleCounts, GitSource, RegisteredTmuxSession,
+    SharedGitMonitorDiagnostics, SharedTmuxRegistry, Source, SubscriptionSnapshot,
+    SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
     default_registry_state_path, inspect_tmux_registry_state, list_active_tmux_registrations,
-    load_tmux_registry_state, register_runtime_tmux_registration, remove_tmux_registrations,
-    tmux_registry_diagnostics,
+    load_tmux_registry_state, new_shared_git_monitor_diagnostics,
+    register_runtime_tmux_registration, remove_tmux_registrations,
+    snapshot_git_monitor_diagnostics, tmux_registry_diagnostics,
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
@@ -82,6 +84,7 @@ struct AppState {
     cron_state_path: PathBuf,
     discord_watch_lock: Arc<Mutex<()>>,
     subscriptions: SharedSubscriptionRegistry,
+    git_monitor_diagnostics: SharedGitMonitorDiagnostics,
 }
 
 type SharedSubscriptionRegistry = Arc<RwLock<BTreeMap<String, SubscriptionEntry>>>;
@@ -153,7 +156,11 @@ pub async fn run(
             eprintln!("clawhip dispatcher stopped: {error}");
         }
     });
-    spawn_source(GitSource::new(config.clone()), tx.clone());
+    let git_monitor_diagnostics = new_shared_git_monitor_diagnostics();
+    spawn_source(
+        GitSource::new(config.clone(), git_monitor_diagnostics.clone()),
+        tx.clone(),
+    );
     spawn_source(GitHubSource::new(config.clone()), tx.clone());
     spawn_source(
         TmuxSource::new(
@@ -221,6 +228,7 @@ pub async fn run(
         cron_state_path,
         discord_watch_lock: Arc::new(Mutex::new(())),
         subscriptions: subscriptions.clone(),
+        git_monitor_diagnostics,
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -348,6 +356,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         inspect_tmux_registry_state(&default_registry_state_path(&state.cron_state_path)).await;
     let tmux = tmux_registry_diagnostics(&state.tmux_registry, registry_state).await;
     let subscriptions = subscription_snapshots(&state.subscription_registry()).await;
+    let git_monitors = snapshot_git_monitor_diagnostics(&state.git_monitor_diagnostics);
     Json(health_payload(
         state.config.as_ref(),
         state.port,
@@ -355,6 +364,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         native_hooks,
         json!(tmux),
         &subscriptions,
+        git_monitors,
     ))
 }
 
@@ -365,27 +375,30 @@ fn health_payload(
     native_hooks: Value,
     tmux: Value,
     subscriptions: &[SubscriptionSnapshot],
+    git_monitors: GitMonitorLifecycleCounts,
 ) -> Value {
-    let degraded = subscriptions.iter().any(|subscription| {
+    let subscription_degraded = subscriptions.iter().any(|subscription| {
         subscription.enabled
             && subscription.desired_running
             && subscription.state == SubscriptionState::Exhausted
     });
+    let git_degraded = git_monitors.degraded > 0 || git_monitors.quarantined > 0;
     json!({
-        "ok": !degraded,
+        "ok": !subscription_degraded && !git_degraded,
         "version": VERSION,
         "token_source": config.discord_token_source(),
         "token_precedence_warning": config.discord_token_env_shadow().map(discord_token_shadow_warning),
         "webhook_routes_configured": config.has_webhook_routes(),
         "port": port,
         "configured_git_monitors": config.monitors.git.repos.len(),
+        "git_monitors": git_monitors,
         "configured_tmux_monitors": config.monitors.tmux.sessions.len(),
         "configured_workspace_monitors": config.monitors.workspace.len(),
         "configured_cron_jobs": config.cron.jobs.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
         "tmux": tmux,
         "native_hooks": native_hooks,
-        "subscriptions": {"configured": subscriptions.len(), "degraded": degraded},
+        "subscriptions": {"configured": subscriptions.len(), "degraded": subscription_degraded},
     })
 }
 
@@ -2007,6 +2020,7 @@ mod tests {
                 cron_state_path: PathBuf::from("cron-state.json"),
                 discord_watch_lock: Arc::new(Mutex::new(())),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+                git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             },
             rx,
         )
@@ -2151,6 +2165,7 @@ mod tests {
                 cron_state_path: PathBuf::from("cron-state.json"),
                 discord_watch_lock: Arc::new(Mutex::new(())),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+                git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             },
             rx,
         )
@@ -2486,6 +2501,7 @@ mod tests {
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -2534,6 +2550,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -2576,6 +2593,10 @@ mod tests {
             snapshot_shared(&new_shared_native_hook_observability()),
             json!({}),
             &[],
+            GitMonitorLifecycleCounts {
+                active: 1,
+                ..GitMonitorLifecycleCounts::default()
+            },
         );
 
         assert_eq!(payload["ok"], Value::Bool(true));
@@ -2583,6 +2604,7 @@ mod tests {
         assert_eq!(payload["token_source"], Value::String("config".to_string()));
         assert_eq!(payload["port"], Value::from(25294));
         assert_eq!(payload["configured_git_monitors"], Value::from(1));
+        assert_eq!(payload["git_monitors"]["active"], Value::from(1));
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
@@ -2622,10 +2644,70 @@ mod tests {
             events_enqueued_total: 0,
             last_reason_code: "retry_exhausted",
         };
-        let payload = health_payload(&config, 25294, 0, json!({}), json!({}), &[snapshot]);
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            json!({}),
+            json!({}),
+            &[snapshot],
+            GitMonitorLifecycleCounts::default(),
+        );
         assert_eq!(payload["ok"], Value::Bool(false));
         assert_eq!(payload["subscriptions"]["degraded"], Value::Bool(true));
         assert!(!payload.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn health_payload_reports_each_git_monitor_lifecycle_independently() {
+        let cases = [
+            (
+                GitMonitorLifecycleCounts {
+                    active: 2,
+                    ..GitMonitorLifecycleCounts::default()
+                },
+                true,
+            ),
+            (
+                GitMonitorLifecycleCounts {
+                    degraded: 1,
+                    ..GitMonitorLifecycleCounts::default()
+                },
+                false,
+            ),
+            (
+                GitMonitorLifecycleCounts {
+                    quarantined: 3,
+                    ..GitMonitorLifecycleCounts::default()
+                },
+                false,
+            ),
+            (
+                GitMonitorLifecycleCounts {
+                    retired: 4,
+                    ..GitMonitorLifecycleCounts::default()
+                },
+                true,
+            ),
+        ];
+
+        for (counts, expected_ok) in cases {
+            let payload = health_payload(
+                &AppConfig::default(),
+                25294,
+                0,
+                json!({}),
+                json!({}),
+                &[],
+                counts,
+            );
+
+            assert_eq!(payload["ok"], Value::Bool(expected_ok));
+            assert_eq!(payload["git_monitors"]["active"], counts.active);
+            assert_eq!(payload["git_monitors"]["degraded"], counts.degraded);
+            assert_eq!(payload["git_monitors"]["quarantined"], counts.quarantined);
+            assert_eq!(payload["git_monitors"]["retired"], counts.retired);
+        }
     }
 
     fn subscription_test_config() -> crate::config::SubscriptionConfig {
@@ -2753,6 +2835,7 @@ mod tests {
             json!({}),
             json!({}),
             &[status],
+            GitMonitorLifecycleCounts::default(),
         );
         assert_eq!(payload["ok"], Value::Bool(false));
         assert_eq!(payload["subscriptions"]["degraded"], Value::Bool(true));
@@ -2898,6 +2981,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -2938,6 +3022,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -2971,6 +3056,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let event = IncomingEvent::agent_started(
             "worker-1".into(),
@@ -3016,6 +3102,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -3072,6 +3159,7 @@ mod tests {
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -3133,6 +3221,7 @@ mod tests {
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -3192,6 +3281,7 @@ mod tests {
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let event = |id: &str| IncomingEvent {
@@ -3249,6 +3339,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -3278,6 +3369,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let payload = json!({"provider": "codex", "event_name": "Bogus"});
 
@@ -3306,6 +3398,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -3348,6 +3441,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -3389,6 +3483,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let payload = json!({
             "provider": "codex",
@@ -3459,6 +3554,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let payload = json!({
             "provider": "claude-code",
@@ -3626,6 +3722,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -3709,6 +3806,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = list_tmux(State(state)).await.into_response();
@@ -3755,6 +3853,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -3787,6 +3886,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -3812,6 +3912,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = approve_update(State(state)).await.into_response();
@@ -3849,6 +3950,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = dismiss_update(State(state)).await.into_response();
@@ -3874,6 +3976,7 @@ mod tests {
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = dismiss_update(State(state)).await.into_response();

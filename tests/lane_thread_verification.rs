@@ -331,19 +331,21 @@ fn config_with_base_url(path: &Path, port: u16, base_port: u16) {
 }
 
 fn start(config_path: &Path, home: &Path, tmux: &Path, discord: &MockDiscord, port: u16) -> Daemon {
-    let child = Command::new(bin())
-        .arg("--config")
-        .arg(config_path)
-        .arg("start")
-        .arg("--port")
-        .arg(port.to_string())
-        .env("HOME", home)
-        .env("CLAWHIP_TMUX_BIN", tmux)
-        .env("CLAWHIP_DISCORD_API_BASE", discord.api_base())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start daemon");
+    let daemon = Daemon(
+        Command::new(bin())
+            .arg("--config")
+            .arg(config_path)
+            .arg("start")
+            .arg("--port")
+            .arg(port.to_string())
+            .env("HOME", home)
+            .env("CLAWHIP_TMUX_BIN", tmux)
+            .env("CLAWHIP_DISCORD_API_BASE", discord.api_base())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start daemon"),
+    );
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
         if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
@@ -353,7 +355,7 @@ fn start(config_path: &Path, home: &Path, tmux: &Path, discord: &MockDiscord, po
             let mut response = String::new();
             let _ = stream.read_to_string(&mut response);
             if response.starts_with("HTTP/1.1 200") {
-                return Daemon(child);
+                return daemon;
             }
         }
         thread::sleep(Duration::from_millis(50));
