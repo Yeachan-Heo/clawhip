@@ -141,6 +141,7 @@ impl TmuxMonitorArgs {
             registered_at: self.registered_at,
             registration_source: self.registration_source,
             parent_process: self.parent_process,
+            registration_generation: 0,
             active_wrapper_monitor,
             lane: None,
         }
@@ -1836,6 +1837,7 @@ mod tests {
                 pid: 42,
                 name: Some("codex".into()),
             }),
+            registration_generation: 0,
             active_wrapper_monitor: true,
             lane: None,
         });

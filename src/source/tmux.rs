@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,36 @@ use crate::telemetry;
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
 static REGISTRY_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static NEXT_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Mint a process-wide monotonically increasing registration generation.
+/// Client-supplied values are always overwritten with the daemon-minted
+/// value, so a stale cleanup observation cannot match a re-registered
+/// entry under the same session name.
+fn mint_registration_generation() -> u64 {
+    NEXT_REGISTRATION_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Advance the allocator past any restored values so a freshly reloaded
+/// registration is never assigned a generation that collides with a stale
+/// prune candidate from before the restart.
+fn advance_registration_generation_above(loaded: u64) {
+    let mut current = NEXT_REGISTRATION_GENERATION.load(Ordering::Relaxed);
+    loop {
+        if loaded <= current {
+            break;
+        }
+        match NEXT_REGISTRATION_GENERATION.compare_exchange(
+            current,
+            loaded + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmuxRegistryDiagnostics {
@@ -103,6 +134,8 @@ pub struct RegisteredTmuxSession {
     pub registration_source: RegistrationSource,
     #[serde(default)]
     pub parent_process: Option<ParentProcessInfo>,
+    #[serde(default)]
+    pub registration_generation: u64,
     #[serde(default)]
     pub active_wrapper_monitor: bool,
     #[serde(skip)]
@@ -713,6 +746,7 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             registered_at: current_timestamp_rfc3339(),
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
+            registration_generation: 0,
             active_wrapper_monitor: false,
             lane: None,
         }
@@ -984,6 +1018,7 @@ pub async fn load_tmux_registry_state(
             match serde_json::from_slice::<BTreeMap<String, StoredRegistryValue>>(&content) {
                 Ok(loaded) => {
                     let mut write = registry.write().await;
+                    let mut max_loaded_generation = 0u64;
                     for (session, stored) in loaded {
                         let mut registration = match stored {
                             StoredRegistryValue::Wrapped(stored) => {
@@ -995,8 +1030,11 @@ pub async fn load_tmux_registry_state(
                         };
                         registration.registration_source =
                             normalize_runtime_registration_source(registration.registration_source);
+                        max_loaded_generation =
+                            max_loaded_generation.max(registration.registration_generation);
                         write.insert(session, registration);
                     }
+                    advance_registration_generation_above(max_loaded_generation);
                     TmuxRegistryStateDiagnostics {
                         path: path.to_path_buf(),
                         status: TmuxRegistryStateStatus::Loaded,
@@ -1079,6 +1117,7 @@ pub async fn register_runtime_tmux_registration(
 ) -> Result<usize> {
     registration.registration_source =
         normalize_runtime_registration_source(registration.registration_source);
+    registration.registration_generation = mint_registration_generation();
     let _mutation = REGISTRY_MUTATION_LOCK.lock().await;
     let mut next = registry.read().await.clone();
     if next
@@ -1116,6 +1155,69 @@ pub async fn remove_tmux_registrations(
     if removed > 0 {
         save_durable_tmux_registry(path, &next).await?;
         *registry.write().await = next;
+    }
+    Ok(removed)
+}
+
+/// A candidate for dynamic-registration pruning identified by session name
+/// and the registration generation observed at selection time. The
+/// generation acts as a compare-and-swap token: if the current registry
+/// entry has a different generation (because a newer registration arrived),
+/// the prune is skipped for that entry.
+#[derive(Debug, Clone)]
+pub struct AbsentRegistrationCandidate {
+    pub session: String,
+    pub registration_generation: u64,
+}
+
+/// Prune daemon-owned dynamic registrations (cli-watch / cli-new) whose tmux
+/// session has been observed absent. Only non-lane entries are eligible;
+/// lane-bearing registrations are preserved regardless of liveness to avoid
+/// destroying in-flight R0/R1/R2 lane evidence that is expected to exist
+/// before the tmux session is created.
+///
+/// Config-monitor registrations are never selected or removed by this
+/// function — they are reconciled declaratively via
+/// `sync_active_config_registrations`.
+pub async fn prune_absent_dynamic_registrations(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    candidates: &[AbsentRegistrationCandidate],
+) -> Result<usize> {
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let _mutation = REGISTRY_MUTATION_LOCK.lock().await;
+    let mut next = registry.read().await.clone();
+    let mut removed = 0;
+    let mut first_removed: Option<&str> = None;
+    for candidate in candidates {
+        let removable = next.get(&candidate.session).is_some_and(|registration| {
+            registration.registration_generation == candidate.registration_generation
+                && registration.registration_source != RegistrationSource::ConfigMonitor
+                && registration.lane.is_none()
+        });
+        if removable && next.remove(&candidate.session).is_some() {
+            if first_removed.is_none() {
+                first_removed = Some(candidate.session.as_str());
+            }
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        save_durable_tmux_registry(path, &next).await?;
+        *registry.write().await = next;
+        let mut record = source_record(
+            telemetry::event_name::SOURCE_INVENTORY,
+            "dynamic_registration_pruned_absent",
+            None,
+            None,
+        );
+        record.insert("removed_count".to_string(), serde_json::json!(removed));
+        if let Some(sample) = first_removed {
+            record.insert("sample_session".to_string(), serde_json::json!(sample));
+        }
+        telemetry::emit(record);
     }
     Ok(removed)
 }
@@ -1162,6 +1264,7 @@ pub async fn register_lane_registration(
     let session = registration.session.clone();
     registration.registration_source =
         normalize_runtime_registration_source(registration.registration_source);
+    registration.registration_generation = mint_registration_generation();
     let _mutation = REGISTRY_MUTATION_LOCK.lock().await;
     let mut next = registry.read().await.clone();
     if let Some(existing) = next.get(&session) {
@@ -1689,6 +1792,24 @@ pub async fn list_active_tmux_registrations(
                 .map(|(session, _)| session.clone())
                 .collect::<Vec<_>>();
             remove_tmux_registrations(registry, registry_state_path, &stale_sessions).await?;
+
+            let orphaned_candidates = registry
+                .read()
+                .await
+                .iter()
+                .filter(|(session, registration)| {
+                    !available_sessions.contains(*session)
+                        && registration.registration_source != RegistrationSource::ConfigMonitor
+                        && registration.lane.is_none()
+                        && !registration.active_wrapper_monitor
+                })
+                .map(|(session, registration)| AbsentRegistrationCandidate {
+                    session: session.clone(),
+                    registration_generation: registration.registration_generation,
+                })
+                .collect::<Vec<_>>();
+            prune_absent_dynamic_registrations(registry, registry_state_path, &orphaned_candidates)
+                .await?;
         }
         Err(error) => {
             telemetry::emit(source_record(
@@ -1700,7 +1821,6 @@ pub async fn list_active_tmux_registrations(
             eprintln!("clawhip source tmux list-sessions failed: {error}");
         }
     }
-
     let snapshot = registry.read().await;
     Ok(sorted_registry_snapshot(&snapshot))
 }
@@ -1744,6 +1864,7 @@ async fn poll_tmux(
 
     let mut active_panes = HashSet::new();
     let mut sessions_to_unregister = Vec::new();
+    let mut dynamic_prune_candidates = Vec::new();
 
     for (session_name, registration) in &sessions {
         let now = Instant::now();
@@ -1756,7 +1877,17 @@ async fn poll_tmux(
                     Some(session_name),
                     None,
                 ));
-                sessions_to_unregister.push(session_name.clone());
+                if registration.registration_source != RegistrationSource::ConfigMonitor
+                    && registration.lane.is_none()
+                    && !registration.active_wrapper_monitor
+                {
+                    dynamic_prune_candidates.push(AbsentRegistrationCandidate {
+                        session: session_name.clone(),
+                        registration_generation: registration.registration_generation,
+                    });
+                } else {
+                    sessions_to_unregister.push(session_name.clone());
+                }
                 state.pending_keyword_hits.remove(session_name);
                 state.panes.retain(|_, pane| pane.session != *session_name);
                 continue;
@@ -1897,6 +2028,14 @@ async fn poll_tmux(
     if !sessions_to_unregister.is_empty() {
         remove_tmux_registrations(registry, registry_state_path, &sessions_to_unregister).await?;
     }
+    if !dynamic_prune_candidates.is_empty() {
+        prune_absent_dynamic_registrations(
+            registry,
+            registry_state_path,
+            &dynamic_prune_candidates,
+        )
+        .await?;
+    }
 
     state
         .pending_keyword_hits
@@ -1928,6 +2067,7 @@ async fn sync_active_config_registrations(
     registry: &SharedTmuxRegistry,
     available_sessions: &HashSet<String>,
 ) {
+    let _mutation = REGISTRY_MUTATION_LOCK.lock().await;
     let existing_registry = registry.read().await.clone();
     let resolved = resolve_monitored_sessions(
         config
@@ -2440,6 +2580,7 @@ mod tests {
             registered_at: "2026-04-02T00:00:00Z".into(),
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
+            registration_generation: 0,
             active_wrapper_monitor: false,
             lane: None,
         }
@@ -3218,6 +3359,7 @@ PR created #7",
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3239,6 +3381,7 @@ PR created #7",
                         pid: 42,
                         name: Some("codex".into()),
                     }),
+                    registration_generation: 0,
                     active_wrapper_monitor: true,
                     lane: None,
                 },
@@ -3257,6 +3400,7 @@ PR created #7",
                     registered_at: "2026-04-02T02:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3279,6 +3423,7 @@ PR created #7",
                     registered_at: "2026-04-02T09:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3311,6 +3456,7 @@ PR created #7",
                     pid: 42,
                     name: Some("codex".into()),
                 }),
+                registration_generation: 0,
                 active_wrapper_monitor: true,
                 lane: None,
             },
@@ -3332,6 +3478,7 @@ PR created #7",
                     registered_at: "2026-04-02T09:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3759,6 +3906,7 @@ error: failed";
                 registered_at: "2026-04-02T00:00:00Z".into(),
                 registration_source: RegistrationSource::ConfigMonitor,
                 parent_process: None,
+                registration_generation: 0,
                 active_wrapper_monitor: false,
                 lane: None,
             }],
@@ -3790,6 +3938,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3805,6 +3954,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3834,6 +3984,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3849,6 +4000,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3877,6 +4029,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3892,6 +4045,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3920,6 +4074,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3935,6 +4090,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3968,6 +4124,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -3983,6 +4140,7 @@ error: failed";
                     registered_at: "2026-04-02T00:00:00Z".into(),
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
+                    registration_generation: 0,
                     active_wrapper_monitor: false,
                     lane: None,
                 },
@@ -4040,5 +4198,231 @@ error: failed";
         };
         // Dead pane should never emit stale, even after 1 hour idle
         assert!(!should_emit_stale(&pane, Instant::now(), 1));
+    }
+
+    #[tokio::test]
+    async fn prune_absent_dynamic_removes_dead_cliwatch_no_lane() {
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let path = std::env::temp_dir().join(format!(
+            "clawhip-test-prune-cliwatch-{}.json",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        let registration = RegisteredTmuxSession {
+            session: "dead-watch".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            routing: RoutingMetadata::default(),
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-07-29T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: None,
+            registration_generation: 0,
+            active_wrapper_monitor: false,
+            lane: None,
+        };
+        registry
+            .write()
+            .await
+            .insert("dead-watch".into(), registration);
+        let candidates = vec![AbsentRegistrationCandidate {
+            session: "dead-watch".into(),
+            registration_generation: 0,
+        }];
+        let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(registry.read().await.get("dead-watch").is_none());
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn prune_absent_dynamic_preserves_config_monitor() {
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let path = std::env::temp_dir().join(format!(
+            "clawhip-test-prune-config-{}.json",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        let registration = RegisteredTmuxSession {
+            session: "config-mon".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            routing: RoutingMetadata::default(),
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-07-29T00:00:00Z".into(),
+            registration_source: RegistrationSource::ConfigMonitor,
+            parent_process: None,
+            registration_generation: 0,
+            active_wrapper_monitor: false,
+            lane: None,
+        };
+        registry
+            .write()
+            .await
+            .insert("config-mon".into(), registration);
+        let candidates = vec![AbsentRegistrationCandidate {
+            session: "config-mon".into(),
+            registration_generation: 0,
+        }];
+        let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(registry.read().await.get("config-mon").is_some());
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn prune_absent_dynamic_skips_newer_registration() {
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let path = std::env::temp_dir().join(format!(
+            "clawhip-test-prune-race-{}.json",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        // The current registration has generation 42 (re-registered).
+        let registration = RegisteredTmuxSession {
+            session: "re-reg".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            routing: RoutingMetadata::default(),
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-07-29T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliNew,
+            parent_process: None,
+            registration_generation: 42,
+            active_wrapper_monitor: false,
+            lane: None,
+        };
+        registry.write().await.insert("re-reg".into(), registration);
+        // Stale candidate has generation 5 (old observation).
+        let candidates = vec![AbsentRegistrationCandidate {
+            session: "re-reg".into(),
+            registration_generation: 5,
+        }];
+        let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(registry.read().await.get("re-reg").is_some());
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn prune_absent_dynamic_preserves_lane_bearing_entry() {
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let path = std::env::temp_dir().join(format!(
+            "clawhip-test-prune-lane-{}.json",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        let mut registration = RegisteredTmuxSession {
+            session: "lane-session".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            routing: RoutingMetadata::default(),
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-07-29T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliNew,
+            parent_process: None,
+            registration_generation: 1,
+            active_wrapper_monitor: false,
+            lane: None,
+        };
+        registration.lane = Some(LaneEvidence {
+            lane_version: 1,
+            generation_id: "gen-abc123def".into(),
+            kickoff_operation_id: "kick-abc123def".into(),
+            launch_operation_id: "launch-abc123de".into(),
+            executor_id: "exec-abc123def".into(),
+            worker_effect_kind: WorkerEffectKind::CommandSubmission,
+            launch_state: LaneLaunchState::Launched,
+            workflow: LaneWorkflow::Active,
+            revision: 2,
+            quiesced: false,
+            thread_id: None,
+            kickoff_message_id: None,
+            kickoff_delivered_at: None,
+            visibility: Some(LaneVisibility::Visible),
+            verification: None,
+            last_failure: None,
+            latest_update_message_id: None,
+            latest_update_kind: None,
+            latest_update_delivered_at: None,
+            delivery_retry_count: 0,
+            delivery_disposition: None,
+        });
+        registry
+            .write()
+            .await
+            .insert("lane-session".into(), registration);
+        let candidates = vec![AbsentRegistrationCandidate {
+            session: "lane-session".into(),
+            registration_generation: 1,
+        }];
+        let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(registry.read().await.get("lane-session").is_some());
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn prune_preserves_entries_on_durable_save_failure() {
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        // A path inside /proc or a directory should fail on write.
+        let path = std::path::PathBuf::from("/dev/null/impossible-path.json");
+        let registration = RegisteredTmuxSession {
+            session: "fail-save".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            routing: RoutingMetadata::default(),
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-07-29T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: None,
+            registration_generation: 1,
+            active_wrapper_monitor: false,
+            lane: None,
+        };
+        registry
+            .write()
+            .await
+            .insert("fail-save".into(), registration);
+        let candidates = vec![AbsentRegistrationCandidate {
+            session: "fail-save".into(),
+            registration_generation: 1,
+        }];
+        let result = prune_absent_dynamic_registrations(&registry, &path, &candidates).await;
+        assert!(result.is_err(), "prune should fail on durable save error");
+        // Registry must remain unchanged: save-before-swap invariant.
+        assert!(registry.read().await.get("fail-save").is_some());
+    }
+
+    #[tokio::test]
+    async fn mint_registration_generation_is_monotonic() {
+        let a = mint_registration_generation();
+        let b = mint_registration_generation();
+        let c = mint_registration_generation();
+        assert!(b > a, "generation must be monotonically increasing");
+        assert!(c > b, "generation must be monotonically increasing");
     }
 }

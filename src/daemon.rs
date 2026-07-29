@@ -2195,6 +2195,7 @@ mod tests {
                 pid: 4242,
                 name: Some("codex".into()),
             }),
+            registration_generation: 0,
             active_wrapper_monitor: true,
             lane: None,
         }
@@ -3650,6 +3651,31 @@ mod tests {
 
     #[tokio::test]
     async fn list_tmux_returns_registered_sessions_with_metadata() {
+        // Use a stub tmux binary that reports issue-105 as a live session so
+        // the registration is not pruned by the orphaned-dynamic-cleanup path.
+        let stub = std::env::temp_dir().join(format!(
+            "clawhip-test-tmux-stub-list-{}",
+            std::process::id()
+        ));
+        tokio::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"list-sessions\" ]; then echo 'issue-105'; exit 0; fi\nif [ \"$1\" = \"has-session\" ]; then exit 0; fi\nexit 0\n",
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+        }
+        // Safety: set_var is safe in single-threaded test context; the env
+        // var is read back by the same test before any other thread can
+        // observe it.
+        unsafe {
+            std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
+        }
         let (tx, _rx) = mpsc::channel(1);
         let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
         registry.write().await.insert(
@@ -3669,6 +3695,7 @@ mod tests {
                     pid: 4242,
                     name: Some("codex".into()),
                 }),
+                registration_generation: 0,
                 active_wrapper_monitor: false,
                 lane: None,
             },
@@ -3706,6 +3733,7 @@ mod tests {
             registrations[0]["parent_process"]["name"],
             Value::from("codex")
         );
+        let _ = tokio::fs::remove_file(&stub).await;
     }
 
     #[tokio::test]
