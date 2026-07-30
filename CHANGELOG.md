@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- config saves now retire only strictly recognized stale legacy root-level snapshots alongside managed backups under the shared newest-10-or-newer-than-30-days retention policy. Unknown, malformed, symlinked, directory, and unsafe linked entries remain untouched; on platforms where the standard library cannot prove filesystem identity, saves continue while cleanup preserves every candidate. No config schema migration or startup cleanup is required.
+- config saves retire only strictly recognized stale legacy root-level snapshots alongside managed backups under the shared newest-10-or-newer-than-30-days retention policy. On Unix, temp commit, managed snapshot creation, and candidate deletion use directory-handle-relative exclusive/no-follow primitives so preplaced temp collisions, post-write temp replacement, managed-directory path swaps, and post-check candidate replacement cannot redirect writes or unlinks outside the validated objects; on platforms without those primitives, saves continue while cleanup preserves every candidate. Unknown, malformed, symlinked, directory, and unsafe linked entries remain untouched. No config schema migration or startup cleanup is required.
 
 ## 0.6.11 - 2026-06-16
 

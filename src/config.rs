@@ -1,10 +1,14 @@
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -944,19 +948,28 @@ impl AppConfig {
         F: FnMut(&BackupCandidate) -> Result<()>,
     {
         let mut before_rename = || Ok(());
-        self.save_with_backup_at_hooks(path, now, &mut before_rename, before_delete)
+        let mut before_snapshot = || Ok(());
+        self.save_with_backup_at_hooks(
+            path,
+            now,
+            &mut before_rename,
+            &mut before_snapshot,
+            before_delete,
+        )
     }
 
-    fn save_with_backup_at_hooks<F, G>(
+    fn save_with_backup_at_hooks<F, G, H>(
         &self,
         path: &Path,
         now: OffsetDateTime,
         before_rename: &mut G,
+        before_snapshot: &mut H,
         before_delete: &mut F,
     ) -> Result<()>
     where
         F: FnMut(&BackupCandidate) -> Result<()>,
         G: FnMut() -> Result<()>,
+        H: FnMut() -> Result<()>,
     {
         let parent = path
             .parent()
@@ -1008,18 +1021,24 @@ impl AppConfig {
             let managed_dir = managed_dir
                 .as_ref()
                 .ok_or_else(|| "managed config backup directory was not created".to_string())?;
-            create_managed_snapshot_create_new(managed_dir, filename, old_bytes, now)?;
+            create_managed_snapshot_create_new(
+                managed_dir,
+                filename,
+                old_bytes,
+                now,
+                before_snapshot,
+            )?;
         }
 
         revalidate_config_parent_dir(&parent_dir)?;
-        let temp_path = parent_dir
-            .path
-            .join(format!(".{filename}.tmp.{}", std::process::id()));
-        fs::write(&temp_path, new_bytes)?;
-        before_rename()?;
-        revalidate_config_parent_dir(&parent_dir)?;
-        revalidate_active_config(path, &active)?;
-        fs::rename(temp_path, path)?;
+        commit_config_bytes_via_temp(
+            &parent_dir,
+            path,
+            filename,
+            new_bytes,
+            &active,
+            before_rename,
+        )?;
 
         revalidate_config_parent_dir(&parent_dir).map_err(|error| {
             io::Error::other(format!(
@@ -2062,6 +2081,8 @@ impl BackupOrigin {
 #[derive(Debug, Clone)]
 struct BackupCandidate {
     origin: BackupOrigin,
+    /// Absolute path retained for adversarial test hooks and diagnostics.
+    #[allow(dead_code)]
     path: PathBuf,
     entry_name: String,
     created_at: OffsetDateTime,
@@ -2080,6 +2101,323 @@ fn metadata_identity(metadata: &Metadata) -> Option<FileIdentity> {
     {
         let _ = metadata;
         None
+    }
+}
+#[cfg(unix)]
+struct BoundDir {
+    file: File,
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+impl BoundDir {
+    fn open_verified(path: &Path, expected: Option<FileIdentity>) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| {
+                format!(
+                    "failed to open directory for contained IO {}: {error}",
+                    path.display()
+                )
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to stat directory for contained IO {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "path is not a regular directory for contained IO: {}",
+                path.display()
+            )
+            .into());
+        }
+        let identity = metadata_identity(&metadata).ok_or_else(|| {
+            format!(
+                "directory identity unavailable for contained IO: {}",
+                path.display()
+            )
+        })?;
+        if expected.is_some_and(|expected| expected != identity) {
+            return Err(format!("directory changed during use: {}", path.display()).into());
+        }
+        Ok(Self { file, identity })
+    }
+
+    fn revalidate(&self, expected: Option<FileIdentity>) -> Result<()> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|error| format!("failed to revalidate bound directory: {error}"))?;
+        let identity = metadata_identity(&metadata);
+        if !metadata.is_dir()
+            || identity != Some(self.identity)
+            || expected.is_some_and(|expected| Some(expected) != identity)
+        {
+            return Err("bound directory changed during use".to_string().into());
+        }
+        Ok(())
+    }
+
+    fn fd(&self) -> libc::c_int {
+        self.file.as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+fn openat_exclusive_write(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn openat_read_nofollow(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), flags, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn fstatat_regular_identity(
+    dir: &BoundDir,
+    name: &str,
+) -> std::result::Result<Option<(FileIdentity, u64)>, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir.fd(),
+            c_name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Ok(None);
+    }
+    Ok(Some((
+        FileIdentity {
+            device: st.st_dev as u64,
+            inode: st.st_ino as u64,
+        },
+        st.st_nlink as u64,
+    )))
+}
+
+#[cfg(unix)]
+fn renameat_names(dir: &BoundDir, old: &str, new: &str) -> std::result::Result<(), io::Error> {
+    let c_old = CString::new(old).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let c_new = CString::new(new).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let rc = unsafe { libc::renameat(dir.fd(), c_old.as_ptr(), dir.fd(), c_new.as_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlinkat_name(dir: &BoundDir, name: &str) -> std::result::Result<(), io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let rc = unsafe { libc::unlinkat(dir.fd(), c_name.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn commit_config_bytes_via_temp<G>(
+    parent_dir: &ConfigParentDir,
+    path: &Path,
+    filename: &str,
+    new_bytes: &[u8],
+    active: &ActiveConfigState,
+    before_rename: &mut G,
+) -> Result<()>
+where
+    G: FnMut() -> Result<()>,
+{
+    let temp_name = format!(".{filename}.tmp.{}", std::process::id());
+
+    #[cfg(unix)]
+    {
+        let dir = BoundDir::open_verified(&parent_dir.path, parent_dir.identity)?;
+        let mut temp = match openat_exclusive_write(&dir, &temp_name) {
+            Ok(temp) => temp,
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Err(
+                    format!("config temp collision at {temp_name}; config was not saved").into(),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create config temp {temp_name}; config was not saved: {error}"
+                )
+                .into());
+            }
+        };
+        if let Err(error) = temp.write_all(new_bytes) {
+            let _ = unlinkat_name(&dir, &temp_name);
+            return Err(format!(
+                "failed to write config temp {temp_name}; config was not saved: {error}"
+            )
+            .into());
+        }
+        let temp_identity = metadata_identity(&temp.metadata().map_err(|error| {
+            let _ = unlinkat_name(&dir, &temp_name);
+            format!("failed to identity config temp {temp_name}; config was not saved: {error}")
+        })?)
+        .ok_or_else(|| {
+            let _ = unlinkat_name(&dir, &temp_name);
+            format!("config temp identity unavailable for {temp_name}; config was not saved")
+        })?;
+        before_rename().inspect_err(|_| {
+            let _ = unlinkat_name(&dir, &temp_name);
+        })?;
+        dir.revalidate(parent_dir.identity).inspect_err(|_| {
+            let _ = unlinkat_name(&dir, &temp_name);
+        })?;
+        revalidate_active_config(path, active).inspect_err(|_| {
+            let _ = unlinkat_name(&dir, &temp_name);
+        })?;
+        match fstatat_regular_identity(&dir, &temp_name) {
+            Ok(Some((identity, _))) if identity == temp_identity => {}
+            Ok(_) => {
+                let _ = unlinkat_name(&dir, &temp_name);
+                return Err(format!(
+                    "config temp path changed before commit at {temp_name}; config was not saved"
+                )
+                .into());
+            }
+            Err(error) => {
+                let _ = unlinkat_name(&dir, &temp_name);
+                return Err(format!(
+                    "failed to revalidate config temp {temp_name}; config was not saved: {error}"
+                )
+                .into());
+            }
+        }
+        if let Err(error) = renameat_names(&dir, &temp_name, filename) {
+            let _ = unlinkat_name(&dir, &temp_name);
+            return Err(format!(
+                "failed to commit config via {temp_name}; config was not saved: {error}"
+            )
+            .into());
+        }
+        match fstatat_regular_identity(&dir, filename) {
+            Ok(Some((identity, _))) if identity == temp_identity => Ok(()),
+            Ok(_) => Err(format!(
+                "config commit identity mismatch at {}; config path may be unsafe",
+                path.display()
+            )
+            .into()),
+            Err(error) => Err(format!(
+                "failed to verify committed config at {}; config path may be unsafe: {error}",
+                path.display()
+            )
+            .into()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let temp_path = parent_dir.path.join(&temp_name);
+        let mut temp = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp) => temp,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "config temp collision at {}; config was not saved",
+                    temp_path.display()
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create config temp {}; config was not saved: {error}",
+                    temp_path.display()
+                )
+                .into());
+            }
+        };
+        temp.write_all(new_bytes).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            format!(
+                "failed to write config temp {}; config was not saved: {error}",
+                temp_path.display()
+            )
+        })?;
+        before_rename().inspect_err(|_| {
+            let _ = fs::remove_file(&temp_path);
+        })?;
+        revalidate_config_parent_dir(parent_dir).inspect_err(|_| {
+            let _ = fs::remove_file(&temp_path);
+        })?;
+        revalidate_active_config(path, active).inspect_err(|_| {
+            let _ = fs::remove_file(&temp_path);
+        })?;
+        fs::rename(&temp_path, path).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            format!(
+                "failed to commit config via {}; config was not saved: {error}",
+                temp_path.display()
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -2253,46 +2591,89 @@ fn utc_backup_timestamp(now: OffsetDateTime) -> Result<String> {
     Ok(now.format(&format)?)
 }
 
-fn create_managed_snapshot_create_new(
+fn create_managed_snapshot_create_new<H>(
     managed_dir: &ManagedBackupDir,
     filename: &str,
     old_bytes: &[u8],
     now: OffsetDateTime,
-) -> Result<()> {
-    revalidate_managed_backup_dir(managed_dir)?;
+    before_create: &mut H,
+) -> Result<()>
+where
+    H: FnMut() -> Result<()>,
+{
     let timestamp = utc_backup_timestamp(now)?;
-    let backup_path = managed_dir.path.join(format!(
-        "{filename}.{timestamp}.{}.bak",
-        sha256_first8(old_bytes)
-    ));
-    let mut backup = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&backup_path)
+    let entry_name = format!("{filename}.{timestamp}.{}.bak", sha256_first8(old_bytes));
+
+    #[cfg(unix)]
     {
-        Ok(backup) => backup,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(format!(
-                "config backup collision at {}; config was not saved",
+        let dir = BoundDir::open_verified(&managed_dir.path, managed_dir.identity)?;
+        before_create()?;
+        dir.revalidate(managed_dir.identity)?;
+        let mut backup = match openat_exclusive_write(&dir, &entry_name) {
+            Ok(backup) => backup,
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Err(format!(
+                    "config backup collision at {}; config was not saved",
+                    managed_dir.path.join(&entry_name).display()
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create config backup {}; config was not saved: {error}",
+                    managed_dir.path.join(&entry_name).display()
+                )
+                .into());
+            }
+        };
+        backup.write_all(old_bytes).map_err(|error| {
+            let _ = unlinkat_name(&dir, &entry_name);
+            format!(
+                "failed to write config backup {}; config was not saved: {error}",
+                managed_dir.path.join(&entry_name).display()
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        revalidate_managed_backup_dir(managed_dir)?;
+        before_create()?;
+        revalidate_managed_backup_dir(managed_dir)?;
+        let backup_path = managed_dir.path.join(&entry_name);
+        let mut backup = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(backup) => backup,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "config backup collision at {}; config was not saved",
+                    backup_path.display()
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create config backup {}; config was not saved: {error}",
+                    backup_path.display()
+                )
+                .into());
+            }
+        };
+        backup.write_all(old_bytes).map_err(|error| {
+            format!(
+                "failed to write config backup {}; config was not saved: {error}",
                 backup_path.display()
             )
-            .into());
-        }
-        Err(error) => {
-            return Err(format!(
-                "failed to create config backup {}; config was not saved: {error}",
-                backup_path.display()
-            )
-            .into());
-        }
-    };
-    backup.write_all(old_bytes).map_err(|error| {
-        format!(
-            "failed to write config backup {}; config was not saved: {error}",
-            backup_path.display()
-        )
-    })?;
-    Ok(())
+        })?;
+        Ok(())
+    }
 }
 
 fn parse_managed_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
@@ -2460,33 +2841,72 @@ fn collect_cleanup_candidates(
     Ok(candidates)
 }
 
-fn delete_verified_candidate(
+fn delete_verified_candidate<A>(
     candidate: &BackupCandidate,
     parent_dir: &ConfigParentDir,
     managed_dir: Option<&ManagedBackupDir>,
     protected_identities: &[FileIdentity],
-) -> Result<()> {
-    revalidate_config_parent_dir(parent_dir)?;
-    if candidate.origin == BackupOrigin::Managed {
-        let managed_dir = managed_dir
-            .ok_or_else(|| "managed backup candidate has no validated directory".to_string())?;
-        revalidate_managed_backup_dir(managed_dir)?;
+    after_check: &mut A,
+) -> Result<()>
+where
+    A: FnMut(&BackupCandidate) -> Result<()>,
+{
+    #[cfg(unix)]
+    {
+        let (dir_path, expected_identity) = match candidate.origin {
+            BackupOrigin::RootLegacy => {
+                revalidate_config_parent_dir(parent_dir)?;
+                (parent_dir.path.as_path(), parent_dir.identity)
+            }
+            BackupOrigin::Managed => {
+                revalidate_config_parent_dir(parent_dir)?;
+                let managed_dir = managed_dir.ok_or_else(|| {
+                    "managed backup candidate has no validated directory".to_string()
+                })?;
+                revalidate_managed_backup_dir(managed_dir)?;
+                (managed_dir.path.as_path(), managed_dir.identity)
+            }
+        };
+        let dir = BoundDir::open_verified(dir_path, expected_identity)?;
+        let file = match openat_read_nofollow(&dir, &candidate.entry_name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        let Some(identity) = safe_cleanup_file_identity(&metadata) else {
+            return Ok(());
+        };
+        if identity != candidate.identity || protected_identities.contains(&identity) {
+            return Ok(());
+        }
+        after_check(candidate)?;
+        match fstatat_regular_identity(&dir, &candidate.entry_name)? {
+            Some((current, nlink))
+                if current == identity
+                    && nlink == 1
+                    && !protected_identities.contains(&current) => {}
+            _ => return Ok(()),
+        }
+        match unlinkat_name(&dir, &candidate.entry_name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
-    let metadata = match fs::symlink_metadata(&candidate.path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let Some(identity) = safe_cleanup_file_identity(&metadata) else {
-        return Ok(());
-    };
-    if identity != candidate.identity || protected_identities.contains(&identity) {
-        return Ok(());
-    }
-    match fs::remove_file(&candidate.path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+
+    #[cfg(not(unix))]
+    {
+        // Same-object unlink is unavailable without directory-relative primitives.
+        // Fail closed: preserve the candidate rather than unlinking by path alone.
+        let _ = (
+            candidate,
+            parent_dir,
+            managed_dir,
+            protected_identities,
+            after_check,
+        );
+        Ok(())
     }
 }
 
@@ -2501,6 +2921,34 @@ fn cleanup_config_backups_with<F>(
 ) -> Result<()>
 where
     F: FnMut(&BackupCandidate) -> Result<()>,
+{
+    let mut after_check = |_: &BackupCandidate| Ok(());
+    cleanup_config_backups_with_hooks(
+        parent,
+        expected_parent_identity,
+        filename,
+        managed_dir,
+        protected_identities,
+        now,
+        before_delete,
+        &mut after_check,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cleanup_config_backups_with_hooks<F, A>(
+    parent: &Path,
+    expected_parent_identity: Option<FileIdentity>,
+    filename: &str,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+    now: OffsetDateTime,
+    before_delete: &mut F,
+    after_delete_check: &mut A,
+) -> Result<()>
+where
+    F: FnMut(&BackupCandidate) -> Result<()>,
+    A: FnMut(&BackupCandidate) -> Result<()>,
 {
     let parent_dir = validate_config_parent_dir(parent, false)?;
     if expected_parent_identity.is_some_and(|identity| parent_dir.identity != Some(identity)) {
@@ -2532,7 +2980,13 @@ where
     for (index, candidate) in candidates.iter().enumerate() {
         if index < keep_from && candidate.created_at <= cutoff {
             before_delete(candidate)?;
-            delete_verified_candidate(candidate, &parent_dir, managed_dir, protected_identities)?;
+            delete_verified_candidate(
+                candidate,
+                &parent_dir,
+                managed_dir,
+                protected_identities,
+                after_delete_check,
+            )?;
         }
     }
     Ok(())
@@ -4377,9 +4831,16 @@ name = "general"
             fs::write(&path, "replacement")?;
             Ok(())
         };
+        let mut before_snapshot = || Ok(());
 
         let error = changed
-            .save_with_backup_at_hooks(&path, now, &mut replace_active, &mut no_delete)
+            .save_with_backup_at_hooks(
+                &path,
+                now,
+                &mut replace_active,
+                &mut before_snapshot,
+                &mut no_delete,
+            )
             .unwrap_err()
             .to_string();
 
@@ -4387,6 +4848,206 @@ name = "general"
         assert!(error.contains("config was not saved"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
         assert_eq!(fs::read(moved).unwrap(), original_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_rejects_exact_pid_temp_preplacement_without_touching_outside() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let outside = dir.path().join("outside-sentinel");
+        fs::write(&outside, "sentinel").unwrap();
+        let temp_name = format!(".config.toml.tmp.{}", std::process::id());
+        let temp_path = dir.path().join(&temp_name);
+        symlink(&outside, &temp_path).unwrap();
+
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let error = changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("config temp collision") || error.contains("config was not saved"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "sentinel");
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert!(
+            temp_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_rejects_post_write_temp_replacement_before_rename() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let outside = dir.path().join("outside-sentinel");
+        fs::write(&outside, "sentinel").unwrap();
+        let temp_name = format!(".config.toml.tmp.{}", std::process::id());
+        let temp_path = dir.path().join(&temp_name);
+        let moved_temp = dir.path().join("moved-temp");
+
+        let mut replace_temp = || -> Result<()> {
+            if temp_path.exists() {
+                fs::rename(&temp_path, &moved_temp)?;
+            }
+            symlink(&outside, &temp_path)?;
+            Ok(())
+        };
+        let mut before_snapshot = || Ok(());
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+
+        let error = changed
+            .save_with_backup_at_hooks(
+                &path,
+                now,
+                &mut replace_temp,
+                &mut before_snapshot,
+                &mut no_delete,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("config temp path changed before commit")
+                || error.contains("config was not saved")
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "sentinel");
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert!(!fs::read_to_string(&path).unwrap().contains("alerts"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_preserves_candidate_replaced_after_final_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "original",
+            )
+            .unwrap();
+        }
+        let target = parent.join("config.toml.bak-20000101");
+        let moved = parent.join("replaced-original");
+        let mut replaced = false;
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        let mut after_check = |candidate: &BackupCandidate| -> Result<()> {
+            if !replaced && candidate.path == target {
+                fs::rename(&target, &moved)?;
+                fs::write(&target, "replacement")?;
+                replaced = true;
+            }
+            Ok(())
+        };
+
+        cleanup_config_backups_with_hooks(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+            &mut after_check,
+        )
+        .unwrap();
+
+        assert!(replaced);
+        assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(moved).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_managed_snapshot_stays_in_bound_dir_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let backups_dir = dir.path().join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let outside = dir.path().join("outside-backups");
+        fs::create_dir(&outside).unwrap();
+        let moved = dir.path().join("moved-backups");
+        let mut swapped = false;
+        let mut before_snapshot = || -> Result<()> {
+            if !swapped {
+                fs::rename(&backups_dir, &moved)?;
+                symlink(&outside, &backups_dir)?;
+                swapped = true;
+            }
+            Ok(())
+        };
+        let mut before_rename = || Ok(());
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let result = changed.save_with_backup_at_hooks(
+            &path,
+            now,
+            &mut before_rename,
+            &mut before_snapshot,
+            &mut no_delete,
+        );
+
+        assert!(swapped);
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "managed snapshot must not write outside swapped directory"
+        );
+        let managed_entries = fs::read_dir(&moved)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(managed_entries.len(), 1);
+        assert_eq!(fs::read(managed_entries[0].path()).unwrap(), original_bytes);
+        match result {
+            Ok(()) => {
+                assert!(fs::read_to_string(&path).unwrap().contains("alerts"));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("config was saved")
+                        || message.contains("config was not saved")
+                        || message.contains("managed config backup directory")
+                );
+                // Snapshot containment is the contract under test; path-based
+                // post-commit cleanup may observe the swapped managed path.
+                let _ = message;
+            }
+        }
     }
 }
 

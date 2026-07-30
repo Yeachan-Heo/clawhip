@@ -23,6 +23,8 @@ tokio = { version = "1.45", features = ["full"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 serial_test = "3"
