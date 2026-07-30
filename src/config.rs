@@ -1,13 +1,15 @@
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use time::{Duration as TimeDuration, OffsetDateTime, PrimitiveDateTime, format_description};
+use time::{Date, Duration as TimeDuration, OffsetDateTime, PrimitiveDateTime, format_description};
 
 use crate::Result;
 use crate::events::MessageFormat;
@@ -928,52 +930,127 @@ impl AppConfig {
     }
 
     pub fn save_with_backup(&self, path: &Path) -> Result<()> {
-        let serialized = self.to_pretty_toml()?;
-        let new_bytes = serialized.as_bytes();
-        let old_bytes = if path.exists() {
-            Some(fs::read(path)?)
-        } else {
-            None
-        };
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        self.save_with_backup_at(path, OffsetDateTime::now_utc(), &mut before_delete)
+    }
 
-        if old_bytes.as_deref() == Some(new_bytes) {
-            return Ok(());
-        }
+    fn save_with_backup_at<F>(
+        &self,
+        path: &Path,
+        now: OffsetDateTime,
+        before_delete: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&BackupCandidate) -> Result<()>,
+    {
+        let mut before_rename = || Ok(());
+        self.save_with_backup_at_hooks(path, now, &mut before_rename, before_delete)
+    }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let backup_context = if let Some(old_bytes) = old_bytes.as_deref() {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            let backups_dir = parent.join(".clawhip-config-backups");
-            fs::create_dir_all(&backups_dir)?;
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| "config path must have a UTF-8 filename".to_string())?;
-            let timestamp = utc_backup_timestamp(OffsetDateTime::now_utc())?;
-            let backup_path = backups_dir.join(format!(
-                "{filename}.{timestamp}.{}.bak",
-                sha256_first8(old_bytes)
-            ));
-            fs::write(&backup_path, old_bytes)?;
-            Some((backups_dir, filename.to_string()))
-        } else {
-            None
-        };
-
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fn save_with_backup_at_hooks<F, G>(
+        &self,
+        path: &Path,
+        now: OffsetDateTime,
+        before_rename: &mut G,
+        before_delete: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&BackupCandidate) -> Result<()>,
+        G: FnMut() -> Result<()>,
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| "config path must have a UTF-8 filename".to_string())?;
-        let temp_path = parent.join(format!(".{filename}.tmp.{}", std::process::id()));
-        fs::write(&temp_path, new_bytes)?;
-        fs::rename(temp_path, path)?;
-        if let Some((backups_dir, filename)) = backup_context {
-            cleanup_config_backups(&backups_dir, &filename, OffsetDateTime::now_utc())?;
+        let parent_dir = validate_config_parent_dir(parent, true)?;
+        revalidate_config_parent_dir(&parent_dir)?;
+        let serialized = self.to_pretty_toml()?;
+        let new_bytes = serialized.as_bytes();
+        let active = read_active_config_no_follow(path)?;
+
+        if active.bytes() == Some(new_bytes) {
+            revalidate_config_parent_dir(&parent_dir).map_err(|error| {
+                io::Error::other(format!(
+                    "config was already current; backup retention cleanup remains incomplete: {error}"
+                ))
+            })?;
+            let managed_dir =
+                validate_managed_backup_dir(&parent_dir.path, false).map_err(|error| {
+                    io::Error::other(format!(
+                        "config was already current; backup retention cleanup remains incomplete: {error}"
+                    ))
+                })?;
+            let protected_identities = active.identity().into_iter().collect::<Vec<_>>();
+            cleanup_config_backups_with(
+                &parent_dir.path,
+                parent_dir.identity,
+                filename,
+                managed_dir.as_ref(),
+                &protected_identities,
+                now,
+                before_delete,
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "config was already current; backup retention cleanup remains incomplete: {error}"
+                ))
+            })?;
+            return Ok(());
         }
+
+        revalidate_config_parent_dir(&parent_dir)?;
+        let managed_dir = validate_managed_backup_dir(&parent_dir.path, active.bytes().is_some())?;
+        if let Some(old_bytes) = active.bytes() {
+            let managed_dir = managed_dir
+                .as_ref()
+                .ok_or_else(|| "managed config backup directory was not created".to_string())?;
+            create_managed_snapshot_create_new(managed_dir, filename, old_bytes, now)?;
+        }
+
+        revalidate_config_parent_dir(&parent_dir)?;
+        let temp_path = parent_dir
+            .path
+            .join(format!(".{filename}.tmp.{}", std::process::id()));
+        fs::write(&temp_path, new_bytes)?;
+        before_rename()?;
+        revalidate_config_parent_dir(&parent_dir)?;
+        revalidate_active_config(path, &active)?;
+        fs::rename(temp_path, path)?;
+
+        revalidate_config_parent_dir(&parent_dir).map_err(|error| {
+            io::Error::other(format!(
+                "config was saved; backup retention cleanup remains incomplete: {error}"
+            ))
+        })?;
+        let current_identity = current_active_config_identity(path).map_err(|error| {
+            io::Error::other(format!(
+                "config was saved; backup retention cleanup remains incomplete: {error}"
+            ))
+        })?;
+        let mut protected_identities = active.identity().into_iter().collect::<Vec<_>>();
+        if let Some(current_identity) = current_identity
+            && !protected_identities.contains(&current_identity)
+        {
+            protected_identities.push(current_identity);
+        }
+        cleanup_config_backups_with(
+            &parent_dir.path,
+            parent_dir.identity,
+            filename,
+            managed_dir.as_ref(),
+            &protected_identities,
+            now,
+            before_delete,
+        )
+        .map_err(|error| {
+            io::Error::other(format!(
+                "config was saved; backup retention cleanup remains incomplete: {error}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -1922,6 +1999,250 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[derive(Debug)]
+enum ActiveConfigState {
+    Absent,
+    Present {
+        identity: Option<FileIdentity>,
+        bytes: Vec<u8>,
+    },
+}
+
+impl ActiveConfigState {
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Absent => None,
+            Self::Present { bytes, .. } => Some(bytes),
+        }
+    }
+
+    fn identity(&self) -> Option<FileIdentity> {
+        match self {
+            Self::Absent => None,
+            Self::Present { identity, .. } => *identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigParentDir {
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedBackupDir {
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BackupOrigin {
+    RootLegacy,
+    Managed,
+}
+
+impl BackupOrigin {
+    fn retention_rank(self) -> u8 {
+        match self {
+            Self::RootLegacy => 0,
+            Self::Managed => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackupCandidate {
+    origin: BackupOrigin,
+    path: PathBuf,
+    entry_name: String,
+    created_at: OffsetDateTime,
+    identity: FileIdentity,
+}
+
+fn metadata_identity(metadata: &Metadata) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn config_parent_dir_from_metadata(path: PathBuf, metadata: Metadata) -> Result<ConfigParentDir> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "config parent path must be a regular directory, not a symlink: {}",
+            path.display()
+        )
+        .into());
+    }
+    let identity = metadata_identity(&metadata);
+    Ok(ConfigParentDir { path, identity })
+}
+
+fn validate_config_parent_dir(parent: &Path, create: bool) -> Result<ConfigParentDir> {
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => config_parent_dir_from_metadata(parent.to_path_buf(), metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+            fs::create_dir_all(parent)?;
+            let metadata = fs::symlink_metadata(parent)?;
+            config_parent_dir_from_metadata(parent.to_path_buf(), metadata)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn revalidate_config_parent_dir(parent_dir: &ConfigParentDir) -> Result<()> {
+    let metadata = fs::symlink_metadata(&parent_dir.path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || parent_dir
+            .identity
+            .is_some_and(|identity| metadata_identity(&metadata) != Some(identity))
+    {
+        return Err(format!(
+            "config parent directory changed during use: {}",
+            parent_dir.path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn read_active_config_no_follow(path: &Path) -> Result<ActiveConfigState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ActiveConfigState::Absent);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "active config path must be a regular non-symlink file: {}",
+            path.display()
+        )
+        .into());
+    }
+    let identity = metadata_identity(&metadata);
+    let mut file = File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || identity.is_some_and(|identity| metadata_identity(&opened_metadata) != Some(identity))
+    {
+        return Err(format!(
+            "active config changed while it was being opened: {}",
+            path.display()
+        )
+        .into());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(ActiveConfigState::Present { identity, bytes })
+}
+
+fn revalidate_active_config(path: &Path, active: &ActiveConfigState) -> Result<()> {
+    match active {
+        ActiveConfigState::Absent => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(format!(
+                "active config appeared before replacement; config was not saved: {}",
+                path.display()
+            )
+            .into()),
+            Err(error) => Err(error.into()),
+        },
+        ActiveConfigState::Present { identity, .. } => {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || identity.is_some_and(|identity| metadata_identity(&metadata) != Some(identity))
+            {
+                return Err(format!(
+                    "active config changed before replacement; config was not saved: {}",
+                    path.display()
+                )
+                .into());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn current_active_config_identity(path: &Path) -> Result<Option<FileIdentity>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "saved config is not a regular non-symlink file: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(metadata_identity(&metadata))
+}
+
+fn managed_backup_dir_from_metadata(path: PathBuf, metadata: Metadata) -> Result<ManagedBackupDir> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "managed config backup path must be a regular directory, not a symlink: {}",
+            path.display()
+        )
+        .into());
+    }
+    let identity = metadata_identity(&metadata);
+    Ok(ManagedBackupDir { path, identity })
+}
+
+fn validate_managed_backup_dir(parent: &Path, create: bool) -> Result<Option<ManagedBackupDir>> {
+    let path = parent.join(".clawhip-config-backups");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => managed_backup_dir_from_metadata(path, metadata).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !create => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            managed_backup_dir_from_metadata(path, metadata).map(Some)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn revalidate_managed_backup_dir(managed_dir: &ManagedBackupDir) -> Result<()> {
+    let metadata = fs::symlink_metadata(&managed_dir.path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || managed_dir
+            .identity
+            .is_some_and(|identity| metadata_identity(&metadata) != Some(identity))
+    {
+        return Err(format!(
+            "managed config backup directory changed during use: {}",
+            managed_dir.path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn sha256_first8(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")[..8].to_string()
@@ -1932,42 +2253,288 @@ fn utc_backup_timestamp(now: OffsetDateTime) -> Result<String> {
     Ok(now.format(&format)?)
 }
 
-fn cleanup_config_backups(backups_dir: &Path, filename: &str, now: OffsetDateTime) -> Result<()> {
-    let prefix = format!("{filename}.");
-    let cutoff = now - TimeDuration::days(30);
-    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z")?;
-    let mut backups = Vec::new();
+fn create_managed_snapshot_create_new(
+    managed_dir: &ManagedBackupDir,
+    filename: &str,
+    old_bytes: &[u8],
+    now: OffsetDateTime,
+) -> Result<()> {
+    revalidate_managed_backup_dir(managed_dir)?;
+    let timestamp = utc_backup_timestamp(now)?;
+    let backup_path = managed_dir.path.join(format!(
+        "{filename}.{timestamp}.{}.bak",
+        sha256_first8(old_bytes)
+    ));
+    let mut backup = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup_path)
+    {
+        Ok(backup) => backup,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(format!(
+                "config backup collision at {}; config was not saved",
+                backup_path.display()
+            )
+            .into());
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to create config backup {}; config was not saved: {error}",
+                backup_path.display()
+            )
+            .into());
+        }
+    };
+    backup.write_all(old_bytes).map_err(|error| {
+        format!(
+            "failed to write config backup {}; config was not saved: {error}",
+            backup_path.display()
+        )
+    })?;
+    Ok(())
+}
 
-    for entry in fs::read_dir(backups_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&prefix) || !name.ends_with(".bak") {
+fn parse_managed_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
+    let prefix = format!("{filename}.");
+    let rest = name.strip_prefix(&prefix)?.strip_suffix(".bak")?;
+    let (timestamp, hash) = rest.split_once('.')?;
+    if hash.len() != 8 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z").ok()?;
+    PrimitiveDateTime::parse(timestamp, &format)
+        .ok()
+        .map(|value| value.assume_utc())
+}
+
+fn parse_compact_backup_timestamp_seconds(value: &str) -> Option<OffsetDateTime> {
+    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z").ok()?;
+    PrimitiveDateTime::parse(value, &format)
+        .ok()
+        .map(|timestamp| timestamp.assume_utc())
+}
+
+fn parse_compact_backup_timestamp_minutes(value: &str) -> Option<OffsetDateTime> {
+    let format = format_description::parse("[year][month][day]T[hour][minute]Z").ok()?;
+    PrimitiveDateTime::parse(value, &format)
+        .ok()
+        .map(|timestamp| timestamp.assume_utc())
+}
+
+fn parse_compact_backup_date(value: &str) -> Option<OffsetDateTime> {
+    let format = format_description::parse("[year][month][day]").ok()?;
+    Date::parse(value, &format)
+        .ok()
+        .map(|date| date.midnight().assume_utc())
+}
+
+fn valid_legacy_backup_label_prefix(prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    let Some(label) = prefix.strip_suffix('-') else {
+        return false;
+    };
+    !label.is_empty()
+        && label.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn parse_root_legacy_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
+    let prefix = format!("{filename}.bak-");
+    let suffix = name.strip_prefix(&prefix)?;
+    for (length, parser) in [
+        (
+            16,
+            parse_compact_backup_timestamp_seconds as fn(&str) -> Option<OffsetDateTime>,
+        ),
+        (14, parse_compact_backup_timestamp_minutes),
+        (8, parse_compact_backup_date),
+    ] {
+        if suffix.len() < length {
             continue;
         }
-        let rest = &name[prefix.len()..name.len() - 4];
-        let Some((timestamp, hash)) = rest.split_once('.') else {
+        let (label_prefix, timestamp) = suffix.split_at(suffix.len() - length);
+        if let Some(created_at) = parser(timestamp) {
+            return valid_legacy_backup_label_prefix(label_prefix).then_some(created_at);
+        }
+    }
+    None
+}
+
+fn parse_duplicated_legacy_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
+    let prefix = format!("config.{filename}.bak-");
+    let timestamp = name.strip_prefix(&prefix)?;
+    let format = format_description::parse("[year]-[month]-[day]-[hour][minute]").ok()?;
+    PrimitiveDateTime::parse(timestamp, &format)
+        .ok()
+        .map(|value| value.assume_utc())
+}
+
+fn safe_cleanup_file_identity(metadata: &Metadata) -> Option<FileIdentity> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return None;
+    }
+    metadata_identity(metadata)
+}
+
+fn collect_cleanup_candidates(
+    parent_dir: &ConfigParentDir,
+    filename: &str,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+) -> Result<Vec<BackupCandidate>> {
+    revalidate_config_parent_dir(parent_dir)?;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&parent_dir.path)? {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
             continue;
         };
-        if hash.len() != 8 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            continue;
-        }
-        let Ok(created_at) =
-            PrimitiveDateTime::parse(timestamp, &format).map(|value| value.assume_utc())
+        let Some(created_at) = parse_root_legacy_backup_name(entry_name, filename)
+            .or_else(|| parse_duplicated_legacy_backup_name(entry_name, filename))
         else {
             continue;
         };
-        backups.push((created_at, entry.path()));
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(identity) = safe_cleanup_file_identity(&metadata) else {
+            continue;
+        };
+        if protected_identities.contains(&identity) {
+            continue;
+        }
+        candidates.push(BackupCandidate {
+            origin: BackupOrigin::RootLegacy,
+            path,
+            entry_name: entry_name.to_string(),
+            created_at,
+            identity,
+        });
     }
 
-    backups.sort_by_key(|(created_at, _)| *created_at);
-    let keep_from = backups.len().saturating_sub(10);
-    for (index, (created_at, path)) in backups.into_iter().enumerate() {
-        if index < keep_from && created_at < cutoff {
-            fs::remove_file(path)?;
+    if let Some(managed_dir) = managed_dir {
+        revalidate_managed_backup_dir(managed_dir)?;
+        for entry in fs::read_dir(&managed_dir.path)? {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            let Some(entry_name) = entry_name.to_str() else {
+                continue;
+            };
+            let Some(created_at) = parse_managed_backup_name(entry_name, filename) else {
+                continue;
+            };
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let Some(identity) = safe_cleanup_file_identity(&metadata) else {
+                continue;
+            };
+            if protected_identities.contains(&identity) {
+                continue;
+            }
+            candidates.push(BackupCandidate {
+                origin: BackupOrigin::Managed,
+                path,
+                entry_name: entry_name.to_string(),
+                created_at,
+                identity,
+            });
         }
     }
+    Ok(candidates)
+}
 
+fn delete_verified_candidate(
+    candidate: &BackupCandidate,
+    parent_dir: &ConfigParentDir,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+) -> Result<()> {
+    revalidate_config_parent_dir(parent_dir)?;
+    if candidate.origin == BackupOrigin::Managed {
+        let managed_dir = managed_dir
+            .ok_or_else(|| "managed backup candidate has no validated directory".to_string())?;
+        revalidate_managed_backup_dir(managed_dir)?;
+    }
+    let metadata = match fs::symlink_metadata(&candidate.path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(identity) = safe_cleanup_file_identity(&metadata) else {
+        return Ok(());
+    };
+    if identity != candidate.identity || protected_identities.contains(&identity) {
+        return Ok(());
+    }
+    match fs::remove_file(&candidate.path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cleanup_config_backups_with<F>(
+    parent: &Path,
+    expected_parent_identity: Option<FileIdentity>,
+    filename: &str,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+    now: OffsetDateTime,
+    before_delete: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&BackupCandidate) -> Result<()>,
+{
+    let parent_dir = validate_config_parent_dir(parent, false)?;
+    if expected_parent_identity.is_some_and(|identity| parent_dir.identity != Some(identity)) {
+        return Err(format!(
+            "config parent directory changed during use: {}",
+            parent.display()
+        )
+        .into());
+    }
+    if parent_dir.identity.is_none() {
+        return Ok(());
+    }
+    let cutoff = now - TimeDuration::days(30);
+    let mut candidates =
+        collect_cleanup_candidates(&parent_dir, filename, managed_dir, protected_identities)?;
+    candidates.sort_by(|left, right| {
+        (
+            left.created_at,
+            left.origin.retention_rank(),
+            left.entry_name.as_str(),
+        )
+            .cmp(&(
+                right.created_at,
+                right.origin.retention_rank(),
+                right.entry_name.as_str(),
+            ))
+    });
+    let keep_from = candidates.len().saturating_sub(10);
+    for (index, candidate) in candidates.iter().enumerate() {
+        if index < keep_from && candidate.created_at <= cutoff {
+            before_delete(candidate)?;
+            delete_verified_candidate(candidate, &parent_dir, managed_dir, protected_identities)?;
+        }
+    }
     Ok(())
 }
 
@@ -3139,34 +3706,687 @@ name = "general"
     }
 
     #[test]
-    fn backup_retention_removes_old_backups_but_keeps_newest_ten() {
-        let dir = tempfile::tempdir().unwrap();
-        let backups_dir = dir.path().join(".clawhip-config-backups");
-        fs::create_dir(&backups_dir).unwrap();
-        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    fn backup_filename_parsers_accept_evidenced_families_and_reject_near_misses() {
+        let expected = parse_compact_backup_timestamp_seconds("20260708T072000Z").unwrap();
+        assert_eq!(
+            parse_root_legacy_backup_name(
+                "config.toml.bak-gajae-runtime-rename-20260708T072000Z",
+                "config.toml"
+            ),
+            Some(expected)
+        );
+        assert!(
+            parse_root_legacy_backup_name(
+                "config.toml.bak-release-radar-20260708T0720Z",
+                "config.toml"
+            )
+            .is_some()
+        );
+        assert!(
+            parse_root_legacy_backup_name("config.toml.bak-gp-mention-20260708", "config.toml")
+                .is_some()
+        );
+        assert!(
+            parse_root_legacy_backup_name("config.toml.bak-20260708T072000Z", "config.toml")
+                .is_some()
+        );
+        assert!(
+            parse_duplicated_legacy_backup_name(
+                "config.config.toml.bak-2026-04-10-0206",
+                "config.toml"
+            )
+            .is_some()
+        );
+        assert!(
+            parse_root_legacy_backup_name(
+                "custom.name.toml.bak-label-20260708T072000Z",
+                "custom.name.toml"
+            )
+            .is_some()
+        );
+        assert!(
+            parse_duplicated_legacy_backup_name(
+                "config.custom.name.toml.bak-2026-04-10-0206",
+                "custom.name.toml"
+            )
+            .is_some()
+        );
 
-        for index in 0..12 {
-            let created_at = now - TimeDuration::days(45 - index);
+        for name in [
+            "config.toml.bak-label_with_underscore-20260708T072000Z",
+            "config.toml.bak-label-20260708T072000",
+            "config.toml.bak-20260708T07200Z",
+            "config.toml.bak-20260708-extra",
+            "config.config.toml.bak-2026-04-10-0206-extra",
+            "other.toml.bak-20260708T072000Z",
+        ] {
+            assert!(
+                parse_root_legacy_backup_name(name, "config.toml").is_none()
+                    && parse_duplicated_legacy_backup_name(name, "config.toml").is_none(),
+                "unexpected recognized backup: {name}"
+            );
+        }
+        assert!(
+            parse_managed_backup_name("config.toml.20260708T072000Z.abcdef12.bak", "config.toml")
+                .is_some()
+        );
+        assert!(
+            parse_managed_backup_name("config.toml.20260708T072000Z.abcdef1g.bak", "config.toml")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_retention_combines_legacy_and_managed_with_deterministic_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let backups_dir = parent.join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let managed_dir = validate_managed_backup_dir(parent, false).unwrap().unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let tie = now - TimeDuration::days(50);
+        let root_tie = format!("config.toml.bak-{}", utc_backup_timestamp(tie).unwrap());
+        let managed_tie = format!(
+            "config.toml.{}.abcdef12.bak",
+            utc_backup_timestamp(tie).unwrap()
+        );
+        fs::write(parent.join(&root_tie), "root").unwrap();
+        fs::write(backups_dir.join(&managed_tie), "managed").unwrap();
+        let mut later_names = Vec::new();
+        for index in 0..9 {
+            let created_at = tie + TimeDuration::seconds(index + 1);
             let name = format!(
-                "config.toml.{}.0000000{:x}.bak",
+                "config.toml.{}.{:08x}.bak",
                 utc_backup_timestamp(created_at).unwrap(),
                 index
             );
-            fs::write(backups_dir.join(name), "old").unwrap();
+            fs::write(backups_dir.join(&name), "later").unwrap();
+            later_names.push(name);
         }
-        let recent_name = format!(
-            "config.toml.{}.abcdef12.bak",
-            utc_backup_timestamp(now - TimeDuration::days(5)).unwrap()
+
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            Some(&managed_dir),
+            &[],
+            now,
+            &mut before_delete,
+        )
+        .unwrap();
+        assert!(!parent.join(&root_tie).exists());
+        assert!(backups_dir.join(&managed_tie).exists());
+        assert!(
+            later_names
+                .iter()
+                .all(|name| backups_dir.join(name).exists())
         );
-        fs::write(backups_dir.join(recent_name), "recent").unwrap();
 
-        cleanup_config_backups(&backups_dir, "config.toml", now).unwrap();
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            Some(&managed_dir),
+            &[],
+            now,
+            &mut before_delete,
+        )
+        .unwrap();
+        assert!(backups_dir.join(&managed_tie).exists());
+    }
 
-        let remaining = fs::read_dir(&backups_dir)
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
+    #[cfg(unix)]
+    #[test]
+    fn backup_retention_deletes_exact_cutoff_but_keeps_just_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let exact_cutoff = format!(
+            "config.toml.bak-exact-cutoff-{}",
+            utc_backup_timestamp(now - TimeDuration::days(30)).unwrap()
+        );
+        let just_newer = format!(
+            "config.toml.bak-just-newer-{}",
+            utc_backup_timestamp(now - TimeDuration::days(30) + TimeDuration::seconds(1)).unwrap()
+        );
+        fs::write(parent.join(&exact_cutoff), "cutoff").unwrap();
+        fs::write(parent.join(&just_newer), "recent").unwrap();
+        for index in 0..10 {
+            let name = format!(
+                "config.toml.bak-later-{index}-{}",
+                utc_backup_timestamp(now - TimeDuration::days(20 - index)).unwrap()
+            );
+            fs::write(parent.join(name), "later").unwrap();
+        }
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            now,
+            &mut before_delete,
+        )
+        .unwrap();
+        assert!(!parent.join(exact_cutoff).exists());
+        assert!(parent.join(just_newer).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_retention_deletes_stale_duplicated_legacy_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let duplicated = parent.join("config.config.toml.bak-2000-01-01-0000");
+        fs::write(&duplicated, "duplicated").unwrap();
+        for day in 2..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "later",
+            )
             .unwrap();
-        assert_eq!(remaining.len(), 10);
+        }
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut no_delete,
+        )
+        .unwrap();
+
+        assert!(!duplicated.exists());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn backup_initial_save_succeeds_without_identity_cleanup_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        AppConfig::default().save_with_backup(&path).unwrap();
+        assert!(path.is_file());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_preserves_unknown_symlink_directory_and_hardlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let active = parent.join("config.toml");
+        fs::write(&active, "active").unwrap();
+        let unknown = parent.join("config.toml.bak-not-a-date");
+        fs::write(&unknown, "unknown").unwrap();
+        let directory = parent.join("config.toml.bak-20200101");
+        fs::create_dir(&directory).unwrap();
+        let outside = parent.join("outside");
+        fs::write(&outside, "outside").unwrap();
+        let symlink_path = parent.join("config.toml.bak-20190101");
+        symlink(&outside, &symlink_path).unwrap();
+        let hardlink_path = parent.join("config.toml.bak-20180101");
+        fs::hard_link(&active, &hardlink_path).unwrap();
+
+        let protected = current_active_config_identity(&active)
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &protected,
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+        )
+        .unwrap();
+
+        assert!(unknown.exists());
+        assert!(directory.is_dir());
+        assert!(
+            symlink_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(hardlink_path.exists());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_rejects_active_and_managed_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.toml");
+        fs::write(&outside, "outside").unwrap();
+        let active = dir.path().join("config.toml");
+        symlink(&outside, &active).unwrap();
+        let error = AppConfig::default()
+            .save_with_backup(&active)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("regular non-symlink"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+
+        fs::remove_file(&active).unwrap();
+        fs::create_dir(&active).unwrap();
+        let directory_error = AppConfig::default()
+            .save_with_backup(&active)
+            .unwrap_err()
+            .to_string();
+        assert!(directory_error.contains("regular non-symlink"));
+        fs::remove_dir(&active).unwrap();
+        AppConfig::default().save_with_backup(&active).unwrap();
+        let outside_dir = dir.path().join("outside-backups");
+        fs::create_dir(&outside_dir).unwrap();
+        let managed_path = dir.path().join(".clawhip-config-backups");
+        symlink(&outside_dir, &managed_path).unwrap();
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let error = changed.save_with_backup(&active).unwrap_err().to_string();
+        assert!(error.contains("regular directory"));
+        assert!(fs::read_dir(outside_dir).unwrap().next().is_none());
+        assert!(!fs::read_to_string(&active).unwrap().contains("alerts"));
+
+        fs::remove_file(&managed_path).unwrap();
+        fs::write(&managed_path, "not a directory").unwrap();
+        let error = changed.save_with_backup(&active).unwrap_err().to_string();
+        assert!(error.contains("regular directory"));
+        assert!(!fs::read_to_string(&active).unwrap().contains("alerts"));
+
+        let outside_parent = dir.path().join("outside-parent");
+        fs::create_dir(&outside_parent).unwrap();
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&outside_parent, &linked_parent).unwrap();
+        let linked_config = linked_parent.join("config.toml");
+        let error = AppConfig::default()
+            .save_with_backup(&linked_config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config parent path must be a regular directory"));
+        assert!(fs::read_dir(outside_parent).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn save_with_backup_collision_is_precommit_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let backups_dir = dir.path().join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let collision = backups_dir.join(format!(
+            "config.toml.{}.{}.bak",
+            utc_backup_timestamp(now).unwrap(),
+            sha256_first8(&old_bytes)
+        ));
+        fs::write(&collision, "sentinel").unwrap();
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+
+        let error = changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config backup collision"));
+        assert!(error.contains("config was not saved"));
+        assert_eq!(fs::read_to_string(collision).unwrap(), "sentinel");
+        assert_eq!(fs::read(&path).unwrap(), old_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_reports_postcommit_cleanup_failure_and_retries_on_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        fs::write(dir.path().join("config.toml.bak-20100101"), "stale root").unwrap();
+        for index in 0..10 {
+            let name = format!("config.toml.bak-201001{:02}", index + 2);
+            fs::write(dir.path().join(name), "retained").unwrap();
+        }
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let mut fail_once =
+            |_: &BackupCandidate| -> Result<()> { Err("injected cleanup failure".into()) };
+
+        let error = changed
+            .save_with_backup_at(&path, now, &mut fail_once)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config was saved; backup retention cleanup remains incomplete"));
+        assert!(fs::read_to_string(&path).unwrap().contains("alerts"));
+
+        changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        assert!(!dir.path().join("config.toml.bak-20100101").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_revalidates_managed_directory_before_unlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let backups_dir = parent.join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let managed_dir = validate_managed_backup_dir(parent, false).unwrap().unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        for index in 0..11 {
+            let name = format!(
+                "config.toml.{}.{:08x}.bak",
+                utc_backup_timestamp(now - TimeDuration::days(60 - index)).unwrap(),
+                index
+            );
+            fs::write(backups_dir.join(name), "managed").unwrap();
+        }
+        let outside = parent.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let outside_name = format!(
+            "config.toml.{}.abcdef12.bak",
+            utc_backup_timestamp(now - TimeDuration::days(90)).unwrap()
+        );
+        fs::write(outside.join(&outside_name), "outside").unwrap();
+        let moved = parent.join("moved-backups");
+        let mut swapped = false;
+        let mut swap_manager = |_: &BackupCandidate| -> Result<()> {
+            if !swapped {
+                fs::rename(&backups_dir, &moved)?;
+                symlink(&outside, &backups_dir)?;
+                swapped = true;
+            }
+            Ok(())
+        };
+
+        let error = cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            Some(&managed_dir),
+            &[],
+            now,
+            &mut swap_manager,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("managed config backup directory changed"));
+        assert_eq!(
+            fs::read_to_string(outside.join(outside_name)).unwrap(),
+            "outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_preserves_old_active_hardlink_legacy_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let alias = dir.path().join("config.toml.bak-20000101");
+        fs::hard_link(&path, &alias).unwrap();
+        for day in 2..=11 {
+            fs::write(
+                dir.path().join(format!("config.toml.bak-200001{day:02}")),
+                "later",
+            )
+            .unwrap();
+        }
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+
+        changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+
+        assert_eq!(fs::read(alias).unwrap(), old_bytes);
+        assert!(fs::read_to_string(path).unwrap().contains("alerts"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_symlink_collision_does_not_follow_outside_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let backups_dir = dir.path().join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let outside = dir.path().join("outside-backup");
+        fs::write(&outside, "outside").unwrap();
+        let collision = backups_dir.join(format!(
+            "config.toml.{}.{}.bak",
+            utc_backup_timestamp(now).unwrap(),
+            sha256_first8(&old_bytes)
+        ));
+        symlink(&outside, &collision).unwrap();
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+
+        let error = changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config backup collision"));
+        assert_eq!(fs::read_to_string(outside).unwrap(), "outside");
+        assert_eq!(fs::read(path).unwrap(), old_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_skips_non_utf8_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = b"config.toml.bak-label-".to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"-20100101");
+        let path = dir.path().join(OsString::from_vec(bytes));
+        fs::write(&path, "unknown").unwrap();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+
+        cleanup_config_backups_with(
+            dir.path(),
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut no_delete,
+        )
+        .unwrap();
+
+        assert!(fs::symlink_metadata(path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_noop_cleanup_failure_reports_current_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let config = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        config
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original = fs::read(&path).unwrap();
+        for day in 1..=11 {
+            fs::write(
+                dir.path().join(format!("config.toml.bak-200001{day:02}")),
+                "stale",
+            )
+            .unwrap();
+        }
+        let mut fail = |_: &BackupCandidate| -> Result<()> { Err("injected no-op failure".into()) };
+
+        let error = config
+            .save_with_backup_at(&path, now, &mut fail)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "config was already current; backup retention cleanup remains incomplete"
+            )
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_skips_candidate_replaced_after_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "original",
+            )
+            .unwrap();
+        }
+        let target = parent.join("config.toml.bak-20000101");
+        let moved = parent.join("replaced-original");
+        let mut replaced = false;
+        let mut replace_candidate = |candidate: &BackupCandidate| -> Result<()> {
+            if !replaced && candidate.path == target {
+                fs::rename(&target, &moved)?;
+                fs::write(&target, "replacement")?;
+                replaced = true;
+            }
+            Ok(())
+        };
+
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut replace_candidate,
+        )
+        .unwrap();
+
+        assert!(replaced);
+        assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(moved).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_revalidates_config_parent_before_root_unlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("config-root");
+        fs::create_dir(&parent).unwrap();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "root",
+            )
+            .unwrap();
+        }
+        let outside = dir.path().join("outside-root");
+        fs::create_dir(&outside).unwrap();
+        let oldest_name = "config.toml.bak-20000101";
+        fs::write(outside.join(oldest_name), "outside").unwrap();
+        let moved = dir.path().join("moved-root");
+        let mut swapped = false;
+        let mut swap_parent = |_: &BackupCandidate| -> Result<()> {
+            if !swapped {
+                fs::rename(&parent, &moved)?;
+                symlink(&outside, &parent)?;
+                swapped = true;
+            }
+            Ok(())
+        };
+
+        let error = cleanup_config_backups_with(
+            &parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut swap_parent,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("config parent directory changed"));
+        assert_eq!(
+            fs::read_to_string(outside.join(oldest_name)).unwrap(),
+            "outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_rejects_active_replacement_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let moved = dir.path().join("original-config");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let mut replace_active = || -> Result<()> {
+            fs::rename(&path, &moved)?;
+            fs::write(&path, "replacement")?;
+            Ok(())
+        };
+
+        let error = changed
+            .save_with_backup_at_hooks(&path, now, &mut replace_active, &mut no_delete)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("active config changed before replacement"));
+        assert!(error.contains("config was not saved"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(fs::read(moved).unwrap(), original_bytes);
     }
 }
 
