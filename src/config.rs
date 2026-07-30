@@ -2188,6 +2188,7 @@ enum CandidateReadability {
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     static FORCE_FACCESSAT2_ENOSYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_FACCESSAT2_EPERM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_PROC_FD_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -2396,6 +2397,10 @@ fn faccessat2_read_access(file: &File) -> std::result::Result<(), io::Error> {
     if FORCE_FACCESSAT2_ENOSYS.with(std::cell::Cell::get) {
         return Err(io::Error::from_raw_os_error(libc::ENOSYS));
     }
+    #[cfg(test)]
+    if FORCE_FACCESSAT2_EPERM.with(std::cell::Cell::get) {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
 
     const EMPTY_PATH: &[u8] = b"\0";
     let flags = libc::AT_EMPTY_PATH | libc::AT_EACCESS;
@@ -2479,7 +2484,7 @@ fn candidate_readability_via_proc_fd(
 fn candidate_readability(file: &File) -> std::result::Result<CandidateReadability, io::Error> {
     match faccessat2_read_access(file) {
         Ok(()) => candidate_readability_via_proc_fd(file),
-        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) => {
             candidate_readability_via_proc_fd(file)
         }
         Err(error) => classify_candidate_readability_error(error),
@@ -5385,13 +5390,13 @@ name = "general"
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn faccessat2_enosys_fallback_deletes_readable_and_preserves_unsafe_candidates() {
+    fn faccessat2_compatibility_fallback_deletes_readable_and_preserves_unsafe_candidates() {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
-        const CHILD_ENV: &str = "CLAWHIP_TEST_FACCESSAT2_ENOSYS_CHILD";
-        const CHILD_OK: &str = "CLAWHIP_FACCESSAT2_ENOSYS_CHILD_OK";
-        const TEST_NAME: &str = "config::tests::faccessat2_enosys_fallback_deletes_readable_and_preserves_unsafe_candidates";
+        const CHILD_ENV: &str = "CLAWHIP_TEST_FACCESSAT2_COMPAT_CHILD";
+        const CHILD_OK: &str = "CLAWHIP_FACCESSAT2_COMPAT_CHILD_OK";
+        const TEST_NAME: &str = "config::tests::faccessat2_compatibility_fallback_deletes_readable_and_preserves_unsafe_candidates";
 
         if std::env::var_os(CHILD_ENV).is_some() {
             FORCE_FACCESSAT2_ENOSYS.with(|force| force.set(true));
@@ -5542,6 +5547,72 @@ name = "general"
             FORCE_PROC_FD_UNAVAILABLE.with(|force| force.set(false));
 
             FORCE_FACCESSAT2_ENOSYS.with(|force| force.set(false));
+            FORCE_FACCESSAT2_EPERM.with(|force| force.set(true));
+            let eperm_readable = parent.join("config.toml.bak-20000105");
+            fs::write(&eperm_readable, "eperm-readable").unwrap();
+            let eperm_readable_candidate = make_candidate(&eperm_readable);
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let eperm_readable_outcome = delete_verified_candidate(
+                &eperm_readable_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(eperm_readable_outcome, CandidateDeletionOutcome::Deleted);
+            assert!(!eperm_readable.exists());
+
+            let eperm_unreadable = parent.join("config.toml.bak-20000106");
+            fs::write(&eperm_unreadable, "eperm-unreadable").unwrap();
+            let eperm_unreadable_candidate = make_candidate(&eperm_unreadable);
+            fs::set_permissions(&eperm_unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let eperm_unreadable_outcome = delete_verified_candidate(
+                &eperm_unreadable_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                eperm_unreadable_outcome,
+                CandidateDeletionOutcome::Preserved(CandidatePreserveReason::Unreadable)
+            );
+            assert!(eperm_unreadable.exists());
+            fs::set_permissions(&eperm_unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let eperm_no_proc = parent.join("config.toml.bak-20000107");
+            fs::write(&eperm_no_proc, "eperm-no-proc").unwrap();
+            let eperm_no_proc_candidate = make_candidate(&eperm_no_proc);
+            FORCE_PROC_FD_UNAVAILABLE.with(|force| force.set(true));
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let eperm_no_proc_outcome = delete_verified_candidate(
+                &eperm_no_proc_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                eperm_no_proc_outcome,
+                CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::CompatibilityProbeUnavailable
+                )
+            );
+            assert!(eperm_no_proc.exists());
+            FORCE_PROC_FD_UNAVAILABLE.with(|force| force.set(false));
+            FORCE_FACCESSAT2_EPERM.with(|force| force.set(false));
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+
             println!("{CHILD_OK}");
             return;
         }
