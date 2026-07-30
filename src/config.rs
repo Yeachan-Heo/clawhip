@@ -2125,8 +2125,9 @@ enum CandidatePreserveReason {
     MultipleLinks,
     ProtectedIdentity,
     Unreadable,
+    #[cfg(target_os = "linux")]
     ReadabilityProbeUnsupported,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     UnsupportedPlatform,
 }
 
@@ -2137,7 +2138,7 @@ enum CandidateDeletionOutcome {
     Preserved(CandidatePreserveReason),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateNameState {
     Missing,
@@ -2262,6 +2263,42 @@ fn openat_path_nofollow(dir: &BoundDir, name: &str) -> std::result::Result<File,
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[cfg(target_os = "macos")]
+fn openat_read_nonblocking_nofollow(
+    dir: &BoundDir,
+    name: &str,
+) -> std::result::Result<File, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    // Darwin guarantees O_NONBLOCK returns immediately if open would otherwise block.
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), flags, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "macos")]
+fn apple_candidate_open_error_needs_state_check(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES)
+            | Some(libc::EPERM)
+            | Some(libc::ELOOP)
+            | Some(libc::ENXIO)
+            | Some(libc::ENODEV)
+            | Some(libc::EOPNOTSUPP)
+            | Some(libc::EAGAIN)
+            | Some(libc::EBUSY)
+            | Some(libc::EISDIR)
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn classify_candidate_path_open_error(
     error: io::Error,
@@ -2347,7 +2384,7 @@ fn fstatat_regular_identity(
     )))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fstatat_candidate_state(
     dir: &BoundDir,
     name: &str,
@@ -2384,6 +2421,37 @@ fn fstatat_candidate_state(
         },
         nlink: st.st_nlink as u64,
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn candidate_name_state_outcome(
+    state: CandidateNameState,
+    expected_identity: FileIdentity,
+    protected_identities: &[FileIdentity],
+) -> Option<CandidateDeletionOutcome> {
+    match state {
+        CandidateNameState::Missing => Some(CandidateDeletionOutcome::Disappeared),
+        CandidateNameState::NonRegular => Some(CandidateDeletionOutcome::Preserved(
+            CandidatePreserveReason::NonRegular,
+        )),
+        CandidateNameState::Regular { identity, nlink } => {
+            if identity != expected_identity {
+                Some(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::IdentityChanged,
+                ))
+            } else if nlink != 1 {
+                Some(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::MultipleLinks,
+                ))
+            } else if protected_identities.contains(&identity) {
+                Some(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::ProtectedIdentity,
+                ))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -3019,41 +3087,46 @@ where
         };
         let dir = BoundDir::open_verified(dir_path, expected_identity)?;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            match fstatat_candidate_state(&dir, &candidate.entry_name)? {
-                CandidateNameState::Missing => {
-                    return Ok(CandidateDeletionOutcome::Disappeared);
-                }
-                CandidateNameState::NonRegular => {
-                    return Ok(CandidateDeletionOutcome::Preserved(
-                        CandidatePreserveReason::NonRegular,
-                    ));
-                }
-                CandidateNameState::Regular { identity, nlink } => {
-                    if identity != candidate.identity {
-                        return Ok(CandidateDeletionOutcome::Preserved(
-                            CandidatePreserveReason::IdentityChanged,
-                        ));
-                    }
-                    if nlink != 1 {
-                        return Ok(CandidateDeletionOutcome::Preserved(
-                            CandidatePreserveReason::MultipleLinks,
-                        ));
-                    }
-                    if protected_identities.contains(&identity) {
-                        return Ok(CandidateDeletionOutcome::Preserved(
-                            CandidatePreserveReason::ProtectedIdentity,
-                        ));
-                    }
-                }
+            if let Some(outcome) = candidate_name_state_outcome(
+                fstatat_candidate_state(&dir, &candidate.entry_name)?,
+                candidate.identity,
+                protected_identities,
+            ) {
+                return Ok(outcome);
             }
 
             after_preflight(candidate)?;
+            #[cfg(target_os = "linux")]
             let file = match openat_path_nofollow(&dir, &candidate.entry_name) {
                 Ok(file) => file,
                 Err(error) => return Ok(classify_candidate_path_open_error(error)?),
             };
+            #[cfg(target_os = "macos")]
+            let file = match openat_read_nonblocking_nofollow(&dir, &candidate.entry_name) {
+                Ok(file) => file,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    return Ok(CandidateDeletionOutcome::Disappeared);
+                }
+                Err(error) if apple_candidate_open_error_needs_state_check(&error) => {
+                    if let Some(outcome) = candidate_name_state_outcome(
+                        fstatat_candidate_state(&dir, &candidate.entry_name)?,
+                        candidate.identity,
+                        protected_identities,
+                    ) {
+                        return Ok(outcome);
+                    }
+                    if matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
+                        return Ok(CandidateDeletionOutcome::Preserved(
+                            CandidatePreserveReason::Unreadable,
+                        ));
+                    }
+                    return Err(error.into());
+                }
+                Err(error) => return Err(error.into()),
+            };
+
             let metadata = file.metadata()?;
             if !metadata.is_file() {
                 return Ok(CandidateDeletionOutcome::Preserved(
@@ -3077,6 +3150,7 @@ where
                     CandidatePreserveReason::ProtectedIdentity,
                 ));
             }
+            #[cfg(target_os = "linux")]
             match candidate_readability(&file)? {
                 CandidateReadability::Readable => {}
                 CandidateReadability::Preserved(reason) => {
@@ -3085,35 +3159,12 @@ where
             }
 
             after_check(candidate)?;
-            match fstatat_candidate_state(&dir, &candidate.entry_name)? {
-                CandidateNameState::Missing => {
-                    return Ok(CandidateDeletionOutcome::Disappeared);
-                }
-                CandidateNameState::NonRegular => {
-                    return Ok(CandidateDeletionOutcome::Preserved(
-                        CandidatePreserveReason::NonRegular,
-                    ));
-                }
-                CandidateNameState::Regular {
-                    identity: current,
-                    nlink,
-                } => {
-                    if current != identity {
-                        return Ok(CandidateDeletionOutcome::Preserved(
-                            CandidatePreserveReason::IdentityChanged,
-                        ));
-                    }
-                    if nlink != 1 {
-                        return Ok(CandidateDeletionOutcome::Preserved(
-                            CandidatePreserveReason::MultipleLinks,
-                        ));
-                    }
-                    if protected_identities.contains(&current) {
-                        return Ok(CandidateDeletionOutcome::Preserved(
-                            CandidatePreserveReason::ProtectedIdentity,
-                        ));
-                    }
-                }
+            if let Some(outcome) = candidate_name_state_outcome(
+                fstatat_candidate_state(&dir, &candidate.entry_name)?,
+                identity,
+                protected_identities,
+            ) {
+                return Ok(outcome);
             }
             match unlinkat_name(&dir, &candidate.entry_name) {
                 Ok(()) => Ok(CandidateDeletionOutcome::Deleted),
@@ -3124,7 +3175,7 @@ where
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (
                 dir,
@@ -4517,7 +4568,7 @@ name = "general"
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn backup_retention_combines_legacy_and_managed_with_deterministic_ties() {
         let dir = tempfile::tempdir().unwrap();
@@ -4578,7 +4629,7 @@ name = "general"
         assert!(backups_dir.join(&managed_tie).exists());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn backup_retention_deletes_exact_cutoff_but_keeps_just_newer() {
         let dir = tempfile::tempdir().unwrap();
@@ -4616,7 +4667,7 @@ name = "general"
         assert!(parent.join(just_newer).exists());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn backup_retention_deletes_stale_duplicated_legacy_family() {
         let dir = tempfile::tempdir().unwrap();
@@ -4655,9 +4706,9 @@ name = "general"
         assert!(path.is_file());
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     #[test]
-    fn backup_cleanup_preserves_selected_candidate_without_linux_descriptor_proof() {
+    fn backup_cleanup_preserves_selected_candidate_without_supported_descriptor_proof() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path();
         for day in 1..=11 {
@@ -4848,14 +4899,14 @@ name = "general"
         assert!(error.contains("config was saved; backup retention cleanup remains incomplete"));
         assert!(fs::read_to_string(&path).unwrap().contains("alerts"));
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             changed
                 .save_with_backup_at(&path, now, &mut no_delete)
                 .unwrap();
             assert!(!dir.path().join("config.toml.bak-20100101").exists());
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             changed
                 .save_with_backup_at(&path, now, &mut no_delete)
@@ -5104,52 +5155,87 @@ name = "general"
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_candidate_open_errors_reprobe_only_candidate_states() {
+        for code in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::ELOOP,
+            libc::ENXIO,
+            libc::ENODEV,
+            libc::EOPNOTSUPP,
+            libc::EAGAIN,
+            libc::EBUSY,
+            libc::EISDIR,
+        ] {
+            assert!(apple_candidate_open_error_needs_state_check(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [
+            libc::EINTR,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::EINVAL,
+            libc::ENOTDIR,
+        ] {
+            assert!(!apple_candidate_open_error_needs_state_check(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn save_with_backup_preserves_fifo_replacement_after_preflight_without_blocking() {
+        use std::io::Read as _;
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-        use std::sync::mpsc;
+        use std::os::unix::fs::FileTypeExt;
+        use std::process::{Command, Stdio};
         use std::thread;
-        use std::time::Duration as StdDuration;
+        use std::time::{Duration as StdDuration, Instant};
 
-        let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("config-root");
-        fs::create_dir(&parent).unwrap();
-        let path = parent.join("config.toml");
-        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
-        let original = AppConfig::default();
-        let mut no_delete = |_: &BackupCandidate| Ok(());
-        original
-            .save_with_backup_at(&path, now, &mut no_delete)
-            .unwrap();
-        for day in 1..=11 {
-            fs::write(
-                parent.join(format!("config.toml.bak-200001{day:02}")),
-                format!("original-{day}"),
-            )
-            .unwrap();
-        }
-        let target = parent.join("config.toml.bak-20000101");
-        let moved = parent.join("moved-original");
-        let outside = root.path().join("outside-sentinel");
-        fs::write(&outside, "outside").unwrap();
+        const CHILD_ENV: &str = "CLAWHIP_TEST_FIFO_REPLACEMENT_CHILD";
+        const CHILD_OK: &str = "CLAWHIP_FIFO_REPLACEMENT_CHILD_OK";
+        const TEST_NAME: &str = "config::tests::save_with_backup_preserves_fifo_replacement_after_preflight_without_blocking";
 
-        let mut changed = AppConfig::default();
-        changed.defaults.channel = Some("alerts".into());
-        let expected_config = changed.to_pretty_toml().unwrap().into_bytes();
-        let worker_path = path.clone();
-        let worker_target = target.clone();
-        let worker_moved = moved.clone();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("config-root");
+            fs::create_dir(&parent).unwrap();
+            let path = parent.join("config.toml");
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            let original = AppConfig::default();
+            let mut no_delete = |_: &BackupCandidate| Ok(());
+            original
+                .save_with_backup_at(&path, now, &mut no_delete)
+                .unwrap();
+            for day in 1..=11 {
+                fs::write(
+                    parent.join(format!("config.toml.bak-200001{day:02}")),
+                    format!("original-{day}"),
+                )
+                .unwrap();
+            }
+            let target = parent.join("config.toml.bak-20000101");
+            let moved = parent.join("moved-original");
+            let outside = root.path().join("outside-sentinel");
+            fs::write(&outside, "outside").unwrap();
+
+            let mut changed = AppConfig::default();
+            changed.defaults.channel = Some("alerts".into());
+            let expected_config = changed.to_pretty_toml().unwrap().into_bytes();
             let mut before_rename = || Ok(());
             let mut before_snapshot = || Ok(());
             let mut before_delete = |_: &BackupCandidate| Ok(());
             let mut after_preflight = |candidate: &BackupCandidate| -> Result<()> {
-                if candidate.path == worker_target {
-                    fs::rename(&worker_target, &worker_moved)?;
-                    let target_name = CString::new(worker_target.as_os_str().as_bytes()).unwrap();
+                if candidate.path == target {
+                    fs::rename(&target, &moved)?;
+                    let target_name = CString::new(target.as_os_str().as_bytes()).unwrap();
                     let rc = unsafe { libc::mkfifo(target_name.as_ptr(), 0o600) };
                     if rc != 0 {
                         return Err(io::Error::last_os_error().into());
@@ -5157,50 +5243,81 @@ name = "general"
                 }
                 Ok(())
             };
-            let result = changed.save_with_backup_at_candidate_hooks(
-                &worker_path,
-                now,
-                &mut before_rename,
-                &mut before_snapshot,
-                &mut before_delete,
-                &mut after_preflight,
+
+            changed
+                .save_with_backup_at_candidate_hooks(
+                    &path,
+                    now,
+                    &mut before_rename,
+                    &mut before_snapshot,
+                    &mut before_delete,
+                    &mut after_preflight,
+                )
+                .unwrap();
+
+            assert_eq!(fs::read(&path).unwrap(), expected_config);
+            assert!(
+                fs::symlink_metadata(&target).unwrap().file_type().is_fifo(),
+                "FIFO replacement was not preserved"
             );
-            sender.send(result).unwrap();
+            assert_eq!(fs::read_to_string(&moved).unwrap(), "original-1");
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+            println!("{CHILD_OK}");
+            return;
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).unwrap();
+            bytes
         });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let deadline = Instant::now() + StdDuration::from_secs(10);
 
-        let result = match receiver.recv_timeout(StdDuration::from_secs(2)) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let rescue = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-                    .open(&target)
-                    .unwrap();
-                let rescued = receiver.recv_timeout(StdDuration::from_secs(2));
-                drop(rescue);
-                match rescued {
-                    Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        worker.join().unwrap();
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        panic!("config save remained blocked after nonblocking FIFO rescue");
-                    }
-                }
-                panic!("config save blocked while verifying a FIFO candidate");
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                worker.join().unwrap();
-                panic!("config save worker disconnected before returning a result");
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                let stdout = stdout_reader.join().unwrap();
+                let stderr = stderr_reader.join().unwrap();
+                panic!(
+                    "FIFO replacement child timed out and was killed/reaped with {status}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
             }
+            thread::sleep(StdDuration::from_millis(10));
         };
-        worker.join().unwrap();
-        result.unwrap();
-
-        assert_eq!(fs::read(&path).unwrap(), expected_config);
-        assert!(fs::symlink_metadata(&target).unwrap().file_type().is_fifo());
-        assert_eq!(fs::read_to_string(&moved).unwrap(), "original-1");
-        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+        let stdout = stdout_reader.join().unwrap();
+        let stderr = stderr_reader.join().unwrap();
+        let stdout_text = String::from_utf8_lossy(&stdout);
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        assert!(
+            status.success(),
+            "FIFO replacement child failed with {status}\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
+        );
+        assert!(
+            stdout_text.contains(CHILD_OK),
+            "FIFO replacement child did not execute the preservation scenario\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
+        );
     }
 
     #[cfg(unix)]
@@ -5421,7 +5538,7 @@ name = "general"
         assert!(!fs::read_to_string(&path).unwrap().contains("alerts"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn backup_cleanup_preserves_candidate_replaced_after_final_identity_check() {
         let dir = tempfile::tempdir().unwrap();

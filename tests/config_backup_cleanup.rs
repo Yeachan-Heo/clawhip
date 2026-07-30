@@ -1,17 +1,17 @@
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Read;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
 use std::process::{Command, Output};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::thread;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -40,7 +40,7 @@ fn run_setup(config_path: &Path, channel: &str) -> Output {
         .expect("run clawhip setup")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_setup_bounded(config_path: &Path, channel: &str) -> Output {
     let mut command = setup_command(config_path, channel);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -85,7 +85,7 @@ fn run_setup_bounded(config_path: &Path, channel: &str) -> Output {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn managed_backup_state(config_path: &Path) -> Vec<(String, Vec<u8>)> {
     let backup_dir = config_path
         .parent()
@@ -105,20 +105,20 @@ fn managed_backup_state(config_path: &Path) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct PermissionRestore {
     path: PathBuf,
     mode: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for PermissionRestore {
     fn drop(&mut self) {
         let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn config_backup_cleanup_converges_legacy_snapshots_on_changed_and_noop_saves() {
     let temp = TempDir::new().expect("tempdir");
@@ -188,7 +188,7 @@ fn config_backup_cleanup_converges_legacy_snapshots_on_changed_and_noop_saves() 
     assert!(duplicated.exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn config_backup_cleanup_preserves_mode_000_candidate_on_changed_and_noop_setup() {
     let temp = TempDir::new().expect("tempdir");
