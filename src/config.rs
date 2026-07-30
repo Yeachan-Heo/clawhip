@@ -2125,8 +2125,6 @@ enum CandidatePreserveReason {
     MultipleLinks,
     ProtectedIdentity,
     Unreadable,
-    #[cfg(target_os = "linux")]
-    ReadabilityProbeUnsupported,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     UnsupportedPlatform,
 }
@@ -2151,6 +2149,11 @@ enum CandidateNameState {
 enum CandidateReadability {
     Readable,
     Preserved(CandidatePreserveReason),
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FORCE_FACCESSAT2_ENOSYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn metadata_identity(metadata: &Metadata) -> Option<FileIdentity> {
@@ -2314,19 +2317,35 @@ fn classify_candidate_path_open_error(
 fn classify_candidate_readability_error(
     error: io::Error,
 ) -> std::result::Result<CandidateReadability, io::Error> {
-    match error.raw_os_error() {
-        Some(libc::EACCES) => Ok(CandidateReadability::Preserved(
+    if error.raw_os_error() == Some(libc::EACCES) {
+        Ok(CandidateReadability::Preserved(
             CandidatePreserveReason::Unreadable,
-        )),
-        Some(libc::ENOSYS) => Ok(CandidateReadability::Preserved(
-            CandidatePreserveReason::ReadabilityProbeUnsupported,
-        )),
-        _ => Err(error),
+        ))
+    } else {
+        Err(error)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn candidate_readability(file: &File) -> std::result::Result<CandidateReadability, io::Error> {
+fn classify_proc_fd_reopen_error(
+    error: io::Error,
+) -> std::result::Result<CandidateReadability, io::Error> {
+    if matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
+        Ok(CandidateReadability::Preserved(
+            CandidatePreserveReason::Unreadable,
+        ))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn faccessat2_read_access(file: &File) -> std::result::Result<(), io::Error> {
+    #[cfg(test)]
+    if FORCE_FACCESSAT2_ENOSYS.with(std::cell::Cell::get) {
+        return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+    }
+
     const EMPTY_PATH: &[u8] = b"\0";
     let flags = libc::AT_EMPTY_PATH | libc::AT_EACCESS;
     let rc = unsafe {
@@ -2339,9 +2358,70 @@ fn candidate_readability(file: &File) -> std::result::Result<CandidateReadabilit
         )
     };
     if rc == 0 {
-        Ok(CandidateReadability::Readable)
+        Ok(())
     } else {
-        classify_candidate_readability_error(io::Error::last_os_error())
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_readability_via_proc_fd(
+    file: &File,
+) -> std::result::Result<CandidateReadability, io::Error> {
+    // Reopen the already-held O_PATH object, not the mutable candidate pathname.
+    // Each proc-fd descriptor is identity-checked so path substitution fails closed.
+    let proc_fd_dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open("/proc/self/fd")?;
+    let fd_name = CString::new(file.as_raw_fd().to_string()).expect("fd contains no NUL");
+    let anchored_fd = unsafe {
+        libc::openat(
+            proc_fd_dir.as_raw_fd(),
+            fd_name.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if anchored_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let anchored = unsafe { File::from_raw_fd(anchored_fd) };
+    let original_metadata = file.metadata()?;
+    let anchored_metadata = anchored.metadata()?;
+    if !anchored_metadata.is_file()
+        || metadata_identity(&anchored_metadata) != metadata_identity(&original_metadata)
+    {
+        return Err(io::Error::other(
+            "proc fd readability check anchored a different backup candidate",
+        ));
+    }
+
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let reopened_fd = unsafe { libc::openat(proc_fd_dir.as_raw_fd(), fd_name.as_ptr(), flags, 0) };
+    if reopened_fd < 0 {
+        return classify_proc_fd_reopen_error(io::Error::last_os_error());
+    }
+    let reopened = unsafe { File::from_raw_fd(reopened_fd) };
+    let reopened_metadata = reopened.metadata()?;
+    if !reopened_metadata.is_file()
+        || metadata_identity(&reopened_metadata) != metadata_identity(&original_metadata)
+    {
+        return Err(io::Error::other(
+            "proc fd readability check reopened a different backup candidate",
+        ));
+    }
+    Ok(CandidateReadability::Readable)
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_readability(file: &File) -> std::result::Result<CandidateReadability, io::Error> {
+    match faccessat2_read_access(file) {
+        Ok(()) => Ok(CandidateReadability::Readable),
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+            candidate_readability_via_proc_fd(file)
+        }
+        Err(error) => classify_candidate_readability_error(error),
     }
 }
 
@@ -3389,6 +3469,76 @@ fn normalize_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_bounded_test_child(
+        test_name: &str,
+        child_env: &str,
+        child_marker: &str,
+        drop_privileges: bool,
+    ) {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration as StdDuration, Instant};
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(child_env, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if drop_privileges && unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                let stdout = stdout_reader.join().unwrap();
+                let stderr = stderr_reader.join().unwrap();
+                panic!(
+                    "test child timed out and was killed/reaped with {status}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        };
+        let stdout = stdout_reader.join().unwrap();
+        let stderr = stderr_reader.join().unwrap();
+        let stdout_text = String::from_utf8_lossy(&stdout);
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        assert!(
+            status.success(),
+            "test child failed with {status}\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
+        );
+        assert!(
+            stdout_text.contains(child_marker),
+            "test child did not execute the requested scenario\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
+        );
+    }
 
     #[test]
     fn discord_token_source_prefers_env_over_config() {
@@ -5126,19 +5276,14 @@ name = "general"
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn candidate_readability_errors_preserve_only_unreadable_or_unsupported() {
+    fn candidate_readability_errors_preserve_only_attributable_denials() {
         assert_eq!(
             classify_candidate_readability_error(io::Error::from_raw_os_error(libc::EACCES))
                 .unwrap(),
             CandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
         );
-        assert_eq!(
-            classify_candidate_readability_error(io::Error::from_raw_os_error(libc::ENOSYS))
-                .unwrap(),
-            CandidateReadability::Preserved(CandidatePreserveReason::ReadabilityProbeUnsupported)
-        );
-
         for code in [
+            libc::ENOSYS,
             libc::EINVAL,
             libc::EINTR,
             libc::EPERM,
@@ -5153,6 +5298,141 @@ name = "general"
                 .unwrap_err();
             assert_eq!(error.raw_os_error(), Some(code));
         }
+
+        for code in [libc::EACCES, libc::EPERM] {
+            assert_eq!(
+                classify_proc_fd_reopen_error(io::Error::from_raw_os_error(code)).unwrap(),
+                CandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
+            );
+        }
+        for code in [
+            libc::ENOENT,
+            libc::EINVAL,
+            libc::EINTR,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::ESTALE,
+        ] {
+            let error =
+                classify_proc_fd_reopen_error(io::Error::from_raw_os_error(code)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn faccessat2_enosys_fallback_deletes_readable_and_preserves_unsafe_candidates() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        const CHILD_ENV: &str = "CLAWHIP_TEST_FACCESSAT2_ENOSYS_CHILD";
+        const CHILD_OK: &str = "CLAWHIP_FACCESSAT2_ENOSYS_CHILD_OK";
+        const TEST_NAME: &str = "config::tests::faccessat2_enosys_fallback_deletes_readable_and_preserves_unsafe_candidates";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            FORCE_FACCESSAT2_ENOSYS.with(|force| force.set(true));
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path();
+            let parent_dir = validate_config_parent_dir(parent, false).unwrap();
+            let outside = parent.join("outside-sentinel");
+            fs::write(&outside, "outside").unwrap();
+            let make_candidate = |path: &Path| {
+                let metadata = fs::symlink_metadata(path).unwrap();
+                BackupCandidate {
+                    origin: BackupOrigin::RootLegacy,
+                    path: path.to_path_buf(),
+                    entry_name: path.file_name().unwrap().to_str().unwrap().to_string(),
+                    created_at: OffsetDateTime::now_utc(),
+                    identity: metadata_identity(&metadata).unwrap(),
+                }
+            };
+
+            let readable = parent.join("config.toml.bak-20000101");
+            fs::write(&readable, "readable").unwrap();
+            let readable_candidate = make_candidate(&readable);
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let readable_outcome = delete_verified_candidate(
+                &readable_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(readable_outcome, CandidateDeletionOutcome::Deleted);
+            assert!(!readable.exists());
+
+            let unreadable = parent.join("config.toml.bak-20000102");
+            fs::write(&unreadable, "unreadable").unwrap();
+            let unreadable_bytes = fs::read(&unreadable).unwrap();
+            let unreadable_candidate = make_candidate(&unreadable);
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let unreadable_outcome = delete_verified_candidate(
+                &unreadable_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                unreadable_outcome,
+                CandidateDeletionOutcome::Preserved(CandidatePreserveReason::Unreadable)
+            );
+            assert!(unreadable.exists());
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::read(&unreadable).unwrap(), unreadable_bytes);
+
+            let special = parent.join("config.toml.bak-20000103");
+            let moved = parent.join("moved-special-original");
+            fs::write(&special, "special-original").unwrap();
+            let special_candidate = make_candidate(&special);
+            let mut replace_with_fifo = |_: &BackupCandidate| -> Result<()> {
+                fs::rename(&special, &moved)?;
+                let special_name = CString::new(special.as_os_str().as_bytes()).unwrap();
+                let rc = unsafe { libc::mkfifo(special_name.as_ptr(), 0o600) };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                Ok(())
+            };
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let special_outcome = delete_verified_candidate(
+                &special_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut replace_with_fifo,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                special_outcome,
+                CandidateDeletionOutcome::Preserved(CandidatePreserveReason::NonRegular)
+            );
+            assert!(
+                fs::symlink_metadata(&special)
+                    .unwrap()
+                    .file_type()
+                    .is_fifo()
+            );
+            assert_eq!(fs::read_to_string(&moved).unwrap(), "special-original");
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+
+            FORCE_FACCESSAT2_ENOSYS.with(|force| force.set(false));
+            println!("{CHILD_OK}");
+            return;
+        }
+
+        run_bounded_test_child(TEST_NAME, CHILD_ENV, CHILD_OK, true);
     }
 
     #[cfg(target_os = "macos")]
@@ -5192,12 +5472,8 @@ name = "general"
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn save_with_backup_preserves_fifo_replacement_after_preflight_without_blocking() {
-        use std::io::Read as _;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::FileTypeExt;
-        use std::process::{Command, Stdio};
-        use std::thread;
-        use std::time::{Duration as StdDuration, Instant};
 
         const CHILD_ENV: &str = "CLAWHIP_TEST_FIFO_REPLACEMENT_CHILD";
         const CHILD_OK: &str = "CLAWHIP_FIFO_REPLACEMENT_CHILD_OK";
@@ -5266,58 +5542,7 @@ name = "general"
             return;
         }
 
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg(TEST_NAME)
-            .arg("--nocapture")
-            .env(CHILD_ENV, "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
-        let stdout_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).unwrap();
-            bytes
-        });
-        let stderr_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).unwrap();
-            bytes
-        });
-        let deadline = Instant::now() + StdDuration::from_secs(10);
-
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let status = child.wait().unwrap();
-                let stdout = stdout_reader.join().unwrap();
-                let stderr = stderr_reader.join().unwrap();
-                panic!(
-                    "FIFO replacement child timed out and was killed/reaped with {status}\nstdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-            thread::sleep(StdDuration::from_millis(10));
-        };
-        let stdout = stdout_reader.join().unwrap();
-        let stderr = stderr_reader.join().unwrap();
-        let stdout_text = String::from_utf8_lossy(&stdout);
-        let stderr_text = String::from_utf8_lossy(&stderr);
-        assert!(
-            status.success(),
-            "FIFO replacement child failed with {status}\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
-        );
-        assert!(
-            stdout_text.contains(CHILD_OK),
-            "FIFO replacement child did not execute the preservation scenario\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
-        );
+        run_bounded_test_child(TEST_NAME, CHILD_ENV, CHILD_OK, false);
     }
 
     #[cfg(unix)]
