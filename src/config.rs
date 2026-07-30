@@ -2157,7 +2157,7 @@ enum CandidatePreserveReason {
     MultipleLinks,
     ProtectedIdentity,
     Unreadable,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     CompatibilityProbeUnavailable,
     #[cfg(target_os = "linux")]
     ReadLeaseContended,
@@ -2184,6 +2184,13 @@ enum CandidateNameState {
 #[derive(Debug)]
 enum CandidateReadability {
     Readable { descriptor: File },
+    Preserved(CandidatePreserveReason),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppleCandidateReadability {
+    Readable,
     Preserved(CandidatePreserveReason),
 }
 
@@ -2306,19 +2313,19 @@ fn openat_path_nofollow(dir: &BoundDir, name: &str) -> std::result::Result<File,
 }
 
 #[cfg(target_os = "macos")]
-fn openat_read_nonblocking_nofollow(
-    dir: &BoundDir,
-    name: &str,
-) -> std::result::Result<File, io::Error> {
+fn apple_candidate_open_flags() -> libc::c_int {
+    libc::O_EVTONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+}
+
+#[cfg(target_os = "macos")]
+fn openat_event_nofollow(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
     let c_name = CString::new(name).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "entry name contains interior NUL",
         )
     })?;
-    // Darwin guarantees O_NONBLOCK returns immediately if open would otherwise block.
-    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), flags, 0) };
+    let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), apple_candidate_open_flags(), 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -2339,6 +2346,74 @@ fn apple_candidate_open_error_needs_state_check(error: &io::Error) -> bool {
             | Some(libc::EBUSY)
             | Some(libc::EISDIR)
     )
+}
+
+#[cfg(target_os = "macos")]
+fn classify_apple_user_access(user_access: u32) -> AppleCandidateReadability {
+    if user_access & libc::R_OK as u32 != 0 {
+        AppleCandidateReadability::Readable
+    } else {
+        AppleCandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn classify_apple_readability_error(
+    error: io::Error,
+) -> std::result::Result<AppleCandidateReadability, io::Error> {
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EOPNOTSUPP)
+    ) {
+        Ok(AppleCandidateReadability::Preserved(
+            CandidatePreserveReason::CompatibilityProbeUnavailable,
+        ))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apple_candidate_readability(
+    file: &File,
+) -> std::result::Result<AppleCandidateReadability, io::Error> {
+    #[repr(C)]
+    struct UserAccessBuffer {
+        length: u32,
+        user_access: u32,
+    }
+
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_USERACCESS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buffer = UserAccessBuffer {
+        length: 0,
+        user_access: 0,
+    };
+    let rc = unsafe {
+        libc::fgetattrlist(
+            file.as_raw_fd(),
+            (&mut attributes as *mut libc::attrlist).cast::<libc::c_void>(),
+            (&mut buffer as *mut UserAccessBuffer).cast::<libc::c_void>(),
+            std::mem::size_of::<UserAccessBuffer>(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return classify_apple_readability_error(io::Error::last_os_error());
+    }
+    if (buffer.length as usize) < std::mem::size_of::<UserAccessBuffer>() {
+        return Ok(AppleCandidateReadability::Preserved(
+            CandidatePreserveReason::CompatibilityProbeUnavailable,
+        ));
+    }
+    Ok(classify_apple_user_access(buffer.user_access))
 }
 
 #[cfg(target_os = "linux")]
@@ -3259,7 +3334,7 @@ where
                 Err(error) => return Ok(classify_candidate_path_open_error(error)?),
             };
             #[cfg(target_os = "macos")]
-            let file = match openat_read_nonblocking_nofollow(&dir, &candidate.entry_name) {
+            let file = match openat_event_nofollow(&dir, &candidate.entry_name) {
                 Ok(file) => file,
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
                     return Ok(CandidateDeletionOutcome::Disappeared);
@@ -3305,6 +3380,13 @@ where
                     CandidatePreserveReason::ProtectedIdentity,
                 ));
             }
+            #[cfg(target_os = "macos")]
+            match apple_candidate_readability(&file)? {
+                AppleCandidateReadability::Readable => {}
+                AppleCandidateReadability::Preserved(reason) => {
+                    return Ok(CandidateDeletionOutcome::Preserved(reason));
+                }
+            }
             #[cfg(target_os = "linux")]
             let _readable_descriptor = match candidate_readability(&file)? {
                 CandidateReadability::Readable { descriptor } => descriptor,
@@ -3320,6 +3402,13 @@ where
                 protected_identities,
             ) {
                 return Ok(outcome);
+            }
+            #[cfg(target_os = "macos")]
+            match apple_candidate_readability(&file)? {
+                AppleCandidateReadability::Readable => {}
+                AppleCandidateReadability::Preserved(reason) => {
+                    return Ok(CandidateDeletionOutcome::Preserved(reason));
+                }
             }
             #[cfg(target_os = "linux")]
             let _final_readable_descriptor = match candidate_readability(&file)? {
@@ -5663,7 +5752,7 @@ name = "general"
         run_bounded_test_child(TEST_NAME, CHILD_ENV, CHILD_OK, true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn backup_cleanup_rechecks_readability_after_permission_change() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -5749,7 +5838,40 @@ name = "general"
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn apple_candidate_open_errors_reprobe_only_candidate_states() {
+    fn apple_candidate_descriptor_is_event_only_and_fail_closed() {
+        let flags = apple_candidate_open_flags();
+        assert_eq!(flags & libc::O_EVTONLY, libc::O_EVTONLY);
+        assert_eq!(flags & libc::O_NONBLOCK, libc::O_NONBLOCK);
+        assert_eq!(flags & libc::O_NOFOLLOW, libc::O_NOFOLLOW);
+        assert_eq!(flags & libc::O_CLOEXEC, libc::O_CLOEXEC);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_eq!(
+            classify_apple_user_access(libc::R_OK as u32),
+            AppleCandidateReadability::Readable
+        );
+        assert_eq!(
+            classify_apple_user_access(0),
+            AppleCandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
+        );
+        for code in [libc::EACCES, libc::EPERM, libc::EOPNOTSUPP] {
+            assert_eq!(
+                classify_apple_readability_error(io::Error::from_raw_os_error(code)).unwrap(),
+                AppleCandidateReadability::Preserved(
+                    CandidatePreserveReason::CompatibilityProbeUnavailable
+                )
+            );
+        }
+        for code in [
+            libc::EBADF,
+            libc::EINTR,
+            libc::EINVAL,
+            libc::ENOMEM,
+            libc::EIO,
+        ] {
+            let error =
+                classify_apple_readability_error(io::Error::from_raw_os_error(code)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
         for code in [
             libc::EACCES,
             libc::EPERM,
