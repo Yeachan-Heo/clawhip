@@ -971,6 +971,33 @@ impl AppConfig {
         G: FnMut() -> Result<()>,
         H: FnMut() -> Result<()>,
     {
+        let mut after_preflight = |_: &BackupCandidate| Ok(());
+        self.save_with_backup_at_candidate_hooks(
+            path,
+            now,
+            before_rename,
+            before_snapshot,
+            before_delete,
+            &mut after_preflight,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_with_backup_at_candidate_hooks<F, G, H, P>(
+        &self,
+        path: &Path,
+        now: OffsetDateTime,
+        before_rename: &mut G,
+        before_snapshot: &mut H,
+        before_delete: &mut F,
+        after_preflight: &mut P,
+    ) -> Result<()>
+    where
+        F: FnMut(&BackupCandidate) -> Result<()>,
+        G: FnMut() -> Result<()>,
+        H: FnMut() -> Result<()>,
+        P: FnMut(&BackupCandidate) -> Result<()>,
+    {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -998,7 +1025,7 @@ impl AppConfig {
                     ))
                 })?;
             let protected_identities = active.identity().into_iter().collect::<Vec<_>>();
-            cleanup_config_backups_with(
+            cleanup_config_backups_with_preflight_hook(
                 &parent_dir.path,
                 parent_dir.identity,
                 filename,
@@ -1006,6 +1033,7 @@ impl AppConfig {
                 &protected_identities,
                 now,
                 before_delete,
+                after_preflight,
             )
             .map_err(|error| {
                 io::Error::other(format!(
@@ -1056,7 +1084,7 @@ impl AppConfig {
         {
             protected_identities.push(current_identity);
         }
-        cleanup_config_backups_with(
+        cleanup_config_backups_with_preflight_hook(
             &parent_dir.path,
             parent_dir.identity,
             filename,
@@ -1064,6 +1092,7 @@ impl AppConfig {
             &protected_identities,
             now,
             before_delete,
+            after_preflight,
         )
         .map_err(|error| {
             io::Error::other(format!(
@@ -2089,6 +2118,40 @@ struct BackupCandidate {
     identity: FileIdentity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidatePreserveReason {
+    NonRegular,
+    IdentityChanged,
+    MultipleLinks,
+    ProtectedIdentity,
+    Unreadable,
+    ReadabilityProbeUnsupported,
+    #[cfg(not(target_os = "linux"))]
+    UnsupportedPlatform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateDeletionOutcome {
+    Deleted,
+    Disappeared,
+    Preserved(CandidatePreserveReason),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateNameState {
+    Missing,
+    NonRegular,
+    Regular { identity: FileIdentity, nlink: u64 },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateReadability {
+    Readable,
+    Preserved(CandidatePreserveReason),
+}
+
 fn metadata_identity(metadata: &Metadata) -> Option<FileIdentity> {
     #[cfg(unix)]
     {
@@ -2183,20 +2246,66 @@ fn openat_exclusive_write(dir: &BoundDir, name: &str) -> std::result::Result<Fil
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-#[cfg(unix)]
-fn openat_read_nofollow(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
+#[cfg(target_os = "linux")]
+fn openat_path_nofollow(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
     let c_name = CString::new(name).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "entry name contains interior NUL",
         )
     })?;
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), flags, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn classify_candidate_path_open_error(
+    error: io::Error,
+) -> std::result::Result<CandidateDeletionOutcome, io::Error> {
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(CandidateDeletionOutcome::Disappeared)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_candidate_readability_error(
+    error: io::Error,
+) -> std::result::Result<CandidateReadability, io::Error> {
+    match error.raw_os_error() {
+        Some(libc::EACCES) => Ok(CandidateReadability::Preserved(
+            CandidatePreserveReason::Unreadable,
+        )),
+        Some(libc::ENOSYS) => Ok(CandidateReadability::Preserved(
+            CandidatePreserveReason::ReadabilityProbeUnsupported,
+        )),
+        _ => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_readability(file: &File) -> std::result::Result<CandidateReadability, io::Error> {
+    const EMPTY_PATH: &[u8] = b"\0";
+    let flags = libc::AT_EMPTY_PATH | libc::AT_EACCESS;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            file.as_raw_fd(),
+            EMPTY_PATH.as_ptr().cast::<libc::c_char>(),
+            libc::R_OK,
+            flags,
+        )
+    };
+    if rc == 0 {
+        Ok(CandidateReadability::Readable)
+    } else {
+        classify_candidate_readability_error(io::Error::last_os_error())
+    }
 }
 
 #[cfg(unix)]
@@ -2236,6 +2345,45 @@ fn fstatat_regular_identity(
         },
         st.st_nlink as u64,
     )))
+}
+
+#[cfg(target_os = "linux")]
+fn fstatat_candidate_state(
+    dir: &BoundDir,
+    name: &str,
+) -> std::result::Result<CandidateNameState, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir.fd(),
+            c_name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(CandidateNameState::Missing);
+        }
+        return Err(error);
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Ok(CandidateNameState::NonRegular);
+    }
+    Ok(CandidateNameState::Regular {
+        identity: FileIdentity {
+            device: st.st_dev as u64,
+            inode: st.st_ino as u64,
+        },
+        nlink: st.st_nlink as u64,
+    })
 }
 
 #[cfg(unix)]
@@ -2841,14 +2989,16 @@ fn collect_cleanup_candidates(
     Ok(candidates)
 }
 
-fn delete_verified_candidate<A>(
+fn delete_verified_candidate<P, A>(
     candidate: &BackupCandidate,
     parent_dir: &ConfigParentDir,
     managed_dir: Option<&ManagedBackupDir>,
     protected_identities: &[FileIdentity],
+    after_preflight: &mut P,
     after_check: &mut A,
-) -> Result<()>
+) -> Result<CandidateDeletionOutcome>
 where
+    P: FnMut(&BackupCandidate) -> Result<()>,
     A: FnMut(&BackupCandidate) -> Result<()>,
 {
     #[cfg(unix)]
@@ -2868,30 +3018,124 @@ where
             }
         };
         let dir = BoundDir::open_verified(dir_path, expected_identity)?;
-        let file = match openat_read_nofollow(&dir, &candidate.entry_name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        let metadata = file.metadata()?;
-        let Some(identity) = safe_cleanup_file_identity(&metadata) else {
-            return Ok(());
-        };
-        if identity != candidate.identity || protected_identities.contains(&identity) {
-            return Ok(());
+
+        #[cfg(target_os = "linux")]
+        {
+            match fstatat_candidate_state(&dir, &candidate.entry_name)? {
+                CandidateNameState::Missing => {
+                    return Ok(CandidateDeletionOutcome::Disappeared);
+                }
+                CandidateNameState::NonRegular => {
+                    return Ok(CandidateDeletionOutcome::Preserved(
+                        CandidatePreserveReason::NonRegular,
+                    ));
+                }
+                CandidateNameState::Regular { identity, nlink } => {
+                    if identity != candidate.identity {
+                        return Ok(CandidateDeletionOutcome::Preserved(
+                            CandidatePreserveReason::IdentityChanged,
+                        ));
+                    }
+                    if nlink != 1 {
+                        return Ok(CandidateDeletionOutcome::Preserved(
+                            CandidatePreserveReason::MultipleLinks,
+                        ));
+                    }
+                    if protected_identities.contains(&identity) {
+                        return Ok(CandidateDeletionOutcome::Preserved(
+                            CandidatePreserveReason::ProtectedIdentity,
+                        ));
+                    }
+                }
+            }
+
+            after_preflight(candidate)?;
+            let file = match openat_path_nofollow(&dir, &candidate.entry_name) {
+                Ok(file) => file,
+                Err(error) => return Ok(classify_candidate_path_open_error(error)?),
+            };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Ok(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::NonRegular,
+                ));
+            }
+            if metadata.nlink() != 1 {
+                return Ok(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::MultipleLinks,
+                ));
+            }
+            let identity = metadata_identity(&metadata)
+                .ok_or_else(|| "backup candidate descriptor identity unavailable".to_string())?;
+            if identity != candidate.identity {
+                return Ok(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::IdentityChanged,
+                ));
+            }
+            if protected_identities.contains(&identity) {
+                return Ok(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::ProtectedIdentity,
+                ));
+            }
+            match candidate_readability(&file)? {
+                CandidateReadability::Readable => {}
+                CandidateReadability::Preserved(reason) => {
+                    return Ok(CandidateDeletionOutcome::Preserved(reason));
+                }
+            }
+
+            after_check(candidate)?;
+            match fstatat_candidate_state(&dir, &candidate.entry_name)? {
+                CandidateNameState::Missing => {
+                    return Ok(CandidateDeletionOutcome::Disappeared);
+                }
+                CandidateNameState::NonRegular => {
+                    return Ok(CandidateDeletionOutcome::Preserved(
+                        CandidatePreserveReason::NonRegular,
+                    ));
+                }
+                CandidateNameState::Regular {
+                    identity: current,
+                    nlink,
+                } => {
+                    if current != identity {
+                        return Ok(CandidateDeletionOutcome::Preserved(
+                            CandidatePreserveReason::IdentityChanged,
+                        ));
+                    }
+                    if nlink != 1 {
+                        return Ok(CandidateDeletionOutcome::Preserved(
+                            CandidatePreserveReason::MultipleLinks,
+                        ));
+                    }
+                    if protected_identities.contains(&current) {
+                        return Ok(CandidateDeletionOutcome::Preserved(
+                            CandidatePreserveReason::ProtectedIdentity,
+                        ));
+                    }
+                }
+            }
+            match unlinkat_name(&dir, &candidate.entry_name) {
+                Ok(()) => Ok(CandidateDeletionOutcome::Deleted),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    Ok(CandidateDeletionOutcome::Disappeared)
+                }
+                Err(error) => Err(error.into()),
+            }
         }
-        after_check(candidate)?;
-        match fstatat_regular_identity(&dir, &candidate.entry_name)? {
-            Some((current, nlink))
-                if current == identity
-                    && nlink == 1
-                    && !protected_identities.contains(&current) => {}
-            _ => return Ok(()),
-        }
-        match unlinkat_name(&dir, &candidate.entry_name) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                dir,
+                candidate,
+                protected_identities,
+                after_preflight,
+                after_check,
+            );
+            Ok(CandidateDeletionOutcome::Preserved(
+                CandidatePreserveReason::UnsupportedPlatform,
+            ))
         }
     }
 
@@ -2904,12 +3148,16 @@ where
             parent_dir,
             managed_dir,
             protected_identities,
+            after_preflight,
             after_check,
         );
-        Ok(())
+        Ok(CandidateDeletionOutcome::Preserved(
+            CandidatePreserveReason::UnsupportedPlatform,
+        ))
     }
 }
 
+#[cfg(test)]
 fn cleanup_config_backups_with<F>(
     parent: &Path,
     expected_parent_identity: Option<FileIdentity>,
@@ -2922,6 +3170,7 @@ fn cleanup_config_backups_with<F>(
 where
     F: FnMut(&BackupCandidate) -> Result<()>,
 {
+    let mut after_preflight = |_: &BackupCandidate| Ok(());
     let mut after_check = |_: &BackupCandidate| Ok(());
     cleanup_config_backups_with_hooks(
         parent,
@@ -2931,12 +3180,13 @@ where
         protected_identities,
         now,
         before_delete,
+        &mut after_preflight,
         &mut after_check,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cleanup_config_backups_with_hooks<F, A>(
+fn cleanup_config_backups_with_preflight_hook<F, P>(
     parent: &Path,
     expected_parent_identity: Option<FileIdentity>,
     filename: &str,
@@ -2944,10 +3194,41 @@ fn cleanup_config_backups_with_hooks<F, A>(
     protected_identities: &[FileIdentity],
     now: OffsetDateTime,
     before_delete: &mut F,
+    after_preflight: &mut P,
+) -> Result<()>
+where
+    F: FnMut(&BackupCandidate) -> Result<()>,
+    P: FnMut(&BackupCandidate) -> Result<()>,
+{
+    let mut after_check = |_: &BackupCandidate| Ok(());
+    cleanup_config_backups_with_hooks(
+        parent,
+        expected_parent_identity,
+        filename,
+        managed_dir,
+        protected_identities,
+        now,
+        before_delete,
+        after_preflight,
+        &mut after_check,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cleanup_config_backups_with_hooks<F, P, A>(
+    parent: &Path,
+    expected_parent_identity: Option<FileIdentity>,
+    filename: &str,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+    now: OffsetDateTime,
+    before_delete: &mut F,
+    after_preflight: &mut P,
     after_delete_check: &mut A,
 ) -> Result<()>
 where
     F: FnMut(&BackupCandidate) -> Result<()>,
+    P: FnMut(&BackupCandidate) -> Result<()>,
     A: FnMut(&BackupCandidate) -> Result<()>,
 {
     let parent_dir = validate_config_parent_dir(parent, false)?;
@@ -2980,13 +3261,19 @@ where
     for (index, candidate) in candidates.iter().enumerate() {
         if index < keep_from && candidate.created_at <= cutoff {
             before_delete(candidate)?;
-            delete_verified_candidate(
+            match delete_verified_candidate(
                 candidate,
                 &parent_dir,
                 managed_dir,
                 protected_identities,
+                after_preflight,
                 after_delete_check,
-            )?;
+            )? {
+                CandidateDeletionOutcome::Deleted | CandidateDeletionOutcome::Disappeared => {}
+                CandidateDeletionOutcome::Preserved(reason) => {
+                    let _ = reason;
+                }
+            }
         }
     }
     Ok(())
@@ -4230,7 +4517,7 @@ name = "general"
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn backup_retention_combines_legacy_and_managed_with_deterministic_ties() {
         let dir = tempfile::tempdir().unwrap();
@@ -4291,7 +4578,7 @@ name = "general"
         assert!(backups_dir.join(&managed_tie).exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn backup_retention_deletes_exact_cutoff_but_keeps_just_newer() {
         let dir = tempfile::tempdir().unwrap();
@@ -4329,7 +4616,7 @@ name = "general"
         assert!(parent.join(just_newer).exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn backup_retention_deletes_stale_duplicated_legacy_family() {
         let dir = tempfile::tempdir().unwrap();
@@ -4366,6 +4653,35 @@ name = "general"
         let path = dir.path().join("config.toml");
         AppConfig::default().save_with_backup(&path).unwrap();
         assert!(path.is_file());
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn backup_cleanup_preserves_selected_candidate_without_linux_descriptor_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "candidate",
+            )
+            .unwrap();
+        }
+        let oldest = parent.join("config.toml.bak-20000101");
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(oldest).unwrap(), "candidate");
     }
     #[cfg(unix)]
     #[test]
@@ -4532,10 +4848,20 @@ name = "general"
         assert!(error.contains("config was saved; backup retention cleanup remains incomplete"));
         assert!(fs::read_to_string(&path).unwrap().contains("alerts"));
 
-        changed
-            .save_with_backup_at(&path, now, &mut no_delete)
-            .unwrap();
-        assert!(!dir.path().join("config.toml.bak-20100101").exists());
+        #[cfg(target_os = "linux")]
+        {
+            changed
+                .save_with_backup_at(&path, now, &mut no_delete)
+                .unwrap();
+            assert!(!dir.path().join("config.toml.bak-20100101").exists());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            changed
+                .save_with_backup_at(&path, now, &mut no_delete)
+                .unwrap();
+            assert!(dir.path().join("config.toml.bak-20100101").exists());
+        }
     }
 
     #[cfg(unix)]
@@ -4720,6 +5046,161 @@ name = "general"
             )
         );
         assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_path_open_errors_preserve_only_disappearance() {
+        assert_eq!(
+            classify_candidate_path_open_error(io::Error::from_raw_os_error(libc::ENOENT)).unwrap(),
+            CandidateDeletionOutcome::Disappeared
+        );
+
+        for code in [
+            libc::EINTR,
+            libc::EACCES,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::ESTALE,
+            libc::EINVAL,
+        ] {
+            let error =
+                classify_candidate_path_open_error(io::Error::from_raw_os_error(code)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_readability_errors_preserve_only_unreadable_or_unsupported() {
+        assert_eq!(
+            classify_candidate_readability_error(io::Error::from_raw_os_error(libc::EACCES))
+                .unwrap(),
+            CandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
+        );
+        assert_eq!(
+            classify_candidate_readability_error(io::Error::from_raw_os_error(libc::ENOSYS))
+                .unwrap(),
+            CandidateReadability::Preserved(CandidatePreserveReason::ReadabilityProbeUnsupported)
+        );
+
+        for code in [
+            libc::EINVAL,
+            libc::EINTR,
+            libc::EPERM,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::ESTALE,
+        ] {
+            let error = classify_candidate_readability_error(io::Error::from_raw_os_error(code))
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_with_backup_preserves_fifo_replacement_after_preflight_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration as StdDuration;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("config-root");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                format!("original-{day}"),
+            )
+            .unwrap();
+        }
+        let target = parent.join("config.toml.bak-20000101");
+        let moved = parent.join("moved-original");
+        let outside = root.path().join("outside-sentinel");
+        fs::write(&outside, "outside").unwrap();
+
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let expected_config = changed.to_pretty_toml().unwrap().into_bytes();
+        let worker_path = path.clone();
+        let worker_target = target.clone();
+        let worker_moved = moved.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut before_rename = || Ok(());
+            let mut before_snapshot = || Ok(());
+            let mut before_delete = |_: &BackupCandidate| Ok(());
+            let mut after_preflight = |candidate: &BackupCandidate| -> Result<()> {
+                if candidate.path == worker_target {
+                    fs::rename(&worker_target, &worker_moved)?;
+                    let target_name = CString::new(worker_target.as_os_str().as_bytes()).unwrap();
+                    let rc = unsafe { libc::mkfifo(target_name.as_ptr(), 0o600) };
+                    if rc != 0 {
+                        return Err(io::Error::last_os_error().into());
+                    }
+                }
+                Ok(())
+            };
+            let result = changed.save_with_backup_at_candidate_hooks(
+                &worker_path,
+                now,
+                &mut before_rename,
+                &mut before_snapshot,
+                &mut before_delete,
+                &mut after_preflight,
+            );
+            sender.send(result).unwrap();
+        });
+
+        let result = match receiver.recv_timeout(StdDuration::from_secs(2)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let rescue = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(&target)
+                    .unwrap();
+                let rescued = receiver.recv_timeout(StdDuration::from_secs(2));
+                drop(rescue);
+                match rescued {
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        worker.join().unwrap();
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("config save remained blocked after nonblocking FIFO rescue");
+                    }
+                }
+                panic!("config save blocked while verifying a FIFO candidate");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                worker.join().unwrap();
+                panic!("config save worker disconnected before returning a result");
+            }
+        };
+        worker.join().unwrap();
+        result.unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), expected_config);
+        assert!(fs::symlink_metadata(&target).unwrap().file_type().is_fifo());
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "original-1");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
     }
 
     #[cfg(unix)]
@@ -4940,7 +5421,7 @@ name = "general"
         assert!(!fs::read_to_string(&path).unwrap().contains("alerts"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn backup_cleanup_preserves_candidate_replaced_after_final_identity_check() {
         let dir = tempfile::tempdir().unwrap();
@@ -4956,6 +5437,7 @@ name = "general"
         let moved = parent.join("replaced-original");
         let mut replaced = false;
         let mut before_delete = |_: &BackupCandidate| Ok(());
+        let mut after_preflight = |_: &BackupCandidate| Ok(());
         let mut after_check = |candidate: &BackupCandidate| -> Result<()> {
             if !replaced && candidate.path == target {
                 fs::rename(&target, &moved)?;
@@ -4973,6 +5455,7 @@ name = "general"
             &[],
             OffsetDateTime::now_utc(),
             &mut before_delete,
+            &mut after_preflight,
             &mut after_check,
         )
         .unwrap();
