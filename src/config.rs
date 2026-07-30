@@ -2159,6 +2159,8 @@ enum CandidatePreserveReason {
     Unreadable,
     #[cfg(target_os = "linux")]
     CompatibilityProbeUnavailable,
+    #[cfg(target_os = "linux")]
+    ReadLeaseContended,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     UnsupportedPlatform,
 }
@@ -2190,6 +2192,7 @@ thread_local! {
     static FORCE_FACCESSAT2_ENOSYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_FACCESSAT2_EPERM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_PROC_FD_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_PROC_FD_REOPEN_EAGAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn metadata_identity(metadata: &Metadata) -> Option<FileIdentity> {
@@ -2366,12 +2369,14 @@ fn classify_candidate_readability_error(
 fn classify_proc_fd_reopen_error(
     error: io::Error,
 ) -> std::result::Result<CandidateReadability, io::Error> {
-    if matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
-        Ok(CandidateReadability::Preserved(
+    match error.raw_os_error() {
+        Some(libc::EACCES) | Some(libc::EPERM) => Ok(CandidateReadability::Preserved(
             CandidatePreserveReason::Unreadable,
-        ))
-    } else {
-        Err(error)
+        )),
+        Some(libc::EAGAIN) => Ok(CandidateReadability::Preserved(
+            CandidatePreserveReason::ReadLeaseContended,
+        )),
+        _ => Err(error),
     }
 }
 
@@ -2461,6 +2466,10 @@ fn candidate_readability_via_proc_fd(
         ));
     }
 
+    #[cfg(test)]
+    if FORCE_PROC_FD_REOPEN_EAGAIN.with(std::cell::Cell::get) {
+        return classify_proc_fd_reopen_error(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
     let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
     let reopened_fd = unsafe { libc::openat(proc_fd_dir.as_raw_fd(), fd_name.as_ptr(), flags, 0) };
     if reopened_fd < 0 {
@@ -5349,6 +5358,10 @@ name = "general"
                 CandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
             ));
         }
+        assert!(matches!(
+            classify_proc_fd_reopen_error(io::Error::from_raw_os_error(libc::EAGAIN)).unwrap(),
+            CandidateReadability::Preserved(CandidatePreserveReason::ReadLeaseContended)
+        ));
         for code in [
             libc::ENOENT,
             libc::EINVAL,
@@ -5611,6 +5624,36 @@ name = "general"
             assert!(eperm_no_proc.exists());
             FORCE_PROC_FD_UNAVAILABLE.with(|force| force.set(false));
             FORCE_FACCESSAT2_EPERM.with(|force| force.set(false));
+
+            let lease_root = parent.join("lease-save");
+            fs::create_dir(&lease_root).unwrap();
+            let lease_config_path = lease_root.join("config.toml");
+            let lease_initial = AppConfig::default();
+            let mut lease_delete_hook = |_: &BackupCandidate| Ok(());
+            lease_initial
+                .save_with_backup_at(&lease_config_path, now, &mut lease_delete_hook)
+                .unwrap();
+            for day in 1..=11 {
+                fs::write(
+                    lease_root.join(format!("config.toml.bak-200002{day:02}")),
+                    format!("lease-{day}"),
+                )
+                .unwrap();
+            }
+            let lease_candidate = lease_root.join("config.toml.bak-20000201");
+            FORCE_PROC_FD_REOPEN_EAGAIN.with(|force| force.set(true));
+            let mut lease_changed = AppConfig::default();
+            lease_changed.defaults.channel = Some("lease-alerts".into());
+            lease_changed
+                .save_with_backup_at(&lease_config_path, now, &mut lease_delete_hook)
+                .unwrap();
+            let lease_changed_bytes = fs::read(&lease_config_path).unwrap();
+            lease_changed
+                .save_with_backup_at(&lease_config_path, now, &mut lease_delete_hook)
+                .unwrap();
+            assert_eq!(fs::read(&lease_config_path).unwrap(), lease_changed_bytes);
+            assert!(lease_candidate.exists());
+            FORCE_PROC_FD_REOPEN_EAGAIN.with(|force| force.set(false));
             assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
 
             println!("{CHILD_OK}");
