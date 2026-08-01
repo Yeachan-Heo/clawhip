@@ -1528,7 +1528,10 @@ pub async fn list_lane_snapshots(
     registry: &SharedTmuxRegistry,
     session: Option<&str>,
 ) -> Vec<LaneSnapshot> {
-    let runtime = list_tmux_sessions().await.ok();
+    let runtime = match list_tmux_sessions().await.ok() {
+        Some(TmuxSessionInventory::Sessions(sessions)) => Some(sessions),
+        Some(TmuxSessionInventory::NoServer) | None => None,
+    };
     registry
         .read()
         .await
@@ -1758,7 +1761,7 @@ pub async fn tmux_registry_diagnostics(
     drop(snapshot);
 
     let live_probe = match list_tmux_sessions().await {
-        Ok(sessions) => {
+        Ok(TmuxSessionInventory::Sessions(sessions)) => {
             let mut sample = sessions.iter().take(5).cloned().collect::<Vec<_>>();
             sample.sort();
             TmuxLiveProbeDiagnostics {
@@ -1768,6 +1771,12 @@ pub async fn tmux_registry_diagnostics(
                 error: None,
             }
         }
+        Ok(TmuxSessionInventory::NoServer) => TmuxLiveProbeDiagnostics {
+            ok: true,
+            count: 0,
+            sample: Vec::new(),
+            error: None,
+        },
         Err(error) => TmuxLiveProbeDiagnostics {
             ok: false,
             count: 0,
@@ -1791,8 +1800,15 @@ pub async fn list_active_tmux_registrations(
     registry_state_path: &Path,
 ) -> Result<Vec<RegisteredTmuxSession>> {
     match list_tmux_sessions().await {
-        Ok(available_sessions) => {
-            sync_active_config_registrations(config, registry, &available_sessions).await;
+        Ok(inventory) => {
+            let no_server = matches!(inventory, TmuxSessionInventory::NoServer);
+            let available_sessions = match inventory {
+                TmuxSessionInventory::Sessions(sessions) => sessions,
+                TmuxSessionInventory::NoServer => HashSet::new(),
+            };
+            if !no_server {
+                sync_active_config_registrations(config, registry, &available_sessions).await;
+            }
             // Capture a single atomic snapshot of the registry after config
             // reconciliation so the generation captured for each candidate
             // matches the liveness observation.
@@ -1848,8 +1864,9 @@ async fn poll_tmux(
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut TmuxMonitorState,
 ) -> Result<()> {
-    let available_sessions = match list_tmux_sessions().await {
-        Ok(sessions) => Some(sessions),
+    let (available_sessions, definitive_no_server) = match list_tmux_sessions().await {
+        Ok(TmuxSessionInventory::Sessions(sessions)) => (Some(sessions), false),
+        Ok(TmuxSessionInventory::NoServer) => (Some(HashSet::new()), true),
         Err(error) => {
             telemetry::emit(source_record(
                 telemetry::event_name::SOURCE_DEGRADED,
@@ -1858,11 +1875,13 @@ async fn poll_tmux(
                 Some(error.to_string()),
             ));
             eprintln!("clawhip source tmux list-sessions failed: {error}");
-            None
+            (None, false)
         }
     };
-    if let Some(available_sessions) = available_sessions.as_ref() {
-        sync_active_config_registrations(config, registry, available_sessions).await;
+    if !definitive_no_server {
+        if let Some(available_sessions) = available_sessions.as_ref() {
+            sync_active_config_registrations(config, registry, available_sessions).await;
+        }
     }
     let mut sessions = resolve_monitored_sessions(
         config
@@ -1887,6 +1906,16 @@ async fn poll_tmux(
 
         match session_exists(session_name).await {
             Ok(false) => {
+                let preserve_registration = definitive_no_server
+                    && (registration.registration_source == RegistrationSource::ConfigMonitor
+                        || registration.lane.as_ref().is_some_and(|lane| {
+                            lane.workflow != LaneWorkflow::Retired || !lane.quiesced
+                        }));
+                if preserve_registration {
+                    state.pending_keyword_hits.remove(session_name);
+                    state.panes.retain(|_, pane| pane.session != *session_name);
+                    continue;
+                }
                 telemetry::emit(source_record(
                     telemetry::event_name::SOURCE_INVENTORY,
                     "source_missing",
@@ -2483,6 +2512,9 @@ pub(crate) async fn session_exists(session: &str) -> Result<bool> {
     }
 
     let stderr = tmux_stderr(&output.stderr);
+    if is_definitive_no_server(&stderr) {
+        return Ok(false);
+    }
     if stderr == format!("can't find session: {session}") {
         Ok(false)
     } else if stderr.is_empty() {
@@ -2492,7 +2524,13 @@ pub(crate) async fn session_exists(session: &str) -> Result<bool> {
     }
 }
 
-async fn list_tmux_sessions() -> Result<HashSet<String>> {
+#[derive(Debug)]
+enum TmuxSessionInventory {
+    Sessions(HashSet<String>),
+    NoServer,
+}
+
+async fn list_tmux_sessions() -> Result<TmuxSessionInventory> {
     let output = Command::new(tmux_bin())
         .arg("list-sessions")
         .arg("-F")
@@ -2502,17 +2540,20 @@ async fn list_tmux_sessions() -> Result<HashSet<String>> {
     if !output.status.success() {
         let stderr = tmux_stderr(&output.stderr);
         if is_definitive_no_server(&stderr) {
-            return Ok(HashSet::new());
+            return Ok(TmuxSessionInventory::NoServer);
         }
+
         return Err(stderr.into());
     }
 
-    Ok(String::from_utf8(output.stdout)?
-        .lines()
-        .map(str::trim)
-        .filter(|session| !session.is_empty())
-        .map(ToString::to_string)
-        .collect())
+    Ok(TmuxSessionInventory::Sessions(
+        String::from_utf8(output.stdout)?
+            .lines()
+            .map(str::trim)
+            .filter(|session| !session.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+    ))
 }
 
 async fn snapshot_tmux_session(session: &str) -> Result<Vec<TmuxPaneSnapshot>> {
@@ -3620,7 +3661,74 @@ PR created #7",
             }
         }
 
-        assert!(sessions.is_empty());
+        assert!(matches!(sessions, TmuxSessionInventory::NoServer));
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn poll_tmux_prunes_dynamic_but_preserves_config_and_active_lane_on_no_server() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-no-server-poll-stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ncase \"$1\" in\n  list-sessions|has-session) echo 'no server running on /tmp/tmux-1000/default' >&2; exit 1 ;;\n  *) exit 1 ;;\nesac\n",
+        )
+        .expect("write tmux no-server poll stub");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux no-server poll stub");
+
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut dynamic = registration(Vec::new());
+        dynamic.session = "dynamic-stale".into();
+        dynamic.registration_source = RegistrationSource::CliWatch;
+        registry
+            .write()
+            .await
+            .insert(dynamic.session.clone(), dynamic);
+        let mut config_registration = registration(Vec::new());
+        config_registration.session = "config-preserved".into();
+        config_registration.registration_source = RegistrationSource::ConfigMonitor;
+        registry
+            .write()
+            .await
+            .insert(config_registration.session.clone(), config_registration);
+        register_lane_registration(&registry, &path, lane_input("active-lane", "g1"))
+            .await
+            .unwrap();
+
+        let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
+        unsafe {
+            std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
+        }
+        let (tx, _rx) = mpsc::channel(4);
+        let result = poll_tmux(
+            &AppConfig::default(),
+            &registry,
+            &path,
+            &tx,
+            &mut TmuxMonitorState::default(),
+        )
+        .await;
+        unsafe {
+            match prior_tmux_bin {
+                Some(value) => std::env::set_var("CLAWHIP_TMUX_BIN", value),
+                None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+            }
+        }
+        result.unwrap();
+
+        let snapshot = registry.read().await;
+        assert!(!snapshot.contains_key("dynamic-stale"));
+        assert!(snapshot.contains_key("config-preserved"));
+        assert!(snapshot.contains_key("active-lane"));
+        drop(snapshot);
+        let persisted: BTreeMap<String, StoredTmuxRegistration> =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert!(!persisted.contains_key("dynamic-stale"));
+        assert!(persisted.contains_key("active-lane"));
     }
 
     #[tokio::test]
