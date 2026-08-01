@@ -24,20 +24,24 @@ use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
 use crate::source::tmux::{
+    AbsentRegistrationCandidate, prune_absent_dynamic_registrations, session_exists,
+};
+use crate::source::tmux::{
     BoundedCategory, BoundedReason, LaneDeliveryMutation, LaneEvidenceMutation, LaneLaunchState,
     LaneRegistrationInput, LaneRetirementMutation, LaneVerificationMutation, LaneVisibility,
     LaneWorkflow, LaneWorkflowMutation, claim_lane, lane_detail_for_session, list_lane_snapshots,
     record_lane_delivery, record_lane_verification, register_lane_registration,
     retire_lane_if_absent, update_lane_evidence, update_lane_workflow,
 };
+
 use crate::source::{
     GitHubSource, GitMonitorLifecycleCounts, GitSource, RegisteredTmuxSession,
     SharedGitMonitorDiagnostics, SharedTmuxRegistry, Source, SubscriptionSnapshot,
     SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
     default_registry_state_path, inspect_tmux_registry_state, list_active_tmux_registrations,
     load_tmux_registry_state, new_shared_git_monitor_diagnostics,
-    register_runtime_tmux_registration, remove_tmux_registrations,
-    snapshot_git_monitor_diagnostics, tmux_registry_diagnostics,
+    register_runtime_tmux_registration, snapshot_git_monitor_diagnostics,
+    tmux_registry_diagnostics,
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
@@ -1236,20 +1240,58 @@ async fn expire_terminal_tmux_registration(state: &AppState, event: &IncomingEve
         return;
     }
 
-    let candidates = terminal_session_candidates(&event.payload);
-    if candidates.is_empty() {
+    let candidate_sessions = terminal_session_candidates(&event.payload);
+    if candidate_sessions.is_empty() {
+        return;
+    }
+
+    let observed_candidates = {
+        let snapshot = state.tmux_registry.read().await;
+        candidate_sessions
+            .iter()
+            .filter_map(|session| {
+                snapshot
+                    .get(session)
+                    .filter(|registration| registration.lane.is_none())
+                    .map(|registration| AbsentRegistrationCandidate {
+                        session: session.clone(),
+                        registration_generation: registration.registration_generation,
+                    })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut absent_candidates = Vec::new();
+    for candidate in observed_candidates {
+        match session_exists(&candidate.session).await {
+            Ok(false) => absent_candidates.push(candidate),
+            Ok(true) => {}
+            Err(error) => {
+                eprintln!(
+                    "clawhip tmux terminal expiry liveness probe failed for {}: {error}",
+                    candidate.session
+                );
+                return;
+            }
+        }
+    }
+    if absent_candidates.is_empty() {
         return;
     }
 
     let registry_state_path = default_registry_state_path(&state.cron_state_path);
-    match remove_tmux_registrations(&state.tmux_registry, &registry_state_path, &candidates).await {
+    match prune_absent_dynamic_registrations(
+        &state.tmux_registry,
+        &registry_state_path,
+        &absent_candidates,
+    )
+    .await
+    {
         Ok(removed) => {
             if removed > 0 {
-                for session in candidates {
-                    telemetry::emit(tmux_terminal_expiry_record(&session));
-                }
+                telemetry::emit(tmux_terminal_expiry_record(removed));
             }
         }
+
         Err(error) => {
             eprintln!("clawhip tmux registry expiry save failed: {error}");
         }
@@ -1263,14 +1305,14 @@ fn is_terminal_session_event(kind: &str) -> bool {
     )
 }
 
-fn tmux_terminal_expiry_record(session: &str) -> serde_json::Map<String, Value> {
+fn tmux_terminal_expiry_record(removed_count: usize) -> serde_json::Map<String, Value> {
     let mut record = telemetry::record(
         telemetry::event_name::SOURCE_INVENTORY,
         "terminal_session_expired",
-        format!("source:tmux:{session}"),
+        "source:tmux:terminal",
     );
     record.insert("source".to_string(), json!("tmux"));
-    record.insert("session".to_string(), json!(session));
+    record.insert("removed_count".to_string(), json!(removed_count));
     record
 }
 
@@ -2003,8 +2045,11 @@ mod tests {
     use crate::sink::SinkTarget;
     use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
+    #[cfg(unix)]
+    use serial_test::serial;
     use std::fs;
     use tempfile::tempdir;
+
     use tokio::time::{Duration, timeout};
 
     fn native_hook_test_state() -> (AppState, mpsc::Receiver<IncomingEvent>) {
@@ -2478,6 +2523,8 @@ mod tests {
             .insert(path[path.len() - 1].to_string(), Value::String(value));
     }
 
+    #[cfg(unix)]
+    #[serial]
     #[tokio::test]
     async fn accepted_terminal_session_event_expires_matching_tmux_registration() {
         let (tx, mut rx) = mpsc::channel(1);
@@ -2491,6 +2538,19 @@ mod tests {
             .await
             .insert("still-active".into(), tmux_registration("still-active"));
         let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-expiry-stub.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then exit 1; fi\nexit 1\n",
+        )
+        .expect("write tmux expiry stub");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux expiry stub");
+        let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
+        unsafe {
+            std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
+        }
         let state = AppState {
             config: Arc::new(AppConfig::default()),
             port: 25294,
@@ -2527,9 +2587,18 @@ mod tests {
             rx.recv().await.expect("queued event").kind,
             "session.finished"
         );
-        let registry = registry.read().await;
-        assert!(!registry.contains_key("issue-221"));
-        assert!(registry.contains_key("still-active"));
+        {
+            let registry = registry.read().await;
+            assert!(!registry.contains_key("issue-221"));
+            assert!(registry.contains_key("still-active"));
+        }
+        unsafe {
+            match prior_tmux_bin {
+                Some(value) => std::env::set_var("CLAWHIP_TMUX_BIN", value),
+                None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+            }
+        }
+        let _ = fs::remove_file(stub);
     }
 
     #[tokio::test]
@@ -3796,11 +3865,16 @@ mod tests {
                 lane: None,
             },
         );
+        registry
+            .write()
+            .await
+            .insert("stale-wrapper".into(), tmux_registration("stale-wrapper"));
+
         let state = AppState {
             config: Arc::new(AppConfig::default()),
             port: 25294,
             tx,
-            tmux_registry: registry,
+            tmux_registry: registry.clone(),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
@@ -3830,6 +3904,7 @@ mod tests {
             registrations[0]["parent_process"]["name"],
             Value::from("codex")
         );
+        assert!(!registry.read().await.contains_key("stale-wrapper"));
         // Safety: single-threaded test context; restore prior env state.
         unsafe {
             match &prior_tmux_bin {

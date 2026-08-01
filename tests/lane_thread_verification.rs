@@ -1034,6 +1034,69 @@ fn legacy_registry_projection_is_loaded_without_lane_private_fields() {
 
 #[test]
 #[serial]
+fn restart_reconciles_stale_terminal_watch_registry_without_duplicate_live_watch() {
+    let temp = TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let config_path = temp.path().join("config.toml");
+    let state = temp.path().join("tmux");
+    let tmux = temp.path().join("tmux.sh");
+    fs::create_dir_all(&home).expect("home");
+    fake_tmux(&tmux, &state);
+    write_file(&state.join("session"), "live-watch");
+    write_file(&state.join("live"), "1");
+    config(&config_path, free_port());
+    write_file(
+        &registry_path(&config_path),
+        &json!({
+            "stale-watch": {
+                "session": "stale-watch",
+                "channel": "alerts",
+                "mention": null,
+                "keywords": ["owner-endpoint-unreachable"],
+                "keyword_window_secs": 30,
+                "stale_minutes": 60,
+                "format": "compact",
+                "registered_at": "2026-08-01T00:00:00Z",
+                "registration_source": "cli-watch",
+                "parent_process": null,
+                "registration_generation": 7,
+                "active_wrapper_monitor": true
+            },
+            "live-watch": {
+                "session": "live-watch",
+                "channel": "alerts",
+                "mention": null,
+                "keywords": ["owner-endpoint-unreachable"],
+                "keyword_window_secs": 30,
+                "stale_minutes": 60,
+                "format": "compact",
+                "registered_at": "2026-08-01T00:00:01Z",
+                "registration_source": "cli-watch",
+                "parent_process": null,
+                "registration_generation": 8,
+                "active_wrapper_monitor": true
+            }
+        })
+        .to_string(),
+    );
+    let discord = MockDiscord::start("success");
+    let port = free_port();
+    config(&config_path, port);
+    let _daemon = start(&config_path, &home, &tmux, &discord, port);
+
+    let listed = lane_command(&config_path, &home, &tmux, &discord, &["tmux", "list"]);
+    successful(&listed);
+    let public = String::from_utf8_lossy(&listed.stdout);
+    assert!(public.contains("live-watch"));
+    assert!(!public.contains("stale-watch"));
+
+    let persisted = registry(&config_path);
+    assert!(persisted.get("stale-watch").is_none());
+    assert!(persisted.get("live-watch").is_some());
+}
+
+#[test]
+#[serial]
 fn absent_lane_can_retire_then_replace_while_old_generation_is_fenced() {
     let temp = TempDir::new().expect("temp");
     let home = temp.path().join("home");

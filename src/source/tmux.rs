@@ -1152,8 +1152,9 @@ pub async fn remove_tmux_registrations(
             registration
                 .lane
                 .as_ref()
-                .is_none_or(|lane| lane.workflow == LaneWorkflow::Retired)
+                .is_none_or(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced)
         });
+
         if removable && next.remove(session).is_some() {
             removed += 1;
         }
@@ -1176,9 +1177,9 @@ pub struct AbsentRegistrationCandidate {
     pub registration_generation: u64,
 }
 
-/// Prune daemon-owned dynamic registrations (cli-watch / cli-new) whose tmux
-/// session has been observed absent. Only non-lane entries are eligible;
-/// lane-bearing registrations are preserved regardless of liveness to avoid
+/// Prune daemon-owned dynamic registrations and explicitly retired/quiesced
+/// lane registrations whose tmux session has been observed absent. Active and
+/// handoff lane evidence is preserved regardless of liveness to avoid
 /// destroying in-flight R0/R1/R2 lane evidence that is expected to exist
 /// before the tmux session is created.
 ///
@@ -1201,8 +1202,12 @@ pub async fn prune_absent_dynamic_registrations(
         let removable = next.get(&candidate.session).is_some_and(|registration| {
             registration.registration_generation == candidate.registration_generation
                 && registration.registration_source != RegistrationSource::ConfigMonitor
-                && registration.lane.is_none()
+                && registration
+                    .lane
+                    .as_ref()
+                    .is_none_or(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced)
         });
+
         if removable && next.remove(&candidate.session).is_some() {
             if first_removed.is_none() {
                 first_removed = Some(candidate.session.as_str());
@@ -1792,28 +1797,33 @@ pub async fn list_active_tmux_registrations(
             // reconciliation so the generation captured for each candidate
             // matches the liveness observation.
             let snapshot = registry.read().await;
-            let stale_sessions: Vec<String> = snapshot
-                .iter()
-                .filter(|(session, registration)| {
-                    registration.active_wrapper_monitor && !available_sessions.contains(*session)
-                })
-                .map(|(session, _)| session.clone())
-                .collect();
-            let orphaned_candidates: Vec<AbsentRegistrationCandidate> = snapshot
+            let retired_lane_candidates: Vec<AbsentRegistrationCandidate> = snapshot
                 .iter()
                 .filter(|(session, registration)| {
                     !available_sessions.contains(*session)
-                        && registration.registration_source != RegistrationSource::ConfigMonitor
-                        && registration.lane.is_none()
-                        && !registration.active_wrapper_monitor
+                        && registration.lane.as_ref().is_some_and(|lane| {
+                            lane.workflow == LaneWorkflow::Retired && lane.quiesced
+                        })
                 })
                 .map(|(session, registration)| AbsentRegistrationCandidate {
                     session: session.clone(),
                     registration_generation: registration.registration_generation,
                 })
                 .collect();
+            let mut orphaned_candidates: Vec<AbsentRegistrationCandidate> = snapshot
+                .iter()
+                .filter(|(session, registration)| {
+                    !available_sessions.contains(*session)
+                        && registration.registration_source != RegistrationSource::ConfigMonitor
+                        && registration.lane.is_none()
+                })
+                .map(|(session, registration)| AbsentRegistrationCandidate {
+                    session: session.clone(),
+                    registration_generation: registration.registration_generation,
+                })
+                .collect();
+            orphaned_candidates.extend(retired_lane_candidates);
             drop(snapshot);
-            remove_tmux_registrations(registry, registry_state_path, &stale_sessions).await?;
             prune_absent_dynamic_registrations(registry, registry_state_path, &orphaned_candidates)
                 .await?;
         }
@@ -1883,9 +1893,12 @@ async fn poll_tmux(
                     Some(session_name),
                     None,
                 ));
+                let retired_lane = registration
+                    .lane
+                    .as_ref()
+                    .is_some_and(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced);
                 if registration.registration_source != RegistrationSource::ConfigMonitor
-                    && registration.lane.is_none()
-                    && !registration.active_wrapper_monitor
+                    && (registration.lane.is_none() || retired_lane)
                 {
                     dynamic_prune_candidates.push(AbsentRegistrationCandidate {
                         session: session_name.clone(),
@@ -4227,7 +4240,8 @@ error: failed";
             registration_source: RegistrationSource::CliWatch,
             parent_process: None,
             registration_generation: 0,
-            active_wrapper_monitor: false,
+            active_wrapper_monitor: true,
+
             lane: None,
         };
         registry
@@ -4386,6 +4400,80 @@ error: failed";
         assert_eq!(removed, 0);
         assert!(registry.read().await.get("lane-session").is_some());
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn remove_tmux_registrations_requires_quiesced_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        register_lane_registration(&registry, &path, lane_input("retained-lane", "g"))
+            .await
+            .unwrap();
+        {
+            let mut snapshot = registry.write().await;
+            let lane = snapshot
+                .get_mut("retained-lane")
+                .and_then(|registration| registration.lane.as_mut())
+                .unwrap();
+            lane.workflow = LaneWorkflow::Retired;
+            assert!(!lane.quiesced);
+        }
+
+        assert_eq!(
+            remove_tmux_registrations(&registry, &path, &["retained-lane".into()])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(registry.read().await.contains_key("retained-lane"));
+
+        registry
+            .write()
+            .await
+            .get_mut("retained-lane")
+            .and_then(|registration| registration.lane.as_mut())
+            .unwrap()
+            .quiesced = true;
+        assert_eq!(
+            remove_tmux_registrations(&registry, &path, &["retained-lane".into()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!registry.read().await.contains_key("retained-lane"));
+    }
+
+    #[tokio::test]
+    async fn prune_absent_dynamic_removes_retired_quiesced_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        register_lane_registration(&registry, &path, lane_input("retired-lane", "g2"))
+            .await
+            .unwrap();
+        let generation = {
+            let mut snapshot = registry.write().await;
+            let registration = snapshot.get_mut("retired-lane").unwrap();
+            let generation = registration.registration_generation;
+            let lane = registration.lane.as_mut().unwrap();
+            lane.workflow = LaneWorkflow::Retired;
+            lane.quiesced = true;
+            generation
+        };
+
+        let removed = prune_absent_dynamic_registrations(
+            &registry,
+            &path,
+            &[AbsentRegistrationCandidate {
+                session: "retired-lane".into(),
+                registration_generation: generation,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!registry.read().await.contains_key("retired-lane"));
     }
 
     #[tokio::test]
