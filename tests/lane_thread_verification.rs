@@ -292,7 +292,7 @@ mkdir -p "$S"
 printf '%s\n' "$1" >> "$S/calls"
 case "$1" in
   new-session) test -f "$S/fail_new_session" && exit 1; session=""; while [ $# -gt 0 ]; do case "$1" in -s) session="$2"; shift 2 ;; *) shift ;; esac; done; printf '%s' "$session" > "$S/session"; printf '1' > "$S/live" ;;
-  has-session) test -f "$S/live" ;;
+  has-session) target="${{3#=}}"; if test -f "$S/live"; then if test -f "$S/strict_has_session" && test "$target" != "$(cat "$S/session")"; then echo "can't find session: $target" >&2; exit 1; fi; exit 0; else echo "can't find session: $target" >&2; exit 1; fi ;;
   set-option) key="$4"; value="$5"; test "$key" = "@clawhip_lane_generation" && test -f "$S/fail_generation_set" && exit 1; printf '%s' "$value" > "$S/${{key#@}}"; test "$key" = "@clawhip_lane_generation" && test -f "$S/mismatch_generation" && printf 'different-generation' > "$S/${{key#@}}" ;;
   show-options) key="$5"; safe="${{key#@}}"; test -f "$S/unreadable_$safe" && exit 1; file="$S/$safe"; if test -f "$file"; then printf '%s\n' "$(cat "$file")"; else echo 'invalid option' >&2; exit 1; fi ;;
   send-keys) test "${{4:-}}" = "-l" || printf '1' >> "$S/sends" ;;
@@ -1030,6 +1030,100 @@ fn legacy_registry_projection_is_loaded_without_lane_private_fields() {
     assert!(public.contains("legacy-session"));
     assert!(!public.contains("thread_id"));
     assert!(!public.contains("123456789012345678"));
+}
+
+#[test]
+#[serial]
+fn restart_reconciles_stale_terminal_watch_registry_without_duplicate_live_watch() {
+    let temp = TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let config_path = temp.path().join("config.toml");
+    let state = temp.path().join("tmux");
+    let tmux = temp.path().join("tmux.sh");
+    fs::create_dir_all(&home).expect("home");
+    fake_tmux(&tmux, &state);
+    write_file(&state.join("session"), "live-watch");
+    write_file(&state.join("live"), "1");
+    config(&config_path, free_port());
+    write_file(
+        &registry_path(&config_path),
+        &json!({
+            "stale-watch": {
+                "session": "stale-watch",
+                "channel": "alerts",
+                "mention": null,
+                "keywords": ["owner-endpoint-unreachable"],
+                "keyword_window_secs": 30,
+                "stale_minutes": 60,
+                "format": "compact",
+                "registered_at": "2026-08-01T00:00:00Z",
+                "registration_source": "cli-watch",
+                "parent_process": null,
+                "registration_generation": 7,
+                "active_wrapper_monitor": true
+            },
+            "live-watch": {
+                "session": "live-watch",
+                "channel": "alerts",
+                "mention": null,
+                "keywords": ["owner-endpoint-unreachable"],
+                "keyword_window_secs": 30,
+                "stale_minutes": 60,
+                "format": "compact",
+                "registered_at": "2026-08-01T00:00:01Z",
+                "registration_source": "cli-watch",
+                "parent_process": null,
+                "registration_generation": 8,
+                "active_wrapper_monitor": true
+            }
+        })
+        .to_string(),
+    );
+    let discord = MockDiscord::start("success");
+    let port = free_port();
+    config(&config_path, port);
+    let mut config_contents = fs::read_to_string(&config_path).expect("read config");
+    config_contents.push_str("\n[monitors]\npoll_interval_secs = 1\n");
+    write_file(&config_path, &config_contents);
+    write_file(&state.join("strict_has_session"), "1");
+
+    let _daemon = start(&config_path, &home, &tmux, &discord, port);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(content) = fs::read_to_string(registry_path(&config_path))
+            && let Ok(persisted) = serde_json::from_str::<Value>(&content)
+            && persisted.get("stale-watch").is_none()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let reconciled = registry(&config_path);
+    assert!(reconciled.get("stale-watch").is_none());
+    assert!(reconciled.get("live-watch").is_some());
+
+    let listed = lane_command(&config_path, &home, &tmux, &discord, &["tmux", "list"]);
+    successful(&listed);
+    let public = String::from_utf8_lossy(&listed.stdout);
+    assert!(public.contains("live-watch"));
+    assert!(!public.contains("stale-watch"));
+
+    let persisted = registry(&config_path);
+    assert!(persisted.get("stale-watch").is_none());
+    assert!(persisted.get("live-watch").is_some());
+    let baseline = fs::read_to_string(state.join("calls")).unwrap_or_default();
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(registry(&config_path), reconciled);
+    assert_eq!(
+        command_count(&calls_after(&state, &baseline), "new-session"),
+        0
+    );
+
+    let listed_again = lane_command(&config_path, &home, &tmux, &discord, &["tmux", "list"]);
+    successful(&listed_again);
+    let public_again = String::from_utf8_lossy(&listed_again.stdout);
+    assert!(public_again.contains("live-watch"));
+    assert!(!public_again.contains("stale-watch"));
 }
 
 #[test]

@@ -240,6 +240,18 @@ fn should_ignore_launcher_line(line: &str) -> bool {
     LAUNCHER_NOISE_PATTERNS
         .iter()
         .any(|pattern| trimmed.contains(pattern))
+        || is_tmux_watch_command_echo(trimmed)
+}
+
+fn is_tmux_watch_command_echo(line: &str) -> bool {
+    let command = line
+        .strip_prefix("$ ")
+        .or_else(|| line.strip_prefix("% "))
+        .or_else(|| line.strip_prefix("> "))
+        .unwrap_or(line);
+    command.starts_with("clawhip tmux watch ")
+        && (command.contains(" --session ") || command.contains(" -s "))
+        && command.contains(" --keywords ")
 }
 
 fn appended_lines_with_cursors<'a>(previous: &'a str, current: &'a str) -> Vec<(usize, &'a str)> {
@@ -363,6 +375,55 @@ mod tests {
             vec![KeywordHit {
                 keyword: "error".into(),
                 line: "error: real failure".into(),
+                provenance: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_ignores_detached_watch_command_but_keeps_owner_failure() {
+        let hits = collect_keyword_hits_with_provenance(
+            "boot",
+            "boot
+$ clawhip tmux watch --session clawhip-issue-299 --stale-minutes 60 --keywords owner-endpoint-unreachable
+owner-endpoint-unreachable: runtime owner failed
+good output",
+            &["owner-endpoint-unreachable".into()],
+            KeywordMatchProvenance {
+                pane_id: "%29".into(),
+                pane_name: "0.0".into(),
+                cursor: None,
+                source: KeywordMatchSource::FreshOutput,
+            },
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].keyword, "owner-endpoint-unreachable");
+        assert_eq!(
+            hits[0].line,
+            "owner-endpoint-unreachable: runtime owner failed"
+        );
+        assert_eq!(
+            hits[0].provenance.as_ref().and_then(|value| value.cursor),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_ignores_short_form_detached_watch_command() {
+        let hits = collect_keyword_hits(
+            "boot",
+            "boot
+clawhip tmux watch -s clawhip-issue-299 --keywords owner-endpoint-unreachable
+owner-endpoint-unreachable: runtime owner failed",
+            &["owner-endpoint-unreachable".into()],
+        );
+
+        assert_eq!(
+            hits,
+            vec![KeywordHit {
+                keyword: "owner-endpoint-unreachable".into(),
+                line: "owner-endpoint-unreachable: runtime owner failed".into(),
                 provenance: None,
             }]
         );
