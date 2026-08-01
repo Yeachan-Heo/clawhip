@@ -2475,7 +2475,7 @@ pub(crate) async fn session_exists(session: &str) -> Result<bool> {
     let output = Command::new(tmux_bin())
         .arg("has-session")
         .arg("-t")
-        .arg(session)
+        .arg(format!("={session}"))
         .output()
         .await?;
     if output.status.success() {
@@ -2596,6 +2596,8 @@ mod tests {
     use super::*;
     use crate::event::{EventBody, compat::from_incoming_event};
     use crate::keyword_window::{KeywordHit, collect_keyword_hits};
+    use serial_test::serial;
+    use tempfile::tempdir;
 
     fn registration(keywords: Vec<&str>) -> RegisteredTmuxSession {
         RegisteredTmuxSession {
@@ -3551,6 +3553,36 @@ PR created #7",
     fn default_registry_state_path_sits_beside_cron_state() {
         let path = default_registry_state_path(Path::new("/tmp/clawhip/cron-state.json"));
         assert_eq!(path, PathBuf::from("/tmp/clawhip/tmux-watch-registry.json"));
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn session_exists_requires_exact_job_target_not_job_old_prefix() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-prefix-stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then\n  if [ \"$3\" = \"job\" ]; then exit 0; fi\n  if [ \"$3\" = \"=job\" ]; then echo \"can't find session: job\" >&2; exit 1; fi\nfi\nexit 1\n",
+        )
+        .expect("write tmux prefix stub");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux prefix stub");
+
+        let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
+        unsafe {
+            std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
+        }
+        let live = session_exists("job").await.unwrap();
+        unsafe {
+            match prior_tmux_bin {
+                Some(value) => std::env::set_var("CLAWHIP_TMUX_BIN", value),
+                None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+            }
+        }
+
+        assert!(!live, "job must not match the live job-old prefix");
     }
 
     #[tokio::test]

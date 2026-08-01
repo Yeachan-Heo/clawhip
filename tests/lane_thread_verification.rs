@@ -292,7 +292,7 @@ mkdir -p "$S"
 printf '%s\n' "$1" >> "$S/calls"
 case "$1" in
   new-session) test -f "$S/fail_new_session" && exit 1; session=""; while [ $# -gt 0 ]; do case "$1" in -s) session="$2"; shift 2 ;; *) shift ;; esac; done; printf '%s' "$session" > "$S/session"; printf '1' > "$S/live" ;;
-  has-session) if test -f "$S/live"; then if test -f "$S/strict_has_session" && test "$3" != "$(cat "$S/session")"; then echo "can't find session: $3" >&2; exit 1; fi; exit 0; else echo "can't find session: ${{3:-unknown}}" >&2; exit 1; fi ;;
+  has-session) target="${{3#=}}"; if test -f "$S/live"; then if test -f "$S/strict_has_session" && test "$target" != "$(cat "$S/session")"; then echo "can't find session: $target" >&2; exit 1; fi; exit 0; else echo "can't find session: $target" >&2; exit 1; fi ;;
   set-option) key="$4"; value="$5"; test "$key" = "@clawhip_lane_generation" && test -f "$S/fail_generation_set" && exit 1; printf '%s' "$value" > "$S/${{key#@}}"; test "$key" = "@clawhip_lane_generation" && test -f "$S/mismatch_generation" && printf 'different-generation' > "$S/${{key#@}}" ;;
   show-options) key="$5"; safe="${{key#@}}"; test -f "$S/unreadable_$safe" && exit 1; file="$S/$safe"; if test -f "$file"; then printf '%s\n' "$(cat "$file")"; else echo 'invalid option' >&2; exit 1; fi ;;
   send-keys) test "${{4:-}}" = "-l" || printf '1' >> "$S/sends" ;;
