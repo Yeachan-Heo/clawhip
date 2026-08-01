@@ -250,7 +250,7 @@ fn is_tmux_watch_command_echo(line: &str) -> bool {
         .or_else(|| line.strip_prefix("> "))
         .unwrap_or(line);
     command.starts_with("clawhip tmux watch ")
-        && command.contains(" --session ")
+        && (command.contains(" --session ") || command.contains(" -s "))
         && command.contains(" --keywords ")
 }
 
@@ -406,6 +406,26 @@ good output",
         assert_eq!(
             hits[0].provenance.as_ref().and_then(|value| value.cursor),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_ignores_short_form_detached_watch_command() {
+        let hits = collect_keyword_hits(
+            "boot",
+            "boot
+clawhip tmux watch -s clawhip-issue-299 --keywords owner-endpoint-unreachable
+owner-endpoint-unreachable: runtime owner failed",
+            &["owner-endpoint-unreachable".into()],
+        );
+
+        assert_eq!(
+            hits,
+            vec![KeywordHit {
+                keyword: "owner-endpoint-unreachable".into(),
+                line: "owner-endpoint-unreachable: runtime owner failed".into(),
+                provenance: None,
+            }]
         );
     }
 
