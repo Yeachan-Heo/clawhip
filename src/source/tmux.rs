@@ -2500,7 +2500,11 @@ async fn list_tmux_sessions() -> Result<HashSet<String>> {
         .output()
         .await?;
     if !output.status.success() {
-        return Err(tmux_stderr(&output.stderr).into());
+        let stderr = tmux_stderr(&output.stderr);
+        if is_definitive_no_server(&stderr) {
+            return Ok(HashSet::new());
+        }
+        return Err(stderr.into());
     }
 
     Ok(String::from_utf8(output.stdout)?
@@ -2579,6 +2583,10 @@ pub(crate) fn tmux_bin() -> String {
 
 fn tmux_stderr(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
+}
+
+fn is_definitive_no_server(stderr: &str) -> bool {
+    stderr.starts_with("no server running on ")
 }
 
 fn default_keyword_window_secs() -> u64 {
@@ -3585,6 +3593,36 @@ PR created #7",
         assert!(!live, "job must not match the live job-old prefix");
     }
 
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn list_tmux_sessions_converges_definitive_no_server_to_empty_inventory() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-no-server-stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"list-sessions\" ]; then echo 'no server running on /tmp/tmux-1000/default' >&2; exit 1; fi\nexit 1\n",
+        )
+        .expect("write tmux no-server stub");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux no-server stub");
+
+        let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
+        unsafe {
+            std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
+        }
+        let sessions = list_tmux_sessions().await.unwrap();
+        unsafe {
+            match prior_tmux_bin {
+                Some(value) => std::env::set_var("CLAWHIP_TMUX_BIN", value),
+                None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+            }
+        }
+
+        assert!(sessions.is_empty());
+    }
+
     #[tokio::test]
     async fn runtime_registry_persistence_filters_config_entries_and_normalizes_source() {
         let dir = tempfile::tempdir().unwrap();
@@ -4248,6 +4286,17 @@ error: failed";
     }
 
     #[test]
+    fn definitive_no_server_is_safe_absence_but_other_failures_are_unknown() {
+        assert!(is_definitive_no_server(
+            "no server running on /tmp/tmux-1000/default"
+        ));
+        assert!(!is_definitive_no_server(
+            "failed to connect to server: Connection refused"
+        ));
+        assert!(!is_definitive_no_server("can't find session: worker"));
+    }
+
+    #[test]
     fn pane_dead_suppresses_stale_alert() {
         let pane = TmuxPaneState {
             session: "test".into(),
@@ -4369,6 +4418,10 @@ error: failed";
             lane: None,
         };
         registry.write().await.insert("re-reg".into(), registration);
+        save_durable_tmux_registry(&path, &registry.read().await.clone())
+            .await
+            .unwrap();
+
         // Stale candidate has generation 5 (old observation).
         let candidates = vec![AbsentRegistrationCandidate {
             session: "re-reg".into(),
@@ -4379,6 +4432,9 @@ error: failed";
             .unwrap();
         assert_eq!(removed, 0);
         assert!(registry.read().await.get("re-reg").is_some());
+        let persisted: BTreeMap<String, StoredTmuxRegistration> =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(persisted["re-reg"].registration.registration_generation, 42);
         let _ = tokio::fs::remove_file(&path).await;
     }
 
