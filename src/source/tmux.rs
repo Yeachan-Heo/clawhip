@@ -1878,10 +1878,8 @@ async fn poll_tmux(
             (None, false)
         }
     };
-    if !definitive_no_server {
-        if let Some(available_sessions) = available_sessions.as_ref() {
-            sync_active_config_registrations(config, registry, available_sessions).await;
-        }
+    if !definitive_no_server && let Some(available_sessions) = available_sessions.as_ref() {
+        sync_active_config_registrations(config, registry, available_sessions).await;
     }
     let mut sessions = resolve_monitored_sessions(
         config
