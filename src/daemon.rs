@@ -2045,8 +2045,8 @@ mod tests {
     use crate::sink::SinkTarget;
     use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
-    #[cfg(unix)]
     use serial_test::serial;
+
     use std::fs;
     use tempfile::tempdir;
 
@@ -3867,6 +3867,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "non-git payload should not enqueue");
     }
 
+    #[serial]
     #[tokio::test]
     async fn list_tmux_returns_registered_sessions_with_metadata() {
         // Use a stub tmux binary that reports issue-105 as a live session so
