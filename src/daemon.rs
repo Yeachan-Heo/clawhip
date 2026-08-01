@@ -2600,7 +2600,8 @@ mod tests {
         let stub = dir.path().join("tmux-expiry-stub.sh");
         fs::write(
             &stub,
-            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then exit 1; fi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then echo \"can't find session: issue-221\" >&2; exit 1; fi\nexit 1\n",
+
         )
         .expect("write tmux expiry stub");
         use std::os::unix::fs::PermissionsExt;
@@ -2633,6 +2634,23 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let missing_tmux = dir.path().join("missing-tmux");
         assert_terminal_event_registry_presence(&missing_tmux, true).await;
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn accepted_terminal_session_event_preserves_registration_on_unknown_probe_status() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-unknown-stub.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then echo \"tmux server unavailable\" >&2; exit 1; fi\nexit 1\n",
+        )
+        .expect("write tmux unknown stub");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux unknown stub");
+        assert_terminal_event_registry_presence(&stub, true).await;
     }
 
     #[tokio::test]

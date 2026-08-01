@@ -2478,7 +2478,18 @@ pub(crate) async fn session_exists(session: &str) -> Result<bool> {
         .arg(session)
         .output()
         .await?;
-    Ok(output.status.success())
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = tmux_stderr(&output.stderr);
+    if stderr == format!("can't find session: {session}") {
+        Ok(false)
+    } else if stderr.is_empty() {
+        Err("tmux has-session failed without diagnostics".into())
+    } else {
+        Err(stderr.into())
+    }
 }
 
 async fn list_tmux_sessions() -> Result<HashSet<String>> {
