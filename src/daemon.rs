@@ -2524,9 +2524,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[serial]
-    #[tokio::test]
-    async fn accepted_terminal_session_event_expires_matching_tmux_registration() {
+    async fn assert_terminal_event_registry_presence(
+        tmux_bin: &std::path::Path,
+        expected_present: bool,
+    ) {
         let (tx, mut rx) = mpsc::channel(1);
         let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
         registry
@@ -2538,18 +2539,9 @@ mod tests {
             .await
             .insert("still-active".into(), tmux_registration("still-active"));
         let dir = tempdir().expect("tempdir");
-        let stub = dir.path().join("tmux-expiry-stub.sh");
-        fs::write(
-            &stub,
-            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then exit 1; fi\nexit 1\n",
-        )
-        .expect("write tmux expiry stub");
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
-            .expect("chmod tmux expiry stub");
         let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
         unsafe {
-            std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
+            std::env::set_var("CLAWHIP_TMUX_BIN", tmux_bin);
         }
         let state = AppState {
             config: Arc::new(AppConfig::default()),
@@ -2589,7 +2581,7 @@ mod tests {
         );
         {
             let registry = registry.read().await;
-            assert!(!registry.contains_key("issue-221"));
+            assert_eq!(registry.contains_key("issue-221"), expected_present);
             assert!(registry.contains_key("still-active"));
         }
         unsafe {
@@ -2598,7 +2590,49 @@ mod tests {
                 None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
             }
         }
-        let _ = fs::remove_file(stub);
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn accepted_terminal_session_event_expires_matching_tmux_registration() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-expiry-stub.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then exit 1; fi\nexit 1\n",
+        )
+        .expect("write tmux expiry stub");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux expiry stub");
+        assert_terminal_event_registry_presence(&stub, false).await;
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn accepted_terminal_session_event_preserves_live_tmux_registration() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-live-stub.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then exit 0; fi\nexit 0\n",
+        )
+        .expect("write tmux live stub");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux live stub");
+        assert_terminal_event_registry_presence(&stub, true).await;
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn accepted_terminal_session_event_preserves_registration_on_probe_error() {
+        let dir = tempdir().expect("tempdir");
+        let missing_tmux = dir.path().join("missing-tmux");
+        assert_terminal_event_registry_presence(&missing_tmux, true).await;
     }
 
     #[tokio::test]
