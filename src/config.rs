@@ -45,6 +45,8 @@ pub struct AppConfig {
     pub gajae: GajaeConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<SubscriptionConfig>,
+    #[serde(default, skip_serializing_if = "LedgerConfig::is_empty")]
+    pub ledger: LedgerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +172,102 @@ fn default_subscription_max_delay_ms() -> u64 {
 }
 fn default_subscription_max_attempts() -> u64 {
     5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default = "default_ledger_raw_retention_days")]
+    pub raw_retention_days: u64,
+    #[serde(default = "default_ledger_summary_retention_days")]
+    pub summary_retention_days: u64,
+    #[serde(default = "default_ledger_compaction_interval_secs")]
+    pub compaction_interval_secs: u64,
+    #[serde(default = "default_ledger_max_records")]
+    pub max_records: usize,
+    #[serde(default = "default_ledger_max_record_bytes")]
+    pub max_record_bytes: usize,
+    #[serde(default = "default_ledger_max_keywords")]
+    pub max_keywords: usize,
+    #[serde(default = "default_ledger_max_keyword_bytes")]
+    pub max_keyword_bytes: usize,
+    #[serde(default = "default_ledger_max_query_results")]
+    pub max_query_results: usize,
+    #[serde(default = "default_ledger_max_records_per_compaction")]
+    pub max_records_per_compaction: usize,
+}
+
+impl Default for LedgerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            raw_retention_days: default_ledger_raw_retention_days(),
+            summary_retention_days: default_ledger_summary_retention_days(),
+            compaction_interval_secs: default_ledger_compaction_interval_secs(),
+            max_records: default_ledger_max_records(),
+            max_record_bytes: default_ledger_max_record_bytes(),
+            max_keywords: default_ledger_max_keywords(),
+            max_keyword_bytes: default_ledger_max_keyword_bytes(),
+            max_query_results: default_ledger_max_query_results(),
+            max_records_per_compaction: default_ledger_max_records_per_compaction(),
+        }
+    }
+}
+
+impl LedgerConfig {
+    fn is_empty(&self) -> bool {
+        !self.enabled && self.path.is_none() && self == &Self::default()
+    }
+}
+
+impl PartialEq for LedgerConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.path == other.path
+            && self.raw_retention_days == other.raw_retention_days
+            && self.summary_retention_days == other.summary_retention_days
+            && self.compaction_interval_secs == other.compaction_interval_secs
+            && self.max_records == other.max_records
+            && self.max_record_bytes == other.max_record_bytes
+            && self.max_keywords == other.max_keywords
+            && self.max_keyword_bytes == other.max_keyword_bytes
+            && self.max_query_results == other.max_query_results
+            && self.max_records_per_compaction == other.max_records_per_compaction
+    }
+}
+impl Eq for LedgerConfig {}
+
+fn default_ledger_raw_retention_days() -> u64 {
+    7
+}
+fn default_ledger_summary_retention_days() -> u64 {
+    90
+}
+fn default_ledger_compaction_interval_secs() -> u64 {
+    3_600
+}
+fn default_ledger_max_records() -> usize {
+    100_000
+}
+fn default_ledger_max_record_bytes() -> usize {
+    8 * 1024
+}
+fn default_ledger_max_keywords() -> usize {
+    16
+}
+fn default_ledger_max_keyword_bytes() -> usize {
+    48
+}
+fn default_ledger_max_query_results() -> usize {
+    200
+}
+fn default_ledger_max_records_per_compaction() -> usize {
+    5_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1313,6 +1411,19 @@ impl AppConfig {
         if self.dispatch.ci_batch_window_secs == 0 {
             return Err("dispatch.ci_batch_window_secs must be at least 1".into());
         }
+        if !(1..=3650).contains(&self.ledger.raw_retention_days)
+            || !(1..=3650).contains(&self.ledger.summary_retention_days)
+            || self.ledger.summary_retention_days < self.ledger.raw_retention_days
+            || !(1..=86_400).contains(&self.ledger.compaction_interval_secs)
+            || !(1..=10_000_000).contains(&self.ledger.max_records)
+            || !(512..=1_048_576).contains(&self.ledger.max_record_bytes)
+            || !(1..=64).contains(&self.ledger.max_keywords)
+            || !(8..=256).contains(&self.ledger.max_keyword_bytes)
+            || !(1..=10_000).contains(&self.ledger.max_query_results)
+            || !(1..=100_000).contains(&self.ledger.max_records_per_compaction)
+        {
+            return Err("invalid_ledger_config".into());
+        }
         if self.subscriptions.len() > 32 {
             return Err("invalid_subscription_config".into());
         }
@@ -2053,7 +2164,7 @@ impl AppConfig {
     fn print_template_hint(&self) {
         println!("Advanced routes and monitors are still edited manually in the config file.");
         println!(
-            "Sections: [providers.discord], [dispatch], [daemon], [cron], [[cron.jobs]], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
+            "Sections: [providers.discord], [dispatch], [daemon], [ledger], [cron], [[cron.jobs]], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
         );
         println!(
             "Routes may set either channel = \"...\" or webhook = \"https://discord.com/api/webhooks/...\"."
@@ -6667,5 +6778,56 @@ format = "compact"
         .unwrap();
 
         config.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ledger_config_tests {
+    use super::AppConfig;
+
+    #[test]
+    fn old_config_defaults_ledger_off() {
+        let config: AppConfig = toml::from_str("[daemon]\nport = 9876\n").unwrap();
+        assert!(!config.ledger.enabled);
+    }
+
+    #[test]
+    fn parses_and_validates_ledger_limits() {
+        let config: AppConfig = toml::from_str(
+            r#"[ledger]
+enabled = true
+raw_retention_days = 7
+summary_retention_days = 30
+compaction_interval_secs = 60
+max_records = 1000
+max_record_bytes = 4096
+max_keywords = 8
+max_keyword_bytes = 32
+max_query_results = 50
+max_records_per_compaction = 100
+
+[[routes]]
+event = "*"
+sink = "localfile"
+local_path = "/tmp/clawhip-ledger-test.jsonl"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.ledger.enabled);
+    }
+
+    #[test]
+    fn rejects_summary_retention_shorter_than_raw() {
+        let mut config = AppConfig::default();
+        config.ledger.raw_retention_days = 30;
+        config.ledger.summary_retention_days = 7;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("ledger")
+        );
     }
 }

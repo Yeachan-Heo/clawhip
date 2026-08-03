@@ -158,6 +158,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: MemoryCommands,
     },
+    /// Query, verify, and inspect the durable public-safe event ledger.
+    Ledger {
+        #[command(subcommand)]
+        command: LedgerCommands,
+    },
+
     /// Install and manage provider-native hook forwarding for Codex and Claude Code.
     Hooks {
         #[command(subcommand)]
@@ -923,6 +929,44 @@ pub struct TmuxWatchArgs {
     pub format: Option<TmuxWrapperFormat>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub retry_enter: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum LedgerCommands {
+    /// Show bounded ledger health and retention counters from the daemon.
+    Status,
+    /// Query public-safe ledger records through indexed filters.
+    Query(LedgerQueryArgs),
+    /// Verify retained ledger files and public-safe schema invariants locally.
+    Verify,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LedgerQueryArgs {
+    /// Match an exact repository identity.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Match an exact worktree path.
+    #[arg(long)]
+    pub worktree: Option<String>,
+    /// Match an exact agent or workspace session id.
+    #[arg(long)]
+    pub session_id: Option<String>,
+    /// Match an exact canonical event type.
+    #[arg(long)]
+    pub event_type: Option<String>,
+    /// Include records at or after this Unix timestamp.
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Include records at or before this Unix timestamp.
+    #[arg(long)]
+    pub until: Option<i64>,
+    /// Require all comma-delimited normalized keywords.
+    #[arg(long, value_delimiter = ',')]
+    pub keywords: Vec<String>,
+    /// Maximum records to return, capped by ledger.max_query_results.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

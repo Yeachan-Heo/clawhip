@@ -223,6 +223,25 @@ impl DaemonClient {
         }
     }
 
+    pub async fn ledger_status(&self) -> Result<Value> {
+        self.private_get_json("/api/ledger/status").await
+    }
+
+    pub async fn ledger_query(&self, params: &[(&str, String)]) -> Result<Value> {
+        self.ensure_loopback_daemon()?;
+        let response = self
+            .http
+            .get(format!("{}/api/ledger/query", self.base_url))
+            .query(params)
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else {
+            Err(format!("daemon ledger request failed with {}", response.status()).into())
+        }
+    }
+
     pub async fn list_subscriptions(&self) -> Result<SubscriptionListResponse> {
         self.private_get_json("/api/subscriptions").await
     }
