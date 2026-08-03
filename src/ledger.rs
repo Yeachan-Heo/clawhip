@@ -390,8 +390,9 @@ impl EventLedger {
             self.status.compacted_records += compacted as u64;
             self.remove_compacted_records(&selected_ids)?;
         }
-        self.prune_summary_before(now_unix - self.config.summary_retention_days as i64 * 86_400)?;
-        if compacted > 0 {
+        let pruned = self
+            .prune_summary_before(now_unix - self.config.summary_retention_days as i64 * 86_400)?;
+        if compacted > 0 || pruned > 0 {
             self.load()?;
         }
         Ok(compacted)
@@ -532,10 +533,11 @@ impl EventLedger {
         Ok(())
     }
 
-    fn prune_summary_before(&self, cutoff: i64) -> Result<()> {
+    fn prune_summary_before(&self, cutoff: i64) -> Result<usize> {
         if !self.summary_dir().exists() {
-            return Ok(());
+            return Ok(0);
         }
+        let mut pruned = 0usize;
         for entry in fs::read_dir(self.summary_dir())? {
             let entry = entry?;
             if entry
@@ -547,9 +549,10 @@ impl EventLedger {
                 < cutoff
             {
                 fs::remove_file(entry.path())?;
+                pruned += 1;
             }
         }
-        Ok(())
+        Ok(pruned)
     }
 }
 
@@ -622,16 +625,33 @@ impl LedgerRecord {
             .and_then(Value::as_str)
             .zip(object.get("event_id").and_then(Value::as_str))
             .is_some_and(|(generated, current)| generated == current);
-        let supplied = first_string(object, &["idempotency_key"]).or_else(|| {
-            (!generated_event_id)
-                .then(|| first_string(object, &["event_id"]))
-                .flatten()
-        });
+        let supplied = object
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+            .map(|key| {
+                object
+                    .get("subscription_name")
+                    .and_then(Value::as_str)
+                    .map(|name| {
+                        serde_json::to_string(&(
+                            event.canonical_kind(),
+                            name.chars().take(MAX_SESSION_CHARS).collect::<String>(),
+                            key,
+                        ))
+                        .unwrap_or_default()
+                    })
+                    .unwrap_or_else(|| key.to_owned())
+            })
+            .or_else(|| {
+                (!generated_event_id)
+                    .then(|| first_string(object, &["event_id"]))
+                    .flatten()
+            });
         let timestamp_text = timestamp.format(&Rfc3339)?;
         let identity = serde_json::json!({
             "event_type": event.canonical_kind(), "timestamp": supplied_timestamp, "source": source,
             "repo": repo, "worktree": worktree, "session_id": session_id, "source_links": source_links,
-            "identity": PUBLIC_STRING_FIELDS.iter().filter_map(|key| object.get(*key).and_then(Value::as_str).map(|value| (*key, value))).collect::<BTreeMap<_, _>>()
+            "identity": PUBLIC_STRING_FIELDS.iter().filter_map(|key| object.get(*key).and_then(public_identity_value).map(|value| (*key, value))).collect::<BTreeMap<_, _>>()
         });
         let dedupe_key = supplied
             .map(|value| hash_bytes(value.as_bytes()))
@@ -830,6 +850,14 @@ fn reject_private_storage_requests(object: &serde_json::Map<String, Value>) -> R
 fn first_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| object.get(*key).and_then(Value::as_str).map(str::to_owned))
+}
+fn public_identity_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => bounded(Some(value.clone()), MAX_SOURCE_LINK_BYTES),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 fn bounded(value: Option<String>, max: usize) -> Option<String> {
     value
@@ -1140,6 +1168,28 @@ mod tests {
     }
 
     #[test]
+    fn built_in_numeric_occurrence_fields_do_not_collapse() {
+        let dir = tempdir().unwrap();
+        let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
+        let first = normalize_event(IncomingEvent::github_issue_opened(
+            "owner/repo".into(),
+            304,
+            "same public title".into(),
+            None,
+        ));
+        let second = normalize_event(IncomingEvent::github_issue_opened(
+            "owner/repo".into(),
+            305,
+            "same public title".into(),
+            None,
+        ));
+
+        assert_eq!(ledger.append(&first).unwrap(), AppendOutcome::Appended);
+        assert_eq!(ledger.append(&second).unwrap(), AppendOutcome::Appended);
+        assert_eq!(ledger.status().records, 2);
+    }
+
+    #[test]
     fn custom_sends_keep_distinct_generated_ids() {
         let dir = tempdir().unwrap();
         let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
@@ -1162,32 +1212,38 @@ mod tests {
             session_id: Some("s1".into()),
             ..RoutingMetadata::default()
         };
-        let event = |payload| {
+        let event = |name, payload| {
             normalize_event(IncomingEvent::subscription(
                 "custom.audit".into(),
                 payload,
                 &routing,
-                "audit-feed",
+                name,
             ))
         };
-        let first = event(json!({"status":"finished","sequence":1}));
-        let second = event(json!({"status":"finished","sequence":1}));
+        let first = event("audit-feed", json!({"status":"finished","sequence":1}));
+        let second = event("audit-feed", json!({"status":"finished","sequence":1}));
 
         assert_ne!(first.payload["event_id"], second.payload["event_id"]);
         assert!(first.payload.get(GENERATED_EVENT_ID_FIELD).is_none());
         assert_eq!(ledger.append(&first).unwrap(), AppendOutcome::Appended);
         assert_eq!(ledger.append(&second).unwrap(), AppendOutcome::Appended);
 
-        let retry_first = event(json!({
-            "status":"finished",
-            "sequence":2,
-            "idempotency_key":"upstream-frame-2"
-        }));
-        let retry_second = event(json!({
-            "status":"finished",
-            "sequence":2,
-            "idempotency_key":"upstream-frame-2"
-        }));
+        let retry_first = event(
+            "audit-feed",
+            json!({
+                "status":"finished",
+                "sequence":2,
+                "idempotency_key":"upstream-frame-2"
+            }),
+        );
+        let retry_second = event(
+            "audit-feed",
+            json!({
+                "status":"finished",
+                "sequence":2,
+                "idempotency_key":"upstream-frame-2"
+            }),
+        );
         assert_eq!(
             ledger.append(&retry_first).unwrap(),
             AppendOutcome::Appended
@@ -1195,6 +1251,18 @@ mod tests {
         assert_eq!(
             ledger.append(&retry_second).unwrap(),
             AppendOutcome::Duplicate
+        );
+        let other_subscription = event(
+            "mirror-feed",
+            json!({
+                "status":"finished",
+                "sequence":2,
+                "idempotency_key":"upstream-frame-2"
+            }),
+        );
+        assert_eq!(
+            ledger.append(&other_subscription).unwrap(),
+            AppendOutcome::Appended
         );
     }
 
@@ -1340,6 +1408,40 @@ mod tests {
         assert_eq!(ledger.status().records, 0);
         let mut reopened = EventLedger::open(cfg, dir.path()).unwrap();
         assert_eq!(reopened.append(&event).unwrap(), AppendOutcome::Duplicate);
+    }
+
+    #[test]
+    fn pruning_without_compaction_refreshes_dedupe_state() {
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.raw_retention_days = 1;
+        cfg.summary_retention_days = 1;
+        let mut ledger = EventLedger::open(cfg, dir.path()).unwrap();
+        let event = IncomingEvent {
+            kind: "github.issue-opened".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "event_id":"expired-summary-replay",
+                "repo":"owner/repo",
+                "timestamp":"2026-07-01T00:00:00Z"
+            }),
+        };
+        ledger.append(&event).unwrap();
+        let compact_at = OffsetDateTime::parse("2026-08-03T00:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp();
+        assert_eq!(ledger.compact_if_due(compact_at).unwrap(), 1);
+        assert_eq!(ledger.append(&event).unwrap(), AppendOutcome::Duplicate);
+
+        let prune_at = OffsetDateTime::parse("2030-01-01T00:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp();
+        assert_eq!(ledger.compact_if_due(prune_at).unwrap(), 0);
+        assert_eq!(fs::read_dir(ledger.summary_dir()).unwrap().count(), 0);
+        assert_eq!(ledger.append(&event).unwrap(), AppendOutcome::Appended);
     }
 
     #[test]

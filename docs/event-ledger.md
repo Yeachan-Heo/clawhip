@@ -56,7 +56,7 @@ All filters are intersected. Time bounds are inclusive. Query limits are capped 
 
 ## Dedupe and failure replay
 
-When a caller supplies `idempotency_key` or `event_id`, its value is hashed and used as the durable dedupe identity. Normalization marks internally generated event UUIDs so they do not masquerade as caller identifiers; identifier-less retries instead hash the canonical event type and allowlisted stable public identity fields. Built-in custom sends and subscription frames receive distinct occurrence event ids. Subscription adapters may provide an explicit stable `idempotency_key` in their restricted public-safe output when reconnect replay suppression is required; identical frames without that key remain distinct occurrences. The dedupe set is rebuilt after restart from retained raw records and the newest compacted summary shards, capped by `max_records`; `/api/ledger/status` reports `dedupe_history_cap_applied` if older summary history cannot fit in that operational bound.
+When a caller supplies `idempotency_key` or `event_id`, its value is hashed and used as the durable dedupe identity. Subscription-supplied idempotency keys are namespaced by canonical event type and bounded subscription name, so reconnect replay dedupes within one feed without colliding with another feed using the same upstream key. Normalization marks internally generated event UUIDs so they do not masquerade as caller identifiers; identifier-less retries instead hash the canonical event type and bounded allowlisted public scalar identity fields, including numeric occurrence fields such as issue or pull-request number. Built-in custom sends and subscription frames receive distinct occurrence event ids. Subscription adapters may provide an explicit stable `idempotency_key` in their restricted public-safe output when reconnect replay suppression is required; identical frames without that key remain distinct occurrences. The dedupe set is rebuilt after restart and after summary pruning from retained raw records and the newest compacted summary shards, capped by `max_records`; `/api/ledger/status` reports `dedupe_history_cap_applied` if older summary history cannot fit in that operational bound.
 
 - append succeeds: routing may continue;
 - duplicate: no second append and no second delivery side effect;
@@ -69,7 +69,7 @@ Sources should supply stable event ids whenever retryable delivery is required.
 
 On the dispatcher cadence, records older than `raw_retention_days` are grouped by UTC day, repository, worktree, and session. Clawhip writes deterministic summary shards containing event counts, first/last timestamps, bounded top keywords, up to 64 source record ids and hashed dedupe keys, and public source links. Groups larger than 64 records are split into deterministic bounded shards. Each shard is flushed and atomically renamed before eligible raw segments are removed.
 
-At most `max_records_per_compaction` records are processed per pass. Summary files older than `summary_retention_days` are deleted even when a pass has no newly eligible raw records. Failed shard writes preserve the raw source segment for the next pass.
+At most `max_records_per_compaction` records are processed per pass. Summary files older than `summary_retention_days` are deleted even when a pass has no newly eligible raw records, and in-memory dedupe history is refreshed immediately so expired keys stop suppressing replay. Failed shard writes preserve the raw source segment for the next pass.
 
 ## Privacy and operations
 
