@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
 use std::time::Duration;
 
 use crate::Result;
@@ -12,6 +13,7 @@ use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::gajae::{HandlerAction, HandlerLimits, HandlerOutcome};
+use crate::ledger::{EventLedger, LedgerQuery, SharedEventLedger};
 use crate::native_hooks::{
     NATIVE_NON_GIT_OUTCOME, NATIVE_NORMALIZATION_OUTCOME_FIELD,
     incoming_event_from_native_hook_json,
@@ -22,6 +24,7 @@ use crate::native_observability::{
 };
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
+
 use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
 use crate::source::tmux::{
     AbsentRegistrationCandidate, prune_absent_dynamic_registrations, session_exists,
@@ -45,7 +48,8 @@ use crate::source::{
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
-use axum::extract::{ConnectInfo, FromRequestParts, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
+
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -58,6 +62,19 @@ const EVENT_QUEUE_CAPACITY: usize = 256;
 pub const LOCAL_CONTROL_HEADER: &str = "x-clawhip-local-control";
 const LOCAL_CONTROL_HEADER_VALUE: &str = "1";
 const LOCAL_CONTROL_REJECTED: &str = "local_control_rejected";
+
+static EVENT_LEDGER: OnceLock<std::sync::Mutex<Option<SharedEventLedger>>> = OnceLock::new();
+
+fn event_ledger_slot() -> &'static std::sync::Mutex<Option<SharedEventLedger>> {
+    EVENT_LEDGER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn shared_event_ledger() -> Option<SharedEventLedger> {
+    event_ledger_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
 
 const STALE_NATIVE_REPLAY_GRACE: Duration = Duration::from_secs(5 * 60);
 const STALE_NATIVE_REPLAY_REASON: &str = "stale_replay";
@@ -142,10 +159,22 @@ pub async fn run(
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
     let native_observability = new_shared_native_hook_observability();
     let subscriptions = new_subscription_registry(config.as_ref(), tx.clone()).await;
+    let ledger_root = cron_state_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let ledger: SharedEventLedger = Arc::new(std::sync::Mutex::new(EventLedger::open(
+        config.ledger.clone(),
+        ledger_root,
+    )?));
+    if let Ok(mut slot) = event_ledger_slot().lock() {
+        *slot = Some(ledger.clone());
+    }
 
     let ci_batch_window = config.dispatch.ci_batch_window();
     let routine_batch_window = config.dispatch.routine_batch_window();
     let dispatcher_native_observability = native_observability.clone();
+    let dispatcher_ledger = ledger.clone();
+
     tokio::spawn(async move {
         let mut dispatcher = Dispatcher::new(
             rx,
@@ -155,7 +184,9 @@ pub async fn run(
             ci_batch_window,
             routine_batch_window,
             dispatcher_native_observability,
-        );
+        )
+        .with_ledger(dispatcher_ledger);
+
         if let Err(error) = dispatcher.run().await {
             eprintln!("clawhip dispatcher stopped: {error}");
         }
@@ -218,6 +249,8 @@ pub async fn run(
         .route("/api/lane/retire", post(retire_lane_handler))
         .route("/api/subscriptions", get(list_subscriptions))
         .route("/api/subscriptions/{name}", get(subscription_detail))
+        .route("/api/ledger/status", get(ledger_status))
+        .route("/api/ledger/query", get(ledger_query))
         .route("/api/subscriptions/{name}/start", post(start_subscription))
         .route("/api/subscriptions/{name}/stop", post(stop_subscription));
     let port = port_override.unwrap_or(config.daemon.port);
@@ -241,6 +274,7 @@ pub async fn run(
         "clawhip daemon v{VERSION} listening on http://{} (token_source: {token_source})",
         local_addr
     );
+
     telemetry::emit(daemon_record(
         telemetry::reason::DAEMON_LISTENING,
         json!({"version": VERSION, "addr": local_addr.to_string(), "token_source": token_source}),
@@ -253,6 +287,73 @@ pub async fn run(
     .await?;
     shutdown_subscriptions(&subscriptions).await;
     Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LedgerQueryParams {
+    repo: Option<String>,
+    worktree: Option<String>,
+    session_id: Option<String>,
+    event_type: Option<String>,
+    since: Option<i64>,
+    until: Option<i64>,
+    keywords: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn ledger_status(_peer: LoopbackLanePeer) -> impl IntoResponse {
+    let Some(ledger) = shared_event_ledger() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ledger_unavailable"})),
+        );
+    };
+    match ledger.lock() {
+        Ok(ledger) => (StatusCode::OK, Json(json!(ledger.status()))),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ledger_unavailable"})),
+        ),
+    }
+}
+
+async fn ledger_query(
+    _peer: LoopbackLanePeer,
+    Query(params): Query<LedgerQueryParams>,
+) -> impl IntoResponse {
+    let query = LedgerQuery {
+        repo: params.repo,
+        worktree: params.worktree,
+        session_id: params.session_id,
+        event_type: params.event_type,
+        since_unix: params.since,
+        until_unix: params.until,
+        keywords: params
+            .keywords
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        limit: params.limit,
+    };
+    let Some(ledger) = shared_event_ledger() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ledger_unavailable"})),
+        );
+    };
+    match ledger.lock() {
+        Ok(mut ledger) => (
+            StatusCode::OK,
+            Json(json!({"records": ledger.query(&query)})),
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ledger_unavailable"})),
+        ),
+    }
 }
 
 fn spawn_source<S>(source: S, tx: mpsc::Sender<IncomingEvent>)

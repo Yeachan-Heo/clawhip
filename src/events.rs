@@ -134,7 +134,10 @@ impl IncomingEvent {
             mention: None,
             format: None,
             template: None,
-            payload: json!({ "message": message }),
+            payload: json!({
+                "event_id": Uuid::new_v4().to_string(),
+                "message": message,
+            }),
         }
     }
 
@@ -776,7 +779,8 @@ impl IncomingEvent {
             format: None,
             template: None,
             payload,
-        };
+        }
+        .with_routing_metadata(routing);
         if let Some(object) = event.payload.as_object_mut() {
             object.insert("event_id".to_string(), json!(Uuid::new_v4().to_string()));
             object.insert(
@@ -803,7 +807,7 @@ impl IncomingEvent {
                 ),
             );
         }
-        event.with_routing_metadata(routing)
+        event
     }
 
     pub fn canonical_kind(&self) -> &str {
@@ -1120,8 +1124,11 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
             .flatten()
     });
     let event_timestamp = first_string(payload, &["/event_timestamp", "/timestamp"]);
-    let event_id =
-        first_string(payload, &["/event_id"]).unwrap_or_else(|| Uuid::new_v4().to_string());
+    let prior_generated_event_id = first_string(payload, &["/_clawhip_generated_event_id"]);
+    let supplied_event_id = first_string(payload, &["/event_id"]);
+    let event_id_generated = supplied_event_id.is_none()
+        || supplied_event_id.as_deref() == prior_generated_event_id.as_deref();
+    let event_id = supplied_event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let correlation_id = first_string(payload, &["/correlation_id"])
         .or_else(|| {
             [
@@ -1182,7 +1189,12 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
         .or_insert_with(|| json!(canonical_kind));
 
     insert_string_if_missing(object, "tool", tool);
-    insert_string_if_missing(object, "event_id", Some(event_id));
+    insert_string_if_missing(object, "event_id", Some(event_id.clone()));
+    if event_id_generated {
+        object.insert("_clawhip_generated_event_id".to_string(), json!(event_id));
+    } else {
+        object.remove("_clawhip_generated_event_id");
+    }
     insert_string_if_missing(object, "correlation_id", Some(correlation_id));
     insert_string_if_missing(object, "first_seen_at", Some(first_seen_at));
     if (canonical_kind.starts_with("agent.") || canonical_kind.starts_with("session."))

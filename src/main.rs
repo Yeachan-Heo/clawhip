@@ -16,6 +16,7 @@ mod gateway_allowlist;
 mod hooks;
 mod keyword_window;
 mod lane;
+mod ledger;
 mod lifecycle;
 mod memory;
 mod native_hooks;
@@ -42,9 +43,9 @@ use tokio::runtime::Builder;
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs,
     GajaeCheckpointCommands, GajaeCommands, GajaeMutationPlanCommands, GajaeProfileCommands,
-    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, MemoryCommands,
-    NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands, TmuxCommands,
-    UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, LedgerCommands,
+    MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands,
+    TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
 
 use crate::client::DaemonClient;
@@ -162,6 +163,57 @@ async fn real_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Ledger { command } => {
+            match command {
+                LedgerCommands::Status => {
+                    let client = DaemonClient::from_config(config.as_ref());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.ledger_status().await?)?
+                    );
+                }
+                LedgerCommands::Query(args) => {
+                    let mut params = Vec::<(&str, String)>::new();
+                    if let Some(value) = args.repo {
+                        params.push(("repo", value));
+                    }
+                    if let Some(value) = args.worktree {
+                        params.push(("worktree", value));
+                    }
+                    if let Some(value) = args.session_id {
+                        params.push(("session_id", value));
+                    }
+                    if let Some(value) = args.event_type {
+                        params.push(("event_type", value));
+                    }
+                    if let Some(value) = args.since {
+                        params.push(("since", value.to_string()));
+                    }
+                    if let Some(value) = args.until {
+                        params.push(("until", value.to_string()));
+                    }
+                    if !args.keywords.is_empty() {
+                        params.push(("keywords", args.keywords.join(",")));
+                    }
+                    if let Some(value) = args.limit {
+                        params.push(("limit", value.to_string()));
+                    }
+                    let client = DaemonClient::from_config(config.as_ref());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.ledger_query(&params).await?)?
+                    );
+                }
+                LedgerCommands::Verify => {
+                    let root = cron_state_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let ledger = crate::ledger::EventLedger::open(config.ledger.clone(), root)?;
+                    println!("{}", serde_json::to_string_pretty(&ledger.verify()?)?);
+                }
+            }
+            Ok(())
+        }
         Commands::Deliver(args) => crate::hooks::prompt_deliver::run(args).await,
         Commands::Emit(args) => {
             let client = DaemonClient::from_config(config.as_ref());

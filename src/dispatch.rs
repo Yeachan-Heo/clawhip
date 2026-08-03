@@ -8,10 +8,12 @@ use tokio::sync::mpsc;
 use crate::Result;
 use crate::core::timer_wheel::{DelayedEntry, TimerWheel};
 use crate::events::{IncomingEvent, normalize_event};
+use crate::ledger::{AppendOutcome, SharedEventLedger};
 use crate::native_observability::{
     SharedNativeHookObservability, is_native_hook_event, native_event_telemetry_fields,
     with_native_observability,
 };
+
 use crate::render::Renderer;
 use crate::router::{ResolvedDelivery, Router};
 use crate::sink::{Sink, SinkMessage, SinkTarget, SinkTelemetry};
@@ -28,6 +30,7 @@ pub struct Dispatcher {
     routine_batcher: Option<RoutineDeliveryBatcher>,
     batch_tick: Duration,
     native_observability: SharedNativeHookObservability,
+    ledger: Option<SharedEventLedger>,
 }
 
 impl Dispatcher {
@@ -49,7 +52,13 @@ impl Dispatcher {
             routine_batcher: routine_batch_window.map(RoutineDeliveryBatcher::new),
             batch_tick: DEFAULT_BATCH_TICK,
             native_observability,
+            ledger: None,
         }
+    }
+
+    pub fn with_ledger(mut self, ledger: SharedEventLedger) -> Self {
+        self.ledger = Some(ledger);
+        self
     }
 
     #[cfg(test)]
@@ -78,6 +87,10 @@ impl Dispatcher {
                     match maybe_event {
                         Some(event) => {
                             let event = normalize_event(event);
+                            if !self.record_event(&event) {
+                                continue;
+                            }
+
                             let now_ms = now_ms();
                             self.flush_due_batches(now_ms).await?;
                             if self.is_ci_event(&event) {
@@ -95,11 +108,47 @@ impl Dispatcher {
                 }
                 _ = ticker.tick() => {
                     self.flush_due_batches(now_ms()).await?;
+                    self.compact_ledger(now_ms() / 1_000);
+
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn record_event(&self, event: &IncomingEvent) -> bool {
+        let Some(ledger) = &self.ledger else {
+            return true;
+        };
+        let mut ledger = match ledger.lock() {
+            Ok(ledger) => ledger,
+            Err(_) => {
+                eprintln!("clawhip ledger rejected event: lock_poisoned");
+                return false;
+            }
+        };
+        match ledger.append(event) {
+            Ok(AppendOutcome::Appended) => true,
+            Ok(AppendOutcome::Duplicate) => false,
+            Err(error) => {
+                eprintln!("clawhip ledger rejected event: {error}");
+                false
+            }
+        }
+    }
+
+    fn compact_ledger(&self, now_unix: u64) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        let Ok(mut ledger) = ledger.lock() else {
+            eprintln!("clawhip ledger compaction skipped: lock_poisoned");
+            return;
+        };
+        if let Err(error) = ledger.compact_if_due(now_unix as i64) {
+            eprintln!("clawhip ledger compaction failed: {error}");
+        }
     }
 
     async fn flush_due_batches(&mut self, now_ms: u64) -> Result<()> {
@@ -956,6 +1005,7 @@ mod tests {
     use crate::native_observability::new_shared_native_hook_observability;
     use crate::render::DefaultRenderer;
     use crate::sink::{DiscordSink, SlackSink};
+    use tempfile::tempdir;
 
     fn test_dispatcher(rx: mpsc::Receiver<IncomingEvent>, router: Router) -> Dispatcher {
         let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
@@ -1838,5 +1888,53 @@ mod tests {
             dispatcher.ci_batcher.window,
             Duration::from_secs(config.dispatch.ci_batch_window_secs)
         );
+    }
+    #[test]
+    fn dispatcher_ledger_gate_suppresses_duplicates_and_failures() {
+        let (_tx, rx) = mpsc::channel(1);
+        let router = Router::new(Arc::new(AppConfig::default()));
+        let dir = tempdir().unwrap();
+        let ledger_config = crate::config::LedgerConfig {
+            enabled: true,
+            path: Some(dir.path().to_path_buf()),
+            raw_retention_days: 7,
+            summary_retention_days: 30,
+            compaction_interval_secs: 60,
+            max_records: 1,
+            max_record_bytes: 4096,
+            max_keywords: 8,
+            max_keyword_bytes: 32,
+            max_query_results: 20,
+            max_records_per_compaction: 20,
+        };
+        let ledger = Arc::new(std::sync::Mutex::new(
+            crate::ledger::EventLedger::open(ledger_config, dir.path()).unwrap(),
+        ));
+        let dispatcher = test_dispatcher(rx, router).with_ledger(ledger.clone());
+        let first = IncomingEvent {
+            kind: "agent.finished".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({"event_id":"one","repo":"owner/repo","summary":"private text"}),
+        };
+        assert!(dispatcher.record_event(&first));
+        assert!(!dispatcher.record_event(&first));
+        let second = IncomingEvent {
+            kind: "agent.failed".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({"event_id":"two","repo":"owner/repo"}),
+        };
+        assert!(!dispatcher.record_event(&second));
+        assert_eq!(ledger.lock().unwrap().status().records, 1);
+        let persisted = std::fs::read_dir(dir.path().join("raw"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(!persisted.contains("private text"));
     }
 }
