@@ -826,6 +826,7 @@ mod tests {
     fn config() -> SubscriptionConfig {
         SubscriptionConfig {
             name: "gjc-workflow-gate".into(),
+            setup_owned: false,
             enabled: true,
             kind: "websocket".into(),
             endpoint_env: "GJC_WS_URL".into(),
@@ -869,6 +870,30 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn question_projection_drops_foreign_repository_frames() {
+        let mut config = config();
+        config.filter = SubscriptionFilterConfig {
+            discriminator_pointer: "/type".into(),
+            discriminator_equals: "question".into(),
+            predicates: vec![SubscriptionPredicateConfig {
+                pointer: "/context/repo_name".into(),
+                equals: "owner/repo".into(),
+            }],
+        };
+        config.projection = BTreeMap::from([
+            (String::from("question_id"), String::from("/question/id")),
+            (String::from("summary"), String::from("/question/summary")),
+        ]);
+
+        let matching = r#"{"type":"question","context":{"repo_name":"owner/repo"},"question":{"id":"q1","summary":"Approve?"}}"#;
+        assert!(project_frame(&config, matching).unwrap().is_some());
+        let foreign = r#"{"type":"question","context":{"repo_name":"other/repo"},"question":{"id":"q2","summary":"Leak?"}}"#;
+        assert!(project_frame(&config, foreign).unwrap().is_none());
+        let missing_metadata = r#"{"type":"question","question":{"id":"q3","summary":"Unknown?"}}"#;
+        assert!(project_frame(&config, missing_metadata).is_err());
     }
 
     #[test]

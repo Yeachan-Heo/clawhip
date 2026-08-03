@@ -325,14 +325,32 @@ clawhip setup \
   --daemon-base-url "http://127.0.0.1:25294"
 ```
 
-`clawhip setup` stays non-interactive and intentionally limited to five presets only:
+`clawhip setup` stays non-interactive and intentionally limited to the supported presets:
 - Discord webhook quickstart route
 - Discord bot token
 - Default channel
 - Default message format
 - Daemon base URL
+- Official GJC question subscription and repository-scoped route (channel, mention, fallback)
 
-Advanced routes and monitor definitions are still edited manually in the config file or revisited through the bounded `clawhip config` editor surface.
+
+To opt into the official GJC question bridge from a repository checkout, provide a destination channel (or explicitly reuse the configured default channel):
+
+```bash
+clawhip setup \
+  --question-channel "QUESTIONS_CHANNEL_ID" \
+  --question-mention "<@OPERATOR_ID>"
+
+# Equivalent fallback form when [defaults].channel is already configured.
+clawhip setup --question-fallback
+```
+
+This setup path converges the setup-owned `gjc-question` websocket subscription and one
+`workflow.question` route filtered by the current repository identity. It never edits an
+existing `workflow.gate` route. Re-running setup updates those same named entries instead of
+duplicating them. Question setup only owns the destination channel, optional mention, and
+fallback-to-default choice; the subscription endpoint remains `GJC_QUESTION_WS` and is read
+only by the daemon environment.
 
 Route example:
 
@@ -1024,8 +1042,8 @@ question_id = "/question/id"
 summary = "/question/summary"
 
 [subscriptions.adapter]
-program = "/absolute/path/to/gjc-question-adapter"
-args = []
+program = "<path-to-clawhip>"
+args = ["subscribe", "adapter", "question"]
 
 [[routes]]
 event = "workflow.question"

@@ -53,6 +53,8 @@ pub struct SubscriptionConfig {
     pub name: String,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub setup_owned: bool,
     pub kind: String,
     pub endpoint_env: String,
     #[serde(default = "default_subscription_max_frame_bytes")]
@@ -77,7 +79,7 @@ pub struct SubscriptionFilterConfig {
     pub predicates: Vec<SubscriptionPredicateConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubscriptionPredicateConfig {
     pub pointer: String,
@@ -138,6 +140,9 @@ pub struct SubscriptionRoutingConfig {
     #[serde(default)]
     pub branch: Option<String>,
 }
+
+pub const GJC_QUESTION_SUBSCRIPTION_NAME: &str = "gjc-question";
+pub const GJC_QUESTION_ENDPOINT_ENV: &str = "GJC_QUESTION_WS";
 
 fn default_subscription_max_frame_bytes() -> usize {
     65_536
@@ -1549,6 +1554,131 @@ impl AppConfig {
             self.daemon.base_url = daemon_base_url;
         }
 
+        Ok(())
+    }
+    pub fn apply_gjc_question_setup(
+        &mut self,
+        channel: Option<String>,
+        mention: Option<String>,
+        fallback: bool,
+        repo: String,
+        adapter_program: String,
+    ) -> Result<()> {
+        let channel = normalize_text(channel).or_else(|| {
+            fallback
+                .then(|| normalize_text(self.defaults.channel.clone()))
+                .flatten()
+        });
+        let channel = channel.ok_or_else(|| {
+            "question setup requires --question-channel or --question-fallback with [defaults].channel"
+                .to_string()
+        })?;
+        let repo = normalize_text(Some(repo))
+            .ok_or_else(|| "question setup requires a non-empty repository identity".to_string())?;
+        let adapter_program = normalize_text(Some(adapter_program))
+            .ok_or_else(|| "question setup requires the clawhip executable path".to_string())?;
+        let mention = normalize_text(mention);
+
+        let subscription_matches = self
+            .subscriptions
+            .iter()
+            .enumerate()
+            .filter(|(_, subscription)| subscription.name == GJC_QUESTION_SUBSCRIPTION_NAME)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if subscription_matches.len() > 1 {
+            return Err("multiple setup-owned GJC question subscriptions found; clean up duplicates before updating".into());
+        }
+        if let Some(index) = subscription_matches.first()
+            && !self.subscriptions[*index].setup_owned
+        {
+            return Err("manual GJC question subscription ownership conflict; remove --question setup or mark the entry setup-owned".into());
+        }
+
+        let route_matches = self
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| {
+                route.event == "workflow.question"
+                    && route.filter.len() == 1
+                    && route.filter.get("repo_name") == Some(&repo)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if route_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned question routes found for repo '{repo}'; clean up duplicates before updating"
+            )
+            .into());
+        }
+
+        match route_matches.as_slice() {
+            [index] => {
+                let route = &mut self.routes[*index];
+                route.channel = Some(channel.clone());
+                route.mention = mention.clone();
+                route.format = Some(MessageFormat::Alert);
+            }
+            [] => {
+                let mut filter = BTreeMap::new();
+                filter.insert("repo_name".to_string(), repo.clone());
+                self.routes.push(RouteRule {
+                    event: "workflow.question".into(),
+                    filter,
+                    sink: default_sink_name(),
+                    channel: Some(channel),
+                    mention,
+                    format: Some(MessageFormat::Alert),
+                    ..RouteRule::default()
+                });
+            }
+            _ => unreachable!(),
+        }
+
+        let projection = [
+            ("question_id", "/question/id"),
+            ("summary", "/question/summary"),
+        ]
+        .into_iter()
+        .map(|(name, pointer)| (name.to_string(), pointer.to_string()))
+        .collect();
+        let subscription = SubscriptionConfig {
+            name: GJC_QUESTION_SUBSCRIPTION_NAME.into(),
+            enabled: true,
+            setup_owned: true,
+            kind: "websocket".into(),
+            endpoint_env: GJC_QUESTION_ENDPOINT_ENV.into(),
+            max_frame_bytes: default_subscription_max_frame_bytes(),
+            max_json_depth: default_subscription_max_json_depth(),
+            filter: SubscriptionFilterConfig {
+                discriminator_pointer: "/type".into(),
+                discriminator_equals: "question".into(),
+                predicates: vec![SubscriptionPredicateConfig {
+                    pointer: "/context/repo_name".into(),
+                    equals: repo.clone(),
+                }],
+            },
+            projection,
+            adapter: SubscriptionAdapterConfig {
+                program: adapter_program,
+                args: vec!["subscribe".into(), "adapter".into(), "question".into()],
+                timeout_ms: default_subscription_timeout_ms(),
+                max_stdin_bytes: default_subscription_stdin_bytes(),
+                max_stdout_bytes: default_subscription_stdout_bytes(),
+                max_stderr_bytes: default_subscription_stderr_bytes(),
+            },
+            reconnect: SubscriptionReconnectConfig::default(),
+            routing: SubscriptionRoutingConfig {
+                tool: Some("gjc".into()),
+                ..SubscriptionRoutingConfig::default()
+            },
+        };
+        match subscription_matches.as_slice() {
+            [index] => self.subscriptions[*index] = subscription,
+            [] => self.subscriptions.push(subscription),
+            _ => unreachable!(),
+        }
         Ok(())
     }
 
@@ -3903,6 +4033,127 @@ thread = "123456789012345678"
 
         assert!(config.validate().is_ok());
         assert_eq!(config.webhook_route_count(), 1);
+    }
+
+    #[test]
+    fn gjc_question_setup_is_idempotent_and_preserves_workflow_route() {
+        let mut config = AppConfig {
+            routes: vec![RouteRule {
+                event: "workflow.gate".into(),
+                channel: Some("workflow-channel".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        config
+            .apply_gjc_question_setup(
+                Some("question-channel".into()),
+                Some("<@123>".into()),
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap();
+        config
+            .apply_gjc_question_setup(
+                Some("updated-question-channel".into()),
+                None,
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap();
+
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, GJC_QUESTION_SUBSCRIPTION_NAME);
+        assert!(config.subscriptions[0].setup_owned);
+        assert_eq!(config.routes.len(), 2);
+        assert_eq!(config.routes[0].event, "workflow.gate");
+        let question = config
+            .routes
+            .iter()
+            .find(|route| route.event == "workflow.question")
+            .expect("question route");
+        assert_eq!(
+            question.filter.get("repo_name").map(String::as_str),
+            Some("owner/repo")
+        );
+        assert_eq!(
+            question.channel.as_deref(),
+            Some("updated-question-channel")
+        );
+        assert_eq!(question.mention, None);
+        assert_eq!(config.subscriptions[0].routing.repo_name, None);
+        assert_eq!(
+            config.subscriptions[0].filter.predicates,
+            vec![SubscriptionPredicateConfig {
+                pointer: "/context/repo_name".into(),
+                equals: "owner/repo".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn gjc_question_setup_requires_explicit_or_default_channel() {
+        let mut config = AppConfig::default();
+        let error = config
+            .apply_gjc_question_setup(
+                None,
+                None,
+                true,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--question-channel"));
+        assert!(config.subscriptions.is_empty());
+        assert!(config.routes.is_empty());
+    }
+
+    #[test]
+    fn gjc_question_setup_rejects_manual_subscription_without_mutation() {
+        let mut config = AppConfig::default();
+        config
+            .apply_gjc_question_setup(
+                Some("question-channel".into()),
+                None,
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap();
+        config.subscriptions[0].setup_owned = false;
+        config.subscriptions[0].adapter.args = vec!["manual-adapter".into()];
+        let before = config.to_pretty_toml().unwrap();
+
+        let error = config
+            .apply_gjc_question_setup(
+                Some("new-channel".into()),
+                None,
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ownership conflict"));
+        assert_eq!(config.to_pretty_toml().unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_config_without_gjc_subscription_remains_valid_and_unchanged() {
+        let config: AppConfig = toml::from_str(
+            "[[routes]]\nevent = \"custom\"\nsink = \"localfile\"\nlocal_path = \"/tmp/events.jsonl\"\n",
+        )
+        .unwrap();
+        assert!(config.subscriptions.is_empty());
+        assert!(config.validate().is_ok());
+        let serialized = config.to_pretty_toml().unwrap();
+        assert!(!serialized.contains("gjc-question"));
+        assert!(!serialized.contains("[[subscriptions]]"));
     }
 
     #[test]

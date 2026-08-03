@@ -33,6 +33,7 @@ mod tmux_wrapper;
 
 mod update;
 
+use std::io::Read;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -88,6 +89,27 @@ fn prepare_event(event: IncomingEvent) -> Result<IncomingEvent> {
     Ok(event)
 }
 
+fn run_subscription_adapter(kind: &str) -> Result<()> {
+    if kind != "question" {
+        return Err(format!("unsupported subscription adapter '{kind}'").into());
+    }
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let payload: serde_json::Value = serde_json::from_str(&input)
+        .map_err(|_| "subscription adapter received malformed projection")?;
+    if !payload.is_object() {
+        return Err("subscription adapter projection must be an object".into());
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "workflow.question",
+            "payload": payload,
+        })
+    );
+    Ok(())
+}
+
 fn load_config_for_cli(config_path: &std::path::Path) -> Result<Arc<AppConfig>> {
     AppConfig::load_or_default(config_path)
         .map(Arc::new)
@@ -110,32 +132,36 @@ async fn real_main(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&health)?);
             Ok(())
         }
-        Commands::Subscribe { command } => {
-            let client = DaemonClient::from_config(config.as_ref());
-            match command {
-                SubscribeCommands::Validate => {
-                    config.validate()?;
-                    println!("Subscription configuration is valid.");
+        Commands::Subscribe { command } => match command {
+            SubscribeCommands::Adapter { kind } => run_subscription_adapter(&kind),
+            command => {
+                let client = DaemonClient::from_config(config.as_ref());
+                match command {
+                    SubscribeCommands::Validate => {
+                        config.validate()?;
+                        println!("Subscription configuration is valid.");
+                    }
+                    SubscribeCommands::List => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.list_subscriptions().await?)?
+                    ),
+                    SubscribeCommands::Status { name } => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.subscription_status(&name).await?)?
+                    ),
+                    SubscribeCommands::Start { name } => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.start_subscription(&name).await?)?
+                    ),
+                    SubscribeCommands::Stop { name } => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.stop_subscription(&name).await?)?
+                    ),
+                    SubscribeCommands::Adapter { .. } => unreachable!(),
                 }
-                SubscribeCommands::List => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&client.list_subscriptions().await?)?
-                ),
-                SubscribeCommands::Status { name } => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&client.subscription_status(&name).await?)?
-                ),
-                SubscribeCommands::Start { name } => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&client.start_subscription(&name).await?)?
-                ),
-                SubscribeCommands::Stop { name } => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&client.stop_subscription(&name).await?)?
-                ),
+                Ok(())
             }
-            Ok(())
-        }
+        },
         Commands::Deliver(args) => crate::hooks::prompt_deliver::run(args).await,
         Commands::Emit(args) => {
             let client = DaemonClient::from_config(config.as_ref());
@@ -725,6 +751,19 @@ fn remote_repo_identity(remote: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+fn current_setup_repo_identity() -> Result<String> {
+    let cwd = std::env::current_dir()?;
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(cwd)
+        .output()?;
+    if !output.status.success() {
+        return Err("question setup could not resolve the current repository remote".into());
+    }
+    remote_repo_identity(String::from_utf8_lossy(&output.stdout).trim())
+        .ok_or_else(|| "question setup could not resolve owner/repo from remote.origin.url".into())
+}
+
 async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()> {
     let mut editable = (*load_config_for_cli(config_path)?).clone();
 
@@ -742,13 +781,30 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
     let expect_map = parse_expect_name_overrides(&args.expect_name)?;
 
     // Must have at least one meaningful action.
-    if standard_edits.is_empty() && binds.is_empty() && !args.verify_bindings {
+    let question_setup_requested = args.question_channel.is_some() || args.question_fallback;
+    if standard_edits.is_empty()
+        && binds.is_empty()
+        && !args.verify_bindings
+        && !question_setup_requested
+    {
         return Err("setup requires at least one non-empty setup flag".into());
     }
 
     // Apply standard setup edits first (only if any are set).
     if !standard_edits.is_empty() {
         editable.apply_setup_edits(standard_edits)?;
+    }
+
+    if question_setup_requested || args.question_mention.is_some() {
+        let repo = current_setup_repo_identity()?;
+        let adapter_program = std::env::current_exe()?.to_string_lossy().into_owned();
+        editable.apply_gjc_question_setup(
+            args.question_channel,
+            args.question_mention,
+            args.question_fallback,
+            repo,
+            adapter_program,
+        )?;
     }
 
     // Process --bind entries: resolve each channel against Discord and write a

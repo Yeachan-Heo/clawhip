@@ -264,6 +264,16 @@ pub struct SetupArgs {
     /// before writing the config. Fails the command if any binding drifts.
     #[arg(long = "verify-bindings", default_value_t = false)]
     pub verify_bindings: bool,
+    /// Opt in to the official GJC question subscription and route questions to this channel.
+    /// The value is a Discord channel ID. Use --question-fallback to reuse [defaults].channel.
+    #[arg(long = "question-channel")]
+    pub question_channel: Option<String>,
+    /// Mention to prepend to question notifications created by official GJC setup.
+    #[arg(long = "question-mention")]
+    pub question_mention: Option<String>,
+    /// Use the configured default channel when no --question-channel is supplied.
+    #[arg(long = "question-fallback", default_value_t = false)]
+    pub question_fallback: bool,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -352,6 +362,8 @@ fn parse_emit_value(raw: &str) -> Value {
 
 #[derive(Debug, Subcommand)]
 pub enum SubscribeCommands {
+    /// Adapt the official GJC question projection into a restricted clawhip event.
+    Adapter { kind: String },
     /// Validate configured subscriptions without exposing endpoint environment details.
     Validate,
     /// List public-safe subscription lifecycle snapshots from the local daemon.
