@@ -961,11 +961,19 @@ fn index_value(map: &mut HashMap<String, BTreeSet<usize>>, value: Option<&str>, 
     }
 }
 fn raw_segment_day(path: &Path) -> Result<i64> {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.strip_prefix("events-"))
-        .and_then(|day| day.parse::<i64>().ok())
-        .ok_or_else(|| "invalid_ledger_raw_segment_name".into())
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("invalid_ledger_raw_segment_name")?;
+    let day = file_name
+        .strip_prefix("events-")
+        .and_then(|value| value.strip_suffix(".jsonl"))
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or("invalid_ledger_raw_segment_name")?;
+    if file_name != format!("events-{day}.jsonl") {
+        return Err("invalid_ledger_raw_segment_name".into());
+    }
+    Ok(day)
 }
 
 fn jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1146,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_retries_use_stable_idempotency_key() {
+    fn subscription_occurrences_are_distinct_unless_idempotency_is_supplied() {
         let dir = tempdir().unwrap();
         let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
         let routing = RoutingMetadata {
@@ -1154,28 +1162,40 @@ mod tests {
             session_id: Some("s1".into()),
             ..RoutingMetadata::default()
         };
-        let event = || {
+        let event = |payload| {
             normalize_event(IncomingEvent::subscription(
                 "custom.audit".into(),
-                json!({"status":"finished","sequence":1}),
+                payload,
                 &routing,
                 "audit-feed",
             ))
         };
-        let first = event();
-        let second = event();
+        let first = event(json!({"status":"finished","sequence":1}));
+        let second = event(json!({"status":"finished","sequence":1}));
 
         assert_ne!(first.payload["event_id"], second.payload["event_id"]);
-        assert_eq!(
-            first.payload["idempotency_key"],
-            second.payload["idempotency_key"]
-        );
-        assert_eq!(
-            first.payload[GENERATED_EVENT_ID_FIELD],
-            first.payload["event_id"]
-        );
+        assert!(first.payload.get(GENERATED_EVENT_ID_FIELD).is_none());
         assert_eq!(ledger.append(&first).unwrap(), AppendOutcome::Appended);
-        assert_eq!(ledger.append(&second).unwrap(), AppendOutcome::Duplicate);
+        assert_eq!(ledger.append(&second).unwrap(), AppendOutcome::Appended);
+
+        let retry_first = event(json!({
+            "status":"finished",
+            "sequence":2,
+            "idempotency_key":"upstream-frame-2"
+        }));
+        let retry_second = event(json!({
+            "status":"finished",
+            "sequence":2,
+            "idempotency_key":"upstream-frame-2"
+        }));
+        assert_eq!(
+            ledger.append(&retry_first).unwrap(),
+            AppendOutcome::Appended
+        );
+        assert_eq!(
+            ledger.append(&retry_second).unwrap(),
+            AppendOutcome::Duplicate
+        );
     }
 
     #[test]
@@ -1226,6 +1246,33 @@ mod tests {
         };
         ledger.append(&event).unwrap();
         fs::rename(ledger.segment_path(20666), ledger.segment_path(20667)).unwrap();
+
+        assert!(ledger.verify().is_err());
+        assert!(EventLedger::open(cfg, dir.path()).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_numeric_alias_raw_segment_name() {
+        let dir = tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mut ledger = EventLedger::open(cfg.clone(), dir.path()).unwrap();
+        let event = IncomingEvent {
+            kind: "custom.audit".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "event_id": "aliased-segment-day",
+                "timestamp": "2026-08-01T12:00:00Z"
+            }),
+        };
+        ledger.append(&event).unwrap();
+        fs::rename(
+            ledger.segment_path(20666),
+            ledger.raw_dir().join("events-020666.jsonl"),
+        )
+        .unwrap();
 
         assert!(ledger.verify().is_err());
         assert!(EventLedger::open(cfg, dir.path()).is_err());

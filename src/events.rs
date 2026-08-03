@@ -4,7 +4,6 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -773,7 +772,6 @@ impl IncomingEvent {
         routing: &RoutingMetadata,
         name: &str,
     ) -> Self {
-        let idempotency_key = stable_subscription_idempotency_key(&kind, &payload, routing, name);
         let mut event = Self {
             kind,
             channel: None,
@@ -784,10 +782,7 @@ impl IncomingEvent {
         }
         .with_routing_metadata(routing);
         if let Some(object) = event.payload.as_object_mut() {
-            let event_id = Uuid::new_v4().to_string();
-            object.insert("event_id".to_string(), json!(event_id.clone()));
-            object.insert("_clawhip_generated_event_id".to_string(), json!(event_id));
-            object.insert("idempotency_key".to_string(), json!(idempotency_key));
+            object.insert("event_id".to_string(), json!(Uuid::new_v4().to_string()));
             object.insert(
                 "correlation_id".to_string(),
                 json!(Uuid::new_v4().to_string()),
@@ -919,24 +914,6 @@ fn insert_context_alias_pair(context: &mut BTreeMap<String, String>, primary: &s
         }
         _ => {}
     }
-}
-
-fn stable_subscription_idempotency_key(
-    kind: &str,
-    payload: &Value,
-    routing: &RoutingMetadata,
-    name: &str,
-) -> String {
-    let identity = json!({
-        "kind": kind,
-        "payload": payload,
-        "routing": routing,
-        "subscription_name": name,
-    });
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&identity).unwrap_or_default())
-    )
 }
 
 pub fn render_template(template: &str, context: &BTreeMap<String, String>) -> String {
