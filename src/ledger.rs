@@ -13,6 +13,16 @@ use crate::config::LedgerConfig;
 use crate::events::IncomingEvent;
 
 const SCHEMA_VERSION: u8 = 1;
+const GENERATED_EVENT_ID_FIELD: &str = "_clawhip_generated_event_id";
+const MAX_EVENT_TYPE_BYTES: usize = 256;
+const MAX_SOURCE_BYTES: usize = 128;
+const MAX_REPO_CHARS: usize = 512;
+const MAX_WORKTREE_CHARS: usize = 1024;
+const MAX_SESSION_CHARS: usize = 256;
+const MAX_RECORD_SOURCE_LINKS: usize = 8;
+const MAX_SUMMARY_SOURCE_LINKS: usize = 32;
+const MAX_SOURCE_LINK_BYTES: usize = 1024;
+const MAX_SUMMARY_RECORDS: usize = 64;
 const PUBLIC_STRING_FIELDS: &[&str] = &[
     "repo",
     "repo_name",
@@ -32,8 +42,6 @@ const PUBLIC_STRING_FIELDS: &[&str] = &[
     "commit",
     "sha",
     "number",
-    "event_id",
-    "idempotency_key",
     "timestamp",
     "event_timestamp",
     "observed_at",
@@ -544,31 +552,43 @@ impl LedgerRecord {
             .as_object()
             .ok_or("ledger_payload_must_be_object")?;
         reject_private_storage_requests(object)?;
-        let timestamp = first_string(
+        let supplied_timestamp = first_string(
             object,
             &["event_timestamp", "timestamp", "observed_at", "created_at"],
-        )
-        .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
-        .unwrap_or_else(OffsetDateTime::now_utc);
+        );
+        let timestamp = supplied_timestamp
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .unwrap_or_else(OffsetDateTime::now_utc);
         let repo = bounded(
             first_string(object, &["repo", "repo_name", "repo_path", "project"]),
-            512,
+            MAX_REPO_CHARS,
         );
         let worktree = bounded(
             first_string(object, &["worktree", "worktree_path", "repo_path"]),
-            1024,
+            MAX_WORKTREE_CHARS,
         );
-        let session_id = bounded(first_string(object, &["session_id"]), 256);
-        let source = bounded(first_string(object, &["source", "provider", "tool"]), 128)
-            .unwrap_or_else(|| "clawhip".into());
+        let session_id = bounded(first_string(object, &["session_id"]), MAX_SESSION_CHARS);
+        let source = bounded(
+            first_string(object, &["source", "provider", "tool"]),
+            MAX_SOURCE_BYTES,
+        )
+        .unwrap_or_else(|| "clawhip".into());
         let mut source_links = Vec::new();
         for key in ["source_url", "html_url", "url"] {
-            if let Some(value) = object
-                .get(key)
-                .and_then(Value::as_str)
-                .filter(|value| is_public_link(value))
-            {
-                push_bounded_unique(&mut source_links, value, 1024, 8);
+            let Some(value) = object.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            if is_credential_bearing_url(value) {
+                return Err("ledger_credential_bearing_source_link_rejected".into());
+            }
+            if is_public_link(value) {
+                push_bounded_unique(
+                    &mut source_links,
+                    value,
+                    MAX_SOURCE_LINK_BYTES,
+                    MAX_RECORD_SOURCE_LINKS,
+                );
             }
         }
         let mut keywords = Vec::new();
@@ -589,10 +609,19 @@ impl LedgerRecord {
                 push_keyword(&mut keywords, value, config);
             }
         }
-        let supplied = first_string(object, &["idempotency_key", "event_id"]);
+        let generated_event_id = object
+            .get(GENERATED_EVENT_ID_FIELD)
+            .and_then(Value::as_str)
+            .zip(object.get("event_id").and_then(Value::as_str))
+            .is_some_and(|(generated, current)| generated == current);
+        let supplied = first_string(object, &["idempotency_key"]).or_else(|| {
+            (!generated_event_id)
+                .then(|| first_string(object, &["event_id"]))
+                .flatten()
+        });
         let timestamp_text = timestamp.format(&Rfc3339)?;
         let identity = serde_json::json!({
-            "event_type": event.canonical_kind(), "timestamp": timestamp_text, "source": source,
+            "event_type": event.canonical_kind(), "timestamp": supplied_timestamp, "source": source,
             "repo": repo, "worktree": worktree, "session_id": session_id, "source_links": source_links,
             "identity": PUBLIC_STRING_FIELDS.iter().filter_map(|key| object.get(*key).and_then(Value::as_str).map(|value| (*key, value))).collect::<BTreeMap<_, _>>()
         });
@@ -625,19 +654,24 @@ impl LedgerRecord {
     }
 
     fn validate(&self, config: &LedgerConfig) -> Result<()> {
+        let parsed_timestamp = OffsetDateTime::parse(&self.timestamp, &Rfc3339)
+            .map_err(|_| "invalid_ledger_record_timestamp")?;
         if self.schema_version != SCHEMA_VERSION
-            || self.id.len() != 64
-            || self.dedupe_key.len() != 64
+            || !is_sha256_hex(&self.id)
+            || !is_sha256_hex(&self.dedupe_key)
             || self.event_type.is_empty()
+            || self.event_type.len() > MAX_EVENT_TYPE_BYTES
+            || self.source.is_empty()
+            || self.source.len() > MAX_SOURCE_BYTES
+            || parsed_timestamp.unix_timestamp() != self.timestamp_unix
+            || !valid_optional_chars(self.repo.as_deref(), MAX_REPO_CHARS)
+            || !valid_optional_chars(self.worktree.as_deref(), MAX_WORKTREE_CHARS)
+            || !valid_optional_chars(self.session_id.as_deref(), MAX_SESSION_CHARS)
+            || !valid_source_links(&self.source_links, MAX_RECORD_SOURCE_LINKS)
         {
             return Err("invalid_ledger_record".into());
         }
-        if self.keywords.len() > config.max_keywords
-            || self
-                .keywords
-                .iter()
-                .any(|value| value.len() > config.max_keyword_bytes)
-        {
+        if !valid_keywords(&self.keywords, config) {
             return Err("invalid_ledger_keywords".into());
         }
         let encoded = serde_json::to_vec(self)?;
@@ -667,12 +701,17 @@ impl LedgerSummary {
             for keyword in &record.keywords {
                 *keyword_counts.entry(keyword.clone()).or_default() += 1;
             }
-            if source_record_ids.len() < 64 {
+            if source_record_ids.len() < MAX_SUMMARY_RECORDS {
                 source_record_ids.push(record.id.clone());
                 source_dedupe_keys.push(record.dedupe_key.clone());
             }
             for link in &record.source_links {
-                push_bounded_unique(&mut source_links, link, 1024, 32);
+                push_bounded_unique(
+                    &mut source_links,
+                    link,
+                    MAX_SOURCE_LINK_BYTES,
+                    MAX_SUMMARY_SOURCE_LINKS,
+                );
             }
         }
         let mut ranked: Vec<_> = keyword_counts.into_iter().collect();
@@ -718,13 +757,44 @@ impl LedgerSummary {
 
 impl LedgerSummary {
     fn validate(&self, config: &LedgerConfig) -> Result<()> {
+        let record_count = self
+            .event_counts
+            .values()
+            .try_fold(0usize, |total, count| total.checked_add(*count))
+            .ok_or("invalid_ledger_summary")?;
+        let expected_shard_id = hash_bytes(
+            serde_json::to_string(&(
+                self.day,
+                &self.repo,
+                &self.worktree,
+                &self.session_id,
+                &self.source_record_ids,
+            ))?
+            .as_bytes(),
+        );
         if self.schema_version != SCHEMA_VERSION
-            || self.shard_id.len() != 64
-            || self.source_record_ids.len() > 64
+            || !is_sha256_hex(&self.shard_id)
+            || self.shard_id != expected_shard_id
+            || self.source_record_ids.is_empty()
+            || self.source_record_ids.len() > MAX_SUMMARY_RECORDS
             || self.source_dedupe_keys.len() != self.source_record_ids.len()
-            || self.source_dedupe_keys.iter().any(|key| key.len() != 64)
-            || self.source_links.len() > 32
-            || self.top_keywords.len() > config.max_keywords
+            || !self.source_record_ids.iter().all(|id| is_sha256_hex(id))
+            || !self.source_dedupe_keys.iter().all(|key| is_sha256_hex(key))
+            || !values_are_unique(&self.source_record_ids)
+            || !values_are_unique(&self.source_dedupe_keys)
+            || record_count != self.source_record_ids.len()
+            || self.event_counts.is_empty()
+            || self.event_counts.iter().any(|(event_type, count)| {
+                event_type.is_empty() || event_type.len() > MAX_EVENT_TYPE_BYTES || *count == 0
+            })
+            || !valid_optional_chars(self.repo.as_deref(), MAX_REPO_CHARS)
+            || !valid_optional_chars(self.worktree.as_deref(), MAX_WORKTREE_CHARS)
+            || !valid_optional_chars(self.session_id.as_deref(), MAX_SESSION_CHARS)
+            || self.first_timestamp_unix > self.last_timestamp_unix
+            || self.first_timestamp_unix.div_euclid(86_400) != self.day
+            || self.last_timestamp_unix.div_euclid(86_400) != self.day
+            || !valid_keywords(&self.top_keywords, config)
+            || !valid_source_links(&self.source_links, MAX_SUMMARY_SOURCE_LINKS)
         {
             return Err("invalid_ledger_summary".into());
         }
@@ -781,8 +851,70 @@ fn push_bounded_unique(values: &mut Vec<String>, value: &str, max_bytes: usize, 
     }
     values.push(value.to_owned());
 }
+fn valid_optional_chars(value: Option<&str>, max_chars: usize) -> bool {
+    value.is_none_or(|value| !value.is_empty() && value.chars().count() <= max_chars)
+}
+
+fn values_are_unique(values: &[String]) -> bool {
+    let mut seen = HashSet::with_capacity(values.len());
+    values.iter().all(|value| seen.insert(value.as_str()))
+}
+
+fn valid_keywords(values: &[String], config: &LedgerConfig) -> bool {
+    values.len() <= config.max_keywords
+        && values_are_unique(values)
+        && values.iter().all(|value| {
+            value.len() >= 2
+                && value.len() <= config.max_keyword_bytes
+                && value == &normalize_keyword(value)
+        })
+}
+
+fn valid_source_links(values: &[String], max_count: usize) -> bool {
+    values.len() <= max_count
+        && values_are_unique(values)
+        && values
+            .iter()
+            .all(|value| value.len() <= MAX_SOURCE_LINK_BYTES && is_public_link(value))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_credential_bearing_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let discord_host = host == "discord.com"
+        || host.ends_with(".discord.com")
+        || host == "discordapp.com"
+        || host.ends_with(".discordapp.com");
+    let discord_webhook = discord_host
+        && segments.len() >= 4
+        && segments[0].eq_ignore_ascii_case("api")
+        && segments[1].eq_ignore_ascii_case("webhooks");
+    let slack_webhook = host == "hooks.slack.com"
+        && segments
+            .first()
+            .is_some_and(|segment| segment.eq_ignore_ascii_case("services"));
+    let telegram_bot = host == "api.telegram.org"
+        && segments
+            .first()
+            .is_some_and(|segment| segment.to_ascii_lowercase().starts_with("bot"));
+    discord_webhook || slack_webhook || telegram_bot
+}
+
 fn is_public_link(value: &str) -> bool {
-    if value.len() > 1024 {
+    if value.len() > MAX_SOURCE_LINK_BYTES || is_credential_bearing_url(value) {
         return false;
     }
     reqwest::Url::parse(value).ok().is_some_and(|url| {
@@ -829,6 +961,7 @@ fn json_files(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::normalize_event;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -899,6 +1032,127 @@ mod tests {
                 .contains("raw_private")
         );
         assert_eq!(ledger.status().records, 0);
+    }
+
+    #[test]
+    fn rejects_credential_bearing_source_links() {
+        let dir = tempdir().unwrap();
+        let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
+        let event = IncomingEvent {
+            kind: "github.issue-opened".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "event_id": "credential-url",
+                "repo": "owner/repo",
+                "source_url": "https://discord.com/api/webhooks/123/secret-token"
+            }),
+        };
+
+        let error = ledger.append(&event).unwrap_err().to_string();
+        assert!(error.contains("credential_bearing_source_link"));
+        assert_eq!(ledger.status().records, 0);
+    }
+
+    #[test]
+    fn generated_event_ids_use_stable_fallback_dedupe() {
+        let dir = tempdir().unwrap();
+        let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
+        let event = || {
+            normalize_event(normalize_event(IncomingEvent {
+                kind: "custom.audit".into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "repo": "owner/repo",
+                    "session_id": "s1",
+                    "status": "finished",
+                    "source_url": "https://github.com/owner/repo/issues/304"
+                }),
+            }))
+        };
+        let first = event();
+        let second = event();
+        assert_ne!(first.payload["event_id"], second.payload["event_id"]);
+        assert_eq!(
+            first.payload[GENERATED_EVENT_ID_FIELD],
+            first.payload["event_id"]
+        );
+
+        assert_eq!(ledger.append(&first).unwrap(), AppendOutcome::Appended);
+        assert_eq!(ledger.append(&second).unwrap(), AppendOutcome::Duplicate);
+    }
+
+    #[test]
+    fn verify_rejects_tampered_raw_public_safe_fields() {
+        let dir = tempdir().unwrap();
+        let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
+        let event = IncomingEvent {
+            kind: "custom.audit".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "event_id": "raw-verify",
+                "source_url": "https://github.com/owner/repo/issues/304",
+                "timestamp": "2026-08-01T12:00:00Z"
+            }),
+        };
+        ledger.append(&event).unwrap();
+        let path = ledger.segment_path(20666);
+        let line = fs::read_to_string(&path).unwrap();
+        let mut record: LedgerRecord = serde_json::from_str(line.trim()).unwrap();
+        record.source_links = vec!["https://discord.com/api/webhooks/123/secret-token".into()];
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        assert!(ledger.verify().is_err());
+    }
+
+    #[test]
+    fn verify_rejects_tampered_summary_hash_and_time() {
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.raw_retention_days = 1;
+        let mut ledger = EventLedger::open(cfg, dir.path()).unwrap();
+        let event = IncomingEvent {
+            kind: "github.issue-opened".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "event_id": "summary-verify",
+                "repo": "owner/repo",
+                "source_url": "https://github.com/owner/repo/issues/304",
+                "timestamp": "2026-07-01T00:00:00Z"
+            }),
+        };
+        ledger.append(&event).unwrap();
+        let now = OffsetDateTime::parse("2026-08-03T00:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp();
+        ledger.compact_if_due(now).unwrap();
+        let path = json_files(&ledger.summary_dir()).unwrap().remove(0);
+        let summary: LedgerSummary = serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+
+        let mut malformed_hash = summary.clone();
+        malformed_hash.shard_id = "g".repeat(64);
+        fs::write(&path, serde_json::to_vec(&malformed_hash).unwrap()).unwrap();
+        assert!(ledger.verify().is_err());
+
+        let mut invalid_time = summary;
+        invalid_time.first_timestamp_unix -= 86_400;
+        fs::write(&path, serde_json::to_vec(&invalid_time).unwrap()).unwrap();
+        assert!(ledger.verify().is_err());
     }
 
     #[test]

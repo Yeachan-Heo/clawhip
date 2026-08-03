@@ -30,10 +30,10 @@ Each JSONL record contains only:
 - schema version, public record id, and hashed dedupe key;
 - canonical event type, timestamp, and bounded source label;
 - optional repository, worktree, and session identity;
-- bounded public HTTP(S) source links;
+- bounded public HTTP(S) source links, excluding credential-bearing webhook/bot endpoint forms;
 - bounded normalized categorical keywords.
 
-Projection is closed and allowlisted. Adding a field to an incoming event does not make it durable. Explicit `raw`, `raw_payload`, `private_payload`, `retain_raw`, or `store_raw` requests are rejected.
+Projection is closed and allowlisted. Adding a field to an incoming event does not make it durable. Explicit `raw`, `raw_payload`, `private_payload`, `retain_raw`, or `store_raw` requests and known credential-bearing source URLs are rejected before delivery.
 
 Daily raw segments live under `raw/events-<utc-day>.jsonl`. Indexes are rebuilt from retained records at startup and are hard-capped by `max_records`.
 
@@ -52,11 +52,11 @@ clawhip ledger query --repo owner/repo --session-id s1 --event-type session.fini
 clawhip ledger verify
 ```
 
-All filters are intersected. Time bounds are inclusive. Query limits are capped by `max_query_results`. Event-type filters use the normalized canonical type (for example, an incoming `agent.finished` lifecycle event is stored as `session.finished`). `verify` scans retained raw segments and summary shards and validates schema, field bounds, dedupe metadata, and public-safe shape without printing private input.
+All filters are intersected. Time bounds are inclusive. Query limits are capped by `max_query_results`. Event-type filters use the normalized canonical type (for example, an incoming `agent.finished` lifecycle event is stored as `session.finished`). `verify` scans retained raw segments and summary shards and revalidates hashes, timestamps, identity bounds, keyword normalization, source-link safety, shard identity, and temporal invariants without printing private input.
 
 ## Dedupe and failure replay
 
-When `idempotency_key` or `event_id` is present, its value is hashed and used as the durable dedupe identity. Otherwise Clawhip hashes the canonical event type and allowlisted public identity fields. The dedupe set is rebuilt after restart from retained raw records and the newest compacted summary shards, capped by `max_records`; `/api/ledger/status` reports `dedupe_history_cap_applied` if older summary history cannot fit in that operational bound.
+When a caller supplies `idempotency_key` or `event_id`, its value is hashed and used as the durable dedupe identity. Normalization marks internally generated event UUIDs so they do not masquerade as caller identifiers; identifier-less retries instead hash the canonical event type and allowlisted stable public identity fields. The dedupe set is rebuilt after restart from retained raw records and the newest compacted summary shards, capped by `max_records`; `/api/ledger/status` reports `dedupe_history_cap_applied` if older summary history cannot fit in that operational bound.
 
 - append succeeds: routing may continue;
 - duplicate: no second append and no second delivery side effect;
