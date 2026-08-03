@@ -79,7 +79,7 @@ pub struct SubscriptionFilterConfig {
     pub predicates: Vec<SubscriptionPredicateConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubscriptionPredicateConfig {
     pub pointer: String,
@@ -1579,6 +1579,22 @@ impl AppConfig {
             .ok_or_else(|| "question setup requires the clawhip executable path".to_string())?;
         let mention = normalize_text(mention);
 
+        let subscription_matches = self
+            .subscriptions
+            .iter()
+            .enumerate()
+            .filter(|(_, subscription)| subscription.name == GJC_QUESTION_SUBSCRIPTION_NAME)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if subscription_matches.len() > 1 {
+            return Err("multiple setup-owned GJC question subscriptions found; clean up duplicates before updating".into());
+        }
+        if let Some(index) = subscription_matches.first()
+            && !self.subscriptions[*index].setup_owned
+        {
+            return Err("manual GJC question subscription ownership conflict; remove --question setup or mark the entry setup-owned".into());
+        }
+
         let route_matches = self
             .routes
             .iter()
@@ -1620,17 +1636,6 @@ impl AppConfig {
             _ => unreachable!(),
         }
 
-        let subscription_matches = self
-            .subscriptions
-            .iter()
-            .enumerate()
-            .filter(|(_, subscription)| subscription.name == GJC_QUESTION_SUBSCRIPTION_NAME)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if subscription_matches.len() > 1 {
-            return Err("multiple setup-owned GJC question subscriptions found; clean up duplicates before updating".into());
-        }
-
         let projection = [
             ("question_id", "/question/id"),
             ("summary", "/question/summary"),
@@ -1649,7 +1654,10 @@ impl AppConfig {
             filter: SubscriptionFilterConfig {
                 discriminator_pointer: "/type".into(),
                 discriminator_equals: "question".into(),
-                predicates: Vec::new(),
+                predicates: vec![SubscriptionPredicateConfig {
+                    pointer: "/context/repo_name".into(),
+                    equals: repo.clone(),
+                }],
             },
             projection,
             adapter: SubscriptionAdapterConfig {
@@ -1663,7 +1671,6 @@ impl AppConfig {
             reconnect: SubscriptionReconnectConfig::default(),
             routing: SubscriptionRoutingConfig {
                 tool: Some("gjc".into()),
-                repo_name: Some(repo),
                 ..SubscriptionRoutingConfig::default()
             },
         };
@@ -4077,9 +4084,13 @@ thread = "123456789012345678"
             Some("updated-question-channel")
         );
         assert_eq!(question.mention, None);
+        assert_eq!(config.subscriptions[0].routing.repo_name, None);
         assert_eq!(
-            config.subscriptions[0].routing.repo_name.as_deref(),
-            Some("owner/repo")
+            config.subscriptions[0].filter.predicates,
+            vec![SubscriptionPredicateConfig {
+                pointer: "/context/repo_name".into(),
+                equals: "owner/repo".into(),
+            }]
         );
     }
 
@@ -4099,6 +4110,37 @@ thread = "123456789012345678"
         assert!(error.contains("--question-channel"));
         assert!(config.subscriptions.is_empty());
         assert!(config.routes.is_empty());
+    }
+
+    #[test]
+    fn gjc_question_setup_rejects_manual_subscription_without_mutation() {
+        let mut config = AppConfig::default();
+        config
+            .apply_gjc_question_setup(
+                Some("question-channel".into()),
+                None,
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap();
+        config.subscriptions[0].setup_owned = false;
+        config.subscriptions[0].adapter.args = vec!["manual-adapter".into()];
+        let before = config.to_pretty_toml().unwrap();
+
+        let error = config
+            .apply_gjc_question_setup(
+                Some("new-channel".into()),
+                None,
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ownership conflict"));
+        assert_eq!(config.to_pretty_toml().unwrap(), before);
     }
 
     #[test]
