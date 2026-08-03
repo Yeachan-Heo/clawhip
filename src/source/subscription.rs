@@ -826,6 +826,7 @@ mod tests {
     fn config() -> SubscriptionConfig {
         SubscriptionConfig {
             name: "gjc-workflow-gate".into(),
+            setup_owned: false,
             enabled: true,
             kind: "websocket".into(),
             endpoint_env: "GJC_WS_URL".into(),

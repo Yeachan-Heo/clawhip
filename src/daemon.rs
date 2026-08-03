@@ -2835,6 +2835,7 @@ mod tests {
         crate::config::SubscriptionConfig {
             name: "workflow-gate".into(),
             enabled: true,
+            setup_owned: false,
             kind: "websocket".into(),
             endpoint_env: "!".into(),
             max_frame_bytes: 65_536,
