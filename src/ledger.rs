@@ -305,6 +305,7 @@ impl EventLedger {
             return Ok(verified);
         }
         for path in jsonl_files(&self.raw_dir())? {
+            let segment_day = raw_segment_day(&path)?;
             let file = File::open(path)?;
             for line in BufReader::new(file).lines() {
                 let line = line?;
@@ -313,6 +314,9 @@ impl EventLedger {
                 }
                 let record: LedgerRecord = serde_json::from_str(&line)?;
                 record.validate(&self.config)?;
+                if record.timestamp_unix.div_euclid(86_400) != segment_day {
+                    return Err("ledger_record_segment_day_mismatch".into());
+                }
                 verified.records += 1;
             }
         }
@@ -399,6 +403,7 @@ impl EventLedger {
         self.indexes = Indexes::default();
         let mut loaded = Vec::new();
         for path in jsonl_files(&self.raw_dir())? {
+            let segment_day = raw_segment_day(&path)?;
             let file = File::open(path)?;
             for line in BufReader::new(file).lines() {
                 let line = line?;
@@ -407,6 +412,9 @@ impl EventLedger {
                 }
                 let record: LedgerRecord = serde_json::from_str(&line)?;
                 record.validate(&self.config)?;
+                if record.timestamp_unix.div_euclid(86_400) != segment_day {
+                    return Err("ledger_record_segment_day_mismatch".into());
+                }
                 loaded.push(record);
             }
         }
@@ -898,10 +906,28 @@ fn is_credential_bearing_url(value: &str) -> bool {
         || host.ends_with(".discord.com")
         || host == "discordapp.com"
         || host.ends_with(".discordapp.com");
+    let discord_webhook_index = if segments
+        .get(1)
+        .is_some_and(|segment| segment.eq_ignore_ascii_case("webhooks"))
+    {
+        Some(1)
+    } else if segments.get(1).is_some_and(|segment| {
+        segment.strip_prefix(['v', 'V']).is_some_and(|version| {
+            !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }) && segments
+        .get(2)
+        .is_some_and(|segment| segment.eq_ignore_ascii_case("webhooks"))
+    {
+        Some(2)
+    } else {
+        None
+    };
     let discord_webhook = discord_host
-        && segments.len() >= 4
-        && segments[0].eq_ignore_ascii_case("api")
-        && segments[1].eq_ignore_ascii_case("webhooks");
+        && segments
+            .first()
+            .is_some_and(|segment| segment.eq_ignore_ascii_case("api"))
+        && discord_webhook_index.is_some_and(|index| segments.len() >= index + 3);
     let slack_webhook = host == "hooks.slack.com"
         && segments
             .first()
@@ -934,6 +960,14 @@ fn index_value(map: &mut HashMap<String, BTreeSet<usize>>, value: Option<&str>, 
         map.entry(value.to_owned()).or_default().insert(index);
     }
 }
+fn raw_segment_day(path: &Path) -> Result<i64> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("events-"))
+        .and_then(|day| day.parse::<i64>().ok())
+        .ok_or_else(|| "invalid_ledger_raw_segment_name".into())
+}
+
 fn jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -961,7 +995,7 @@ fn json_files(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::normalize_event;
+    use crate::events::{RoutingMetadata, normalize_event};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1038,21 +1072,31 @@ mod tests {
     fn rejects_credential_bearing_source_links() {
         let dir = tempdir().unwrap();
         let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
-        let event = IncomingEvent {
-            kind: "github.issue-opened".into(),
-            channel: None,
-            mention: None,
-            format: None,
-            template: None,
-            payload: json!({
-                "event_id": "credential-url",
-                "repo": "owner/repo",
-                "source_url": "https://discord.com/api/webhooks/123/secret-token"
-            }),
-        };
+        for (index, source_url) in [
+            "https://discord.com/api/webhooks/123/secret-token",
+            "https://discord.com/api/v10/webhooks/123/secret-token",
+            "https://hooks.slack.com/services/T000/B000/secret",
+            "https://api.telegram.org/bot123:secret/sendMessage",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = IncomingEvent {
+                kind: "github.issue-opened".into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "event_id": format!("credential-url-{index}"),
+                    "repo": "owner/repo",
+                    "source_url": source_url
+                }),
+            };
 
-        let error = ledger.append(&event).unwrap_err().to_string();
-        assert!(error.contains("credential_bearing_source_link"));
+            let error = ledger.append(&event).unwrap_err().to_string();
+            assert!(error.contains("credential_bearing_source_link"));
+        }
         assert_eq!(ledger.status().records, 0);
     }
 
@@ -1088,6 +1132,53 @@ mod tests {
     }
 
     #[test]
+    fn custom_sends_keep_distinct_generated_ids() {
+        let dir = tempdir().unwrap();
+        let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
+        let first = normalize_event(IncomingEvent::custom(Some("alpha".into()), "one".into()));
+        let second = normalize_event(IncomingEvent::custom(Some("beta".into()), "two".into()));
+
+        assert_ne!(first.payload["event_id"], second.payload["event_id"]);
+        assert!(first.payload.get(GENERATED_EVENT_ID_FIELD).is_none());
+        assert_eq!(ledger.append(&first).unwrap(), AppendOutcome::Appended);
+        assert_eq!(ledger.append(&second).unwrap(), AppendOutcome::Appended);
+        assert_eq!(ledger.status().records, 2);
+    }
+
+    #[test]
+    fn subscription_retries_use_stable_idempotency_key() {
+        let dir = tempdir().unwrap();
+        let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
+        let routing = RoutingMetadata {
+            repo_name: Some("owner/repo".into()),
+            session_id: Some("s1".into()),
+            ..RoutingMetadata::default()
+        };
+        let event = || {
+            normalize_event(IncomingEvent::subscription(
+                "custom.audit".into(),
+                json!({"status":"finished","sequence":1}),
+                &routing,
+                "audit-feed",
+            ))
+        };
+        let first = event();
+        let second = event();
+
+        assert_ne!(first.payload["event_id"], second.payload["event_id"]);
+        assert_eq!(
+            first.payload["idempotency_key"],
+            second.payload["idempotency_key"]
+        );
+        assert_eq!(
+            first.payload[GENERATED_EVENT_ID_FIELD],
+            first.payload["event_id"]
+        );
+        assert_eq!(ledger.append(&first).unwrap(), AppendOutcome::Appended);
+        assert_eq!(ledger.append(&second).unwrap(), AppendOutcome::Duplicate);
+    }
+
+    #[test]
     fn verify_rejects_tampered_raw_public_safe_fields() {
         let dir = tempdir().unwrap();
         let mut ledger = EventLedger::open(config(dir.path()), dir.path()).unwrap();
@@ -1115,6 +1206,29 @@ mod tests {
         .unwrap();
 
         assert!(ledger.verify().is_err());
+    }
+
+    #[test]
+    fn verify_rejects_record_in_wrong_raw_segment_day() {
+        let dir = tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mut ledger = EventLedger::open(cfg.clone(), dir.path()).unwrap();
+        let event = IncomingEvent {
+            kind: "custom.audit".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "event_id": "wrong-segment-day",
+                "timestamp": "2026-08-01T12:00:00Z"
+            }),
+        };
+        ledger.append(&event).unwrap();
+        fs::rename(ledger.segment_path(20666), ledger.segment_path(20667)).unwrap();
+
+        assert!(ledger.verify().is_err());
+        assert!(EventLedger::open(cfg, dir.path()).is_err());
     }
 
     #[test]

@@ -52,11 +52,11 @@ clawhip ledger query --repo owner/repo --session-id s1 --event-type session.fini
 clawhip ledger verify
 ```
 
-All filters are intersected. Time bounds are inclusive. Query limits are capped by `max_query_results`. Event-type filters use the normalized canonical type (for example, an incoming `agent.finished` lifecycle event is stored as `session.finished`). `verify` scans retained raw segments and summary shards and revalidates hashes, timestamps, identity bounds, keyword normalization, source-link safety, shard identity, and temporal invariants without printing private input.
+All filters are intersected. Time bounds are inclusive. Query limits are capped by `max_query_results`. Event-type filters use the normalized canonical type (for example, an incoming `agent.finished` lifecycle event is stored as `session.finished`). `verify` scans retained raw segments and summary shards and revalidates segment-day placement, hashes, timestamps, identity bounds, keyword normalization, source-link safety, shard identity, counts, and temporal invariants without printing private input.
 
 ## Dedupe and failure replay
 
-When a caller supplies `idempotency_key` or `event_id`, its value is hashed and used as the durable dedupe identity. Normalization marks internally generated event UUIDs so they do not masquerade as caller identifiers; identifier-less retries instead hash the canonical event type and allowlisted stable public identity fields. The dedupe set is rebuilt after restart from retained raw records and the newest compacted summary shards, capped by `max_records`; `/api/ledger/status` reports `dedupe_history_cap_applied` if older summary history cannot fit in that operational bound.
+When a caller supplies `idempotency_key` or `event_id`, its value is hashed and used as the durable dedupe identity. Normalization marks internally generated event UUIDs so they do not masquerade as caller identifiers; identifier-less retries instead hash the canonical event type and allowlisted stable public identity fields. Built-in custom sends receive distinct event ids, while subscription events receive a deterministic idempotency key derived from their restricted public-safe adapter output, routing identity, and subscription name. The dedupe set is rebuilt after restart from retained raw records and the newest compacted summary shards, capped by `max_records`; `/api/ledger/status` reports `dedupe_history_cap_applied` if older summary history cannot fit in that operational bound.
 
 - append succeeds: routing may continue;
 - duplicate: no second append and no second delivery side effect;
