@@ -104,8 +104,6 @@ struct ComponentEntry {
     name: String,
     #[serde(default)]
     status: String,
-    #[serde(default)]
-    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,7 +665,6 @@ mod tests {
                 components: vec![ComponentEntry {
                     name: "Actions".into(),
                     status: "degraded_performance".into(),
-                    description: None,
                 }],
                 incident_updates: vec![IncidentUpdateEntry {
                     id: "u1".into(),
@@ -684,7 +681,6 @@ mod tests {
                 components: vec![ComponentEntry {
                     name: "Pages".into(),
                     status: "degraded_performance".into(),
-                    description: None,
                 }],
                 incident_updates: vec![],
             },
