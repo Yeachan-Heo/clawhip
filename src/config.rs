@@ -3504,17 +3504,11 @@ fn parse_compact_backup_date(value: &str) -> Option<OffsetDateTime> {
         .map(|date| date.midnight().assume_utc())
 }
 
-/// Root backup labels are prune-eligible only when provenance is evidenced by
-/// historical clawhip backup producers (commits 25ba837 and 1e17b35).
+/// Root backup labels are preserved because no historical clawhip producer proves
+/// their provenance. An owner-approved compatibility boundary is required before
+/// labeled root backups become prune-eligible.
 fn valid_legacy_backup_label_prefix(prefix: &str) -> bool {
-    if prefix.is_empty() {
-        return true;
-    }
-
-    matches!(
-        prefix.strip_suffix('-'),
-        Some("gajae-runtime-rename" | "release-radar" | "gp-mention")
-    )
+    prefix.is_empty()
 }
 
 fn parse_root_legacy_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
@@ -3896,12 +3890,10 @@ where
                 after_preflight,
                 after_delete_check,
             )? {
-                CandidateDeletionOutcome::Deleted | CandidateDeletionOutcome::Disappeared => {
+                CandidateDeletionOutcome::Deleted => {
                     deleted += 1;
                 }
-                CandidateDeletionOutcome::Preserved(reason) => {
-                    let _ = reason;
-                }
+                CandidateDeletionOutcome::Disappeared | CandidateDeletionOutcome::Preserved(_) => {}
             }
         }
     }
@@ -5279,29 +5271,11 @@ name = "general"
     }
 
     #[test]
-    fn backup_filename_parsers_accept_evidenced_families_and_reject_near_misses() {
+    fn backup_filename_parsers_accept_unlabeled_root_families_and_preserve_labels() {
         let expected = parse_compact_backup_timestamp_seconds("20260708T072000Z").unwrap();
         assert_eq!(
-            parse_root_legacy_backup_name(
-                "config.toml.bak-gajae-runtime-rename-20260708T072000Z",
-                "config.toml"
-            ),
+            parse_root_legacy_backup_name("config.toml.bak-20260708T072000Z", "config.toml"),
             Some(expected)
-        );
-        assert!(
-            parse_root_legacy_backup_name(
-                "config.toml.bak-release-radar-20260708T0720Z",
-                "config.toml"
-            )
-            .is_some()
-        );
-        assert!(
-            parse_root_legacy_backup_name("config.toml.bak-gp-mention-20260708", "config.toml")
-                .is_some()
-        );
-        assert!(
-            parse_root_legacy_backup_name("config.toml.bak-20260708T072000Z", "config.toml")
-                .is_some()
         );
         assert!(
             parse_duplicated_legacy_backup_name(
@@ -5309,13 +5283,6 @@ name = "general"
                 "config.toml"
             )
             .is_some()
-        );
-        assert!(
-            parse_root_legacy_backup_name(
-                "custom.name.toml.bak-label-20260708T072000Z",
-                "custom.name.toml"
-            )
-            .is_none()
         );
         assert!(
             parse_duplicated_legacy_backup_name(
@@ -5326,6 +5293,9 @@ name = "general"
         );
 
         for name in [
+            "config.toml.bak-gajae-runtime-rename-20260708T072000Z",
+            "config.toml.bak-release-radar-20260708T0720Z",
+            "config.toml.bak-gp-mention-20260708",
             "config.toml.bak-label_with_underscore-20260708T072000Z",
             "config.toml.bak-label-20260708T072000Z",
             "config.toml.bak-label-20260708T072000",
@@ -5418,18 +5388,18 @@ name = "general"
         let parent = dir.path();
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
         let exact_cutoff = format!(
-            "config.toml.bak-gajae-runtime-rename-{}",
+            "config.toml.bak-{}",
             utc_backup_timestamp(now - TimeDuration::days(30)).unwrap()
         );
         let just_newer = format!(
-            "config.toml.bak-gajae-runtime-rename-{}",
+            "config.toml.bak-{}",
             utc_backup_timestamp(now - TimeDuration::days(30) + TimeDuration::seconds(1)).unwrap()
         );
         fs::write(parent.join(&exact_cutoff), "cutoff").unwrap();
         fs::write(parent.join(&just_newer), "recent").unwrap();
         for index in 0..10 {
             let name = format!(
-                "config.toml.bak-gajae-runtime-rename-{}",
+                "config.toml.bak-{}",
                 utc_backup_timestamp(now - TimeDuration::days(20 - index)).unwrap()
             );
             fs::write(parent.join(name), "later").unwrap();
@@ -5500,7 +5470,7 @@ name = "general"
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     #[test]
-    fn backup_cleanup_preserves_selected_candidate_without_supported_descriptor_proof() {
+    fn backup_cleanup_counts_candidates_without_supported_descriptor_proof() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path();
         for day in 1..=11 {
@@ -5512,8 +5482,7 @@ name = "general"
         }
         let oldest = parent.join("config.toml.bak-20000101");
         let mut before_delete = |_: &BackupCandidate| Ok(());
-
-        cleanup_config_backups_with(
+        let summary = cleanup_config_backups_with_hooks(
             parent,
             None,
             "config.toml",
@@ -5521,9 +5490,19 @@ name = "general"
             &[],
             OffsetDateTime::now_utc(),
             &mut before_delete,
+            &mut |_: &BackupCandidate| Ok(()),
+            &mut |_: &BackupCandidate| Ok(()),
         )
         .unwrap();
 
+        assert_eq!(
+            summary,
+            CleanupSummary {
+                classified: 11,
+                deleted: 0,
+                preserved: 11,
+            }
+        );
         assert_eq!(fs::read_to_string(oldest).unwrap(), "candidate");
     }
     #[cfg(unix)]
@@ -6517,6 +6496,53 @@ name = "general"
         assert!(replaced);
         assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
         assert_eq!(fs::read_to_string(moved).unwrap(), "original");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn backup_cleanup_does_not_report_concurrently_disappeared_candidate_as_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "original",
+            )
+            .unwrap();
+        }
+        let target = parent.join("config.toml.bak-20000101");
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        let mut removed = false;
+        let mut remove_candidate = |candidate: &BackupCandidate| -> Result<()> {
+            if candidate.path == target && !removed {
+                fs::remove_file(&target)?;
+                removed = true;
+            }
+            Ok(())
+        };
+        let summary = cleanup_config_backups_with_hooks(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+            &mut remove_candidate,
+            &mut |_: &BackupCandidate| Ok(()),
+        )
+        .unwrap();
+
+        assert!(removed);
+        assert_eq!(
+            summary,
+            CleanupSummary {
+                classified: 11,
+                deleted: 0,
+                preserved: 11,
+            }
+        );
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]

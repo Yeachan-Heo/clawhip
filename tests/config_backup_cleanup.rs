@@ -151,8 +151,9 @@ fn config_backup_cleanup_converges_legacy_snapshots_on_changed_and_noop_saves() 
         "unknown",
     )
     .expect("write unknown backup");
-    let evidenced = temp.path().join("config.toml.bak-release-radar-20190101");
-    fs::write(&evidenced, "evidenced").expect("write evidenced backup");
+    let labeled = temp.path().join("config.toml.bak-release-radar-20190101");
+    fs::write(&labeled, "labeled").expect("write labeled backup");
+
     let lookalike = temp
         .path()
         .join("config.toml.bak-release-radar-copy-20200115");
@@ -186,7 +187,7 @@ fn config_backup_cleanup_converges_legacy_snapshots_on_changed_and_noop_saves() 
     assert!(temp.path().join("config.toml.bak-unknown-format").exists());
     let duplicated = temp.path().join("config.config.toml.bak-2020-01-13-0000");
     assert!(duplicated.exists());
-    assert!(!evidenced.exists());
+    assert!(labeled.exists());
     assert!(lookalike.exists());
     let noop_only = temp.path().join("config.toml.bak-20190101");
     fs::write(&noop_only, "no-op-only stale backup").expect("write no-op-only backup");
