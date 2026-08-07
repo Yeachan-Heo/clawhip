@@ -3556,7 +3556,14 @@ fn safe_cleanup_file_identity(metadata: &Metadata) -> Option<FileIdentity> {
     if metadata.nlink() != 1 {
         return None;
     }
-    metadata_identity(metadata)
+    #[cfg(unix)]
+    {
+        metadata_identity(metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        Some(FileIdentity {})
+    }
 }
 
 fn collect_cleanup_candidates(
@@ -3859,9 +3866,6 @@ where
             parent.display()
         )
         .into());
-    }
-    if parent_dir.identity.is_none() {
-        return Ok(CleanupSummary::default());
     }
     let cutoff = now - TimeDuration::days(30);
     let mut candidates =
