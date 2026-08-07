@@ -5,7 +5,9 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::PathBuf;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
 use std::process::{Command, Output};
@@ -149,6 +151,13 @@ fn config_backup_cleanup_converges_legacy_snapshots_on_changed_and_noop_saves() 
         "unknown",
     )
     .expect("write unknown backup");
+    let labeled = temp.path().join("config.toml.bak-release-radar-20190101");
+    fs::write(&labeled, "labeled").expect("write labeled backup");
+
+    let lookalike = temp
+        .path()
+        .join("config.toml.bak-release-radar-copy-20200115");
+    fs::write(&lookalike, "lookalike").expect("write lookalike backup");
 
     let changed = run_setup(&config_path, "changed");
     assert!(
@@ -157,6 +166,12 @@ fn config_backup_cleanup_converges_legacy_snapshots_on_changed_and_noop_saves() 
         String::from_utf8_lossy(&changed.stdout),
         String::from_utf8_lossy(&changed.stderr)
     );
+    let changed_stdout = String::from_utf8_lossy(&changed.stdout);
+    assert!(changed_stdout.contains("Config backup cleanup: "));
+    assert!(changed_stdout.contains(" classified, "));
+    assert!(changed_stdout.contains(" deleted, "));
+    assert!(changed_stdout.contains(" preserved"));
+    assert!(!changed_stdout.contains("release-radar"));
     assert!(
         fs::read_to_string(&config_path)
             .unwrap()
@@ -172,6 +187,8 @@ fn config_backup_cleanup_converges_legacy_snapshots_on_changed_and_noop_saves() 
     assert!(temp.path().join("config.toml.bak-unknown-format").exists());
     let duplicated = temp.path().join("config.config.toml.bak-2020-01-13-0000");
     assert!(duplicated.exists());
+    assert!(labeled.exists());
+    assert!(lookalike.exists());
     let noop_only = temp.path().join("config.toml.bak-20190101");
     fs::write(&noop_only, "no-op-only stale backup").expect("write no-op-only backup");
     assert!(noop_only.exists());
@@ -274,21 +291,37 @@ fn config_backup_cleanup_preserves_mode_000_candidate_on_changed_and_noop_setup(
 
 #[cfg(not(unix))]
 #[test]
-fn config_backup_cleanup_preserves_candidates_without_identity_proof() {
+fn config_backup_cleanup_counts_and_preserves_root_candidates_without_identity_proof() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config.toml");
     let initial = run_setup(&config_path, "initial");
     assert!(initial.status.success());
-    let legacy = temp.path().join("config.toml.bak-20200101");
-    fs::write(&legacy, "legacy").expect("write legacy backup");
 
-    let changed = run_setup(&config_path, "changed");
+    for day in 1..=11 {
+        fs::write(
+            temp.path().join(format!("config.toml.bak-202001{day:02}")),
+            format!("legacy-{day}"),
+        )
+        .expect("write legacy backup");
+    }
+
+    let observed = run_setup(&config_path, "initial");
     assert!(
-        changed.status.success(),
-        "changed setup failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&changed.stdout),
-        String::from_utf8_lossy(&changed.stderr)
+        observed.status.success(),
+        "no-op setup failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&observed.stdout),
+        String::from_utf8_lossy(&observed.stderr)
     );
-    assert!(legacy.exists());
-    assert!(fs::read_to_string(config_path).unwrap().contains("changed"));
+    assert!(
+        String::from_utf8_lossy(&observed.stdout)
+            .contains("Config backup cleanup: 11 classified, 0 deleted, 11 preserved")
+    );
+    for day in 1..=11 {
+        assert!(
+            temp.path()
+                .join(format!("config.toml.bak-202001{day:02}"))
+                .exists()
+        );
+    }
+    assert!(fs::read_to_string(config_path).unwrap().contains("initial"));
 }

@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -1757,10 +1759,11 @@ fn write_receipt_tempfile(input: &[u8]) -> Result<TempReceiptFile> {
         "clawhip-gajae-receipt-{}.json",
         uuid::Uuid::new_v4()
     ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&path)
         .context("failed to create temporary receipt file")?;
     file.write_all(input)

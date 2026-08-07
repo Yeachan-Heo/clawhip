@@ -108,6 +108,16 @@ jobs:
           done
       - run: cargo test
 
+  windows-backup-cleanup:
+    name: Windows backup cleanup
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test config_backup_cleanup
+
   clippy:
     name: Clippy
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository

@@ -956,8 +956,14 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
         }
     }
 
-    editable.save_with_backup(config_path)?;
+    let cleanup = editable.save_with_backup_reporting(config_path)?;
     println!("Saved {}", config_path.display());
+    if cleanup.classified > 0 {
+        println!(
+            "Config backup cleanup: {} classified, {} deleted, {} preserved",
+            cleanup.classified, cleanup.deleted, cleanup.preserved
+        );
+    }
     Ok(())
 }
 

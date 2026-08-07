@@ -1103,7 +1103,12 @@ impl AppConfig {
         Ok(toml::to_string_pretty(self)?)
     }
 
+    #[allow(dead_code)] // Retained for callers that do not need cleanup observation.
     pub fn save_with_backup(&self, path: &Path) -> Result<()> {
+        self.save_with_backup_reporting(path).map(|_| ())
+    }
+
+    pub fn save_with_backup_reporting(&self, path: &Path) -> Result<CleanupSummary> {
         let mut before_delete = |_: &BackupCandidate| Ok(());
         self.save_with_backup_at(path, OffsetDateTime::now_utc(), &mut before_delete)
     }
@@ -1113,7 +1118,7 @@ impl AppConfig {
         path: &Path,
         now: OffsetDateTime,
         before_delete: &mut F,
-    ) -> Result<()>
+    ) -> Result<CleanupSummary>
     where
         F: FnMut(&BackupCandidate) -> Result<()>,
     {
@@ -1135,7 +1140,7 @@ impl AppConfig {
         before_rename: &mut G,
         before_snapshot: &mut H,
         before_delete: &mut F,
-    ) -> Result<()>
+    ) -> Result<CleanupSummary>
     where
         F: FnMut(&BackupCandidate) -> Result<()>,
         G: FnMut() -> Result<()>,
@@ -1161,7 +1166,7 @@ impl AppConfig {
         before_snapshot: &mut H,
         before_delete: &mut F,
         after_preflight: &mut P,
-    ) -> Result<()>
+    ) -> Result<CleanupSummary>
     where
         F: FnMut(&BackupCandidate) -> Result<()>,
         G: FnMut() -> Result<()>,
@@ -1190,7 +1195,7 @@ impl AppConfig {
         before_delete: &mut F,
         after_preflight: &mut P,
         after_check: &mut A,
-    ) -> Result<()>
+    ) -> Result<CleanupSummary>
     where
         F: FnMut(&BackupCandidate) -> Result<()>,
         G: FnMut() -> Result<()>,
@@ -1225,7 +1230,7 @@ impl AppConfig {
                     ))
                 })?;
             let protected_identities = active.identity().into_iter().collect::<Vec<_>>();
-            cleanup_config_backups_with_hooks(
+            return cleanup_config_backups_with_hooks(
                 &parent_dir.path,
                 parent_dir.identity,
                 filename,
@@ -1240,8 +1245,8 @@ impl AppConfig {
                 io::Error::other(format!(
                     "config was already current; backup retention cleanup remains incomplete: {error}"
                 ))
-            })?;
-            return Ok(());
+            })
+            .map_err(Into::into);
         }
 
         revalidate_config_parent_dir(&parent_dir)?;
@@ -1300,8 +1305,8 @@ impl AppConfig {
             io::Error::other(format!(
                 "config was saved; backup retention cleanup remains incomplete: {error}"
             ))
-        })?;
-        Ok(())
+        })
+        .map_err(Into::into)
     }
 
     pub fn effective_token(&self) -> Option<String> {
@@ -2210,8 +2215,9 @@ impl AppConfig {
                     self.scaffold_webhook_quickstart(webhook)?;
                 }
                 "6" => {
-                    self.save_with_backup(path)?;
+                    let cleanup = self.save_with_backup_reporting(path)?;
                     println!("Saved {}", path.display());
+                    print_cleanup_summary(cleanup);
                     break;
                 }
                 "7" => {
@@ -2472,6 +2478,13 @@ impl BackupOrigin {
             Self::Managed => 1,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CleanupSummary {
+    pub classified: usize,
+    pub deleted: usize,
+    pub preserved: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -3491,18 +3504,11 @@ fn parse_compact_backup_date(value: &str) -> Option<OffsetDateTime> {
         .map(|date| date.midnight().assume_utc())
 }
 
+/// Root backup labels are preserved because no historical clawhip producer proves
+/// their provenance. An owner-approved compatibility boundary is required before
+/// labeled root backups become prune-eligible.
 fn valid_legacy_backup_label_prefix(prefix: &str) -> bool {
-    if prefix.is_empty() {
-        return true;
-    }
-    let Some(label) = prefix.strip_suffix('-') else {
-        return false;
-    };
-    !label.is_empty()
-        && label.bytes().any(|byte| byte.is_ascii_alphanumeric())
-        && label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    prefix.is_empty()
 }
 
 fn parse_root_legacy_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
@@ -3544,7 +3550,14 @@ fn safe_cleanup_file_identity(metadata: &Metadata) -> Option<FileIdentity> {
     if metadata.nlink() != 1 {
         return None;
     }
-    metadata_identity(metadata)
+    #[cfg(unix)]
+    {
+        metadata_identity(metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        Some(FileIdentity {})
+    }
 }
 
 fn collect_cleanup_candidates(
@@ -3820,6 +3833,7 @@ where
         &mut after_preflight,
         &mut after_check,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3833,7 +3847,7 @@ fn cleanup_config_backups_with_hooks<F, P, A>(
     before_delete: &mut F,
     after_preflight: &mut P,
     after_delete_check: &mut A,
-) -> Result<()>
+) -> Result<CleanupSummary>
 where
     F: FnMut(&BackupCandidate) -> Result<()>,
     P: FnMut(&BackupCandidate) -> Result<()>,
@@ -3846,9 +3860,6 @@ where
             parent.display()
         )
         .into());
-    }
-    if parent_dir.identity.is_none() {
-        return Ok(());
     }
     let cutoff = now - TimeDuration::days(30);
     let mut candidates =
@@ -3865,7 +3876,9 @@ where
                 right.entry_name.as_str(),
             ))
     });
-    let keep_from = candidates.len().saturating_sub(10);
+    let classified = candidates.len();
+    let keep_from = classified.saturating_sub(10);
+    let mut deleted = 0;
     for (index, candidate) in candidates.iter().enumerate() {
         if index < keep_from && candidate.created_at <= cutoff {
             before_delete(candidate)?;
@@ -3877,16 +3890,28 @@ where
                 after_preflight,
                 after_delete_check,
             )? {
-                CandidateDeletionOutcome::Deleted | CandidateDeletionOutcome::Disappeared => {}
-                CandidateDeletionOutcome::Preserved(reason) => {
-                    let _ = reason;
+                CandidateDeletionOutcome::Deleted => {
+                    deleted += 1;
                 }
+                CandidateDeletionOutcome::Disappeared | CandidateDeletionOutcome::Preserved(_) => {}
             }
         }
     }
-    Ok(())
+    Ok(CleanupSummary {
+        classified,
+        deleted,
+        preserved: classified - deleted,
+    })
 }
 
+fn print_cleanup_summary(summary: CleanupSummary) {
+    if summary.classified > 0 {
+        println!(
+            "Config backup cleanup: {} classified, {} deleted, {} preserved",
+            summary.classified, summary.deleted, summary.preserved
+        );
+    }
+}
 fn is_canonical_quickstart_route(route: &RouteRule) -> bool {
     route.event == "*"
         && route.filter.is_empty()
@@ -5246,41 +5271,16 @@ name = "general"
     }
 
     #[test]
-    fn backup_filename_parsers_accept_evidenced_families_and_reject_near_misses() {
+    fn backup_filename_parsers_accept_unlabeled_root_families_and_preserve_labels() {
         let expected = parse_compact_backup_timestamp_seconds("20260708T072000Z").unwrap();
         assert_eq!(
-            parse_root_legacy_backup_name(
-                "config.toml.bak-gajae-runtime-rename-20260708T072000Z",
-                "config.toml"
-            ),
+            parse_root_legacy_backup_name("config.toml.bak-20260708T072000Z", "config.toml"),
             Some(expected)
-        );
-        assert!(
-            parse_root_legacy_backup_name(
-                "config.toml.bak-release-radar-20260708T0720Z",
-                "config.toml"
-            )
-            .is_some()
-        );
-        assert!(
-            parse_root_legacy_backup_name("config.toml.bak-gp-mention-20260708", "config.toml")
-                .is_some()
-        );
-        assert!(
-            parse_root_legacy_backup_name("config.toml.bak-20260708T072000Z", "config.toml")
-                .is_some()
         );
         assert!(
             parse_duplicated_legacy_backup_name(
                 "config.config.toml.bak-2026-04-10-0206",
                 "config.toml"
-            )
-            .is_some()
-        );
-        assert!(
-            parse_root_legacy_backup_name(
-                "custom.name.toml.bak-label-20260708T072000Z",
-                "custom.name.toml"
             )
             .is_some()
         );
@@ -5293,7 +5293,11 @@ name = "general"
         );
 
         for name in [
+            "config.toml.bak-gajae-runtime-rename-20260708T072000Z",
+            "config.toml.bak-release-radar-20260708T0720Z",
+            "config.toml.bak-gp-mention-20260708",
             "config.toml.bak-label_with_underscore-20260708T072000Z",
+            "config.toml.bak-label-20260708T072000Z",
             "config.toml.bak-label-20260708T072000",
             "config.toml.bak-20260708T07200Z",
             "config.toml.bak-20260708-extra",
@@ -5384,24 +5388,24 @@ name = "general"
         let parent = dir.path();
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
         let exact_cutoff = format!(
-            "config.toml.bak-exact-cutoff-{}",
+            "config.toml.bak-{}",
             utc_backup_timestamp(now - TimeDuration::days(30)).unwrap()
         );
         let just_newer = format!(
-            "config.toml.bak-just-newer-{}",
+            "config.toml.bak-{}",
             utc_backup_timestamp(now - TimeDuration::days(30) + TimeDuration::seconds(1)).unwrap()
         );
         fs::write(parent.join(&exact_cutoff), "cutoff").unwrap();
         fs::write(parent.join(&just_newer), "recent").unwrap();
         for index in 0..10 {
             let name = format!(
-                "config.toml.bak-later-{index}-{}",
+                "config.toml.bak-{}",
                 utc_backup_timestamp(now - TimeDuration::days(20 - index)).unwrap()
             );
             fs::write(parent.join(name), "later").unwrap();
         }
         let mut before_delete = |_: &BackupCandidate| Ok(());
-        cleanup_config_backups_with(
+        let summary = cleanup_config_backups_with_hooks(
             parent,
             None,
             "config.toml",
@@ -5409,8 +5413,18 @@ name = "general"
             &[],
             now,
             &mut before_delete,
+            &mut |_: &BackupCandidate| Ok(()),
+            &mut |_: &BackupCandidate| Ok(()),
         )
         .unwrap();
+        assert_eq!(
+            summary,
+            CleanupSummary {
+                classified: 12,
+                deleted: 1,
+                preserved: 11,
+            }
+        );
         assert!(!parent.join(exact_cutoff).exists());
         assert!(parent.join(just_newer).exists());
     }
@@ -5456,7 +5470,7 @@ name = "general"
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     #[test]
-    fn backup_cleanup_preserves_selected_candidate_without_supported_descriptor_proof() {
+    fn backup_cleanup_counts_candidates_without_supported_descriptor_proof() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path();
         for day in 1..=11 {
@@ -5468,8 +5482,7 @@ name = "general"
         }
         let oldest = parent.join("config.toml.bak-20000101");
         let mut before_delete = |_: &BackupCandidate| Ok(());
-
-        cleanup_config_backups_with(
+        let summary = cleanup_config_backups_with_hooks(
             parent,
             None,
             "config.toml",
@@ -5477,9 +5490,19 @@ name = "general"
             &[],
             OffsetDateTime::now_utc(),
             &mut before_delete,
+            &mut |_: &BackupCandidate| Ok(()),
+            &mut |_: &BackupCandidate| Ok(()),
         )
         .unwrap();
 
+        assert_eq!(
+            summary,
+            CleanupSummary {
+                classified: 11,
+                deleted: 0,
+                preserved: 11,
+            }
+        );
         assert_eq!(fs::read_to_string(oldest).unwrap(), "candidate");
     }
     #[cfg(unix)]
@@ -6475,6 +6498,53 @@ name = "general"
         assert_eq!(fs::read_to_string(moved).unwrap(), "original");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn backup_cleanup_does_not_report_concurrently_disappeared_candidate_as_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "original",
+            )
+            .unwrap();
+        }
+        let target = parent.join("config.toml.bak-20000101");
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        let mut removed = false;
+        let mut remove_candidate = |candidate: &BackupCandidate| -> Result<()> {
+            if candidate.path == target && !removed {
+                fs::remove_file(&target)?;
+                removed = true;
+            }
+            Ok(())
+        };
+        let summary = cleanup_config_backups_with_hooks(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+            &mut remove_candidate,
+            &mut |_: &BackupCandidate| Ok(()),
+        )
+        .unwrap();
+
+        assert!(removed);
+        assert_eq!(
+            summary,
+            CleanupSummary {
+                classified: 11,
+                deleted: 0,
+                preserved: 11,
+            }
+        );
+        assert!(!target.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn backup_cleanup_revalidates_config_parent_before_root_unlink() {
@@ -6748,7 +6818,7 @@ name = "general"
         assert_eq!(managed_entries.len(), 1);
         assert_eq!(fs::read(managed_entries[0].path()).unwrap(), original_bytes);
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 assert!(fs::read_to_string(&path).unwrap().contains("alerts"));
             }
             Err(error) => {
