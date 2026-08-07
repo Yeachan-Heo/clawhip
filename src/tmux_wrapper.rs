@@ -1527,6 +1527,7 @@ fn default_keyword_window_secs() -> u64 {
     30
 }
 
+#[cfg(unix)]
 fn current_parent_process_info() -> Option<ParentProcessInfo> {
     let pid = std::os::unix::process::parent_id();
     if pid == 0 {
@@ -1539,6 +1540,11 @@ fn current_parent_process_info() -> Option<ParentProcessInfo> {
         .filter(|value| !value.is_empty());
 
     Some(ParentProcessInfo { pid, name })
+}
+
+#[cfg(not(unix))]
+fn current_parent_process_info() -> Option<ParentProcessInfo> {
+    None
 }
 
 fn format_watch_audit_log(registration: &RegisteredTmuxSession) -> String {
