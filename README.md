@@ -978,6 +978,52 @@ clawhip includes a [`geobench`](https://github.com/NomaDamas/geobench) product s
 - Spec: [`geobench/clawhip.yaml`](geobench/clawhip.yaml)
 - Runbook: [`docs/geobench.md`](docs/geobench.md)
 
+## GitHub Actions platform status monitor
+
+Poll the public GitHub Statuspage machine-readable API for GitHub Actions (and optionally other components) without using GitHub API tokens or websocket subscriptions.
+
+This is a daemon monitor (`monitors.github_status`), **not** a `[[subscriptions]]` websocket worker. Keep it separate from GJC workflow-gate / question subscriptions.
+
+Official public endpoints (no auth, no secrets):
+
+- `https://www.githubstatus.com/api/v2/summary.json`
+- `https://www.githubstatus.com/api/v2/status.json`
+- `https://www.githubstatus.com/api/v2/components.json`
+- `https://www.githubstatus.com/api/v2/incidents.json`
+
+`status.github.com` serves the same Statuspage surface; clawhip defaults to the `www.githubstatus.com` API base.
+
+```toml
+[monitors.github_status]
+enabled = true
+# Public Statuspage API; no token. Override only for tests/mirrors.
+api_base = "https://www.githubstatus.com/api/v2"
+components = ["Actions"]
+poll_interval_secs = 60
+# Optional direct channel; prefer an explicit route for gajae-code dev.
+# channel = "YOUR_GAJAE_CODE_DEV_CHANNEL_ID"
+# channel_name = "gajae-code-dev"
+format = "alert"
+
+[[routes]]
+event = "github.actions-*"
+sink = "discord"
+channel = "YOUR_GAJAE_CODE_DEV_CHANNEL_ID"
+channel_name = "gajae-code-dev"
+format = "alert"
+```
+
+Events:
+
+- `github.actions-status` — watched component transitions among `degraded_performance`, `partial_outage`, `major_outage`, `under_maintenance`, and recovery to `operational`
+- `github.actions-incident` — incident opened / update / resolved for incidents that affect a watched component
+
+Anti-spam:
+
+- first successful poll establishes a baseline and emits nothing
+- stable component status and identical incident update IDs do not re-alert
+- only lifecycle deltas (status change, new update id, resolve) emit
+
 ## Websocket subscriptions
 
 Subscriptions are daemon-owned, guarded local ingress for a configured websocket event stream. Keep endpoint credentials outside the TOML file: the configuration names an environment variable, and `clawhip subscribe`, health, and API responses never print that name, its value, the endpoint URL, adapter arguments, adapter stderr, frames, or adapter output.

@@ -38,7 +38,7 @@ use crate::source::tmux::{
 };
 
 use crate::source::{
-    GitHubSource, GitMonitorLifecycleCounts, GitSource, RegisteredTmuxSession,
+    GitHubSource, GitHubStatusSource, GitMonitorLifecycleCounts, GitSource, RegisteredTmuxSession,
     SharedGitMonitorDiagnostics, SharedTmuxRegistry, Source, SubscriptionSnapshot,
     SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
     default_registry_state_path, inspect_tmux_registry_state, list_active_tmux_registrations,
@@ -197,6 +197,7 @@ pub async fn run(
         tx.clone(),
     );
     spawn_source(GitHubSource::new(config.clone()), tx.clone());
+    spawn_source(GitHubStatusSource::new(config.clone()), tx.clone());
     spawn_source(
         TmuxSource::new(
             config.clone(),
@@ -499,6 +500,7 @@ fn health_payload(
         "git_monitors": git_monitors,
         "configured_tmux_monitors": config.monitors.tmux.sessions.len(),
         "configured_workspace_monitors": config.monitors.workspace.len(),
+        "configured_github_status_monitor": config.monitors.github_status.enabled,
         "configured_cron_jobs": config.cron.jobs.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
         "tmux": tmux,

@@ -523,6 +523,80 @@ impl IncomingEvent {
         }
     }
 
+    /// GitHub Actions (or other watched Statuspage component) status transition.
+    pub fn github_actions_status(
+        component: String,
+        old_status: String,
+        new_status: String,
+        url: String,
+        channel: Option<String>,
+    ) -> Self {
+        Self {
+            kind: "github.actions-status".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "component": component,
+                "old_status": old_status,
+                "new_status": new_status,
+                "url": url,
+                "provider": "github-statuspage",
+            }),
+        }
+    }
+
+    /// GitHub platform incident lifecycle update for watched Statuspage components.
+    #[allow(clippy::too_many_arguments)]
+    pub fn github_actions_incident(
+        incident_id: String,
+        name: String,
+        status: String,
+        impact: String,
+        change: String,
+        old_status: Option<String>,
+        update_id: Option<String>,
+        update_status: Option<String>,
+        update_body: Option<String>,
+        affected_components: Vec<String>,
+        url: String,
+        channel: Option<String>,
+    ) -> Self {
+        let mut payload = Map::new();
+        payload.insert("incident_id".to_string(), json!(incident_id));
+        payload.insert("name".to_string(), json!(name));
+        payload.insert("status".to_string(), json!(status));
+        payload.insert("impact".to_string(), json!(impact));
+        payload.insert("change".to_string(), json!(change));
+        payload.insert("url".to_string(), json!(url));
+        payload.insert("provider".to_string(), json!("github-statuspage"));
+        payload.insert(
+            "affected_components".to_string(),
+            json!(affected_components),
+        );
+        if let Some(old_status) = old_status {
+            payload.insert("old_status".to_string(), json!(old_status));
+        }
+        if let Some(update_id) = update_id {
+            payload.insert("update_id".to_string(), json!(update_id));
+        }
+        if let Some(update_status) = update_status {
+            payload.insert("update_status".to_string(), json!(update_status));
+        }
+        if let Some(update_body) = update_body {
+            payload.insert("update_body".to_string(), json!(update_body));
+        }
+        Self {
+            kind: "github.actions-incident".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: Value::Object(payload),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gajae_release_hold(
         repo: String,

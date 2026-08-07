@@ -201,6 +201,44 @@ impl Renderer for DefaultRenderer {
                 serde_json::to_string_pretty(payload)?
             }
 
+            ("github.actions-status", MessageFormat::Compact) => format!(
+                "GitHub {}: {} -> {} ({})",
+                string_field(payload, "component")?,
+                string_field(payload, "old_status")?,
+                string_field(payload, "new_status")?,
+                string_field(payload, "url")?
+            ),
+            ("github.actions-status", MessageFormat::Alert) => format!(
+                "🚨 GitHub platform {}: {} -> {} ({})",
+                string_field(payload, "component")?,
+                string_field(payload, "old_status")?,
+                string_field(payload, "new_status")?,
+                string_field(payload, "url")?
+            ),
+            ("github.actions-status", MessageFormat::Inline) => format!(
+                "[status:{}] {} -> {}",
+                string_field(payload, "component")?,
+                string_field(payload, "old_status")?,
+                string_field(payload, "new_status")?
+            ),
+            ("github.actions-status", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
+
+            ("github.actions-incident", MessageFormat::Compact) => {
+                render_github_actions_incident(payload, false)?
+            }
+            ("github.actions-incident", MessageFormat::Alert) => {
+                format!("🚨 {}", render_github_actions_incident(payload, true)?)
+            }
+            ("github.actions-incident", MessageFormat::Inline) => format!(
+                "[incident:{}] {} ({})",
+                string_field(payload, "change")?,
+                string_field(payload, "name")?,
+                string_field(payload, "status")?
+            ),
+            ("github.actions-incident", MessageFormat::Raw) => {
+                serde_json::to_string_pretty(payload)?
+            }
+
             (
                 "github.ci-started"
                 | "github.ci-failed"
@@ -672,6 +710,30 @@ fn render_github_release(payload: &Value, kind: &str) -> Result<String> {
     Ok(parts.join(" · "))
 }
 
+fn render_github_actions_incident(payload: &Value, include_body: bool) -> Result<String> {
+    let name = string_field(payload, "name")?;
+    let change = string_field(payload, "change")?;
+    let status = string_field(payload, "status")?;
+    let impact = string_field(payload, "impact")?;
+    let url = optional_string_field(payload, "url").unwrap_or_default();
+    let mut parts = vec![format!(
+        "GitHub incident {change}: {name} ({status}, impact={impact})"
+    )];
+    if include_body && let Some(body) = optional_string_field(payload, "update_body") {
+        let trimmed = if body.chars().count() > 180 {
+            let clipped: String = body.chars().take(177).collect();
+            format!("{clipped}...")
+        } else {
+            body
+        };
+        parts.push(trimmed);
+    }
+    if !url.is_empty() {
+        parts.push(url);
+    }
+    Ok(parts.join(" · "))
+}
+
 fn render_gajae_hold(payload: &Value, kind: &str) -> Result<String> {
     let repo = string_field(payload, "repo")?;
     let action = string_field(payload, "action")?;
@@ -1082,5 +1144,43 @@ mod tests {
         assert!(rendered.contains("blocked action: merge pull request #252 into main"));
         assert!(rendered.contains("autonomous execution disallowed"));
         assert!(rendered.contains("owner/maintainer approval"));
+    }
+
+    #[test]
+    fn renders_github_actions_status_and_incident() {
+        let status = IncomingEvent::github_actions_status(
+            "Actions".into(),
+            "operational".into(),
+            "degraded_performance".into(),
+            "https://www.githubstatus.com".into(),
+            Some("dev".into()),
+        );
+        let rendered = DefaultRenderer
+            .render(&status, &MessageFormat::Alert)
+            .unwrap();
+        assert!(rendered.starts_with("🚨"));
+        assert!(rendered.contains("Actions"));
+        assert!(rendered.contains("degraded_performance"));
+
+        let incident = IncomingEvent::github_actions_incident(
+            "inc-1".into(),
+            "Incident with Actions".into(),
+            "monitoring".into(),
+            "critical".into(),
+            "updated".into(),
+            Some("investigating".into()),
+            Some("upd-2".into()),
+            Some("monitoring".into()),
+            Some("Mitigated; monitoring".into()),
+            vec!["Actions".into()],
+            "https://stspg.io/example".into(),
+            Some("dev".into()),
+        );
+        let rendered = DefaultRenderer
+            .render(&incident, &MessageFormat::Compact)
+            .unwrap();
+        assert!(rendered.contains("Incident with Actions"));
+        assert!(rendered.contains("updated"));
+        assert!(rendered.contains("impact=critical"));
     }
 }
