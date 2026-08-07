@@ -530,6 +530,10 @@ pub struct MonitorConfig {
     pub tmux: TmuxMonitorConfig,
     #[serde(default)]
     pub workspace: Vec<WorkspaceMonitor>,
+    /// Public GitHub Statuspage monitor for platform components (default: Actions).
+    /// Independent from websocket `[[subscriptions]]` and per-repo GitHub API monitors.
+    #[serde(default, skip_serializing_if = "GitHubStatusMonitorConfig::is_default")]
+    pub github_status: GitHubStatusMonitorConfig,
 }
 
 impl Default for MonitorConfig {
@@ -541,6 +545,7 @@ impl Default for MonitorConfig {
             git: GitMonitorConfig::default(),
             tmux: TmuxMonitorConfig::default(),
             workspace: Vec::new(),
+            github_status: GitHubStatusMonitorConfig::default(),
         }
     }
 }
@@ -667,6 +672,59 @@ impl Default for WorkspaceMonitor {
             poll_interval_secs: None,
             debounce_ms: default_workspace_debounce_ms(),
         }
+    }
+}
+
+/// Monitor GitHub platform component/incident status via the public Statuspage API.
+///
+/// Uses machine-readable endpoints under `api_base` (default
+/// `https://www.githubstatus.com/api/v2`). No authentication is required or stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubStatusMonitorConfig {
+    /// When false (default), the monitor does not run.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Public Statuspage API base. Override only for tests or mirrors.
+    #[serde(default = "default_github_status_api_base")]
+    pub api_base: String,
+    /// Component names to watch (Statuspage `components[].name`). Default: `["Actions"]`.
+    #[serde(default = "default_github_status_components")]
+    pub components: Vec<String>,
+    /// Poll interval for the status monitor (independent of git/tmux poll interval).
+    #[serde(default = "default_github_status_poll_interval")]
+    pub poll_interval_secs: u64,
+    pub channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_name: Option<String>,
+    pub mention: Option<String>,
+    pub format: Option<MessageFormat>,
+}
+
+impl Default for GitHubStatusMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_base: default_github_status_api_base(),
+            components: default_github_status_components(),
+            poll_interval_secs: default_github_status_poll_interval(),
+            channel: None,
+            channel_name: None,
+            mention: None,
+            format: None,
+        }
+    }
+}
+
+impl GitHubStatusMonitorConfig {
+    fn is_default(&self) -> bool {
+        !self.enabled
+            && self.api_base == default_github_status_api_base()
+            && self.components == default_github_status_components()
+            && self.poll_interval_secs == default_github_status_poll_interval()
+            && self.channel.is_none()
+            && self.channel_name.is_none()
+            && self.mention.is_none()
+            && self.format.is_none()
     }
 }
 
@@ -843,6 +901,15 @@ fn default_poll_interval() -> u64 {
 }
 fn default_github_api_base() -> String {
     "https://api.github.com".to_string()
+}
+fn default_github_status_api_base() -> String {
+    "https://www.githubstatus.com/api/v2".to_string()
+}
+fn default_github_status_components() -> Vec<String> {
+    vec!["Actions".to_string()]
+}
+fn default_github_status_poll_interval() -> u64 {
+    60
 }
 fn default_remote() -> String {
     "origin".to_string()
@@ -1337,6 +1404,13 @@ impl AppConfig {
                     .as_ref()
                     .is_some_and(|channel| !channel.trim().is_empty())
             })
+            || (self.monitors.github_status.enabled
+                && self
+                    .monitors
+                    .github_status
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty()))
     }
 
     fn default_channel_can_fallback_to_discord(&self) -> bool {
@@ -1594,6 +1668,26 @@ impl AppConfig {
                     index + 1
                 )
                 .into());
+            }
+        }
+        if self.monitors.github_status.enabled {
+            if self.monitors.github_status.poll_interval_secs == 0 {
+                return Err("monitors.github_status.poll_interval_secs must be at least 1".into());
+            }
+            if self.monitors.github_status.api_base.trim().is_empty() {
+                return Err("monitors.github_status.api_base must not be empty".into());
+            }
+            if self
+                .monitors
+                .github_status
+                .components
+                .iter()
+                .all(|name| name.trim().is_empty())
+            {
+                return Err(
+                    "monitors.github_status.components must list at least one component name"
+                        .into(),
+                );
             }
         }
 
@@ -6828,6 +6922,80 @@ local_path = "/tmp/clawhip-ledger-test.jsonl"
                 .unwrap_err()
                 .to_string()
                 .contains("ledger")
+        );
+    }
+
+    #[test]
+    fn github_status_monitor_parses_and_validates_without_secrets() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[monitors.github_status]
+enabled = true
+api_base = "https://www.githubstatus.com/api/v2"
+components = ["Actions"]
+poll_interval_secs = 90
+channel = "1480171113253175356"
+channel_name = "gajae-code-dev"
+format = "alert"
+
+[[routes]]
+event = "github.actions-*"
+sink = "discord"
+channel = "1480171113253175356"
+channel_name = "gajae-code-dev"
+format = "alert"
+
+[providers.discord]
+token = "test-token"
+"#,
+        )
+        .expect("github_status config parses");
+        config.validate().expect("github_status config validates");
+        assert!(config.monitors.github_status.enabled);
+        assert_eq!(
+            config.monitors.github_status.api_base,
+            "https://www.githubstatus.com/api/v2"
+        );
+        assert_eq!(config.monitors.github_status.components, vec!["Actions"]);
+        assert_eq!(config.monitors.github_status.poll_interval_secs, 90);
+        assert_eq!(
+            config.monitors.github_status.channel_name.as_deref(),
+            Some("gajae-code-dev")
+        );
+        // Ensure disabled-by-default keeps old configs valid.
+        let old: AppConfig = toml::from_str(
+            r#"
+[[routes]]
+event = "custom"
+sink = "localfile"
+local_path = "/tmp/clawhip/events.jsonl"
+"#,
+        )
+        .expect("old config");
+        assert!(!old.monitors.github_status.enabled);
+        assert!(old.validate().is_ok());
+    }
+
+    #[test]
+    fn github_status_monitor_rejects_empty_components_when_enabled() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[monitors.github_status]
+enabled = true
+components = ["", "  "]
+poll_interval_secs = 60
+
+[[routes]]
+event = "*"
+sink = "localfile"
+local_path = "/tmp/clawhip/events.jsonl"
+"#,
+        )
+        .expect("parses");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("monitors.github_status.components"),
+            "unexpected error: {err}"
         );
     }
 }

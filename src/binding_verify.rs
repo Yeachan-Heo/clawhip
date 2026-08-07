@@ -44,6 +44,7 @@ pub enum BindingSource {
     GitMonitor { index: usize },
     TmuxMonitor { index: usize },
     WorkspaceMonitor { index: usize },
+    GitHubStatusMonitor,
 }
 
 impl fmt::Display for BindingSource {
@@ -54,6 +55,7 @@ impl fmt::Display for BindingSource {
             Self::GitMonitor { index } => write!(f, "monitors.git.repos[{}]", index + 1),
             Self::TmuxMonitor { index } => write!(f, "monitors.tmux.sessions[{}]", index + 1),
             Self::WorkspaceMonitor { index } => write!(f, "monitors.workspace[{}]", index + 1),
+            Self::GitHubStatusMonitor => write!(f, "monitors.github_status"),
         }
     }
 }
@@ -162,6 +164,19 @@ pub fn collect_bindings(config: &AppConfig) -> Vec<ChannelBinding> {
                 label: format!("workspace:{}", workspace.path),
             });
         }
+    }
+
+    // github status monitor (platform Statuspage; not repo CI)
+    if config.monitors.github_status.enabled
+        && let Some(channel) = config.monitors.github_status.channel.as_deref()
+        && !channel.is_empty()
+    {
+        bindings.push(ChannelBinding {
+            channel_id: channel.to_string(),
+            expected_name: config.monitors.github_status.channel_name.clone(),
+            source: BindingSource::GitHubStatusMonitor,
+            label: "github_status".to_string(),
+        });
     }
 
     bindings
