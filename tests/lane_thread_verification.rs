@@ -1060,7 +1060,7 @@ fn restart_reconciles_stale_terminal_watch_registry_without_duplicate_live_watch
                 "registration_source": "cli-watch",
                 "parent_process": null,
                 "registration_generation": 7,
-                "active_wrapper_monitor": true
+                "active_wrapper_monitor": false
             },
             "live-watch": {
                 "session": "live-watch",
@@ -1101,6 +1101,11 @@ fn restart_reconciles_stale_terminal_watch_registry_without_duplicate_live_watch
     let reconciled = registry(&config_path);
     assert!(reconciled.get("stale-watch").is_none());
     assert!(reconciled.get("live-watch").is_some());
+    let health = http_json_value(port, "GET", "/health", json!({}));
+    assert_eq!(health["configured_tmux_monitors"], 0);
+    assert_eq!(health["registered_tmux_sessions"], 1);
+    assert_eq!(health["tmux"]["configured_monitor_count"], 0);
+    assert_eq!(health["tmux"]["registry_registration_count"], 1);
 
     let listed = lane_command(&config_path, &home, &tmux, &discord, &["tmux", "list"]);
     successful(&listed);
