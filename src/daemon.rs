@@ -479,10 +479,20 @@ fn health_payload(
     port: u16,
     registered_tmux_sessions: usize,
     native_hooks: Value,
-    tmux: Value,
+    mut tmux: Value,
     subscriptions: &[SubscriptionSnapshot],
     git_monitors: GitMonitorLifecycleCounts,
 ) -> Value {
+    if let Some(diagnostics) = tmux.as_object_mut() {
+        diagnostics.insert(
+            "configured_monitor_count".to_string(),
+            json!(config.monitors.tmux.sessions.len()),
+        );
+        diagnostics.insert(
+            "registry_registration_count".to_string(),
+            json!(registered_tmux_sessions),
+        );
+    }
     let subscription_degraded = subscriptions.iter().any(|subscription| {
         subscription.enabled
             && subscription.desired_running
@@ -1355,7 +1365,11 @@ async fn expire_terminal_tmux_registration(state: &AppState, event: &IncomingEve
             .filter_map(|session| {
                 snapshot
                     .get(session)
-                    .filter(|registration| registration.lane.is_none())
+                    .filter(|registration| {
+                        registration.lane.is_none()
+                            && registration.parent_process.is_none()
+                            && !registration.active_wrapper_monitor
+                    })
                     .map(|registration| AbsentRegistrationCandidate {
                         session: session.clone(),
                         registration_generation: registration.registration_generation,
@@ -2364,6 +2378,13 @@ mod tests {
         }
     }
 
+    fn ownerless_tmux_registration(session: &str) -> RegisteredTmuxSession {
+        let mut registration = tmux_registration(session);
+        registration.parent_process = None;
+        registration.active_wrapper_monitor = false;
+        registration
+    }
+
     fn gajae_test_event() -> IncomingEvent {
         IncomingEvent {
             kind: "github.pr.opened".into(),
@@ -2636,7 +2657,7 @@ mod tests {
         registry
             .write()
             .await
-            .insert("issue-221".into(), tmux_registration("issue-221"));
+            .insert("issue-221".into(), ownerless_tmux_registration("issue-221"));
         registry
             .write()
             .await
@@ -2832,6 +2853,11 @@ mod tests {
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
+        assert_eq!(payload["tmux"]["configured_monitor_count"], Value::from(1));
+        assert_eq!(
+            payload["tmux"]["registry_registration_count"],
+            Value::from(3)
+        );
         assert!(payload["native_hooks"]["totals"]["received"].is_number());
         assert_eq!(payload["token_precedence_warning"], Value::Null);
     }
@@ -4022,10 +4048,10 @@ mod tests {
                 lane: None,
             },
         );
-        registry
-            .write()
-            .await
-            .insert("stale-wrapper".into(), tmux_registration("stale-wrapper"));
+        registry.write().await.insert(
+            "stale-wrapper".into(),
+            ownerless_tmux_registration("stale-wrapper"),
+        );
 
         let state = AppState {
             config: Arc::new(AppConfig::default()),

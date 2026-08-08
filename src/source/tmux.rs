@@ -1177,6 +1177,10 @@ pub struct AbsentRegistrationCandidate {
     pub registration_generation: u64,
 }
 
+fn registration_is_ownerless(registration: &RegisteredTmuxSession) -> bool {
+    !registration.active_wrapper_monitor && registration.parent_process.is_none()
+}
+
 /// Prune daemon-owned dynamic registrations and explicitly retired/quiesced
 /// lane registrations whose tmux session has been observed absent. Active and
 /// handoff lane evidence is preserved regardless of liveness to avoid
@@ -1206,6 +1210,7 @@ pub async fn prune_absent_dynamic_registrations(
                     .lane
                     .as_ref()
                     .is_none_or(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced)
+                && (registration.lane.is_some() || registration_is_ownerless(registration))
         });
 
         if removable && next.remove(&candidate.session).is_some() {
@@ -1832,6 +1837,7 @@ pub async fn list_active_tmux_registrations(
                     !available_sessions.contains(*session)
                         && registration.registration_source != RegistrationSource::ConfigMonitor
                         && registration.lane.is_none()
+                        && registration_is_ownerless(registration)
                 })
                 .map(|(session, registration)| AbsentRegistrationCandidate {
                     session: session.clone(),
@@ -1925,7 +1931,8 @@ async fn poll_tmux(
                     .as_ref()
                     .is_some_and(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced);
                 if registration.registration_source != RegistrationSource::ConfigMonitor
-                    && (registration.lane.is_none() || retired_lane)
+                    && ((registration.lane.is_none() && registration_is_ownerless(registration))
+                        || retired_lane)
                 {
                     dynamic_prune_candidates.push(AbsentRegistrationCandidate {
                         session: session_name.clone(),
@@ -4418,7 +4425,7 @@ error: failed";
     }
 
     #[tokio::test]
-    async fn prune_absent_dynamic_removes_dead_cliwatch_no_lane() {
+    async fn prune_absent_dynamic_preserves_live_owner_then_removes_ownerless_registration() {
         let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
         let path = std::env::temp_dir().join(format!(
             "clawhip-test-prune-cliwatch-{}.json",
@@ -4436,7 +4443,10 @@ error: failed";
             format: None,
             registered_at: "2026-07-29T00:00:00Z".into(),
             registration_source: RegistrationSource::CliWatch,
-            parent_process: None,
+            parent_process: Some(ParentProcessInfo {
+                pid: 42,
+                name: Some("clawhip-wrapper".into()),
+            }),
             registration_generation: 0,
             active_wrapper_monitor: true,
 
@@ -4450,6 +4460,27 @@ error: failed";
             session: "dead-watch".into(),
             registration_generation: 0,
         }];
+        let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(registry.read().await.contains_key("dead-watch"));
+        registry
+            .write()
+            .await
+            .get_mut("dead-watch")
+            .unwrap()
+            .active_wrapper_monitor = false;
+        let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        registry
+            .write()
+            .await
+            .get_mut("dead-watch")
+            .unwrap()
+            .parent_process = None;
         let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
             .await
             .unwrap();
