@@ -1149,10 +1149,12 @@ pub async fn remove_tmux_registrations(
     let mut removed = 0;
     for session in sessions {
         let removable = next.get(session).is_none_or(|registration| {
-            registration
-                .lane
-                .as_ref()
-                .is_none_or(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced)
+            registration.registration_source == RegistrationSource::ConfigMonitor
+                || registration
+                    .lane
+                    .as_ref()
+                    .is_some_and(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced)
+                || (registration.lane.is_none() && registration_is_ownerless(registration))
         });
 
         if removable && next.remove(session).is_some() {
@@ -4678,6 +4680,29 @@ error: failed";
             1
         );
         assert!(!registry.read().await.contains_key("retained-lane"));
+    }
+
+    #[tokio::test]
+    async fn remove_tmux_registrations_preserves_owned_dynamic_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut owned = registration(Vec::new());
+        owned.session = "owned-runtime".into();
+        owned.registration_source = RegistrationSource::CliWatch;
+        owned.parent_process = Some(ParentProcessInfo {
+            pid: 42,
+            name: Some("clawhip-wrapper".into()),
+        });
+        registry.write().await.insert(owned.session.clone(), owned);
+
+        assert_eq!(
+            remove_tmux_registrations(&registry, &path, &["owned-runtime".into()])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(registry.read().await.contains_key("owned-runtime"));
     }
 
     #[tokio::test]
