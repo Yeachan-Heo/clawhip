@@ -703,6 +703,20 @@ pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     ends_with_wildcard || remainder.is_empty()
 }
 
+/// Enforce Discord's 2,000 Unicode scalar content limit on the final composed
+/// message. If the composed content (mention + body) exceeds the limit, truncate
+/// from the end with an ellipsis, preserving the mention prefix and as much
+/// leading content as possible.
+pub(crate) fn cap_to_discord_limit(content: String) -> String {
+    if content.chars().count() <= DISCORD_MAX_CONTENT_SCALARS {
+        return content;
+    }
+    let ellipsis = "…";
+    let take = DISCORD_MAX_CONTENT_SCALARS.saturating_sub(ellipsis.chars().count());
+    let truncated: String = content.chars().take(take).collect();
+    format!("{truncated}{ellipsis}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3066,18 +3080,4 @@ mod tests {
         );
         assert!(content.ends_with('…'));
     }
-}
-
-/// Enforce Discord's 2,000 Unicode scalar content limit on the final composed
-/// message. If the composed content (mention + body) exceeds the limit, truncate
-/// from the end with an ellipsis, preserving the mention prefix and as much
-/// leading content as possible.
-pub(crate) fn cap_to_discord_limit(content: String) -> String {
-    if content.chars().count() <= DISCORD_MAX_CONTENT_SCALARS {
-        return content;
-    }
-    let ellipsis = "…";
-    let take = DISCORD_MAX_CONTENT_SCALARS.saturating_sub(ellipsis.chars().count());
-    let truncated: String = content.chars().take(take).collect();
-    format!("{truncated}{ellipsis}")
 }
