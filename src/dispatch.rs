@@ -415,13 +415,22 @@ impl Dispatcher {
         }
 
         self.emit_routine_flushed(first, contents.len());
+        let joined = contents.join("\n");
+        // Apply the Discord content cap to the final joined batch only for
+        // Discord targets. Slack and local-file targets are not Discord-capped.
+        let batched_content = match &first.delivery.target {
+            SinkTarget::DiscordChannel(_)
+            | SinkTarget::DiscordThread(_)
+            | SinkTarget::DiscordWebhook(_) => crate::router::cap_to_discord_limit(joined),
+            _ => joined,
+        };
         self.send_sink_message(
             sink.as_ref(),
             &first.delivery.target,
             SinkMessage {
                 event_kind: "dispatch.routine-batched".to_string(),
                 format: first.delivery.format.clone(),
-                content: contents.join("\n"),
+                content: batched_content,
                 payload: json!({
                     "batched": true,
                     "count": contents.len(),
@@ -1936,5 +1945,139 @@ mod tests {
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
             .collect::<String>();
         assert!(!persisted.contains("private text"));
+    }
+
+    #[tokio::test]
+    async fn routine_batch_caps_combined_discord_content_to_2000() {
+        use tokio::time::{Duration, timeout};
+
+        // Two individually-valid routine messages that combine > 2000 scalars
+        // when joined with "\n". The Discord webhook target must be capped.
+        let (webhook, mut requests, server) = spawn_webhook_collector(1).await;
+        let config = AppConfig {
+            defaults: crate::config::DefaultsConfig {
+                channel: None,
+                channel_name: None,
+                format: crate::events::MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                webhook: Some(webhook),
+                template: None,
+                ..RouteRule::default()
+            }],
+            dispatch: crate::config::DispatchConfig {
+                ci_batch_window_secs: 30,
+                routine_batch_window_secs: 5,
+            },
+            ..AppConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(4);
+        let router = Router::new(Arc::new(config));
+        let mut dispatcher = test_dispatcher(rx, router)
+            .with_routine_batch_window(Some(Duration::from_millis(50)))
+            .with_batch_tick(Duration::from_millis(5));
+        let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
+
+        // Send two events with long messages that will combine past 2000.
+        for i in 0..2 {
+            let event = IncomingEvent {
+                kind: "tmux.keyword".into(),
+                channel: Some("ops".into()),
+                mention: None,
+                format: Some(crate::events::MessageFormat::Compact),
+                template: None,
+                payload: json!({
+                    "session": format!("session-{i}"),
+                    "keyword": "notice",
+                    "line": format!("routine event {} with a long descriptive message body: {}", i, "x".repeat(1100)),
+                }),
+            };
+            tx.send(event).await.unwrap();
+        }
+
+        let request = timeout(Duration::from_millis(300), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(tx);
+        task.await.unwrap();
+        server.await.unwrap();
+
+        // Extract and parse the JSON content field from the POST body.
+        let json_start = request.find("{").unwrap_or(0);
+        let json_str = &request[json_start..];
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or_default();
+        let content = parsed["content"].as_str().unwrap_or("");
+        assert!(
+            content.chars().count() <= 2000,
+            "routine batch Discord content is {} scalars, exceeds 2000",
+            content.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn routine_batch_does_not_cap_slack_content() {
+        use tokio::time::{Duration, timeout};
+
+        // Slack targets must not be Discord-capped for routine batches.
+        let (webhook, mut requests, server) = spawn_webhook_collector(1).await;
+        let config = AppConfig {
+            defaults: crate::config::DefaultsConfig {
+                channel: None,
+                channel_name: None,
+                format: crate::events::MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "slack".into(),
+                slack_webhook: Some(webhook),
+                template: None,
+                ..RouteRule::default()
+            }],
+            dispatch: crate::config::DispatchConfig {
+                ci_batch_window_secs: 30,
+                routine_batch_window_secs: 5,
+            },
+            ..AppConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(4);
+        let router = Router::new(Arc::new(config));
+        let mut dispatcher = test_dispatcher(rx, router)
+            .with_routine_batch_window(Some(Duration::from_millis(50)))
+            .with_batch_tick(Duration::from_millis(5));
+        let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
+
+        for i in 0..2 {
+            let event = IncomingEvent {
+                kind: "tmux.keyword".into(),
+                channel: Some("ops".into()),
+                mention: None,
+                format: Some(crate::events::MessageFormat::Compact),
+                template: None,
+                payload: json!({
+                    "session": format!("session-{i}"),
+                    "keyword": "notice",
+                    "line": format!("routine event {} with a long descriptive message body: {}", i, "x".repeat(1100)),
+                }),
+            };
+            tx.send(event).await.unwrap();
+        }
+
+        let request = timeout(Duration::from_millis(300), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(tx);
+        task.await.unwrap();
+        server.await.unwrap();
+
+        // Slack payload is JSON with a "text" field. It should NOT be truncated.
+        // The combined content should be well over 2000 chars.
+        assert!(
+            request.contains(&"x".repeat(100)),
+            "Slack routine batch should not be Discord-capped — expected long content"
+        );
     }
 }

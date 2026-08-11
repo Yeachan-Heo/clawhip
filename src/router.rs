@@ -3072,7 +3072,7 @@ mod tests {
 /// message. If the composed content (mention + body) exceeds the limit, truncate
 /// from the end with an ellipsis, preserving the mention prefix and as much
 /// leading content as possible.
-fn cap_to_discord_limit(content: String) -> String {
+pub(crate) fn cap_to_discord_limit(content: String) -> String {
     if content.chars().count() <= DISCORD_MAX_CONTENT_SCALARS {
         return content;
     }
