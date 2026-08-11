@@ -599,7 +599,15 @@ fn render_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<St
 /// exceed this when the job list is long, so the renderer must bound its output.
 const DISCORD_MAX_CONTENT_SCALARS: usize = 2_000;
 
+/// Reserve for composed prefixes added after the renderer runs:
+/// the Alert format prefix (`🚨 ` = 2 scalars) and a Discord mention prefix
+/// (`{mention} ` — e.g. `<@1234567890> ` ≈ 24 scalars). 64 is a safe ceiling
+/// that covers both without wasting budget on typical short mentions.
+const COMPOSED_PREFIX_RESERVE: usize = 64;
+
 fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<String> {
+    let budget = DISCORD_MAX_CONTENT_SCALARS.saturating_sub(COMPOSED_PREFIX_RESERVE);
+
     let jobs = payload
         .get("jobs")
         .and_then(Value::as_array)
@@ -620,15 +628,11 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
         _ => format!("⏳ CI running · {}", github_ci_target(payload)?),
     };
 
-    // Expandable parts — workflow names and failed-job details. These are the
-    // unbounded elements that can push content past Discord's 2,000 scalar limit.
-    let workflow_names: Vec<String> = jobs
+    // Expandable parts — workflow names (borrowed, no per-job allocation) and
+    // failed-job labels (owned, composed from workflow:conclusion).
+    let workflow_names: Vec<&str> = jobs
         .iter()
-        .filter_map(|job| {
-            job.get("workflow")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
+        .filter_map(|job| job.get("workflow").and_then(Value::as_str))
         .collect();
 
     let failed_job_labels: Vec<String> = if kind == "github.ci-failed" {
@@ -650,7 +654,7 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
         Vec::new()
     };
 
-    // Essential tail parts — counts and link, always kept intact.
+    // Essential tail parts — counts and link, always included.
     let mut tail: Vec<String> = Vec::new();
     if kind != "github.ci-failed" {
         if skipped > 0 {
@@ -667,76 +671,84 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
         tail.push(string_field(payload, "url")?);
     }
 
-    // Assemble expandable slot list in output order.
-    let mut expandable: Vec<Vec<String>> = Vec::new();
+    // First pass: build unbounded message using borrowed slices — no per-job
+    // allocation on the fast path. Return immediately if within budget.
+    let mut parts: Vec<String> = vec![header.clone()];
     if !workflow_names.is_empty() {
-        expandable.push(workflow_names);
+        parts.push(workflow_names.join(", "));
     }
     if !failed_job_labels.is_empty() {
-        expandable.push(failed_job_labels);
-    }
-
-    // First pass: build unbounded message; return immediately if within budget.
-    let mut parts: Vec<String> = vec![header.clone()];
-    for list in &expandable {
-        parts.push(list.join(", "));
+        parts.push(failed_job_labels.join(", "));
     }
     parts.extend(tail.iter().cloned());
     let unbounded = parts.join(" · ");
-    if unbounded.chars().count() <= DISCORD_MAX_CONTENT_SCALARS {
+    if unbounded.chars().count() <= budget {
         return Ok(unbounded);
     }
 
-    // Second pass: truncate expandable parts to fit the Discord content budget.
+    // Second pass: truncate expandable parts to fit the effective budget.
+    // Count how many expandable slots we have for budget distribution.
+    let num_expandable =
+        (!workflow_names.is_empty() as usize) + (!failed_job_labels.is_empty() as usize);
+    let sep_len = " · ".chars().count();
     let essential = {
         let mut e = vec![header.clone()];
         e.extend(tail.iter().cloned());
         e.join(" · ")
     };
-    let sep_len = " · ".chars().count();
     let essential_len = essential.chars().count();
-    let overhead = expandable.len() * sep_len;
-    let budget = DISCORD_MAX_CONTENT_SCALARS
+    let overhead = num_expandable * sep_len;
+    let per_list = budget
         .saturating_sub(essential_len)
-        .saturating_sub(overhead);
-    let per_list = if expandable.is_empty() {
-        budget
-    } else {
-        budget / expandable.len()
-    };
+        .saturating_sub(overhead)
+        / num_expandable.max(1);
 
     parts = vec![header];
-    for list in &expandable {
-        parts.push(truncate_joined_list(list, ", ", per_list));
+    if !workflow_names.is_empty() {
+        parts.push(truncate_joined_list(&workflow_names, ", ", per_list));
+    }
+    if !failed_job_labels.is_empty() {
+        parts.push(truncate_joined_list(&failed_job_labels, ", ", per_list));
     }
     parts.extend(tail.iter().cloned());
 
-    Ok(parts.join(" · "))
+    // Final deterministic hard cap: if essential fields (oversized repo/url)
+    // consumed the entire budget, enforce the limit by truncating from the end.
+    let result = parts.join(" · ");
+    if result.chars().count() <= budget {
+        Ok(result)
+    } else {
+        let ellipsis = "…";
+        let take = budget.saturating_sub(ellipsis.chars().count());
+        let truncated: String = result.chars().take(take).collect();
+        Ok(format!("{truncated}{ellipsis}"))
+    }
 }
 
 /// Join `items` with `separator`, truncating from the end with a count indicator
 /// if the result would exceed `budget` Unicode scalar values.
-fn truncate_joined_list(items: &[String], separator: &str, budget: usize) -> String {
-    if items.is_empty() {
+fn truncate_joined_list<S: AsRef<str>>(items: &[S], separator: &str, budget: usize) -> String {
+    if items.is_empty() || budget == 0 {
         return String::new();
     }
-    let full = items.join(separator);
+    let refs: Vec<&str> = items.iter().map(|s| s.as_ref()).collect();
+    let full = refs.join(separator);
     if full.chars().count() <= budget {
         return full;
     }
     // Drop trailing items until the remainder + truncation marker fits.
-    for kept in (1..items.len()).rev() {
-        let omitted = items.len() - kept;
+    for kept in (1..refs.len()).rev() {
+        let omitted = refs.len() - kept;
         let marker = format!("{separator}… +{omitted}");
-        let candidate = items[..kept].join(separator);
+        let candidate = refs[..kept].join(separator);
         if candidate.chars().count() + marker.chars().count() <= budget {
             return format!("{candidate}{marker}");
         }
     }
     // Even a single item + marker exceeds budget: hard-truncate the first item.
-    let marker = format!("… +{}", items.len());
+    let marker = format!("… +{}", refs.len());
     let content_budget = budget.saturating_sub(marker.chars().count());
-    let truncated: String = items[0].chars().take(content_budget).collect();
+    let truncated: String = refs[0].chars().take(content_budget).collect();
     format!("{truncated}{marker}")
 }
 
@@ -1269,6 +1281,7 @@ mod tests {
         // workflow-name list and job list push content past Discord's 2,000
         // Unicode scalar limit. The renderer must bound the output while
         // preserving repo/PR/status/count/link context.
+        let budget = DISCORD_MAX_CONTENT_SCALARS - COMPOSED_PREFIX_RESERVE;
         let long_workflow = format!("CI / very-long-workflow-name-{:04}", 0);
         let mut jobs = Vec::new();
         for i in 0..80 {
@@ -1313,9 +1326,8 @@ mod tests {
 
         let len = rendered.chars().count();
         assert!(
-            len <= DISCORD_MAX_CONTENT_SCALARS,
-            "rendered batched CI content is {len} scalars, exceeds {} limit",
-            DISCORD_MAX_CONTENT_SCALARS
+            len <= budget,
+            "rendered batched CI content is {len} scalars, exceeds {budget} effective budget"
         );
 
         // Essential context must remain visible after bounding.
@@ -1332,7 +1344,7 @@ mod tests {
             "link missing from bounded output"
         );
         // Truncation indicator should be present since the unbounded output
-        // would exceed 2,000 scalars.
+        // would exceed the effective budget.
         assert!(
             rendered.contains("… +"),
             "truncation indicator missing from bounded output: {rendered}"
@@ -1343,6 +1355,7 @@ mod tests {
     fn batched_ci_oversized_failed_compact_preserves_failed_detail_and_limit() {
         // Failed batch with long failed-job detail list — the failed-job labels
         // are expandable and must be truncated while keeping repo/status/link.
+        let budget = DISCORD_MAX_CONTENT_SCALARS - COMPOSED_PREFIX_RESERVE;
         let mut jobs = Vec::new();
         for i in 0..60 {
             jobs.push(json!({
@@ -1381,9 +1394,8 @@ mod tests {
 
         let len = rendered.chars().count();
         assert!(
-            len <= DISCORD_MAX_CONTENT_SCALARS,
-            "rendered batched CI failed content is {len} scalars, exceeds {} limit",
-            DISCORD_MAX_CONTENT_SCALARS
+            len <= budget,
+            "rendered batched CI failed content is {len} scalars, exceeds {budget} effective budget"
         );
 
         assert!(rendered.contains("CI failed"));
@@ -1395,6 +1407,121 @@ mod tests {
         assert!(
             rendered.contains("… +"),
             "truncation indicator missing from bounded failed output"
+        );
+    }
+
+    #[test]
+    fn batched_ci_oversized_alert_format_respects_composed_limit() {
+        // P1: Alert format adds "🚨 " prefix AFTER the renderer bounds the body.
+        // The composed output (prefix + body) must still respect the 2,000 limit.
+        let mut jobs = Vec::new();
+        for i in 0..80 {
+            jobs.push(json!({
+                "workflow": format!("CI / workflow-{i:04}-with-a-long-descriptive-name"),
+                "status": "in_progress",
+                "conclusion": null,
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/4",
+            }));
+        }
+
+        let event = IncomingEvent {
+            kind: "github.ci-started".into(),
+            channel: None,
+            mention: None,
+            format: Some(MessageFormat::Alert),
+            template: None,
+            payload: json!({
+                "repo": "Yeachan-Heo/clawhip",
+                "number": 61,
+                "branch": "main",
+                "sha": "abcdef1234567890",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/4",
+                "batched": true,
+                "total_count": 80,
+                "passed_count": 0,
+                "skipped_count": 0,
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "jobs": jobs,
+            }),
+        };
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Alert)
+            .unwrap();
+
+        let len = rendered.chars().count();
+        assert!(
+            len <= DISCORD_MAX_CONTENT_SCALARS,
+            "composed Alert output is {len} scalars, exceeds {} limit",
+            DISCORD_MAX_CONTENT_SCALARS
+        );
+        assert!(rendered.starts_with("🚨 "));
+        assert!(rendered.contains("CI running"));
+    }
+
+    #[test]
+    fn batched_ci_oversized_essential_fields_enforce_hard_cap() {
+        // P2: When repo/URL are themselves extremely long, essential_len can
+        // consume the entire budget. The deterministic final hard cap must
+        // still bound the output.
+        let huge_repo = "x".repeat(1_000);
+        let huge_url = format!(
+            "https://github.com/Yeachan-Heo/clawhip/actions/runs/{}",
+            "y".repeat(1_000)
+        );
+
+        let jobs = vec![
+            json!({
+                "workflow": "CI / test",
+                "status": "in_progress",
+                "conclusion": null,
+                "url": &huge_url,
+            }),
+            json!({
+                "workflow": "CI / lint",
+                "status": "in_progress",
+                "conclusion": null,
+                "url": &huge_url,
+            }),
+        ];
+
+        let event = IncomingEvent {
+            kind: "github.ci-started".into(),
+            channel: None,
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "repo": &huge_repo,
+                "number": 999,
+                "branch": "main",
+                "sha": "abcdef1234567890",
+                "url": &huge_url,
+                "batched": true,
+                "total_count": 2,
+                "passed_count": 0,
+                "skipped_count": 0,
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "jobs": jobs,
+            }),
+        };
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+
+        let budget = DISCORD_MAX_CONTENT_SCALARS - COMPOSED_PREFIX_RESERVE;
+        let len = rendered.chars().count();
+        assert!(
+            len <= budget,
+            "oversized essential fields output is {len} scalars, exceeds {budget} budget"
+        );
+        // The hard cap should have kicked in with an ellipsis.
+        assert!(
+            rendered.ends_with('…'),
+            "hard cap ellipsis missing from oversized essential fields output"
         );
     }
 
