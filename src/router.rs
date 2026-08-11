@@ -202,7 +202,15 @@ impl Router {
             _ => content,
         };
 
-        Ok(cap_to_discord_limit(composed))
+        // Enforce Discord's 2,000-scalar content limit only for Discord targets.
+        // Slack and local-file targets have their own limits and must not be
+        // silently truncated by the Discord cap.
+        Ok(match delivery.target {
+            SinkTarget::DiscordChannel(_)
+            | SinkTarget::DiscordThread(_)
+            | SinkTarget::DiscordWebhook(_) => cap_to_discord_limit(composed),
+            _ => composed,
+        })
     }
 
     pub async fn render_delivery_body<R: Renderer + ?Sized>(
@@ -2941,6 +2949,122 @@ mod tests {
         let capped_ok = cap_to_discord_limit(ok.clone());
         assert_eq!(capped_ok, ok);
         assert_eq!(capped_ok.chars().count(), 1_999);
+    }
+
+    #[tokio::test]
+    async fn render_delivery_does_not_cap_slack_targets() {
+        // Slack targets must not be truncated by the Discord 2,000-scalar cap.
+        let long_message = "x".repeat(2_500);
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: None,
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "slack".into(),
+                filter: Default::default(),
+                channel: None,
+                thread: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: Some("https://hooks.slack.com/services/test".into()),
+                local_path: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+                gajae: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+
+        let event = IncomingEvent {
+            kind: "custom".into(),
+            channel: None,
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "message": long_message,
+            }),
+        };
+
+        let deliveries = router.resolve(&event).await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(matches!(deliveries[0].target, SinkTarget::SlackWebhook(_)));
+        let content = router
+            .render_delivery(&event, &deliveries[0], &DefaultRenderer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            content.chars().count(),
+            2_500,
+            "Slack delivery must not be Discord-capped"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_delivery_caps_discord_channel_targets() {
+        // Discord channel targets must be capped even for non-CI custom events.
+        let long_message = "x".repeat(2_500);
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("alerts".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: Some("alerts".into()),
+                thread: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                local_path: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+                gajae: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+
+        let event = IncomingEvent {
+            kind: "custom".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "message": long_message,
+            }),
+        };
+
+        let deliveries = router.resolve(&event).await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(matches!(
+            deliveries[0].target,
+            SinkTarget::DiscordChannel(_)
+        ));
+        let content = router
+            .render_delivery(&event, &deliveries[0], &DefaultRenderer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            content.chars().count(),
+            DISCORD_MAX_CONTENT_SCALARS,
+            "Discord channel delivery must be capped"
+        );
+        assert!(content.ends_with('…'));
     }
 }
 

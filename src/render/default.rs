@@ -721,27 +721,53 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
 
 /// Join `items` with `separator`, truncating from the end with a count indicator
 /// if the result would exceed `budget` Unicode scalar values.
+///
+/// Uses cumulative scalar lengths for O(n) behavior: each item's scalar count
+/// and the separator width are computed once, then a single forward pass finds
+/// the split point without repeatedly re-joining prefixes.
 fn truncate_joined_list<S: AsRef<str>>(items: &[S], separator: &str, budget: usize) -> String {
     if items.is_empty() || budget == 0 {
         return String::new();
     }
     let refs: Vec<&str> = items.iter().map(|s| s.as_ref()).collect();
-    let full = refs.join(separator);
-    if full.chars().count() <= budget {
-        return full;
+
+    // Pre-compute cumulative scalar count for the joined prefix ending at each
+    // item index (inclusive). cumulative[i] = total scalars if we join items[0..=i].
+    let sep_len = separator.chars().count();
+    let item_lens: Vec<usize> = refs.iter().map(|s| s.chars().count()).collect();
+    let mut cumulative = Vec::with_capacity(refs.len());
+    let mut total = 0usize;
+    for (i, &len) in item_lens.iter().enumerate() {
+        if i > 0 {
+            total += sep_len;
+        }
+        total += len;
+        cumulative.push(total);
     }
-    // Drop trailing items until the remainder + truncation marker fits.
+
+    // If the full join fits, return it directly.
+    if *cumulative.last().unwrap() <= budget {
+        return refs.join(separator);
+    }
+
+    // Find the largest `kept` such that cumulative[kept-1] + marker_len <= budget.
+    // The marker is "{separator}… +{omitted}" where omitted = len - kept.
+    // Since marker_len changes with kept, do a single reverse pass — but each
+    // iteration only counts the marker string, no re-joining.
     for kept in (1..refs.len()).rev() {
         let omitted = refs.len() - kept;
-        let marker = format!("{separator}… +{omitted}");
-        let candidate = refs[..kept].join(separator);
-        if candidate.chars().count() + marker.chars().count() <= budget {
+        let marker_len = sep_len + 1 + 2 + omitted.to_string().chars().count(); // "… +N"
+        if cumulative[kept - 1] + marker_len <= budget {
+            let candidate = refs[..kept].join(separator);
+            let marker = format!("{separator}… +{omitted}");
             return format!("{candidate}{marker}");
         }
     }
+
     // Even a single item + marker exceeds budget: hard-truncate the first item.
     let marker = format!("… +{}", refs.len());
-    let content_budget = budget.saturating_sub(marker.chars().count());
+    let marker_len = marker.chars().count();
+    let content_budget = budget.saturating_sub(marker_len);
     let truncated: String = refs[0].chars().take(content_budget).collect();
     format!("{truncated}{marker}")
 }
@@ -1561,5 +1587,58 @@ mod tests {
         assert!(rendered.contains("CI passed"));
         assert!(rendered.contains("clawhip#1"));
         assert!(rendered.contains("CI / test, CI / lint"));
+    }
+
+    #[test]
+    fn batched_ci_large_job_list_truncates_efficiently() {
+        // Guard against O(n²) regression in truncate_joined_list: a large job
+        // list (500+ entries) must truncate without pathological cost.
+        let mut jobs = Vec::new();
+        for i in 0..500 {
+            jobs.push(json!({
+                "workflow": format!("CI / matrix-job-{i:04}"),
+                "status": "in_progress",
+                "conclusion": null,
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/5",
+            }));
+        }
+
+        let event = IncomingEvent {
+            kind: "github.ci-started".into(),
+            channel: None,
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "repo": "Yeachan-Heo/clawhip",
+                "number": 80,
+                "branch": "main",
+                "sha": "abcdef1234567890",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/5",
+                "batched": true,
+                "total_count": 500,
+                "passed_count": 0,
+                "skipped_count": 0,
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "jobs": jobs,
+            }),
+        };
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+
+        assert!(
+            rendered.chars().count() <= DISCORD_MAX_CONTENT_SCALARS,
+            "large job list exceeded {} scalars",
+            DISCORD_MAX_CONTENT_SCALARS
+        );
+        assert!(rendered.contains("CI running"));
+        assert!(rendered.contains("Yeachan-Heo/clawhip#80"));
+        assert!(
+            rendered.contains("… +"),
+            "large job list should show truncation indicator"
+        );
     }
 }
