@@ -592,6 +592,13 @@ fn render_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<St
     Ok(parts.join(" · "))
 }
 
+/// Maximum Discord message content length in Unicode scalar values.
+///
+/// Discord rejects any `content` field exceeding 2,000 Unicode scalars with
+/// HTTP 400 / `BASE_TYPE_MAX_LENGTH` (code 50035). Batched CI notifications can
+/// exceed this when the job list is long, so the renderer must bound its output.
+const DISCORD_MAX_CONTENT_SCALARS: usize = 2_000;
+
 fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<String> {
     let jobs = payload
         .get("jobs")
@@ -602,13 +609,8 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
     let skipped = optional_u64_field(payload, "skipped_count").unwrap_or(0);
     let failed = optional_u64_field(payload, "failed_count").unwrap_or(0);
     let cancelled = optional_u64_field(payload, "cancelled_count").unwrap_or(0);
-    let workflows = jobs
-        .iter()
-        .filter_map(|job| job.get("workflow").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join(", ");
 
-    let mut parts = vec![match kind {
+    let header = match kind {
         "github.ci-passed" => format!(
             "✅ CI passed · {} · {passed}/{total} passed",
             github_ci_target(payload)?
@@ -616,15 +618,21 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
         "github.ci-failed" => format!("❌ CI failed · {}", github_ci_target(payload)?),
         "github.ci-cancelled" => format!("🟡 CI cancelled · {}", github_ci_target(payload)?),
         _ => format!("⏳ CI running · {}", github_ci_target(payload)?),
-    }];
+    };
 
-    if !workflows.is_empty() {
-        parts.push(workflows);
-    }
+    // Expandable parts — workflow names and failed-job details. These are the
+    // unbounded elements that can push content past Discord's 2,000 scalar limit.
+    let workflow_names: Vec<String> = jobs
+        .iter()
+        .filter_map(|job| {
+            job.get("workflow")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect();
 
-    if kind == "github.ci-failed" {
-        let failed_jobs = jobs
-            .iter()
+    let failed_job_labels: Vec<String> = if kind == "github.ci-failed" {
+        jobs.iter()
             .filter_map(|job| {
                 let workflow = job.get("workflow").and_then(Value::as_str)?;
                 let conclusion = job
@@ -637,27 +645,99 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
                     Some(format!("{workflow}:{conclusion}"))
                 }
             })
-            .collect::<Vec<_>>();
-        if !failed_jobs.is_empty() {
-            parts.push(failed_jobs.join(", "));
-        }
+            .collect()
     } else {
+        Vec::new()
+    };
+
+    // Essential tail parts — counts and link, always kept intact.
+    let mut tail: Vec<String> = Vec::new();
+    if kind != "github.ci-failed" {
         if skipped > 0 {
-            parts.push(format!("{skipped} skipped"));
+            tail.push(format!("{skipped} skipped"));
         }
         if cancelled > 0 {
-            parts.push(format!("{cancelled} cancelled"));
+            tail.push(format!("{cancelled} cancelled"));
         }
         if failed > 0 {
-            parts.push(format!("{failed} failed"));
+            tail.push(format!("{failed} failed"));
         }
     }
-
     if include_url {
-        parts.push(string_field(payload, "url")?);
+        tail.push(string_field(payload, "url")?);
     }
 
+    // Assemble expandable slot list in output order.
+    let mut expandable: Vec<Vec<String>> = Vec::new();
+    if !workflow_names.is_empty() {
+        expandable.push(workflow_names);
+    }
+    if !failed_job_labels.is_empty() {
+        expandable.push(failed_job_labels);
+    }
+
+    // First pass: build unbounded message; return immediately if within budget.
+    let mut parts: Vec<String> = vec![header.clone()];
+    for list in &expandable {
+        parts.push(list.join(", "));
+    }
+    parts.extend(tail.iter().cloned());
+    let unbounded = parts.join(" · ");
+    if unbounded.chars().count() <= DISCORD_MAX_CONTENT_SCALARS {
+        return Ok(unbounded);
+    }
+
+    // Second pass: truncate expandable parts to fit the Discord content budget.
+    let essential = {
+        let mut e = vec![header.clone()];
+        e.extend(tail.iter().cloned());
+        e.join(" · ")
+    };
+    let sep_len = " · ".chars().count();
+    let essential_len = essential.chars().count();
+    let overhead = expandable.len() * sep_len;
+    let budget = DISCORD_MAX_CONTENT_SCALARS
+        .saturating_sub(essential_len)
+        .saturating_sub(overhead);
+    let per_list = if expandable.is_empty() {
+        budget
+    } else {
+        budget / expandable.len()
+    };
+
+    parts = vec![header];
+    for list in &expandable {
+        parts.push(truncate_joined_list(list, ", ", per_list));
+    }
+    parts.extend(tail.iter().cloned());
+
     Ok(parts.join(" · "))
+}
+
+/// Join `items` with `separator`, truncating from the end with a count indicator
+/// if the result would exceed `budget` Unicode scalar values.
+fn truncate_joined_list(items: &[String], separator: &str, budget: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let full = items.join(separator);
+    if full.chars().count() <= budget {
+        return full;
+    }
+    // Drop trailing items until the remainder + truncation marker fits.
+    for kept in (1..items.len()).rev() {
+        let omitted = items.len() - kept;
+        let marker = format!("{separator}… +{omitted}");
+        let candidate = items[..kept].join(separator);
+        if candidate.chars().count() + marker.chars().count() <= budget {
+            return format!("{candidate}{marker}");
+        }
+    }
+    // Even a single item + marker exceeds budget: hard-truncate the first item.
+    let marker = format!("… +{}", items.len());
+    let content_budget = budget.saturating_sub(marker.chars().count());
+    let truncated: String = items[0].chars().take(content_budget).collect();
+    format!("{truncated}{marker}")
 }
 
 fn github_ci_action(kind: &str) -> &'static str {
@@ -1182,5 +1262,180 @@ mod tests {
         assert!(rendered.contains("Incident with Actions"));
         assert!(rendered.contains("updated"));
         assert!(rendered.contains("impact=critical"));
+    }
+    #[test]
+    fn batched_ci_oversized_compact_truncates_to_discord_limit() {
+        // Reproduce the Issue #313 scenario: a batched CI notification whose
+        // workflow-name list and job list push content past Discord's 2,000
+        // Unicode scalar limit. The renderer must bound the output while
+        // preserving repo/PR/status/count/link context.
+        let long_workflow = format!("CI / very-long-workflow-name-{:04}", 0);
+        let mut jobs = Vec::new();
+        for i in 0..80 {
+            let wf = if i == 0 {
+                long_workflow.clone()
+            } else {
+                format!("CI / very-long-workflow-name-{i:04}")
+            };
+            jobs.push(json!({
+                "workflow": wf,
+                "status": "in_progress",
+                "conclusion": null,
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/1",
+            }));
+        }
+
+        let event = IncomingEvent {
+            kind: "github.ci-started".into(),
+            channel: None,
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "repo": "Yeachan-Heo/clawhip",
+                "number": 58,
+                "branch": "main",
+                "sha": "abcdef1234567890",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/1",
+                "batched": true,
+                "total_count": 80,
+                "passed_count": 0,
+                "skipped_count": 0,
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "jobs": jobs,
+            }),
+        };
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+
+        let len = rendered.chars().count();
+        assert!(
+            len <= DISCORD_MAX_CONTENT_SCALARS,
+            "rendered batched CI content is {len} scalars, exceeds {} limit",
+            DISCORD_MAX_CONTENT_SCALARS
+        );
+
+        // Essential context must remain visible after bounding.
+        assert!(
+            rendered.contains("Yeachan-Heo/clawhip#58"),
+            "repo/PR context missing from bounded output"
+        );
+        assert!(
+            rendered.contains("CI running"),
+            "status missing from bounded output"
+        );
+        assert!(
+            rendered.contains("https://github.com/Yeachan-Heo/clawhip/actions/runs/1"),
+            "link missing from bounded output"
+        );
+        // Truncation indicator should be present since the unbounded output
+        // would exceed 2,000 scalars.
+        assert!(
+            rendered.contains("… +"),
+            "truncation indicator missing from bounded output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn batched_ci_oversized_failed_compact_preserves_failed_detail_and_limit() {
+        // Failed batch with long failed-job detail list — the failed-job labels
+        // are expandable and must be truncated while keeping repo/status/link.
+        let mut jobs = Vec::new();
+        for i in 0..60 {
+            jobs.push(json!({
+                "workflow": format!("CI / build-matrix-job-{i:04}-extremely-long-workflow"),
+                "status": "completed",
+                "conclusion": "failure",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/2",
+            }));
+        }
+
+        let event = IncomingEvent {
+            kind: "github.ci-failed".into(),
+            channel: None,
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "repo": "Yeachan-Heo/clawhip",
+                "number": 59,
+                "branch": "fix/issue-313",
+                "sha": "abcdef1234567890",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/2",
+                "batched": true,
+                "total_count": 60,
+                "passed_count": 0,
+                "skipped_count": 0,
+                "failed_count": 60,
+                "cancelled_count": 0,
+                "jobs": jobs,
+            }),
+        };
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+
+        let len = rendered.chars().count();
+        assert!(
+            len <= DISCORD_MAX_CONTENT_SCALARS,
+            "rendered batched CI failed content is {len} scalars, exceeds {} limit",
+            DISCORD_MAX_CONTENT_SCALARS
+        );
+
+        assert!(rendered.contains("CI failed"));
+        assert!(rendered.contains("Yeachan-Heo/clawhip#59"));
+        assert!(
+            rendered.contains("https://github.com/Yeachan-Heo/clawhip/actions/runs/2"),
+            "link missing from bounded failed output"
+        );
+        assert!(
+            rendered.contains("… +"),
+            "truncation indicator missing from bounded failed output"
+        );
+    }
+
+    #[test]
+    fn batched_ci_small_batch_is_not_truncated() {
+        // Small batches should pass through unchanged.
+        let event = IncomingEvent {
+            kind: "github.ci-passed".into(),
+            channel: None,
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "repo": "clawhip",
+                "number": 1,
+                "branch": "main",
+                "sha": "abcdef1",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/3",
+                "batched": true,
+                "total_count": 2,
+                "passed_count": 2,
+                "skipped_count": 0,
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "jobs": [
+                    {"workflow": "CI / test", "status": "completed", "conclusion": "success", "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/3"},
+                    {"workflow": "CI / lint", "status": "completed", "conclusion": "success", "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/3"},
+                ],
+            }),
+        };
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+
+        assert!(
+            !rendered.contains("… +"),
+            "small batch should not be truncated: {rendered}"
+        );
+        assert!(rendered.contains("CI passed"));
+        assert!(rendered.contains("clawhip#1"));
+        assert!(rendered.contains("CI / test, CI / lint"));
     }
 }
