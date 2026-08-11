@@ -17,6 +17,14 @@ use crate::sink::SinkMessage;
 use crate::sink::SinkTarget;
 use crate::telemetry;
 
+/// Maximum Discord message content length in Unicode scalar values.
+///
+/// Discord rejects any `content` field exceeding 2,000 Unicode scalars with
+/// HTTP 400 / `BASE_TYPE_MAX_LENGTH` (code 50035). This is the authoritative
+/// composed-content cap: it is enforced on the final string after all prefixes
+/// (mention, alert) are composed, guaranteeing the invariant at the smallest
+/// correct boundary regardless of mention length.
+const DISCORD_MAX_CONTENT_SCALARS: usize = 2_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteTrace {
     pub result: RouteTraceResult,
@@ -189,10 +197,12 @@ impl Router {
     ) -> Result<String> {
         let content = self.render_delivery_body(event, delivery, renderer).await?;
 
-        match delivery.mention.as_deref().map(str::trim) {
-            Some(mention) if !mention.is_empty() => Ok(format!("{mention} {content}")),
-            _ => Ok(content),
-        }
+        let composed = match delivery.mention.as_deref().map(str::trim) {
+            Some(mention) if !mention.is_empty() => format!("{mention} {content}"),
+            _ => content,
+        };
+
+        Ok(cap_to_discord_limit(composed))
     }
 
     pub async fn render_delivery_body<R: Renderer + ?Sized>(
@@ -2763,4 +2773,187 @@ mod tests {
             .to_string();
         assert_eq!(error, "no configured route for subscription event");
     }
+
+    #[tokio::test]
+    async fn render_delivery_caps_composed_content_with_long_mention() {
+        // P1: Router::render_delivery must enforce the 2,000 scalar cap on the
+        // final composed content (mention + body), not just the renderer body.
+        // A long mention prepended to a near-limit body must be truncated.
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("alerts".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "github.ci-started".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: Some("alerts".into()),
+                thread: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                local_path: None,
+                mention: Some(format!("<@{}>", "1".repeat(100))),
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+                gajae: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+
+        let mut jobs = Vec::new();
+        for i in 0..80 {
+            jobs.push(json!({
+                "workflow": format!("CI / workflow-{i:04}-with-a-long-descriptive-name"),
+                "status": "in_progress",
+                "conclusion": null,
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/9",
+            }));
+        }
+
+        let event = IncomingEvent {
+            kind: "github.ci-started".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            format: Some(MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "repo": "Yeachan-Heo/clawhip",
+                "number": 70,
+                "branch": "main",
+                "sha": "abcdef1234567890",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/9",
+                "batched": true,
+                "total_count": 80,
+                "passed_count": 0,
+                "skipped_count": 0,
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "jobs": jobs,
+            }),
+        };
+
+        let deliveries = router.resolve(&event).await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let composed = router
+            .render_delivery(&event, &deliveries[0], &DefaultRenderer)
+            .await
+            .unwrap();
+
+        let len = composed.chars().count();
+        assert!(
+            len <= DISCORD_MAX_CONTENT_SCALARS,
+            "composed delivery with long mention is {len} scalars, exceeds {} limit",
+            DISCORD_MAX_CONTENT_SCALARS
+        );
+        assert!(composed.starts_with("<@"));
+    }
+
+    #[tokio::test]
+    async fn render_delivery_caps_composed_content_alert_with_mention() {
+        // P1: Alert prefix + mention prefix + oversized batched CI body.
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("alerts".into()),
+                channel_name: None,
+                format: MessageFormat::Alert,
+            },
+            routes: vec![RouteRule {
+                event: "github.ci-failed".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: Some("alerts".into()),
+                thread: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                local_path: None,
+                mention: Some(format!("<@{}>", "2".repeat(50))),
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Alert),
+                template: None,
+                gajae: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+
+        let mut jobs = Vec::new();
+        for i in 0..60 {
+            jobs.push(json!({
+                "workflow": format!("CI / build-matrix-job-{i:04}-extremely-long-name"),
+                "status": "completed",
+                "conclusion": "failure",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/10",
+            }));
+        }
+
+        let event = IncomingEvent {
+            kind: "github.ci-failed".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            format: Some(MessageFormat::Alert),
+            template: None,
+            payload: json!({
+                "repo": "Yeachan-Heo/clawhip",
+                "number": 71,
+                "branch": "main",
+                "sha": "abcdef1234567890",
+                "url": "https://github.com/Yeachan-Heo/clawhip/actions/runs/10",
+                "batched": true,
+                "total_count": 60,
+                "passed_count": 0,
+                "skipped_count": 0,
+                "failed_count": 60,
+                "cancelled_count": 0,
+                "jobs": jobs,
+            }),
+        };
+
+        let deliveries = router.resolve(&event).await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let composed = router
+            .render_delivery(&event, &deliveries[0], &DefaultRenderer)
+            .await
+            .unwrap();
+
+        let len = composed.chars().count();
+        assert!(
+            len <= DISCORD_MAX_CONTENT_SCALARS,
+            "composed Alert+mention delivery is {len} scalars, exceeds {} limit",
+            DISCORD_MAX_CONTENT_SCALARS
+        );
+    }
+
+    #[test]
+    fn cap_to_discord_limit_truncates_oversized_content() {
+        let oversized = "x".repeat(2_500);
+        let capped = cap_to_discord_limit(oversized);
+        assert_eq!(capped.chars().count(), DISCORD_MAX_CONTENT_SCALARS);
+        assert!(capped.ends_with('…'));
+
+        // Under-limit content passes through unchanged.
+        let ok = "x".repeat(1_999);
+        let capped_ok = cap_to_discord_limit(ok.clone());
+        assert_eq!(capped_ok, ok);
+        assert_eq!(capped_ok.chars().count(), 1_999);
+    }
+}
+
+/// Enforce Discord's 2,000 Unicode scalar content limit on the final composed
+/// message. If the composed content (mention + body) exceeds the limit, truncate
+/// from the end with an ellipsis, preserving the mention prefix and as much
+/// leading content as possible.
+fn cap_to_discord_limit(content: String) -> String {
+    if content.chars().count() <= DISCORD_MAX_CONTENT_SCALARS {
+        return content;
+    }
+    let ellipsis = "…";
+    let take = DISCORD_MAX_CONTENT_SCALARS.saturating_sub(ellipsis.chars().count());
+    let truncated: String = content.chars().take(take).collect();
+    format!("{truncated}{ellipsis}")
 }

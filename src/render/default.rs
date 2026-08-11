@@ -597,17 +597,11 @@ fn render_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<St
 /// Discord rejects any `content` field exceeding 2,000 Unicode scalars with
 /// HTTP 400 / `BASE_TYPE_MAX_LENGTH` (code 50035). Batched CI notifications can
 /// exceed this when the job list is long, so the renderer must bound its output.
+/// The final composed-content cap (including mention/alert prefixes) is enforced
+/// in `Router::render_delivery`, not here — the renderer bounds only its own body.
 const DISCORD_MAX_CONTENT_SCALARS: usize = 2_000;
 
-/// Reserve for composed prefixes added after the renderer runs:
-/// the Alert format prefix (`🚨 ` = 2 scalars) and a Discord mention prefix
-/// (`{mention} ` — e.g. `<@1234567890> ` ≈ 24 scalars). 64 is a safe ceiling
-/// that covers both without wasting budget on typical short mentions.
-const COMPOSED_PREFIX_RESERVE: usize = 64;
-
 fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> Result<String> {
-    let budget = DISCORD_MAX_CONTENT_SCALARS.saturating_sub(COMPOSED_PREFIX_RESERVE);
-
     let jobs = payload
         .get("jobs")
         .and_then(Value::as_array)
@@ -682,7 +676,7 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
     }
     parts.extend(tail.iter().cloned());
     let unbounded = parts.join(" · ");
-    if unbounded.chars().count() <= budget {
+    if unbounded.chars().count() <= DISCORD_MAX_CONTENT_SCALARS {
         return Ok(unbounded);
     }
 
@@ -698,7 +692,7 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
     };
     let essential_len = essential.chars().count();
     let overhead = num_expandable * sep_len;
-    let per_list = budget
+    let per_list = DISCORD_MAX_CONTENT_SCALARS
         .saturating_sub(essential_len)
         .saturating_sub(overhead)
         / num_expandable.max(1);
@@ -715,11 +709,11 @@ fn render_batched_github_ci(payload: &Value, kind: &str, include_url: bool) -> R
     // Final deterministic hard cap: if essential fields (oversized repo/url)
     // consumed the entire budget, enforce the limit by truncating from the end.
     let result = parts.join(" · ");
-    if result.chars().count() <= budget {
+    if result.chars().count() <= DISCORD_MAX_CONTENT_SCALARS {
         Ok(result)
     } else {
         let ellipsis = "…";
-        let take = budget.saturating_sub(ellipsis.chars().count());
+        let take = DISCORD_MAX_CONTENT_SCALARS.saturating_sub(ellipsis.chars().count());
         let truncated: String = result.chars().take(take).collect();
         Ok(format!("{truncated}{ellipsis}"))
     }
@@ -1281,7 +1275,8 @@ mod tests {
         // workflow-name list and job list push content past Discord's 2,000
         // Unicode scalar limit. The renderer must bound the output while
         // preserving repo/PR/status/count/link context.
-        let budget = DISCORD_MAX_CONTENT_SCALARS - COMPOSED_PREFIX_RESERVE;
+        // Renderer bounds to DISCORD_MAX_CONTENT_SCALARS; the composed cap
+        // (mention + body) is enforced by Router::render_delivery.
         let long_workflow = format!("CI / very-long-workflow-name-{:04}", 0);
         let mut jobs = Vec::new();
         for i in 0..80 {
@@ -1326,8 +1321,9 @@ mod tests {
 
         let len = rendered.chars().count();
         assert!(
-            len <= budget,
-            "rendered batched CI content is {len} scalars, exceeds {budget} effective budget"
+            len <= DISCORD_MAX_CONTENT_SCALARS,
+            "rendered batched CI content is {len} scalars, exceeds {} limit",
+            DISCORD_MAX_CONTENT_SCALARS
         );
 
         // Essential context must remain visible after bounding.
@@ -1355,7 +1351,7 @@ mod tests {
     fn batched_ci_oversized_failed_compact_preserves_failed_detail_and_limit() {
         // Failed batch with long failed-job detail list — the failed-job labels
         // are expandable and must be truncated while keeping repo/status/link.
-        let budget = DISCORD_MAX_CONTENT_SCALARS - COMPOSED_PREFIX_RESERVE;
+        // Renderer bounds to DISCORD_MAX_CONTENT_SCALARS.
         let mut jobs = Vec::new();
         for i in 0..60 {
             jobs.push(json!({
@@ -1394,8 +1390,9 @@ mod tests {
 
         let len = rendered.chars().count();
         assert!(
-            len <= budget,
-            "rendered batched CI failed content is {len} scalars, exceeds {budget} effective budget"
+            len <= DISCORD_MAX_CONTENT_SCALARS,
+            "rendered batched CI failed content is {len} scalars, exceeds {} limit",
+            DISCORD_MAX_CONTENT_SCALARS
         );
 
         assert!(rendered.contains("CI failed"));
@@ -1512,11 +1509,11 @@ mod tests {
             .render(&event, &MessageFormat::Compact)
             .unwrap();
 
-        let budget = DISCORD_MAX_CONTENT_SCALARS - COMPOSED_PREFIX_RESERVE;
         let len = rendered.chars().count();
         assert!(
-            len <= budget,
-            "oversized essential fields output is {len} scalars, exceeds {budget} budget"
+            len <= DISCORD_MAX_CONTENT_SCALARS,
+            "oversized essential fields output is {len} scalars, exceeds {} limit",
+            DISCORD_MAX_CONTENT_SCALARS
         );
         // The hard cap should have kicked in with an ellipsis.
         assert!(
