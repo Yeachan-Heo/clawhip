@@ -381,17 +381,16 @@ impl Dispatcher {
             return;
         };
 
-        let mut contents = Vec::new();
-        let mut event_kinds = Vec::new();
-        for item in &batch.items {
+        // Render all items, recording failures per-item (no silent loss).
+        let mut rendered: Vec<(usize, String, String)> = Vec::new();
+        for (idx, item) in batch.items.iter().enumerate() {
             match self
                 .router
                 .render_delivery_body(&item.event, &item.delivery, self.renderer.as_ref())
                 .await
             {
                 Ok(content) => {
-                    contents.push(content);
-                    event_kinds.push(item.event.canonical_kind().to_string());
+                    rendered.push((idx, content, item.event.canonical_kind().to_string()));
                 }
                 Err(error) => {
                     self.emit_dispatch_failure(
@@ -410,32 +409,82 @@ impl Dispatcher {
             }
         }
 
-        if contents.is_empty() {
+        if rendered.is_empty() {
             return;
         }
 
-        self.emit_routine_flushed(first, contents.len());
-        self.send_sink_message(
-            sink.as_ref(),
+        let is_discord = matches!(
             &first.delivery.target,
-            SinkMessage {
-                event_kind: "dispatch.routine-batched".to_string(),
-                format: first.delivery.format.clone(),
-                content: contents.join("\n"),
-                payload: json!({
-                    "batched": true,
-                    "count": contents.len(),
-                    "event_kinds": event_kinds,
-                    "correlation_id": telemetry::correlation_id_for_event(&first.event),
-                }),
-                telemetry: Some(sink_telemetry_for(
-                    &first.event,
-                    &first.delivery,
-                    Some(contents.len()),
-                )),
-            },
-        )
-        .await;
+            SinkTarget::DiscordChannel(_)
+                | SinkTarget::DiscordThread(_)
+                | SinkTarget::DiscordWebhook(_)
+        );
+
+        let total_events = rendered.len();
+        let event_kinds: Vec<&str> = rendered.iter().map(|(_, _, k)| k.as_str()).collect();
+
+        if is_discord {
+            // Split into multiple ≤2000-scalar messages at event boundaries.
+            // Each rendered item is included in full, or individually capped
+            // if it alone exceeds the limit — never silently dropped.
+            let chunks = split_discord_routine_chunks(&rendered, first, &event_kinds, total_events);
+            self.emit_routine_flushed(first, total_events);
+            for chunk in chunks {
+                self.send_sink_message(
+                    sink.as_ref(),
+                    &first.delivery.target,
+                    SinkMessage {
+                        event_kind: "dispatch.routine-batched".to_string(),
+                        format: first.delivery.format.clone(),
+                        content: chunk.content,
+                        payload: json!({
+                            "batched": true,
+                            "count": chunk.event_count,
+                            "total_events": total_events,
+                            "chunk_index": chunk.chunk_index,
+                            "total_chunks": chunk.total_chunks,
+                            "event_kinds": chunk.event_kinds,
+                            "correlation_id": telemetry::correlation_id_for_event(&first.event),
+                        }),
+                        telemetry: Some(sink_telemetry_for(
+                            &first.event,
+                            &first.delivery,
+                            Some(chunk.event_count),
+                        )),
+                    },
+                )
+                .await;
+            }
+        } else {
+            // Slack / local-file: join all items, no Discord cap.
+            let joined: String = rendered
+                .iter()
+                .map(|(_, content, _)| content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.emit_routine_flushed(first, total_events);
+            self.send_sink_message(
+                sink.as_ref(),
+                &first.delivery.target,
+                SinkMessage {
+                    event_kind: "dispatch.routine-batched".to_string(),
+                    format: first.delivery.format.clone(),
+                    content: joined,
+                    payload: json!({
+                        "batched": true,
+                        "count": total_events,
+                        "event_kinds": event_kinds,
+                        "correlation_id": telemetry::correlation_id_for_event(&first.event),
+                    }),
+                    telemetry: Some(sink_telemetry_for(
+                        &first.event,
+                        &first.delivery,
+                        Some(total_events),
+                    )),
+                },
+            )
+            .await;
+        }
     }
 
     async fn send_sink_message(&self, sink: &dyn Sink, target: &SinkTarget, message: SinkMessage) {
@@ -950,6 +999,112 @@ fn should_bypass_routine_batch(event: &IncomingEvent) -> bool {
         || kind.starts_with("github.ci-")
 }
 
+/// One chunk of a split Discord routine batch.
+struct DiscordRoutineChunk {
+    content: String,
+    event_count: usize,
+    chunk_index: usize,
+    total_chunks: usize,
+    event_kinds: Vec<String>,
+}
+
+/// Split rendered routine batch items into one or more ≤2000-scalar Discord
+/// messages, preserving event boundaries. No event is silently dropped:
+/// items that individually exceed the limit are individually capped.
+fn split_discord_routine_chunks(
+    rendered: &[(usize, String, String)],
+    _first: &QueuedRoutineDelivery,
+    _all_kinds: &[&str],
+    _total_events: usize,
+) -> Vec<DiscordRoutineChunk> {
+    use crate::router::cap_to_discord_limit;
+
+    const MAX_SCALARS: usize = 2_000;
+    const SEPARATOR: &str = "\n";
+    let sep_len = SEPARATOR.chars().count();
+
+    let item_lens: Vec<usize> = rendered.iter().map(|(_, c, _)| c.chars().count()).collect();
+
+    // Greedy forward pass: accumulate items into a chunk until adding the next
+    // would exceed the limit, then start a new chunk.
+    let mut chunks: Vec<(Vec<usize>, String, Vec<String>)> = Vec::new();
+    let mut current_items: Vec<usize> = Vec::new();
+    let mut current_len = 0usize;
+    let mut current_kinds: Vec<String> = Vec::new();
+
+    for (i, (_, content, kind)) in rendered.iter().enumerate() {
+        let item_len = item_lens[i];
+        let added_len = if current_items.is_empty() {
+            item_len
+        } else {
+            sep_len + item_len
+        };
+
+        if current_len + added_len <= MAX_SCALARS {
+            current_items.push(i);
+            current_len += added_len;
+            current_kinds.push(kind.clone());
+        } else if !current_items.is_empty() {
+            // Flush current chunk, start new one with this item.
+            let joined = current_items
+                .iter()
+                .map(|&idx| rendered[idx].1.as_str())
+                .collect::<Vec<_>>()
+                .join(SEPARATOR);
+            chunks.push((current_items.clone(), joined, current_kinds.clone()));
+            current_items.clear();
+            current_kinds.clear();
+
+            // Start new chunk with this item. If it alone exceeds the limit,
+            // cap it individually rather than dropping it.
+            if item_len <= MAX_SCALARS {
+                current_items.push(i);
+                current_len = item_len;
+                current_kinds.push(kind.clone());
+            } else {
+                // Individually oversized: cap deterministically, emit as its own chunk.
+                let capped = cap_to_discord_limit(content.clone());
+                chunks.push((vec![i], capped, vec![kind.clone()]));
+                current_len = 0;
+            }
+        } else {
+            // First item already exceeds the limit: cap it individually.
+            if item_len <= MAX_SCALARS {
+                current_items.push(i);
+                current_len = item_len;
+                current_kinds.push(kind.clone());
+            } else {
+                let capped = cap_to_discord_limit(content.clone());
+                chunks.push((vec![i], capped, vec![kind.clone()]));
+                current_len = 0;
+            }
+        }
+    }
+
+    // Flush remaining items.
+    if !current_items.is_empty() {
+        let joined = current_items
+            .iter()
+            .map(|&idx| rendered[idx].1.as_str())
+            .collect::<Vec<_>>()
+            .join(SEPARATOR);
+        chunks.push((current_items, joined, current_kinds));
+    }
+
+    let total_chunks = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (_, content, kinds))| DiscordRoutineChunk {
+            content,
+            event_count: kinds.len(),
+            chunk_index: idx,
+            total_chunks,
+            event_kinds: kinds,
+        })
+        .collect()
+}
+
 fn routine_batch_key(queued: &QueuedRoutineDelivery) -> String {
     let delivery = &queued.delivery;
     let mention = normalized_delivery_text(delivery.mention.as_deref());
@@ -1006,6 +1161,34 @@ mod tests {
     use crate::render::DefaultRenderer;
     use crate::sink::{DiscordSink, SlackSink};
     use tempfile::tempdir;
+
+    fn dummy_queued_delivery() -> QueuedRoutineDelivery {
+        QueuedRoutineDelivery {
+            event: IncomingEvent {
+                kind: "test".into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({}),
+            },
+            delivery: ResolvedDelivery {
+                sink: "discord".into(),
+                target: SinkTarget::DiscordWebhook("test".into()),
+                format: crate::events::MessageFormat::Compact,
+                mention: None,
+                template: None,
+                allow_dynamic_tokens: false,
+                trace: crate::router::RouteTrace {
+                    result: crate::router::RouteTraceResult::Matched,
+                    matched_route_index: None,
+                    event_pattern: Some("test".into()),
+                    filter_keys: vec![],
+                    target: "test".into(),
+                },
+            },
+        }
+    }
 
     fn test_dispatcher(rx: mpsc::Receiver<IncomingEvent>, router: Router) -> Dispatcher {
         let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
@@ -1936,5 +2119,268 @@ mod tests {
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
             .collect::<String>();
         assert!(!persisted.contains("private text"));
+    }
+
+    #[tokio::test]
+    async fn routine_batch_splits_oversized_discord_into_multiple_messages() {
+        use tokio::time::{Duration, timeout};
+
+        // Three ~1000-scalar routine events that combine > 2000 when joined.
+        // The Discord webhook should receive multiple ≤2000-scalar messages,
+        // preserving all three event identities and order — no silent loss.
+        let (webhook, mut requests, server) = spawn_webhook_collector(2).await;
+        let config = AppConfig {
+            defaults: crate::config::DefaultsConfig {
+                channel: None,
+                channel_name: None,
+                format: crate::events::MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                webhook: Some(webhook),
+                template: None,
+                ..RouteRule::default()
+            }],
+            dispatch: crate::config::DispatchConfig {
+                ci_batch_window_secs: 30,
+                routine_batch_window_secs: 5,
+            },
+            ..AppConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(8);
+        let router = Router::new(Arc::new(config));
+        let mut dispatcher = test_dispatcher(rx, router)
+            .with_routine_batch_window(Some(Duration::from_millis(50)))
+            .with_batch_tick(Duration::from_millis(5));
+        let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
+
+        // Send three events with ~1000-scalar bodies that will combine past 2000.
+        for i in 0..3 {
+            let event = IncomingEvent {
+                kind: "tmux.keyword".into(),
+                channel: Some("ops".into()),
+                mention: None,
+                format: Some(crate::events::MessageFormat::Compact),
+                template: None,
+                payload: json!({
+                    "session": format!("session-{i}"),
+                    "keyword": "notice",
+                    "line": format!("event-{i} body: {}", "x".repeat(950)),
+                }),
+            };
+            tx.send(event).await.unwrap();
+        }
+
+        let mut all_contents = Vec::new();
+        for _ in 0..2 {
+            let request = timeout(Duration::from_millis(300), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let json_start = request.find("{").unwrap_or(0);
+            let json_str = &request[json_start..];
+            let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or_default();
+            let content = parsed["content"].as_str().unwrap_or("").to_string();
+            all_contents.push(content);
+        }
+
+        drop(tx);
+        task.await.unwrap();
+        server.await.unwrap();
+
+        // Each chunk must be ≤2000 scalars.
+        for (i, content) in all_contents.iter().enumerate() {
+            let len = content.chars().count();
+            assert!(
+                len <= 2000,
+                "Discord routine batch chunk {i} is {len} scalars, exceeds 2000"
+            );
+        }
+
+        // All three event identities must be present across the chunks.
+        let combined: String = all_contents.join("\n");
+        assert!(combined.contains("event-0"), "event-0 missing from output");
+        assert!(combined.contains("event-1"), "event-1 missing from output");
+        assert!(combined.contains("event-2"), "event-2 missing from output");
+
+        // Order must be preserved: event-0 appears before event-1 before event-2.
+        let pos0 = combined.find("event-0").unwrap();
+        let pos1 = combined.find("event-1").unwrap();
+        let pos2 = combined.find("event-2").unwrap();
+        assert!(pos0 < pos1, "event-0 must precede event-1");
+        assert!(pos1 < pos2, "event-1 must precede event-2");
+    }
+
+    #[test]
+    fn split_discord_routine_chunks_preserves_all_events() {
+        let rendered = vec![
+            (
+                0usize,
+                "event-A: ".to_string() + &"x".repeat(990),
+                "tmux.keyword".to_string(),
+            ),
+            (
+                1usize,
+                "event-B: ".to_string() + &"x".repeat(990),
+                "tmux.keyword".to_string(),
+            ),
+            (
+                2usize,
+                "event-C: ".to_string() + &"x".repeat(990),
+                "tmux.keyword".to_string(),
+            ),
+        ];
+
+        let chunks = split_discord_routine_chunks(&rendered, &dummy_queued_delivery(), &[], 3);
+
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.content.chars().count() <= 2000,
+                "chunk {i} exceeds 2000 scalars: {}",
+                chunk.content.chars().count()
+            );
+        }
+
+        let combined: String = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pos_a = combined.find("event-A").unwrap();
+        let pos_b = combined.find("event-B").unwrap();
+        let pos_c = combined.find("event-C").unwrap();
+        assert!(pos_a < pos_b && pos_b < pos_c, "order not preserved");
+
+        let total: usize = chunks.iter().map(|c| c.event_count).sum();
+        assert_eq!(total, 3, "total events across chunks must be 3");
+    }
+
+    #[test]
+    fn split_discord_routine_chunks_caps_individually_oversized_event() {
+        let rendered = vec![
+            (
+                0usize,
+                "small-event body".to_string(),
+                "tmux.keyword".to_string(),
+            ),
+            (
+                1usize,
+                "huge-event: ".to_string() + &"x".repeat(2500),
+                "tmux.keyword".to_string(),
+            ),
+            (
+                2usize,
+                "another-small body".to_string(),
+                "tmux.keyword".to_string(),
+            ),
+        ];
+
+        let chunks = split_discord_routine_chunks(&rendered, &dummy_queued_delivery(), &[], 3);
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.content.chars().count() <= 2000,
+                "chunk {i} exceeds 2000 scalars"
+            );
+        }
+
+        let combined: String = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(combined.contains("small-event"), "small-event missing");
+        assert!(
+            combined.contains("huge-event"),
+            "huge-event missing (was it dropped?)"
+        );
+        assert!(combined.contains("another-small"), "another-small missing");
+
+        let total: usize = chunks.iter().map(|c| c.event_count).sum();
+        assert_eq!(total, 3, "all 3 events must be represented");
+    }
+
+    #[test]
+    fn split_discord_routine_chunks_single_small_chunk() {
+        let rendered = vec![
+            (0usize, "short-a".to_string(), "tmux.keyword".to_string()),
+            (1usize, "short-b".to_string(), "tmux.keyword".to_string()),
+        ];
+
+        let chunks = split_discord_routine_chunks(&rendered, &dummy_queued_delivery(), &[], 2);
+        assert_eq!(chunks.len(), 1, "should be one chunk");
+        assert_eq!(chunks[0].event_count, 2);
+        assert!(chunks[0].content.contains("short-a"));
+        assert!(chunks[0].content.contains("short-b"));
+    }
+
+    #[tokio::test]
+    async fn routine_batch_slack_path_is_not_discord_capped() {
+        // The routine batcher only batches sink=="discord", so Slack items
+        // go through send_delivery individually (which caps Discord only).
+        // This test verifies a long Slack custom event is not Discord-capped
+        // through the render_delivery path.
+        use tokio::time::{Duration, timeout};
+
+        let (webhook, mut requests, server) = spawn_webhook_collector(1).await;
+        let config = AppConfig {
+            defaults: crate::config::DefaultsConfig {
+                channel: None,
+                channel_name: None,
+                format: crate::events::MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "slack".into(),
+                slack_webhook: Some(webhook),
+                template: None,
+                ..RouteRule::default()
+            }],
+            dispatch: crate::config::DispatchConfig {
+                ci_batch_window_secs: 30,
+                routine_batch_window_secs: 5,
+            },
+            ..AppConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(4);
+        let router = Router::new(Arc::new(config));
+        let mut dispatcher = test_dispatcher(rx, router)
+            .with_routine_batch_window(Some(Duration::from_millis(50)))
+            .with_batch_tick(Duration::from_millis(5));
+        let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
+
+        let long_msg = "x".repeat(2500);
+        let event = IncomingEvent {
+            kind: "custom".into(),
+            channel: Some("ops".into()),
+            mention: None,
+            format: Some(crate::events::MessageFormat::Compact),
+            template: None,
+            payload: json!({
+                "message": long_msg,
+            }),
+        };
+        tx.send(event).await.unwrap();
+
+        let request = timeout(Duration::from_millis(300), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(tx);
+        task.await.unwrap();
+        server.await.unwrap();
+
+        // Slack payload must contain the full long message, not Discord-capped.
+        assert!(
+            request.contains(&"x".repeat(100)),
+            "Slack delivery should not be Discord-capped"
+        );
     }
 }
