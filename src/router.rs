@@ -3130,6 +3130,26 @@ mod tests {
             "Discord channel delivery must be capped"
         );
         assert!(content.ends_with('…'));
+    }
+
+    #[test]
+    fn explain_redacts_http_endpoint_in_text_and_json() {
+        let endpoint = "https://controller.example/webhooks/clawhip-controller?token=secret";
+        let config = AppConfig {
+            providers: ProvidersConfig {
+                http: HttpConfig {
+                    endpoint: Some(endpoint.into()),
+                    hmac_secret_env: Some("HERMES_CLAWHIP_HMAC_SECRET".into()),
+                },
+                ..ProvidersConfig::default()
+            },
+            routes: vec![RouteRule {
+                event: "session.*".into(),
+                sink: "http".into(),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
         let router = Router::new(Arc::new(config));
         let event = IncomingEvent {
             kind: "session.finished".into(),

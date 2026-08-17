@@ -2890,6 +2890,9 @@ mod tests {
             25294,
             0,
             snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
+            &[],
+            GitMonitorLifecycleCounts::default(),
         );
         let rendered = serde_json::to_string(&payload).unwrap();
 
