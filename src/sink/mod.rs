@@ -1,4 +1,5 @@
 pub mod discord;
+pub mod http;
 pub mod local_file;
 pub mod slack;
 
@@ -9,6 +10,7 @@ use crate::events::MessageFormat;
 use serde_json::Value;
 
 pub use discord::DiscordSink;
+pub use http::HttpSink;
 pub use local_file::LocalFileSink;
 pub use slack::SlackSink;
 
@@ -18,6 +20,7 @@ pub enum SinkTarget {
     DiscordThread(String),
     DiscordWebhook(String),
     SlackWebhook(String),
+    HttpEndpoint(String),
     LocalFile(String),
 }
 

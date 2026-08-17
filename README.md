@@ -385,6 +385,48 @@ webhook = "https://hooks.slack.com/services/T.../B.../yyy"
 format = "alert"
 ```
 
+## Signed HTTP webhook setup
+
+The generic `http` sink delivers a normalized, bounded, public-safe JSON event directly to a
+local controller such as Hermes. Discord is optional when every event you intend to deliver is
+covered by HTTP, Slack, local-file, or Discord-webhook routes.
+
+Keep the HMAC secret outside the TOML file and reference its environment-variable name:
+
+```bash
+export HERMES_CLAWHIP_HMAC_SECRET="replace-with-a-random-shared-secret"
+```
+
+```toml
+[providers.http]
+endpoint = "http://127.0.0.1:8644/webhooks/clawhip-controller"
+hmac_secret_env = "HERMES_CLAWHIP_HMAC_SECRET"
+
+[[routes]]
+event = "*"
+sink = "http"
+```
+
+The sink signs the exact transmitted bytes with HMAC-SHA256 and sends the result as
+`X-Hub-Signature-256: sha256=<hex>`. `X-Request-ID` is stable for the normalized event and is
+also present in the body. Plain HTTP is accepted only for loopback endpoints (`127.0.0.0/8`,
+`::1`, or `localhost`); non-loopback endpoints must use HTTPS. Redirects are disabled, response
+bodies and endpoint paths are not copied into errors or telemetry, and raw event payloads,
+credentials, local paths, and webhook URLs are excluded or redacted from the outbound body.
+
+HTTP and Discord can fan out from the same event by adding a second matching route:
+
+```toml
+[[routes]]
+event = "github.*"
+sink = "http"
+
+[[routes]]
+event = "github.*"
+sink = "discord"
+channel = "PROJECT_CHANNEL_ID"
+```
+
 ## System model
 
 ```text
@@ -392,8 +434,8 @@ format = "alert"
               -> [sources]
               -> [mpsc queue]
               -> [dispatcher]
-              -> [router -> renderer -> Discord/Slack sink]
-              -> [Discord REST / Slack webhook delivery]
+              -> [router -> renderer -> Discord/Slack/HTTP sink]
+              -> [Discord REST / Slack webhook / signed HTTP delivery]
 ```
 
 Input sources in v0.3.0:
@@ -796,7 +838,7 @@ non-zero when any destination is missing or not explicitly allowed.
 
 Output is public-safe by design: text and JSON reports include counts, clawhip
 source labels, and channel IDs only. They do not dump gateway tokens, webhook
-URLs, raw config payloads, or unrelated gateway fields. Webhooks, Slack routes,
+URLs, raw config payloads, or unrelated gateway fields. Discord/Slack webhooks, HTTP routes,
 localfile routes, and thread-only targets are outside this allowlist check.
 
 ## Dynamic token contract

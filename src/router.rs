@@ -247,6 +247,7 @@ impl Router {
             SinkTarget::DiscordThread(_)
             | SinkTarget::DiscordWebhook(_)
             | SinkTarget::SlackWebhook(_)
+            | SinkTarget::HttpEndpoint(_)
             | SinkTarget::LocalFile(_) => Err("matched route uses a non-channel target".into()),
         }
     }
@@ -412,6 +413,19 @@ impl Router {
                     )
                     .into()
                 }),
+            "http" => self
+                .config
+                .providers
+                .http
+                .endpoint()
+                .map(|endpoint| SinkTarget::HttpEndpoint(endpoint.to_string()))
+                .ok_or_else(|| {
+                    format!(
+                        "no HTTP endpoint configured for event {}",
+                        event.canonical_kind()
+                    )
+                    .into()
+                }),
             "localfile" => route
                 .and_then(RouteRule::local_file_target)
                 .map(|path| SinkTarget::LocalFile(path.to_string()))
@@ -502,10 +516,11 @@ fn delivery_explanation(
         SinkTarget::DiscordChannel(name) => {
             (format!("DiscordChannel({name:?})"), Some(name.clone()))
         }
-        SinkTarget::DiscordThread(_) => (telemetry::safe_target_id(&delivery.target), None),
-        SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
-        SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
-        SinkTarget::LocalFile(path) => (format!("LocalFile({path})"), None),
+        SinkTarget::DiscordThread(_)
+        | SinkTarget::DiscordWebhook(_)
+        | SinkTarget::SlackWebhook(_)
+        | SinkTarget::HttpEndpoint(_)
+        | SinkTarget::LocalFile(_) => (telemetry::safe_target_id(&delivery.target), None),
     };
 
     DeliveryExplanation {
@@ -720,7 +735,7 @@ pub(crate) fn cap_to_discord_limit(content: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DefaultsConfig, RouteRule};
+    use crate::config::{DefaultsConfig, HttpConfig, ProvidersConfig, RouteRule};
     use crate::events::{RoutingMetadata, normalize_event};
     use crate::render::DefaultRenderer;
     use crate::sink::{DiscordSink, SlackSink};
@@ -824,6 +839,42 @@ mod tests {
             SinkTarget::LocalFile("/tmp/clawhip/events.jsonl".into())
         );
         assert_eq!(delivery.trace.result, RouteTraceResult::Matched);
+    }
+
+    #[tokio::test]
+    async fn resolve_http_route_uses_provider_endpoint_and_redacted_trace() {
+        let endpoint = "https://controller.example/webhooks/clawhip-controller?token=secret";
+        let config = AppConfig {
+            providers: ProvidersConfig {
+                http: HttpConfig {
+                    endpoint: Some(endpoint.into()),
+                    hmac_secret_env: Some("HERMES_CLAWHIP_HMAC_SECRET".into()),
+                },
+                ..ProvidersConfig::default()
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "http".into(),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-301".into(), "error".into(), "boom".into(), None);
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+
+        assert_eq!(delivery.sink, "http");
+        assert_eq!(delivery.target, SinkTarget::HttpEndpoint(endpoint.into()));
+        assert!(
+            delivery
+                .trace
+                .target
+                .starts_with("http:endpoint:controller.example/redacted/")
+        );
+        assert!(!delivery.trace.target.contains("clawhip-controller"));
+        assert!(!delivery.trace.target.contains("secret"));
     }
 
     #[tokio::test]
@@ -3079,5 +3130,25 @@ mod tests {
             "Discord channel delivery must be capped"
         );
         assert!(content.ends_with('…'));
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent {
+            kind: "session.finished".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({"session_id":"sess-1"}),
+        };
+
+        let provenance = router.explain(&event);
+        let text = provenance.to_string();
+        let serialized = serde_json::to_string(&provenance).unwrap();
+
+        for rendered in [text, serialized] {
+            assert!(rendered.contains("http:endpoint:controller.example/redacted/"));
+            assert!(!rendered.contains("clawhip-controller"));
+            assert!(!rendered.contains("secret"));
+            assert!(!rendered.contains(endpoint));
+        }
     }
 }

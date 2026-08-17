@@ -422,6 +422,11 @@ mod tests {
                     ..RouteRule::default()
                 },
                 RouteRule {
+                    event: "http".into(),
+                    sink: "http".into(),
+                    ..RouteRule::default()
+                },
+                RouteRule {
                     event: "thread".into(),
                     thread: Some("999".into()),
                     ..RouteRule::default()

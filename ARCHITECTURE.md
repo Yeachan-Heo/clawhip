@@ -16,8 +16,8 @@ clawhip v0.3.0 ships a daemon-first event pipeline for Discord delivery. This do
               -> [sources]
               -> [mpsc queue]
               -> [dispatcher]
-              -> [router -> renderer -> discord sink]
-              -> [Discord REST delivery]
+              -> [router -> renderer -> Discord / Slack / HTTP sink]
+              -> [Discord REST / Slack webhook / signed HTTP delivery]
 ```
 
 ## Core components
@@ -74,9 +74,13 @@ That keeps message formatting out of the transport layer and makes the dispatch 
 
 ### Sink (`crate::sink`)
 
-Transport is represented by the `Sink` trait. The sink shipped in v0.3.0 is the Discord sink, which delivers either to a Discord channel or a Discord webhook target.
+Transport is represented by the `Sink` trait. Discord delivers to channels, threads, or Discord
+webhooks; Slack delivers to incoming webhooks; the generic HTTP sink delivers signed normalized
+events to a configured controller endpoint; and the local-file sink appends bounded summaries.
 
-The renderer/sink split is important even with a single shipped sink because it removes transport concerns from routing and event modeling.
+The renderer/sink split keeps transport concerns out of routing and event modeling. Multiple
+matching routes are attempted independently, so one event can fan out to HTTP and Discord and a
+failure at one target does not suppress the remaining deliveries.
 
 ## Configuration model
 
@@ -101,6 +105,26 @@ channel = "1480171113253175356"
 mention = "<@1465264645320474637>"
 format = "compact"
 ```
+
+For direct Clawhip → Hermes delivery, configure one provider endpoint and reference the HMAC
+secret by environment-variable name rather than storing the secret in TOML:
+
+```toml
+[providers.http]
+endpoint = "http://127.0.0.1:8644/webhooks/clawhip-controller"
+hmac_secret_env = "HERMES_CLAWHIP_HMAC_SECRET"
+
+[[routes]]
+event = "*"
+sink = "http"
+```
+
+The HTTP sink serializes a bounded public-safe `clawhip.http-event.v1` body, signs the exact body
+bytes with HMAC-SHA256 in `X-Hub-Signature-256`, and uses the event correlation identity for a
+stable `X-Request-ID`. Plain HTTP is restricted to loopback hosts, HTTPS is allowed for remote
+hosts, and redirects are disabled. Telemetry and provenance retain only a host plus stable
+redacted endpoint fingerprint; secret values, raw response bodies, local paths, and webhook URL
+paths are not emitted. Discord credentials are not required for HTTP-only routing.
 
 ## Delivery semantics
 

@@ -25,7 +25,7 @@ use crate::native_observability::{
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 
-use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
+use crate::sink::{DiscordSink, HttpSink, LocalFileSink, Sink, SlackSink};
 use crate::source::tmux::{
     AbsentRegistrationCandidate, prune_absent_dynamic_registrations, session_exists,
 };
@@ -36,7 +36,6 @@ use crate::source::tmux::{
     record_lane_delivery, record_lane_verification, register_lane_registration,
     retire_lane_if_absent, update_lane_evidence, update_lane_workflow,
 };
-
 use crate::source::{
     GitHubSource, GitHubStatusSource, GitMonitorLifecycleCounts, GitSource, RegisteredTmuxSession,
     SharedGitMonitorDiagnostics, SharedTmuxRegistry, Source, SubscriptionSnapshot,
@@ -133,7 +132,11 @@ pub async fn run(
     println!("clawhip v{VERSION} starting (token_source: {token_source})");
     telemetry::emit(daemon_record(
         telemetry::reason::DAEMON_STARTUP,
-        json!({"version": VERSION, "token_source": token_source}),
+        json!({
+            "version": VERSION,
+            "token_source": token_source,
+            "http_routes_configured": config.has_http_routes(),
+        }),
     ));
     if let Some(env_var) = config.discord_token_env_shadow() {
         let warning = discord_token_shadow_warning(env_var);
@@ -151,6 +154,12 @@ pub async fn run(
     );
     sinks.insert("slack".into(), Box::new(SlackSink::default()));
     sinks.insert("localfile".into(), Box::new(LocalFileSink));
+    if config.has_http_routes() {
+        sinks.insert(
+            "http".into(),
+            Box::new(HttpSink::from_config(&config.providers.http)?),
+        );
+    }
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
@@ -505,6 +514,7 @@ fn health_payload(
         "token_source": config.discord_token_source(),
         "token_precedence_warning": config.discord_token_env_shadow().map(discord_token_shadow_warning),
         "webhook_routes_configured": config.has_webhook_routes(),
+        "http_routes_configured": config.has_http_routes(),
         "port": port,
         "configured_git_monitors": config.monitors.git.repos.len(),
         "git_monitors": git_monitors,
@@ -2860,6 +2870,33 @@ mod tests {
         );
         assert!(payload["native_hooks"]["totals"]["received"].is_number());
         assert_eq!(payload["token_precedence_warning"], Value::Null);
+        assert_eq!(payload["http_routes_configured"], Value::Bool(false));
+    }
+
+    #[test]
+    fn health_payload_reports_http_routes_without_exposing_endpoint() {
+        let mut config = AppConfig::default();
+        config.providers.http.endpoint =
+            Some("https://controller.example/webhooks/clawhip-controller?token=secret".into());
+        config.providers.http.hmac_secret_env = Some("HERMES_CLAWHIP_HMAC_SECRET".into());
+        config.routes.push(RouteRule {
+            event: "*".into(),
+            sink: "http".into(),
+            ..RouteRule::default()
+        });
+
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            snapshot_shared(&new_shared_native_hook_observability()),
+        );
+        let rendered = serde_json::to_string(&payload).unwrap();
+
+        assert_eq!(payload["http_routes_configured"], Value::Bool(true));
+        assert!(!rendered.contains("controller.example"));
+        assert!(!rendered.contains("clawhip-controller"));
+        assert!(!rendered.contains("secret"));
     }
 
     #[tokio::test]
