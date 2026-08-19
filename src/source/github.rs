@@ -88,6 +88,10 @@ struct RepoCIBaseline {
     /// crash between the write and the channel send.
     #[serde(default)]
     pending: Vec<PendingCiDelivery>,
+    /// Tombstones for ACKed deliveries so a stale concurrent merge cannot
+    /// restore a receipt that was already durably removed.
+    #[serde(default)]
+    acked: VecDeque<String>,
 }
 
 /// Durable receipt for one terminal run. Identities are aliases (run-id,
@@ -222,6 +226,26 @@ impl PendingCiDelivery {
             && self.pr_number == other.pr_number
     }
 
+    fn delivery_key(&self) -> String {
+        let outcome = format!("{}:{}", self.kind, self.conclusion.as_deref().unwrap_or(""));
+        if let Some(check) = pending_check_identities(&self.identities).first() {
+            return format!("{check}:{outcome}");
+        }
+        if let Some(run_id) = &self.run_id {
+            return format!(
+                "run:{run_id}:{}:{}:{outcome}",
+                run_attempt_or_one(self.run_attempt),
+                self.workflow
+            );
+        }
+        format!(
+            "fallback:{}:{}:{}:{outcome}",
+            self.sha,
+            self.workflow,
+            self.pr_number.unwrap_or(0)
+        )
+    }
+
     fn into_event(self) -> IncomingEvent {
         let mut event = IncomingEvent::github_ci(
             &self.kind,
@@ -289,6 +313,7 @@ const MAX_CI_PAGES: usize = 5;
 const MAX_PENDING_SEND_ATTEMPTS: u32 = 3;
 const PENDING_RETRY_BACKOFF_SECS: u64 = 3_600;
 const BASELINE_LOCK_STALE_SECS: u64 = 30;
+const MAX_ACKED_DELIVERIES: usize = 512;
 
 /// Beside the cron state file, matching `tmux-watch-registry.json` and
 /// `discord-watch-state.json`.
@@ -643,6 +668,21 @@ fn terminal_records_same_run(left: &TerminalRunRecord, right: &TerminalRunRecord
         .any(|identity| right.contains_identity(identity))
 }
 
+fn pending_is_acked(repo: &RepoCIBaseline, delivery: &PendingCiDelivery) -> bool {
+    let key = delivery.delivery_key();
+    repo.acked.iter().any(|acked| acked == &key)
+}
+
+fn record_acked(repo: &mut RepoCIBaseline, delivery: &PendingCiDelivery) {
+    let key = delivery.delivery_key();
+    if !repo.acked.iter().any(|acked| acked == &key) {
+        repo.acked.push_back(key);
+    }
+    while repo.acked.len() > MAX_ACKED_DELIVERIES {
+        repo.acked.pop_front();
+    }
+}
+
 fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
     for record in source.terminal_runs {
         if let Some(existing) = dest
@@ -666,7 +706,18 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
         }
     }
     cap_repo_baseline(dest);
+    for key in source.acked {
+        if !dest.acked.iter().any(|acked| acked == &key) {
+            dest.acked.push_back(key);
+        }
+    }
+    while dest.acked.len() > MAX_ACKED_DELIVERIES {
+        dest.acked.pop_front();
+    }
     for delivery in source.pending {
+        if pending_is_acked(dest, &delivery) {
+            continue;
+        }
         if let Some(existing) = dest
             .pending
             .iter_mut()
@@ -677,6 +728,11 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
             dest.pending.push(delivery);
         }
     }
+    let acked = dest.acked.clone();
+    dest.pending.retain(|pending| {
+        let key = pending.delivery_key();
+        !acked.iter().any(|item| item == &key)
+    });
 }
 
 fn load_ci_baseline(path: Option<&Path>) -> CIBaseline {
@@ -721,27 +777,46 @@ fn merge_ci_baseline(dest: &mut CIBaseline, source: &CIBaseline) {
 
 struct BaselineLock {
     lock_path: PathBuf,
+    token: String,
 }
 
 impl Drop for BaselineLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.lock_path);
+        let owner = self.lock_path.join("owner");
+        if fs::read_to_string(&owner).ok().as_deref() == Some(self.token.as_str()) {
+            let _ = fs::remove_dir_all(&self.lock_path);
+        }
     }
 }
 
 fn acquire_baseline_lock(path: &Path) -> Result<BaselineLock> {
+    acquire_baseline_lock_inner(path, BASELINE_LOCK_STALE_SECS)
+}
+
+fn acquire_baseline_lock_inner(path: &Path, stale_secs: u64) -> Result<BaselineLock> {
     let lock_path = path.with_extension("json.lock");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
     for _ in 0..40 {
         match fs::create_dir(&lock_path) {
-            Ok(()) => return Ok(BaselineLock { lock_path }),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if baseline_lock_is_stale(&lock_path) {
-                    let _ = fs::remove_dir(&lock_path);
-                    continue;
+            Ok(()) => {
+                if let Err(error) = fs::write(lock_path.join("owner"), token.as_bytes()) {
+                    let _ = fs::remove_dir_all(&lock_path);
+                    return Err(error.into());
                 }
+                return Ok(BaselineLock { lock_path, token });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                try_reclaim_stale_lock(&lock_path, stale_secs);
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(error) => return Err(error.into()),
@@ -750,7 +825,30 @@ fn acquire_baseline_lock(path: &Path) -> Result<BaselineLock> {
     Err("timed out waiting for GitHub CI baseline lock".into())
 }
 
-fn baseline_lock_is_stale(lock_path: &Path) -> bool {
+fn try_reclaim_stale_lock(lock_path: &Path, stale_secs: u64) {
+    if !baseline_lock_is_stale(lock_path, stale_secs) {
+        return;
+    }
+    let owner = lock_path.join("owner");
+    let observed = fs::read_to_string(&owner).unwrap_or_default();
+    let current = fs::read_to_string(&owner).unwrap_or_default();
+    if current != observed {
+        return;
+    }
+    let dead = lock_path.with_extension(format!(
+        "json.lock.dead.{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    if fs::rename(lock_path, &dead).is_ok() {
+        let _ = fs::remove_dir_all(&dead);
+    }
+}
+
+fn baseline_lock_is_stale(lock_path: &Path, stale_secs: u64) -> bool {
     let Ok(metadata) = fs::metadata(lock_path) else {
         return true;
     };
@@ -759,7 +857,7 @@ fn baseline_lock_is_stale(lock_path: &Path) -> bool {
     };
     modified
         .elapsed()
-        .map(|elapsed| elapsed.as_secs() >= BASELINE_LOCK_STALE_SECS)
+        .map(|elapsed| elapsed.as_secs() >= stale_secs)
         .unwrap_or(true)
 }
 
@@ -901,6 +999,9 @@ fn ack_pending_deliveries(
 ) -> Result<()> {
     let Some(path) = path else {
         for repo in ci_baseline.repos.values_mut() {
+            for delivery in delivered {
+                record_acked(repo, delivery);
+            }
             repo.pending
                 .retain(|pending| !delivered.iter().any(|item| pending.same_event(item)));
         }
@@ -909,7 +1010,25 @@ fn ack_pending_deliveries(
     let _lock = acquire_baseline_lock(path)?;
     let mut disk = load_ci_baseline(Some(path));
     merge_ci_baseline(&mut disk, ci_baseline);
-    for repo in disk.repos.values_mut() {
+    for (key, repo) in disk.repos.iter_mut() {
+        let local_repo = ci_baseline.repos.get(key);
+        for delivery in delivered {
+            let in_disk = repo
+                .pending
+                .iter()
+                .any(|pending| pending.same_event(delivery));
+            let in_local = local_repo
+                .map(|local| {
+                    local
+                        .pending
+                        .iter()
+                        .any(|pending| pending.same_event(delivery))
+                })
+                .unwrap_or(false);
+            if in_disk || in_local {
+                record_acked(repo, delivery);
+            }
+        }
         repo.pending
             .retain(|pending| !delivered.iter().any(|item| pending.same_event(item)));
     }
@@ -2262,7 +2381,9 @@ fn classify_ci_event_kind(status: &str, conclusion: Option<&str>) -> &'static st
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use std::time::Duration;
 
     use super::*;
@@ -3427,6 +3548,130 @@ mod tests {
             restarted.repos["/repo"].pending.len(),
             3,
             "restart must keep both jobs and the changed conclusion"
+        );
+    }
+
+    #[test]
+    fn issue_317_concurrent_acks_do_not_resurrect_acked_deliveries() {
+        let lint = check_job(4242, 11, "lint", "success");
+        let test = check_job(4242, 22, "test", "failure");
+        let current = run_map(&[lint.clone(), test.clone()]);
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &current,
+            None,
+        );
+        let pending_a = PendingCiDelivery::from_event(
+            events
+                .iter()
+                .find(|event| event.canonical_kind() == "github.ci-passed")
+                .unwrap(),
+            lint.identities(),
+        );
+        let pending_b = PendingCiDelivery::from_event(
+            events
+                .iter()
+                .find(|event| event.canonical_kind() == "github.ci-failed")
+                .unwrap(),
+            test.identities(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut durable = CIBaseline::default();
+        durable.enqueue_pending("/repo", "/repo", &events, &current);
+        save_ci_baseline(&durable, Some(&path)).unwrap();
+
+        let mut proc1 = load_ci_baseline(Some(&path));
+        let mut proc2 = load_ci_baseline(Some(&path));
+        ack_pending_deliveries(&mut proc1, Some(&path), std::slice::from_ref(&pending_a)).unwrap();
+        ack_pending_deliveries(&mut proc2, Some(&path), std::slice::from_ref(&pending_b)).unwrap();
+
+        let restarted = load_ci_baseline(Some(&path));
+        assert!(
+            restarted.repos["/repo"].pending.is_empty(),
+            "stale concurrent ACK must not restore an already ACKed delivery"
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut drain_state = restarted.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            drain_pending_outbox(&mut drain_state, Some(&path), &tx)
+                .await
+                .unwrap();
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "restart drain must not redeliver an ACKed event"
+        );
+    }
+
+    #[test]
+    fn issue_317_stale_lock_reclaim_does_not_delete_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let lock_path = path.with_extension("json.lock");
+        fs::create_dir_all(&lock_path).unwrap();
+        fs::write(lock_path.join("owner"), b"stale-token").unwrap();
+        std::process::Command::new("touch")
+            .args(["-t", "197001010000"])
+            .arg(&lock_path)
+            .status()
+            .unwrap();
+
+        let overlapping = Arc::new(AtomicUsize::new(0));
+        let current = Arc::new(AtomicUsize::new(0));
+        let live_deleted = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                let overlapping = overlapping.clone();
+                let current = current.clone();
+                let live_deleted = live_deleted.clone();
+                let errors = errors.clone();
+                let path = path.clone();
+                scope.spawn(move || match acquire_baseline_lock_inner(&path, BASELINE_LOCK_STALE_SECS)
+                {
+                    Ok(lock) => {
+                        let owner = lock.lock_path.join("owner");
+                        let token = lock.token.clone();
+                        current.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(30));
+                        if current.load(Ordering::SeqCst) > 1 {
+                            overlapping.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if fs::read_to_string(&owner).ok().as_deref() != Some(token.as_str()) {
+                            live_deleted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        current.fetch_sub(1, Ordering::SeqCst);
+                        drop(lock);
+                    }
+                    Err(error) => errors.lock().unwrap().push(error.to_string()),
+                });
+            }
+        });
+
+        assert!(
+            errors.lock().unwrap().is_empty(),
+            "lock acquire failed: {:?}",
+            errors.lock().unwrap()
+        );
+        assert_eq!(
+            overlapping.load(Ordering::SeqCst),
+            0,
+            "two reclaimers must not enter the critical section together"
+        );
+        assert_eq!(
+            live_deleted.load(Ordering::SeqCst),
+            0,
+            "a reclaimer must not delete another owner's live lock"
         );
     }
 
