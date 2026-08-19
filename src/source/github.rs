@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
-use serde::{Deserialize, Serialize};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK, USER_AGENT};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -69,9 +69,10 @@ impl Source for GitHubSource {
     }
 }
 
-/// Persisted terminal-run identity per monitored repo. Survives restart and
-/// re-enrollment so historical workflow runs cannot replay as fresh events
-/// (#317). Bounded: at most [`MAX_BASELINE_RUNS_PER_REPO`] identities per repo.
+/// Persisted terminal-run identity per monitored GitHub repository. Survives
+/// restart and re-enrollment so historical workflow results never replay as
+/// fresh events (#317). Bounded: at most [`MAX_BASELINE_RUNS_PER_REPO`]
+/// records per repo, evicted oldest-first by GitHub timestamps / run ids.
 #[derive(Default)]
 struct CIBaseline {
     repos: HashMap<String, RepoCIBaseline>,
@@ -79,12 +80,53 @@ struct CIBaseline {
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct RepoCIBaseline {
-    /// Terminal run identities observed for this repo, oldest evicted first.
-    #[serde(default)]
-    terminal_runs: VecDeque<String>,
+    /// Terminal run records observed for this repo, oldest evicted first.
+    #[serde(default, deserialize_with = "deserialize_terminal_runs")]
+    terminal_runs: VecDeque<TerminalRunRecord>,
+}
+
+/// Durable receipt for one terminal run. Identities are aliases (run-id,
+/// check-run id, fallback) so representation drift still suppresses. Receipt
+/// records the persist-before-publish contract: a delivered event is always
+/// already in this set.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct TerminalRunRecord {
+    identities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum PersistedTerminalRun {
+    Legacy(String),
+    Record(TerminalRunRecord),
+}
+
+impl From<PersistedTerminalRun> for TerminalRunRecord {
+    fn from(value: PersistedTerminalRun) -> Self {
+        match value {
+            PersistedTerminalRun::Legacy(identity) => TerminalRunRecord::from_legacy(identity),
+            PersistedTerminalRun::Record(record) => record,
+        }
+    }
+}
+
+fn deserialize_terminal_runs<'de, D>(
+    deserializer: D,
+) -> std::result::Result<VecDeque<TerminalRunRecord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Vec::<PersistedTerminalRun>::deserialize(deserializer)?;
+    Ok(raw.into_iter().map(TerminalRunRecord::from).collect())
 }
 
 const MAX_BASELINE_RUNS_PER_REPO: usize = 256;
+const CI_PAGE_SIZE: usize = 100;
+const MAX_CI_PAGES: usize = 5;
 
 /// Beside the cron state file, matching `tmux-watch-registry.json` and
 /// `discord-watch-state.json`.
@@ -92,59 +134,242 @@ pub fn default_github_ci_baseline_path(cron_state_path: &Path) -> PathBuf {
     cron_state_path.with_file_name("github-ci-baseline.json")
 }
 
-fn baseline_identity(ci: &GitHubCISnapshot) -> String {
-    // Prefer the immutable GitHub run id; fall back to the dedupe key so
-    // check-run snapshots without a run id still dedupe by sha+workflow.
-    ci.run_id
-        .as_ref()
-        .map(|run_id| format!("run:{run_id}"))
-        .unwrap_or_else(|| ci.dedupe_key())
+fn ci_baseline_repo_key(snapshot: &GitSnapshot, repo: &GitRepoMonitor) -> String {
+    snapshot
+        .github_repo
+        .as_deref()
+        .or(repo.github_repo.as_deref())
+        .map(|remote| format!("repo:{remote}"))
+        .unwrap_or_else(|| format!("path:{}", repo.path))
+}
+
+impl TerminalRunRecord {
+    fn from_snapshot(ci: &GitHubCISnapshot) -> Self {
+        Self {
+            identities: ci.identities(),
+            run_id: ci.run_id.clone(),
+            created_at: ci.created_at.clone(),
+        }
+    }
+
+    fn from_legacy(identity: String) -> Self {
+        let run_id = identity
+            .strip_prefix("run:")
+            .filter(|id| !id.is_empty() && !id.contains(':'))
+            .map(ToString::to_string);
+        Self {
+            identities: vec![identity],
+            run_id,
+            created_at: None,
+        }
+    }
+
+    fn contains_identity(&self, identity: &str) -> bool {
+        self.identities.iter().any(|stored| stored == identity)
+    }
+
+    fn unique_identities(&self) -> impl Iterator<Item = &str> {
+        self.identities.iter().filter_map(|identity| {
+            if identity.starts_with("run:") || identity.starts_with("check:") {
+                Some(identity.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn matches_snapshot(&self, ci: &GitHubCISnapshot) -> bool {
+        let unique = ci.unique_identities();
+        if unique
+            .iter()
+            .any(|identity| self.contains_identity(identity))
+        {
+            return true;
+        }
+        for identity in &self.identities {
+            if identity_matches_snapshot(identity, ci)
+                && (unique.is_empty() || self.unique_identities().next().is_none())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn merge_snapshot(&mut self, ci: &GitHubCISnapshot) -> bool {
+        let mut dirty = false;
+        for identity in ci.identities() {
+            if !self.contains_identity(&identity) {
+                self.identities.push(identity);
+                dirty = true;
+            }
+        }
+        if self.run_id.is_none() && ci.run_id.is_some() {
+            self.run_id = ci.run_id.clone();
+            dirty = true;
+        }
+        if self.created_at.is_none() && ci.created_at.is_some() {
+            self.created_at = ci.created_at.clone();
+            dirty = true;
+        }
+        dirty
+    }
+
+    fn eviction_key(&self) -> (u8, String, u64, String) {
+        let created_rank = u8::from(self.created_at.is_none());
+        let created = self.created_at.clone().unwrap_or_default();
+        let run_num = self
+            .run_id
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        let ident = self.identities.first().cloned().unwrap_or_default();
+        (created_rank, created, run_num, ident)
+    }
+}
+
+fn identity_matches_snapshot(identity: &str, ci: &GitHubCISnapshot) -> bool {
+    if ci
+        .identities()
+        .iter()
+        .any(|candidate| candidate == identity)
+    {
+        return true;
+    }
+    let key = ci.dedupe_key();
+    if identity == key {
+        return true;
+    }
+    if let Some(id) = identity.strip_prefix("run:")
+        && !id.contains(':')
+    {
+        if ci.run_id.as_deref() == Some(id) {
+            return true;
+        }
+        if key.starts_with(&format!("run:{id}:")) {
+            return true;
+        }
+    }
+    false
 }
 
 fn repo_ci_baseline_is_suppressed(
     repo_ci_baseline: Option<&RepoCIBaseline>,
-    dedupe_key: &str,
+    ci: &GitHubCISnapshot,
 ) -> bool {
     let Some(baseline) = repo_ci_baseline else {
         return false;
     };
-    baseline.terminal_runs.iter().any(|identity| {
-        identity == dedupe_key || {
-            // Persisted identities are run-id based; a terminal snapshot keyed
-            // by `run:<id>:<workflow>` must still match its persisted
-            // `run:<id>` identity.
-            identity
-                .strip_prefix("run:")
-                .is_some_and(|id| dedupe_key.starts_with(&format!("run:{id}:")))
-        }
-    })
+    baseline
+        .terminal_runs
+        .iter()
+        .any(|record| record.matches_snapshot(ci))
+}
+
+fn snapshot_eviction_key(ci: &GitHubCISnapshot) -> (u8, String, u64, String) {
+    TerminalRunRecord::from_snapshot(ci).eviction_key()
+}
+
+fn cap_repo_baseline(repo_baseline: &mut RepoCIBaseline) -> bool {
+    if repo_baseline.terminal_runs.len() <= MAX_BASELINE_RUNS_PER_REPO {
+        return false;
+    }
+    let mut records: Vec<TerminalRunRecord> = repo_baseline.terminal_runs.drain(..).collect();
+    records.sort_by_key(|record| record.eviction_key());
+    let drop_count = records.len() - MAX_BASELINE_RUNS_PER_REPO;
+    records.drain(..drop_count);
+    repo_baseline.terminal_runs = records.into();
+    true
+}
+
+#[cfg(test)]
+impl RepoCIBaseline {
+    fn contains_identity(&self, identity: &str) -> bool {
+        self.terminal_runs
+            .iter()
+            .any(|record| record.contains_identity(identity))
+    }
 }
 
 impl CIBaseline {
-    /// Records terminal-run identities for one repo. Returns whether the
-    /// persisted state changed (bounded, oldest entries evicted first).
+    fn repo_baseline_mut(&mut self, repo_key: &str, repo_path: &str) -> &mut RepoCIBaseline {
+        if repo_key.starts_with("repo:") {
+            let mut inherited = Vec::new();
+            if let Some(legacy) = self.repos.remove(repo_path) {
+                inherited.push(legacy);
+            }
+            let path_key = format!("path:{repo_path}");
+            if path_key != repo_key
+                && let Some(legacy) = self.repos.remove(&path_key)
+            {
+                inherited.push(legacy);
+            }
+            let dest = self.repos.entry(repo_key.to_string()).or_default();
+            for legacy in inherited {
+                merge_repo_baseline(dest, legacy);
+            }
+            dest
+        } else {
+            self.repos.entry(repo_key.to_string()).or_default()
+        }
+    }
+
+    /// Records terminal-run identities for one canonical GitHub repo. Returns
+    /// whether the persisted state changed (bounded, oldest GitHub runs
+    /// evicted first).
     fn record_terminal_runs(
         &mut self,
+        repo_key: &str,
         repo_path: &str,
         current: &HashMap<String, GitHubCISnapshot>,
     ) -> bool {
-        let repo_baseline = self.repos.entry(repo_path.to_string()).or_default();
-        let mut dirty = repo_baseline.terminal_runs.is_empty();
-        for ci in current.values() {
-            if !ci.is_terminal() {
-                continue;
-            }
-            let identity = baseline_identity(ci);
-            if !repo_baseline.terminal_runs.contains(&identity) {
-                repo_baseline.terminal_runs.push_back(identity);
+        let mut incoming: Vec<&GitHubCISnapshot> =
+            current.values().filter(|ci| ci.is_terminal()).collect();
+        incoming.sort_by_key(|ci| snapshot_eviction_key(ci));
+
+        let repo_baseline = self.repo_baseline_mut(repo_key, repo_path);
+        let mut dirty = false;
+        for ci in incoming {
+            if let Some(existing) = repo_baseline
+                .terminal_runs
+                .iter_mut()
+                .find(|record| record.matches_snapshot(ci))
+            {
+                dirty |= existing.merge_snapshot(ci);
+            } else {
+                repo_baseline
+                    .terminal_runs
+                    .push_back(TerminalRunRecord::from_snapshot(ci));
                 dirty = true;
             }
         }
-        while repo_baseline.terminal_runs.len() > MAX_BASELINE_RUNS_PER_REPO {
-            repo_baseline.terminal_runs.pop_front();
-            dirty = true;
-        }
+        dirty |= cap_repo_baseline(repo_baseline);
         dirty
+    }
+}
+
+fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
+    for record in source.terminal_runs {
+        if let Some(existing) = dest.terminal_runs.iter_mut().find(|candidate| {
+            candidate
+                .identities
+                .iter()
+                .any(|identity| record.contains_identity(identity))
+        }) {
+            for identity in record.identities {
+                if !existing.contains_identity(&identity) {
+                    existing.identities.push(identity);
+                }
+            }
+            if existing.run_id.is_none() {
+                existing.run_id = record.run_id;
+            }
+            if existing.created_at.is_none() {
+                existing.created_at = record.created_at;
+            }
+        } else {
+            dest.terminal_runs.push_back(record);
+        }
     }
 }
 
@@ -164,7 +389,13 @@ fn load_ci_baseline(path: Option<&Path>) -> CIBaseline {
         }
     };
     match serde_json::from_str::<HashMap<String, RepoCIBaseline>>(&raw) {
-        Ok(repos) => CIBaseline { repos },
+        Ok(repos) => {
+            let mut baseline = CIBaseline { repos };
+            for repo_baseline in baseline.repos.values_mut() {
+                cap_repo_baseline(repo_baseline);
+            }
+            baseline
+        }
         Err(error) => {
             eprintln!(
                 "clawhip source github CI baseline '{}' invalid; starting a fresh baseline: {error}",
@@ -183,9 +414,29 @@ fn save_ci_baseline(baseline: &CIBaseline, path: Option<&Path>) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string(&baseline.repos)?;
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, payload.as_bytes())?;
-    fs::rename(&temp_path, path)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_name = format!(
+        "{}.{}.{nonce}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("github-ci-baseline.json"),
+        std::process::id()
+    );
+    let temp_path = match path.parent() {
+        Some(parent) => parent.join(temp_name),
+        None => PathBuf::from(temp_name),
+    };
+    if let Err(error) = fs::write(&temp_path, payload.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -222,15 +473,14 @@ struct GitHubCISnapshot {
     url: String,
     branch: Option<String>,
     run_id: Option<String>,
+    check_run_id: Option<String>,
+    created_at: Option<String>,
     run_job_count: usize,
     run_all_terminal: bool,
 }
 
 impl GitHubCISnapshot {
-    fn dedupe_key(&self) -> String {
-        if let Some(run_id) = &self.run_id {
-            return format!("run:{run_id}:{}", self.workflow);
-        }
+    fn fallback_identity(&self) -> String {
         format!(
             "{}:{}:{}",
             self.pr_number
@@ -241,14 +491,42 @@ impl GitHubCISnapshot {
         )
     }
 
+    fn unique_identities(&self) -> Vec<String> {
+        let mut identities = Vec::new();
+        if let Some(run_id) = &self.run_id {
+            identities.push(format!("run:{run_id}"));
+        }
+        if let Some(check_run_id) = &self.check_run_id {
+            identities.push(format!("check:{check_run_id}"));
+        }
+        identities
+    }
+
+    fn identities(&self) -> Vec<String> {
+        let mut identities = self.unique_identities();
+        identities.push(self.fallback_identity());
+        identities
+    }
+
+    fn dedupe_key(&self) -> String {
+        if let Some(run_id) = &self.run_id {
+            return format!("run:{run_id}:{}", self.workflow);
+        }
+        if let Some(check_run_id) = &self.check_run_id {
+            return format!("check:{check_run_id}");
+        }
+        self.fallback_identity()
+    }
+
     fn event_kind(&self) -> &'static str {
         classify_ci_event_kind(&self.status, self.conclusion.as_deref())
     }
 
-    /// A terminal run will never change state again, so its identity can be
-    /// persisted and suppressed on later re-observation (#317).
+    /// A workflow is terminal only when every job is done. A single completed
+    /// job in a still-running workflow must not be persisted, or restart would
+    /// suppress the eventual completion (#317).
     fn is_terminal(&self) -> bool {
-        self.status == "completed"
+        self.status == "completed" && self.run_all_terminal
     }
 }
 
@@ -364,19 +642,20 @@ async fn poll_github(
                     previous.map(|entry| entry.prs.clone()).unwrap_or_default()
                 }
             };
-        let (ci, ci_baseline_established) = match poll_ci_statuses(
+        let repo_key = ci_baseline_repo_key(&snapshot, repo);
+        let repo_ci_baseline = ci_baseline.repos.get(&repo_key).cloned();
+        let (ci, ci_baseline_established, mut ci_events) = match poll_ci_statuses(
             config,
             github_client,
             repo,
             &snapshot,
             previous,
             &prs,
-            tx,
-            ci_baseline.repos.get(&repo.path),
+            repo_ci_baseline.as_ref(),
         )
         .await
         {
-            Ok(ci) => ci,
+            Ok(result) => result,
             Err(error) => {
                 eprintln!(
                     "clawhip source GitHub CI processing failed for {}: {error}",
@@ -387,20 +666,15 @@ async fn poll_github(
                     previous
                         .map(|entry| entry.ci_baseline_established)
                         .unwrap_or(false),
+                    Vec::new(),
                 )
             }
         };
 
-        let repo_baseline_dirty = ci_baseline.record_terminal_runs(&repo.path, &ci);
-        state.insert(
-            repo.path.clone(),
-            GitHubRepoState {
-                issues,
-                prs,
-                ci,
-                ci_baseline_established,
-            },
-        );
+        // Persist-before-publish: a delivered terminal event must already be
+        // in durable suppression state. If the receipt cannot be written, drop
+        // the events rather than open a restart-replay window.
+        let repo_baseline_dirty = ci_baseline.record_terminal_runs(&repo_key, &repo.path, &ci);
         if repo_baseline_dirty && let Err(error) = save_ci_baseline(ci_baseline, ci_baseline_path) {
             telemetry::emit(source_record(
                 telemetry::event_name::SOURCE_DEGRADED,
@@ -412,7 +686,22 @@ async fn poll_github(
                 "clawhip source github CI baseline persist failed for {}: {error}",
                 repo.path
             );
+            ci_events.clear();
         }
+
+        for event in ci_events {
+            send_event(tx, event).await?;
+        }
+
+        state.insert(
+            repo.path.clone(),
+            GitHubRepoState {
+                issues,
+                prs,
+                ci,
+                ci_baseline_established,
+            },
+        );
     }
 
     Ok(())
@@ -528,7 +817,6 @@ async fn poll_pull_requests(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn poll_ci_statuses(
     config: &AppConfig,
     github_client: Option<&reqwest::Client>,
@@ -536,15 +824,15 @@ async fn poll_ci_statuses(
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
     prs: &HashMap<u64, PullRequestSnapshot>,
-    tx: &mpsc::Sender<IncomingEvent>,
     repo_ci_baseline: Option<&RepoCIBaseline>,
-) -> Result<(HashMap<String, GitHubCISnapshot>, bool)> {
+) -> Result<(HashMap<String, GitHubCISnapshot>, bool, Vec<IncomingEvent>)> {
     if !repo.emit_pr_status {
         return Ok((
             previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
             previous
                 .map(|entry| entry.ci_baseline_established)
                 .unwrap_or(false),
+            Vec::new(),
         ));
     }
 
@@ -554,6 +842,7 @@ async fn poll_ci_statuses(
             previous
                 .map(|entry| entry.ci_baseline_established)
                 .unwrap_or(false),
+            Vec::new(),
         ));
     };
 
@@ -572,20 +861,25 @@ async fn poll_ci_statuses(
     )
     .await
     {
-        Ok(ci) => {
-            if let Some(previous) = previous {
-                for event in collect_ci_events(
+        Ok((ci, window_complete)) => {
+            let events = if let Some(previous) = previous {
+                let mut events = collect_ci_events(
                     repo,
                     &snapshot.repo_name,
                     previous.ci_baseline_established,
                     &previous.ci,
                     &ci,
                     repo_ci_baseline,
-                ) {
-                    send_event(tx, event).await?;
+                );
+                if !window_complete {
+                    events
+                        .retain(|event| previous_snapshot_for_event(&previous.ci, event).is_some());
                 }
-            }
-            Ok((ci, true))
+                events
+            } else {
+                Vec::new()
+            };
+            Ok((ci, window_complete, events))
         }
         Err(error) => {
             telemetry::emit(source_record(
@@ -605,9 +899,32 @@ async fn poll_ci_statuses(
             Ok((
                 previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
                 false,
+                Vec::new(),
             ))
         }
     }
+}
+
+fn previous_snapshot_for_event<'a>(
+    previous: &'a HashMap<String, GitHubCISnapshot>,
+    event: &IncomingEvent,
+) -> Option<&'a GitHubCISnapshot> {
+    let payload = event.payload.as_object()?;
+    let workflow = payload.get("workflow")?.as_str()?;
+    let run_id = payload.get("run_id").and_then(|value| value.as_str());
+    previous.values().find(|ci| {
+        if let Some(run_id) = run_id
+            && ci.run_id.as_deref() == Some(run_id)
+        {
+            return true;
+        }
+        ci.workflow == workflow
+            && ci.sha
+                == payload
+                    .get("sha")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+    })
 }
 
 fn source_record(
@@ -712,6 +1029,24 @@ fn collect_issue_events(
     events
 }
 
+fn previous_snapshot<'a>(
+    previous: &'a HashMap<String, GitHubCISnapshot>,
+    ci: &GitHubCISnapshot,
+) -> Option<&'a GitHubCISnapshot> {
+    if let Some(old) = previous.get(&ci.dedupe_key()) {
+        return Some(old);
+    }
+    let unique = ci.unique_identities();
+    if unique.is_empty() {
+        return None;
+    }
+    previous.values().find(|old| {
+        old.unique_identities()
+            .iter()
+            .any(|identity| unique.iter().any(|candidate| candidate == identity))
+    })
+}
+
 fn collect_ci_events(
     repo: &GitRepoMonitor,
     repo_name: &str,
@@ -721,8 +1056,9 @@ fn collect_ci_events(
     repo_ci_baseline: Option<&RepoCIBaseline>,
 ) -> Vec<IncomingEvent> {
     let mut events = Vec::new();
-    for (key, ci) in current {
-        let changed = match previous.get(key) {
+    for ci in current.values() {
+        let old = previous_snapshot(previous, ci);
+        let changed = match old {
             Some(old) => old.status != ci.status || old.conclusion != ci.conclusion,
             None => {
                 if !previous_ci_baseline_established {
@@ -735,7 +1071,7 @@ fn collect_ci_events(
                     // in-process record: the pagination drift / cursor loss /
                     // re-enrollment replay window. Suppress it when the
                     // persisted baseline already observed it (#317).
-                    !repo_ci_baseline_is_suppressed(repo_ci_baseline, key)
+                    !repo_ci_baseline_is_suppressed(repo_ci_baseline, ci)
                 } else {
                     // Established monitor seeing a genuinely new run start.
                     true
@@ -865,16 +1201,20 @@ async fn fetch_ci_statuses(
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
     open_prs: &[(u64, &PullRequestSnapshot)],
-) -> Result<HashMap<String, GitHubCISnapshot>> {
+) -> Result<(HashMap<String, GitHubCISnapshot>, bool)> {
     let github_repo = snapshot
         .github_repo
         .clone()
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
     let mut check_runs = HashMap::new();
     let mut seen_run_ids = HashSet::new();
+    let mut window_complete = true;
 
     for (number, pr) in open_prs {
-        for check_run in fetch_check_runs(client, api_base, &github_repo, *number, pr).await? {
+        let (fetched, complete) =
+            fetch_check_runs(client, api_base, &github_repo, *number, pr).await?;
+        window_complete &= complete;
+        for check_run in fetched {
             if let Some(run_id) = &check_run.run_id {
                 seen_run_ids.insert(run_id.clone());
             }
@@ -882,8 +1222,10 @@ async fn fetch_ci_statuses(
         }
     }
 
-    for workflow_run in fetch_direct_workflow_runs(client, api_base, &github_repo, snapshot).await?
-    {
+    let (workflow_runs, complete) =
+        fetch_direct_workflow_runs(client, api_base, &github_repo, snapshot).await?;
+    window_complete &= complete;
+    for workflow_run in workflow_runs {
         if workflow_run
             .run_id
             .as_ref()
@@ -894,7 +1236,34 @@ async fn fetch_ci_statuses(
         check_runs.insert(workflow_run.dedupe_key(), workflow_run);
     }
 
-    Ok(check_runs)
+    Ok((check_runs, window_complete))
+}
+
+fn github_link_next(headers: &HeaderMap) -> Option<String> {
+    let header = headers.get(LINK)?.to_str().ok()?;
+    for part in header.split(',') {
+        let mut href = None;
+        let mut is_next = false;
+        for item in part.split(';') {
+            let item = item.trim();
+            if let Some(url) = item
+                .strip_prefix('<')
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                href = Some(url.to_string());
+            } else if item.contains("rel=") && item.contains("next") {
+                is_next = true;
+            }
+        }
+        if is_next {
+            return href;
+        }
+    }
+    None
+}
+
+fn ci_window_complete(has_next: bool, pages_fetched: usize) -> bool {
+    !(has_next && pages_fetched >= MAX_CI_PAGES)
 }
 
 async fn fetch_check_runs(
@@ -903,42 +1272,70 @@ async fn fetch_check_runs(
     github_repo: &str,
     pr_number: u64,
     pr: &PullRequestSnapshot,
-) -> Result<Vec<GitHubCISnapshot>> {
-    let response = github_get(
-        client,
-        api_base,
-        &format!("repos/{github_repo}/commits/{}/check-runs", pr.head_sha),
-        &[("per_page", "100")],
-        &format!("check runs for {github_repo} PR #{pr_number}"),
-    )
-    .await?;
+) -> Result<(Vec<GitHubCISnapshot>, bool)> {
+    let mut all_runs = Vec::new();
+    let mut page = 1_usize;
+    let mut window_complete = true;
+    loop {
+        let page_str = page.to_string();
+        let response = github_get(
+            client,
+            api_base,
+            &format!("repos/{github_repo}/commits/{}/check-runs", pr.head_sha),
+            &[("per_page", "100"), ("page", page_str.as_str())],
+            &format!("check runs for {github_repo} PR #{pr_number}"),
+        )
+        .await?;
+        let has_next = github_link_next(response.headers()).is_some();
+        let runs: GitHubCheckRunsResponse = response.json().await?;
+        let page_len = runs.check_runs.len();
+        all_runs.extend(runs.check_runs);
+        if !has_next || page_len < CI_PAGE_SIZE {
+            break;
+        }
+        if !ci_window_complete(has_next, page) {
+            window_complete = false;
+            break;
+        }
+        page += 1;
+        if page > MAX_CI_PAGES {
+            window_complete = false;
+            break;
+        }
+    }
 
-    let runs: GitHubCheckRunsResponse = response.json().await?;
-    let run_summaries = summarize_workflow_runs(&runs.check_runs);
-    Ok(runs
-        .check_runs
-        .into_iter()
-        .map(|check_run| {
-            let url = check_run.details_url.unwrap_or_else(|| pr.url.clone());
-            let run_id = workflow_run_id(&url);
-            let (run_job_count, run_all_terminal) = run_id
-                .as_deref()
-                .and_then(|id| run_summaries.get(id).copied())
-                .unwrap_or((1, check_run.status == "completed"));
-            GitHubCISnapshot {
-                pr_number: Some(pr_number),
-                workflow: check_run.name,
-                status: check_run.status,
-                conclusion: check_run.conclusion,
-                sha: check_run.head_sha,
-                url,
-                branch: Some(pr.head_branch.clone()),
-                run_id,
-                run_job_count,
-                run_all_terminal,
-            }
-        })
-        .collect())
+    let run_summaries = summarize_workflow_runs(&all_runs);
+    Ok((
+        all_runs
+            .into_iter()
+            .map(|check_run| {
+                let url = check_run
+                    .details_url
+                    .clone()
+                    .unwrap_or_else(|| pr.url.clone());
+                let run_id = workflow_run_id(&url);
+                let (run_job_count, run_all_terminal) = run_id
+                    .as_deref()
+                    .and_then(|id| run_summaries.get(id).copied())
+                    .unwrap_or((1, check_run.status == "completed"));
+                GitHubCISnapshot {
+                    pr_number: Some(pr_number),
+                    workflow: check_run.name,
+                    status: check_run.status,
+                    conclusion: check_run.conclusion,
+                    sha: check_run.head_sha,
+                    url,
+                    branch: Some(pr.head_branch.clone()),
+                    run_id,
+                    check_run_id: (check_run.id != 0).then(|| check_run.id.to_string()),
+                    created_at: check_run.started_at.or(check_run.completed_at),
+                    run_job_count,
+                    run_all_terminal,
+                }
+            })
+            .collect(),
+        window_complete,
+    ))
 }
 
 fn summarize_workflow_runs(check_runs: &[GitHubCheckRun]) -> HashMap<String, (usize, bool)> {
@@ -959,44 +1356,73 @@ async fn fetch_direct_workflow_runs(
     api_base: &str,
     github_repo: &str,
     snapshot: &GitSnapshot,
-) -> Result<Vec<GitHubCISnapshot>> {
-    let mut query = vec![("per_page", "100"), ("event", "push")];
-    if !snapshot.branch.is_empty() {
-        query.push(("branch", snapshot.branch.as_str()));
+) -> Result<(Vec<GitHubCISnapshot>, bool)> {
+    let mut all_runs = Vec::new();
+    let mut page = 1_usize;
+    let mut window_complete = true;
+    loop {
+        let page_str = page.to_string();
+        let mut query = vec![
+            ("per_page", "100"),
+            ("event", "push"),
+            ("page", page_str.as_str()),
+        ];
+        if !snapshot.branch.is_empty() {
+            query.push(("branch", snapshot.branch.as_str()));
+        }
+
+        let response = github_get(
+            client,
+            api_base,
+            &format!("repos/{github_repo}/actions/runs"),
+            &query,
+            &format!("workflow runs for {github_repo}"),
+        )
+        .await?;
+        let has_next = github_link_next(response.headers()).is_some();
+        let runs: GitHubWorkflowRunsResponse = response.json().await?;
+        let page_len = runs.workflow_runs.len();
+        all_runs.extend(runs.workflow_runs);
+        if !has_next || page_len < CI_PAGE_SIZE {
+            break;
+        }
+        if !ci_window_complete(has_next, page) {
+            window_complete = false;
+            break;
+        }
+        page += 1;
+        if page > MAX_CI_PAGES {
+            window_complete = false;
+            break;
+        }
     }
 
-    let response = github_get(
-        client,
-        api_base,
-        &format!("repos/{github_repo}/actions/runs"),
-        &query,
-        &format!("workflow runs for {github_repo}"),
-    )
-    .await?;
-
-    let runs: GitHubWorkflowRunsResponse = response.json().await?;
-    Ok(runs
-        .workflow_runs
-        .into_iter()
-        .filter(|run| run.pull_requests.is_empty())
-        .map(|run| {
-            let run_all_terminal = run.status == "completed";
-            GitHubCISnapshot {
-                pr_number: None,
-                workflow: run
-                    .name
-                    .unwrap_or_else(|| format!("workflow-run-{}", run.id)),
-                status: run.status,
-                conclusion: run.conclusion,
-                sha: run.head_sha,
-                url: run.html_url,
-                branch: non_empty_string(run.head_branch),
-                run_id: Some(run.id.to_string()),
-                run_job_count: 1,
-                run_all_terminal,
-            }
-        })
-        .collect())
+    Ok((
+        all_runs
+            .into_iter()
+            .filter(|run| run.pull_requests.is_empty())
+            .map(|run| {
+                let run_all_terminal = run.status == "completed";
+                GitHubCISnapshot {
+                    pr_number: None,
+                    workflow: run
+                        .name
+                        .unwrap_or_else(|| format!("workflow-run-{}", run.id)),
+                    status: run.status,
+                    conclusion: run.conclusion,
+                    sha: run.head_sha,
+                    url: run.html_url,
+                    branch: non_empty_string(run.head_branch),
+                    run_id: Some(run.id.to_string()),
+                    check_run_id: None,
+                    created_at: run.created_at,
+                    run_job_count: 1,
+                    run_all_terminal,
+                }
+            })
+            .collect(),
+        window_complete,
+    ))
 }
 
 fn workflow_run_id(url: &str) -> Option<String> {
@@ -1065,11 +1491,17 @@ struct GitHubCheckRunsResponse {
 
 #[derive(Deserialize)]
 struct GitHubCheckRun {
+    #[serde(default)]
+    id: u64,
     name: String,
     status: String,
     conclusion: Option<String>,
     details_url: Option<String>,
     head_sha: String,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1087,6 +1519,8 @@ struct GitHubWorkflowRun {
     head_branch: String,
     head_sha: String,
     html_url: String,
+    #[serde(default)]
+    created_at: Option<String>,
     #[serde(default)]
     pull_requests: Vec<serde_json::Value>,
 }
@@ -1232,6 +1666,8 @@ mod tests {
             url: "https://github.com/Yeachan-Heo/clawhip/actions/runs/1".into(),
             branch: Some("feat/github-ci-events".into()),
             run_id: Some("1".into()),
+            check_run_id: None,
+            created_at: None,
             run_job_count: 1,
             run_all_terminal: status == "completed",
         }
@@ -1252,6 +1688,8 @@ mod tests {
             url: format!("https://github.com/org/repo/actions/runs/{run_id}"),
             branch: Some(branch.into()),
             run_id: Some(run_id.to_string()),
+            check_run_id: None,
+            created_at: None,
             run_job_count: 1,
             run_all_terminal: true,
         }
@@ -1298,7 +1736,7 @@ mod tests {
 
         // --- First daemon process: observe and persist the baseline.
         let mut ci_baseline = load_ci_baseline(Some(&path));
-        assert!(ci_baseline.record_terminal_runs("/repo", &run_map(&historical_runs)));
+        assert!(ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&historical_runs)));
         save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
 
         // --- Daemon restart: state HashMap is empty, baseline reloads from disk.
@@ -1309,7 +1747,7 @@ mod tests {
         assert_eq!(repo_baseline.terminal_runs.len(), 3);
         for run in &historical_runs {
             assert!(
-                repo_ci_baseline_is_suppressed(restarted.repos.get("/repo"), &run.dedupe_key()),
+                repo_ci_baseline_is_suppressed(restarted.repos.get("/repo"), run),
                 "historical terminal run {} must be suppressed after restart",
                 run.run_id.as_deref().unwrap_or("?")
             );
@@ -1356,7 +1794,7 @@ mod tests {
         let mut ci_baseline = CIBaseline::default();
         for id in 0..(MAX_BASELINE_RUNS_PER_REPO + 64) {
             let runs = [run_snapshot(id as u64, "CI", Some("success"), "main")];
-            ci_baseline.record_terminal_runs("/repo", &run_map(&runs));
+            ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&runs));
         }
         let repo_baseline = ci_baseline.repos.get("/repo").unwrap();
         assert_eq!(
@@ -1364,11 +1802,9 @@ mod tests {
             MAX_BASELINE_RUNS_PER_REPO
         );
         assert!(
-            repo_baseline
-                .terminal_runs
-                .contains(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 63))
+            repo_baseline.contains_identity(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 63))
         );
-        assert!(!repo_baseline.terminal_runs.contains(&"run:0".to_string()));
+        assert!(!repo_baseline.contains_identity("run:0"));
 
         // Atomic persistence round-trips through a temp file + rename.
         save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
@@ -1390,7 +1826,7 @@ mod tests {
         // repo's runs.
         let mut mixed = CIBaseline::default();
         let other = [run_snapshot(999, "CI", Some("success"), "main")];
-        mixed.record_terminal_runs("/other-repo", &run_map(&other));
+        mixed.record_terminal_runs("/other-repo", "/other-repo", &run_map(&other));
         let events = collect_ci_events(
             &GitRepoMonitor::default(),
             "org/repo",
@@ -1419,7 +1855,11 @@ mod tests {
             run_all_terminal: false,
             ..run_snapshot(4242424242, "CI", Some("success"), "main")
         };
-        ci_baseline.record_terminal_runs("/repo", &run_map(std::slice::from_ref(&in_progress)));
+        ci_baseline.record_terminal_runs(
+            "/repo",
+            "/repo",
+            &run_map(std::slice::from_ref(&in_progress)),
+        );
         assert!(ci_baseline.repos["/repo"].terminal_runs.is_empty());
 
         // ...so its genuinely new started event is emitted even though the
@@ -1450,7 +1890,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-failed");
 
-        ci_baseline.record_terminal_runs("/repo", &run_map(std::slice::from_ref(&completed)));
+        ci_baseline.record_terminal_runs(
+            "/repo",
+            "/repo",
+            &run_map(std::slice::from_ref(&completed)),
+        );
         save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
         let restarted = load_ci_baseline(Some(&path));
         let events = collect_ci_events(
@@ -1465,6 +1909,334 @@ mod tests {
             events.is_empty(),
             "terminal outcome delivered once must never replay"
         );
+    }
+
+    fn fallback_snapshot(pr_number: u64, sha: &str, workflow: &str) -> GitHubCISnapshot {
+        GitHubCISnapshot {
+            pr_number: Some(pr_number),
+            workflow: workflow.into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            sha: sha.into(),
+            url: "https://github.com/org/repo/pull/58".into(),
+            branch: Some("feat/x".into()),
+            run_id: None,
+            check_run_id: None,
+            created_at: None,
+            run_job_count: 1,
+            run_all_terminal: true,
+        }
+    }
+
+    #[test]
+    fn issue_317_representation_drift_fallback_then_run_id_is_suppressed() {
+        let fallback = fallback_snapshot(58, "abcdef1234567890", "CI");
+        let with_run_id = GitHubCISnapshot {
+            run_id: Some("4242".into()),
+            url: "https://github.com/org/repo/actions/runs/4242".into(),
+            ..fallback.clone()
+        };
+
+        let mut ci_baseline = CIBaseline::default();
+        assert!(ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&[fallback])));
+
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&with_run_id)),
+            ci_baseline.repos.get("/repo"),
+        );
+        assert!(
+            events.is_empty(),
+            "run-id representation of a fallback-persisted terminal run must stay suppressed"
+        );
+
+        assert!(ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&[with_run_id])));
+        assert!(
+            ci_baseline.repos["/repo"].contains_identity("run:4242"),
+            "discovering a run id must merge onto the existing fallback record"
+        );
+    }
+
+    #[test]
+    fn issue_317_fallback_collisions_do_not_drop_distinct_reruns() {
+        let first = GitHubCISnapshot {
+            check_run_id: Some("111".into()),
+            ..fallback_snapshot(58, "abcdef1234567890", "CI")
+        };
+        let second = GitHubCISnapshot {
+            check_run_id: Some("222".into()),
+            conclusion: Some("failure".into()),
+            ..fallback_snapshot(58, "abcdef1234567890", "CI")
+        };
+        let current = run_map(&[first.clone(), second.clone()]);
+        assert_eq!(
+            current.len(),
+            2,
+            "distinct check-run ids must not collapse in the poll map"
+        );
+
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.record_terminal_runs("/repo", "/repo", &current);
+        assert_eq!(ci_baseline.repos["/repo"].terminal_runs.len(), 2);
+        assert!(ci_baseline.repos["/repo"].contains_identity("check:111"));
+        assert!(ci_baseline.repos["/repo"].contains_identity("check:222"));
+
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &current,
+            ci_baseline.repos.get("/repo"),
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn issue_317_partial_multi_job_workflow_is_not_terminal_until_all_jobs_complete() {
+        let partial = GitHubCISnapshot {
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            run_all_terminal: false,
+            run_job_count: 2,
+            ..run_snapshot(77, "CI", Some("success"), "main")
+        };
+        let complete = GitHubCISnapshot {
+            run_all_terminal: true,
+            run_job_count: 2,
+            ..run_snapshot(77, "CI", Some("success"), "main")
+        };
+
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.record_terminal_runs(
+            "/repo",
+            "/repo",
+            &run_map(std::slice::from_ref(&partial)),
+        );
+        assert!(
+            ci_baseline
+                .repos
+                .get("/repo")
+                .is_none_or(|repo| repo.terminal_runs.is_empty()),
+            "a completed job in a still-running workflow must not be persisted"
+        );
+
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&complete)),
+            ci_baseline.repos.get("/repo"),
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "eventual multi-job completion after restart must still emit"
+        );
+        assert_eq!(events[0].canonical_kind(), "github.ci-passed");
+
+        ci_baseline.record_terminal_runs(
+            "/repo",
+            "/repo",
+            &run_map(std::slice::from_ref(&complete)),
+        );
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(&[complete]),
+            ci_baseline.repos.get("/repo"),
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn issue_317_persist_failure_does_not_publish_terminal_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"file").unwrap();
+        let path = blocker.join("github-ci-baseline.json");
+
+        let mut ci_baseline = CIBaseline::default();
+        let runs = run_map(&[run_snapshot(9, "CI", Some("success"), "main")]);
+        assert!(ci_baseline.record_terminal_runs("repo:org/repo", "/repo", &runs));
+        assert!(save_ci_baseline(&ci_baseline, Some(&path)).is_err());
+
+        // Receipt contract: without a durable write, treat the run as unpublished.
+        // The in-memory baseline exists, but the failure boundary is the save.
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn issue_317_persist_before_publish_drops_events_when_receipt_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"file").unwrap();
+        let baseline_path = blocker.join("github-ci-baseline.json");
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0_u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"workflow_runs":[{"id": 9001, "name": "CI", "status": "completed", "conclusion": "success", "head_branch": "main", "head_sha": "abc", "html_url": "https://github.com/org/repo/actions/runs/9001", "pull_requests": [], "created_at": "2026-08-19T00:00:00Z"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let mut config = AppConfig::default();
+        config.monitors.github_api_base = format!("http://{addr}");
+        config.monitors.git.repos = vec![GitRepoMonitor {
+            path: "/tmp/persist-boundary".into(),
+            name: Some("repo".into()),
+            github_repo: Some("org/repo".into()),
+            emit_pr_status: true,
+            emit_issue_opened: false,
+            emit_commits: false,
+            emit_branch_changes: false,
+            ..GitRepoMonitor::default()
+        }];
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = HashMap::new();
+        state.insert(
+            "/tmp/persist-boundary".into(),
+            GitHubRepoState {
+                issues: HashMap::new(),
+                prs: HashMap::new(),
+                ci: HashMap::new(),
+                ci_baseline_established: true,
+            },
+        );
+        let mut baseline = CIBaseline::default();
+        poll_once_with_baseline(
+            &config,
+            &client,
+            &mut state,
+            &mut baseline,
+            Some(&baseline_path),
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "persist failure must not publish a terminal event"
+        );
+        assert!(!baseline_path.exists());
+        server.abort();
+    }
+
+    #[test]
+    fn issue_317_baseline_is_keyed_by_canonical_github_repo_not_checkout_path() {
+        let run = run_snapshot(55, "CI", Some("success"), "main");
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.record_terminal_runs(
+            "repo:org/repo",
+            "/old/path",
+            &run_map(std::slice::from_ref(&run)),
+        );
+
+        let renamed = GitRepoMonitor {
+            path: "/new/path".into(),
+            github_repo: Some("org/repo".into()),
+            ..GitRepoMonitor::default()
+        };
+        let snapshot = GitSnapshot {
+            repo_name: "repo".into(),
+            repo_path: "/new/path".into(),
+            worktree_path: "/new/path".into(),
+            branch: "main".into(),
+            head: "sha-55".into(),
+            commits: Vec::new(),
+            github_repo: Some("org/repo".into()),
+        };
+        let key = ci_baseline_repo_key(&snapshot, &renamed);
+        assert_eq!(key, "repo:org/repo");
+        assert!(repo_ci_baseline_is_suppressed(
+            ci_baseline.repos.get(&key),
+            &run
+        ));
+
+        let other_remote = GitHubCISnapshot {
+            sha: "other-sha".into(),
+            ..run_snapshot(55, "CI", Some("success"), "main")
+        };
+        let other_key = "repo:other/remote";
+        assert!(!repo_ci_baseline_is_suppressed(
+            ci_baseline.repos.get(other_key),
+            &other_remote
+        ));
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "other/remote",
+            true,
+            &HashMap::new(),
+            &run_map(&[other_remote]),
+            ci_baseline.repos.get(other_key),
+        );
+        assert_eq!(events.len(), 1, "a different remote must not be suppressed");
+    }
+
+    #[test]
+    fn issue_317_single_poll_evicts_oldest_github_runs_first() {
+        let mut runs = Vec::new();
+        for id in 0..(MAX_BASELINE_RUNS_PER_REPO + 20) {
+            let mut run = run_snapshot(id as u64, "CI", Some("success"), "main");
+            run.created_at = Some(format!("2026-01-01T00:{:02}:{:02}Z", id / 60, id % 60));
+            runs.push(run);
+        }
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&runs));
+        let repo = &ci_baseline.repos["/repo"];
+        assert_eq!(repo.terminal_runs.len(), MAX_BASELINE_RUNS_PER_REPO);
+        assert!(!repo.contains_identity("run:0"));
+        assert!(!repo.contains_identity("run:19"));
+        assert!(repo.contains_identity("run:20"));
+        assert!(repo.contains_identity(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 19)));
+    }
+
+    #[test]
+    fn issue_317_oversized_loaded_state_is_truncated_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut records = Vec::new();
+        for id in 0..(MAX_BASELINE_RUNS_PER_REPO + 12) {
+            records.push(format!(
+                r#"{{"identities":["run:{id}"],"run_id":"{id}","created_at":"2026-01-01T00:{:02}:{:02}Z"}}"#,
+                id / 60,
+                id % 60
+            ));
+        }
+        let payload = format!(r#"{{"/repo":{{"terminal_runs":[{}]}}}}"#, records.join(","));
+        std::fs::write(&path, payload).unwrap();
+        let loaded = load_ci_baseline(Some(&path));
+        let repo = loaded.repos.get("/repo").unwrap();
+        assert_eq!(repo.terminal_runs.len(), MAX_BASELINE_RUNS_PER_REPO);
+        assert!(!repo.contains_identity("run:0"));
+        assert!(repo.contains_identity(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 11)));
+    }
+
+    #[test]
+    fn issue_317_incomplete_pagination_window_is_detected() {
+        assert!(ci_window_complete(false, 1));
+        assert!(ci_window_complete(true, 1));
+        assert!(!ci_window_complete(true, MAX_CI_PAGES));
+        assert!(ci_window_complete(false, MAX_CI_PAGES));
     }
 
     #[tokio::test]
@@ -1642,9 +2414,7 @@ mod tests {
         // in the window — no history scan, no ledger growth.
         let persisted: HashMap<String, RepoCIBaseline> =
             serde_json::from_str(&std::fs::read_to_string(&baseline_path).unwrap()).unwrap();
-        assert!(
-            persisted["/tmp/clawhip-replay-repo"].terminal_runs.len() <= MAX_BASELINE_RUNS_PER_REPO
-        );
+        assert!(persisted["repo:org/repo"].terminal_runs.len() <= MAX_BASELINE_RUNS_PER_REPO);
 
         let requests = server.await.unwrap();
         // Four CI polls; the issues/pulls endpoints add two requests per poll.
@@ -1709,26 +2479,17 @@ mod tests {
             github_repo: Some("ultraworkers/claw-code".into()),
         };
         let client = build_github_client(None).unwrap();
-        let (tx, mut rx) = mpsc::channel(4);
         let prs = HashMap::new();
 
-        let (ci, ci_baseline_established) = poll_ci_statuses(
-            &config,
-            Some(&client),
-            &repo,
-            &snapshot,
-            None,
-            &prs,
-            &tx,
-            None,
-        )
-        .await
-        .unwrap();
+        let (ci, ci_baseline_established, events) =
+            poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, None)
+                .await
+                .unwrap();
 
         assert_eq!(ci.len(), 1);
         assert!(ci_baseline_established);
         assert!(
-            rx.try_recv().is_err(),
+            events.is_empty(),
             "first poll after startup should prime CI baseline without emitting historical events"
         );
 
@@ -1824,7 +2585,7 @@ mod tests {
         };
         let open_prs = vec![(42_u64, &pr)];
 
-        let ci = fetch_ci_statuses(
+        let (ci, window_complete) = fetch_ci_statuses(
             &client,
             &format!("http://{addr}"),
             &GitRepoMonitor::default(),
@@ -1835,6 +2596,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(ci.len(), 2);
+        assert!(window_complete);
         assert_eq!(
             ci.values()
                 .filter(|snapshot| snapshot.run_id.as_deref() == Some("123"))
