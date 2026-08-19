@@ -120,6 +120,10 @@ struct PendingCiDelivery {
     run_all_terminal: bool,
     channel: Option<String>,
     mention: Option<String>,
+    #[serde(default)]
+    send_attempts: u32,
+    #[serde(default)]
+    last_sent_unix: Option<u64>,
 }
 
 impl PendingCiDelivery {
@@ -167,9 +171,11 @@ impl PendingCiDelivery {
             run_all_terminal: payload
                 .and_then(|object| object.get("run_all_terminal"))
                 .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true),
+                .unwrap_or(false),
             channel: event.channel.clone(),
             mention: event.mention.clone(),
+            send_attempts: 0,
+            last_sent_unix: None,
         }
     }
 
@@ -249,6 +255,9 @@ where
 const MAX_BASELINE_RUNS_PER_REPO: usize = 256;
 const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
+const MAX_PENDING_SEND_ATTEMPTS: u32 = 3;
+const PENDING_RETRY_BACKOFF_SECS: u64 = 3_600;
+const BASELINE_LOCK_STALE_SECS: u64 = 30;
 
 /// Beside the cron state file, matching `tmux-watch-registry.json` and
 /// `discord-watch-state.json`.
@@ -535,14 +544,27 @@ impl CIBaseline {
     /// Records terminal-run identities for one canonical GitHub repo. Returns
     /// whether the persisted state changed (bounded, oldest GitHub runs
     /// evicted first).
+    #[cfg(test)]
     fn record_terminal_runs(
         &mut self,
         repo_key: &str,
         repo_path: &str,
         current: &HashMap<String, GitHubCISnapshot>,
     ) -> bool {
-        let mut incoming: Vec<&GitHubCISnapshot> =
-            current.values().filter(|ci| ci.is_terminal()).collect();
+        self.record_terminal_runs_filtered(repo_key, repo_path, current, |_| true)
+    }
+
+    fn record_terminal_runs_filtered(
+        &mut self,
+        repo_key: &str,
+        repo_path: &str,
+        current: &HashMap<String, GitHubCISnapshot>,
+        include: impl Fn(&GitHubCISnapshot) -> bool,
+    ) -> bool {
+        let mut incoming: Vec<&GitHubCISnapshot> = current
+            .values()
+            .filter(|ci| ci.is_terminal() && include(ci))
+            .collect();
         incoming.sort_by_key(|ci| snapshot_eviction_key(ci));
 
         let repo_baseline = self.repo_baseline_mut(repo_key, repo_path);
@@ -655,16 +677,50 @@ fn acquire_baseline_lock(path: &Path) -> Result<BaselineLock> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    for _ in 0..200 {
+    for _ in 0..40 {
         match fs::create_dir(&lock_path) {
             Ok(()) => return Ok(BaselineLock { lock_path }),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if baseline_lock_is_stale(&lock_path) {
+                    let _ = fs::remove_dir(&lock_path);
+                    continue;
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(error) => return Err(error.into()),
         }
     }
     Err("timed out waiting for GitHub CI baseline lock".into())
+}
+
+fn baseline_lock_is_stale(lock_path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(lock_path) else {
+        return true;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    modified
+        .elapsed()
+        .map(|elapsed| elapsed.as_secs() >= BASELINE_LOCK_STALE_SECS)
+        .unwrap_or(true)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn pending_due_for_send(pending: &PendingCiDelivery, now: u64) -> bool {
+    if pending.send_attempts >= MAX_PENDING_SEND_ATTEMPTS {
+        return false;
+    }
+    match pending.last_sent_unix {
+        None => true,
+        Some(timestamp) => now.saturating_sub(timestamp) >= PENDING_RETRY_BACKOFF_SECS,
+    }
 }
 
 fn write_ci_baseline_atomic(baseline: &CIBaseline, path: &Path) -> Result<()> {
@@ -719,19 +775,45 @@ async fn drain_pending_outbox(
     path: Option<&Path>,
     tx: &mpsc::Sender<IncomingEvent>,
 ) -> Result<()> {
-    let pending: Vec<PendingCiDelivery> = ci_baseline
+    let now = unix_now();
+    let due: Vec<PendingCiDelivery> = ci_baseline
         .repos
         .values()
         .flat_map(|repo| repo.pending.iter().cloned())
+        .filter(|pending| pending_due_for_send(pending, now))
         .collect();
-    if pending.is_empty() {
+    if due.is_empty() {
         return Ok(());
     }
-    for delivery in &pending {
-        send_event(tx, delivery.clone().into_event()).await?;
+    let mut sent = Vec::new();
+    for delivery in &due {
+        if send_event(tx, delivery.clone().into_event()).await.is_err() {
+            break;
+        }
+        sent.push(delivery.clone());
     }
-    ack_pending_deliveries(ci_baseline, path, &pending)?;
+    if sent.is_empty() {
+        return Ok(());
+    }
+    bump_pending_send_attempts(ci_baseline, &sent, now);
+    if let Err(error) = commit_ci_baseline(path, ci_baseline) {
+        eprintln!("clawhip source github CI baseline outbox attempt persist failed: {error}");
+    }
+    if let Err(error) = ack_pending_deliveries(ci_baseline, path, &sent) {
+        eprintln!("clawhip source github CI baseline outbox ack failed: {error}");
+    }
     Ok(())
+}
+
+fn bump_pending_send_attempts(ci_baseline: &mut CIBaseline, sent: &[PendingCiDelivery], now: u64) {
+    for repo in ci_baseline.repos.values_mut() {
+        for pending in &mut repo.pending {
+            if sent.iter().any(|item| pending.same_event(item)) {
+                pending.send_attempts = pending.send_attempts.saturating_add(1);
+                pending.last_sent_unix = Some(now);
+            }
+        }
+    }
 }
 
 fn ack_pending_deliveries(
@@ -945,7 +1027,9 @@ async fn poll_github(
     ci_baseline: &mut CIBaseline,
     ci_baseline_path: Option<&Path>,
 ) -> Result<()> {
-    drain_pending_outbox(ci_baseline, ci_baseline_path, tx).await?;
+    if let Err(error) = drain_pending_outbox(ci_baseline, ci_baseline_path, tx).await {
+        eprintln!("clawhip source github CI outbox drain failed: {error}");
+    }
 
     for repo in &config.monitors.git.repos {
         if !repo.emit_issue_opened && !repo.emit_pr_status {
@@ -995,7 +1079,7 @@ async fn poll_github(
             };
         let repo_key = ci_baseline_repo_key(&snapshot, repo);
         let repo_ci_baseline = ci_baseline.repos.get(&repo_key).cloned();
-        let (ci, ci_baseline_established, ci_events) = match poll_ci_statuses(
+        let (ci, ci_baseline_established, ci_events, window_complete) = match poll_ci_statuses(
             config,
             github_client,
             repo,
@@ -1018,6 +1102,7 @@ async fn poll_github(
                         .map(|entry| entry.ci_baseline_established)
                         .unwrap_or(false),
                     Vec::new(),
+                    false,
                 )
             }
         };
@@ -1027,7 +1112,20 @@ async fn poll_github(
         // suppression state. A crash after persist and before send retries
         // from the outbox on the next poll.
         let mut next_baseline = ci_baseline.clone();
-        next_baseline.record_terminal_runs(&repo_key, &repo.path, &ci);
+        let previous_ci = previous.map(|entry| &entry.ci);
+        next_baseline.record_terminal_runs_filtered(&repo_key, &repo.path, &ci, |snapshot| {
+            if previous_ci.is_none() || window_complete {
+                return true;
+            }
+            previous_ci.is_some_and(|old_map| {
+                old_map
+                    .values()
+                    .any(|old| snapshots_same_run(old, snapshot) && old.is_terminal())
+            }) || ci_events.iter().any(|event| {
+                previous_snapshot_for_event(&ci, event)
+                    .is_some_and(|matched| snapshots_same_run(matched, snapshot))
+            })
+        });
         next_baseline.enqueue_pending(&repo_key, &repo.path, &ci_events, &ci);
         match commit_ci_baseline(ci_baseline_path, &next_baseline) {
             Ok(committed) => {
@@ -1205,7 +1303,12 @@ async fn poll_ci_statuses(
     previous: Option<&GitHubRepoState>,
     prs: &HashMap<u64, PullRequestSnapshot>,
     repo_ci_baseline: Option<&RepoCIBaseline>,
-) -> Result<(HashMap<String, GitHubCISnapshot>, bool, Vec<IncomingEvent>)> {
+) -> Result<(
+    HashMap<String, GitHubCISnapshot>,
+    bool,
+    Vec<IncomingEvent>,
+    bool,
+)> {
     if !repo.emit_pr_status {
         return Ok((
             previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
@@ -1213,6 +1316,7 @@ async fn poll_ci_statuses(
                 .map(|entry| entry.ci_baseline_established)
                 .unwrap_or(false),
             Vec::new(),
+            true,
         ));
     }
 
@@ -1223,6 +1327,7 @@ async fn poll_ci_statuses(
                 .map(|entry| entry.ci_baseline_established)
                 .unwrap_or(false),
             Vec::new(),
+            true,
         ));
     };
 
@@ -1263,7 +1368,10 @@ async fn poll_ci_statuses(
             } else {
                 Vec::new()
             };
-            Ok((ci, window_complete, events))
+            let established = previous
+                .map(|entry| entry.ci_baseline_established)
+                .unwrap_or(true);
+            Ok((ci, established, events, window_complete))
         }
         Err(error) => {
             telemetry::emit(source_record(
@@ -1284,6 +1392,7 @@ async fn poll_ci_statuses(
                 previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
                 false,
                 Vec::new(),
+                false,
             ))
         }
     }
@@ -2903,6 +3012,232 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn issue_317_incomplete_window_does_not_suppress_new_terminal_as_prime() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut poll = 0_u32;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0_u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                if !request.contains("/actions/runs") {
+                    let body = "[]";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
+                let page = request
+                    .split(['?', '&'])
+                    .find_map(|part| part.strip_prefix("page="))
+                    .and_then(|value| {
+                        value
+                            .chars()
+                            .take_while(|ch| ch.is_ascii_digit())
+                            .collect::<String>()
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .unwrap_or(1);
+                if page == 1 {
+                    poll += 1;
+                }
+                let start = (page - 1) * CI_PAGE_SIZE;
+                let mut ids: Vec<u64> =
+                    (start as u64 + 1..=start as u64 + CI_PAGE_SIZE as u64).collect();
+                if poll >= 2 && page == 1 {
+                    ids[0] = 9_001;
+                }
+                let runs: Vec<String> = ids
+                    .iter()
+                    .map(|id| {
+                        let conclusion = if *id == 9_001 { "failure" } else { "success" };
+                        format!(
+                            r#"{{"id":{id},"name":"CI","status":"completed","conclusion":"{conclusion}","head_branch":"main","head_sha":"sha-{id}","html_url":"https://github.com/org/repo/actions/runs/{id}","pull_requests":[],"created_at":"2026-01-01T00:00:00Z","run_attempt":1}}"#
+                        )
+                    })
+                    .collect();
+                let body = format!(r#"{{"workflow_runs":[{}]}}"#, runs.join(","));
+                let next = page + 1;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nlink: <http://{addr}/repos/org/repo/actions/runs?per_page=100&page={next}>; rel=\"next\"\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                if poll >= 4 && page == 1 {
+                    break;
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let baseline_path = dir.path().join("github-ci-baseline.json");
+        let mut config = AppConfig::default();
+        config.monitors.github_api_base = format!("http://{addr}");
+        config.monitors.git.repos = vec![GitRepoMonitor {
+            path: "/tmp/clawhip-incomplete-window".into(),
+            name: Some("repo".into()),
+            github_repo: Some("org/repo".into()),
+            emit_pr_status: true,
+            emit_issue_opened: false,
+            emit_commits: false,
+            emit_branch_changes: false,
+            ..GitRepoMonitor::default()
+        }];
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = HashMap::new();
+        let mut baseline = CIBaseline::default();
+        for _ in 0..3 {
+            poll_once_with_baseline(
+                &config,
+                &client,
+                &mut state,
+                &mut baseline,
+                Some(&baseline_path),
+                &tx,
+            )
+            .await
+            .unwrap();
+        }
+        let mut delivered = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            delivered.push(event);
+        }
+        assert_eq!(
+            delivered.len(),
+            1,
+            "new terminal failure must emit once, not be primed away; got {delivered:?}"
+        );
+        assert_eq!(delivered[0].payload["run_id"], json!("9001"));
+        assert_eq!(delivered[0].canonical_kind(), "github.ci-failed");
+        assert!(state["/tmp/clawhip-incomplete-window"].ci_baseline_established);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn issue_317_persistent_ack_failure_bounds_resends_and_keeps_polling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                if request.contains("/issues")
+                    || request.contains("/pulls")
+                    || request.contains("/actions/runs")
+                {
+                    hits_server.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = if request.contains("/actions/runs") {
+                    r#"{"workflow_runs":[]}"#
+                } else {
+                    "[]"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("github-ci-baseline.json");
+        let run = run_snapshot(77, "CI", Some("success"), "main");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            None,
+        );
+        let mut seeded = CIBaseline::default();
+        seeded.enqueue_pending(
+            "repo:org/repo",
+            "/tmp/ack-a",
+            &events,
+            &run_map(std::slice::from_ref(&run)),
+        );
+        save_ci_baseline(&seeded, Some(&good_path)).unwrap();
+
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"file").unwrap();
+        let bad_path = blocker.join("github-ci-baseline.json");
+
+        let mut config = AppConfig::default();
+        config.monitors.github_api_base = format!("http://{addr}");
+        config.monitors.git.repos = vec![
+            GitRepoMonitor {
+                path: "/tmp/ack-a".into(),
+                name: Some("a".into()),
+                github_repo: Some("org/repo".into()),
+                emit_pr_status: true,
+                emit_issue_opened: true,
+                emit_commits: false,
+                emit_branch_changes: false,
+                ..GitRepoMonitor::default()
+            },
+            GitRepoMonitor {
+                path: "/tmp/ack-b".into(),
+                name: Some("b".into()),
+                github_repo: Some("org/other".into()),
+                emit_pr_status: true,
+                emit_issue_opened: true,
+                emit_commits: false,
+                emit_branch_changes: false,
+                ..GitRepoMonitor::default()
+            },
+        ];
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = HashMap::new();
+        let mut baseline = load_ci_baseline(Some(&good_path));
+        for _ in 0..3 {
+            poll_once_with_baseline(
+                &config,
+                &client,
+                &mut state,
+                &mut baseline,
+                Some(&bad_path),
+                &tx,
+            )
+            .await
+            .unwrap();
+        }
+        let mut sent = 0_usize;
+        while rx.try_recv().is_ok() {
+            sent += 1;
+        }
+        assert_eq!(
+            sent, 1,
+            "persistent ACK failure must not resend the full outbox every poll"
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) >= 6,
+            "ACK failure must not abort polling of remaining repositories"
+        );
+        server.abort();
+    }
+
     #[test]
     fn issue_317_incomplete_window_keeps_omitted_in_progress_and_later_completion() {
         let in_progress = GitHubCISnapshot {
@@ -3267,7 +3602,7 @@ mod tests {
         let client = build_github_client(None).unwrap();
         let prs = HashMap::new();
 
-        let (ci, ci_baseline_established, events) =
+        let (ci, ci_baseline_established, events, _window_complete) =
             poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, None)
                 .await
                 .unwrap();
