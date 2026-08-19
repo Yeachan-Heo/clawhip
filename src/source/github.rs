@@ -3637,23 +3637,24 @@ mod tests {
                 let live_deleted = live_deleted.clone();
                 let errors = errors.clone();
                 let path = path.clone();
-                scope.spawn(move || match acquire_baseline_lock_inner(&path, BASELINE_LOCK_STALE_SECS)
-                {
-                    Ok(lock) => {
-                        let owner = lock.lock_path.join("owner");
-                        let token = lock.token.clone();
-                        current.fetch_add(1, Ordering::SeqCst);
-                        thread::sleep(Duration::from_millis(30));
-                        if current.load(Ordering::SeqCst) > 1 {
-                            overlapping.fetch_add(1, Ordering::SeqCst);
+                scope.spawn(move || {
+                    match acquire_baseline_lock_inner(&path, BASELINE_LOCK_STALE_SECS) {
+                        Ok(lock) => {
+                            let owner = lock.lock_path.join("owner");
+                            let token = lock.token.clone();
+                            current.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(30));
+                            if current.load(Ordering::SeqCst) > 1 {
+                                overlapping.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if fs::read_to_string(&owner).ok().as_deref() != Some(token.as_str()) {
+                                live_deleted.fetch_add(1, Ordering::SeqCst);
+                            }
+                            current.fetch_sub(1, Ordering::SeqCst);
+                            drop(lock);
                         }
-                        if fs::read_to_string(&owner).ok().as_deref() != Some(token.as_str()) {
-                            live_deleted.fetch_add(1, Ordering::SeqCst);
-                        }
-                        current.fetch_sub(1, Ordering::SeqCst);
-                        drop(lock);
+                        Err(error) => errors.lock().unwrap().push(error.to_string()),
                     }
-                    Err(error) => errors.lock().unwrap().push(error.to_string()),
                 });
             }
         });
