@@ -1,6 +1,6 @@
-# clawhip Architecture — v0.3.0
+# clawhip Architecture — v0.4.0
 
-clawhip v0.3.0 ships a daemon-first event pipeline for Discord delivery. This document describes the architecture that is present on the `release/0.3.0` branch.
+clawhip v0.4.0 ships a daemon-first event pipeline for Discord delivery, plus the clone-local install/memory surfaces that wrap it. This document describes the architecture that is present on the `release/0.4.0` branch.
 
 ## Release themes
 
@@ -8,6 +8,8 @@ clawhip v0.3.0 ships a daemon-first event pipeline for Discord delivery. This do
 - multi-delivery router
 - extracted event sources
 - renderer/sink separation
+- install lifecycle polish
+- filesystem memory scaffolds
 
 ## High-level flow
 
@@ -24,9 +26,9 @@ clawhip v0.3.0 ships a daemon-first event pipeline for Discord delivery. This do
 
 ### Typed event model (`crate::event`)
 
-The daemon accepts legacy `IncomingEvent` payloads at ingress, normalizes them, and converts them into typed internal events through `crate::event::compat`. That gives v0.3.0 a typed event model without breaking the existing CLI and HTTP surfaces.
+The daemon accepts legacy `IncomingEvent` payloads at ingress, normalizes them, and converts them into typed internal events through `crate::event::compat`. That gives v0.4.0 a typed event model without breaking the existing CLI and HTTP surfaces.
 
-Key event families shipped in v0.3.0:
+Key event families shipped in v0.4.0:
 
 - custom events
 - git commit and branch-change events
@@ -54,7 +56,7 @@ All sources feed a shared Tokio `mpsc` queue. This replaces the earlier tighter 
 3. hands the rendered message to the configured sink
 4. continues best-effort when one delivery fails
 
-This is the central coordination point for the v0.3.0 pipeline.
+This is the central coordination point for the v0.4.0 pipeline.
 
 ### Router (`crate::router`)
 
@@ -64,7 +66,7 @@ The router now resolves **0..N deliveries per event**. In practice that means:
 - a match no longer stops at the first rule
 - each resolved delivery keeps the destination target, format, template, and mention context
 
-This is the main behavioral change behind the v0.3.0 multi-delivery architecture.
+This is the main behavioral change behind the v0.4.0 multi-delivery architecture.
 
 ### Renderer (`crate::render`)
 
@@ -74,13 +76,13 @@ That keeps message formatting out of the transport layer and makes the dispatch 
 
 ### Sink (`crate::sink`)
 
-Transport is represented by the `Sink` trait. The sink shipped in v0.3.0 is the Discord sink, which delivers either to a Discord channel or a Discord webhook target.
+Transport is represented by the `Sink` trait. The primary shipped sink in v0.4.0 is the Discord sink, which delivers either to a Discord channel or a Discord webhook target.
 
 The renderer/sink split is important even with a single shipped sink because it removes transport concerns from routing and event modeling.
 
 ## Configuration model
 
-The preferred Discord configuration surface in v0.3.0 is:
+The preferred Discord configuration surface in v0.4.0 is:
 
 ```toml
 [providers.discord]
@@ -104,7 +106,7 @@ format = "compact"
 
 ## Delivery semantics
 
-v0.3.0 currently uses these delivery rules:
+v0.4.0 currently uses these delivery rules:
 
 - per-source FIFO through the shared queue
 - best-effort multi-delivery; one failed delivery does not stop the others

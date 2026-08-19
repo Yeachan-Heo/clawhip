@@ -142,6 +142,29 @@
 - if you were using wrapper-specific launch flows, migrate to provider-owned hook registration plus `clawhip native hook` for local testing
 - the shared v1 contract now documents only `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`
 
+## 0.6.0 - 2026-04-09
+
+### Highlights
+
+- replace the old bespoke OMC/OMX wrapper glue with provider-native Codex + Claude hook registration built around `clawhip native hook`
+- preserve prompt-submit and stop lifecycle events in the provider-native flow so real interactive sessions emit the same critical lifecycle signals clawhip expects
+- fix Codex native-hook installation/detection to use `~/.codex/hooks.json` as the real hook registry surface instead of treating `.codex/config.toml` as installed-state evidence
+- add tmux session/pane metadata to native hook payloads, including pane id, pane tty, attached state, and client count
+- preserve the tmux metadata through normalization and rendering so local hook logs stay attributable to the originating tmux pane/session
+
+### Documentation and tooling
+
+- update public docs to describe the shared provider-native hook contract instead of the older wrapper/launcher-specific hook assets
+- remove the checked-in OMC/OMX wrapper helper scripts and legacy hook assets that were superseded by provider-owned hook registration
+- add provider-native docs regression coverage so the new installation guidance remains consistent
+
+### Upgrade notes
+
+- crate version is now `0.6.0`
+- rerun `clawhip hooks install --all --scope global --force` to install the latest global Codex/Claude hook wiring into `~/.codex/hooks.json` and `~/.claude/settings.json`
+- Codex hook installation now targets `~/.codex/hooks.json`; `.codex/config.toml` remains a general config surface and should not be treated as the hook registry
+- if you were relying on the older wrapper-specific OMC/OMX launch helpers or checked-in wrapper hook assets, migrate to provider-owned hook registration plus `clawhip native hook` for local verification
+
 ## 0.5.4 - 2026-04-05
 
 ### Highlights

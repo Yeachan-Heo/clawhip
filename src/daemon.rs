@@ -1052,7 +1052,6 @@ fn parse_native_replay_timestamp(value: &str) -> Option<OffsetDateTime> {
     };
     OffsetDateTime::from_unix_timestamp(unix_seconds).ok()
 }
-
 async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response::Response {
     let envelope = match from_incoming_event(&event) {
         Ok(envelope) => envelope,

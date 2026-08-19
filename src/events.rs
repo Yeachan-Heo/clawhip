@@ -1222,6 +1222,96 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
         &["/route_key", "/signal/routeKey", "/context/route_key"],
     );
     let source = first_string(payload, &["/source"]);
+    let tmux_session = first_string(
+        payload,
+        &[
+            "/tmux_session",
+            "/tmuxSession",
+            "/context/tmux_session",
+            "/context/tmuxSession",
+            "/tmux/session",
+            "/context/tmux/session",
+            "/payload/tmux_session",
+            "/payload/tmuxSession",
+            "/payload/tmux/session",
+        ],
+    );
+    let tmux_window = first_string(
+        payload,
+        &[
+            "/tmux_window",
+            "/tmuxWindow",
+            "/context/tmux_window",
+            "/context/tmuxWindow",
+            "/tmux/window",
+            "/context/tmux/window",
+            "/payload/tmux_window",
+            "/payload/tmuxWindow",
+            "/payload/tmux/window",
+        ],
+    );
+    let tmux_pane = first_string(
+        payload,
+        &[
+            "/tmux_pane",
+            "/tmuxPane",
+            "/context/tmux_pane",
+            "/context/tmuxPane",
+            "/tmux/pane",
+            "/context/tmux/pane",
+            "/payload/tmux_pane",
+            "/payload/tmuxPane",
+            "/payload/tmux/pane",
+        ],
+    );
+    let tmux_pane_tty = first_string(
+        payload,
+        &[
+            "/tmux_pane_tty",
+            "/tmuxPaneTty",
+            "/context/tmux_pane_tty",
+            "/context/tmuxPaneTty",
+            "/tmux/pane_tty",
+            "/tmux/paneTty",
+            "/context/tmux/pane_tty",
+            "/context/tmux/paneTty",
+            "/payload/tmux_pane_tty",
+            "/payload/tmuxPaneTty",
+            "/payload/tmux/pane_tty",
+            "/payload/tmux/paneTty",
+        ],
+    );
+    let tmux_attached = first_boolish(
+        payload,
+        &[
+            "/tmux_attached",
+            "/tmuxAttached",
+            "/context/tmux_attached",
+            "/context/tmuxAttached",
+            "/tmux/attached",
+            "/context/tmux/attached",
+            "/payload/tmux_attached",
+            "/payload/tmuxAttached",
+            "/payload/tmux/attached",
+        ],
+    );
+    let tmux_client_count = first_u64ish(
+        payload,
+        &[
+            "/tmux_client_count",
+            "/tmuxClientCount",
+            "/context/tmux_client_count",
+            "/context/tmuxClientCount",
+            "/tmux/client_count",
+            "/tmux/clientCount",
+            "/context/tmux/client_count",
+            "/context/tmux/clientCount",
+            "/payload/tmux_client_count",
+            "/payload/tmuxClientCount",
+            "/payload/tmux/client_count",
+            "/payload/tmux/clientCount",
+        ],
+    );
     let mut issue_number =
         first_u64(payload, &["/issue_number", "/context/issue_number"]).or_else(|| {
             [
@@ -1302,6 +1392,12 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
     insert_string_if_missing(object, "event_timestamp", event_timestamp);
     insert_string_if_missing(object, "route_key", route_key);
     insert_string_if_missing(object, "source", source);
+    insert_string_if_missing(object, "tmux_session", tmux_session);
+    insert_string_if_missing(object, "tmux_window", tmux_window);
+    insert_string_if_missing(object, "tmux_pane", tmux_pane);
+    insert_string_if_missing(object, "tmux_pane_tty", tmux_pane_tty);
+    insert_bool_if_missing(object, "tmux_attached", tmux_attached);
+    insert_u64_if_missing(object, "tmux_client_count", tmux_client_count);
 }
 
 fn gajae_hold_dedupe_key(repo: &str, target: &str, action: &str, relevant_ref: &str) -> String {
@@ -1406,6 +1502,33 @@ fn first_u64(payload: &Value, pointers: &[&str]) -> Option<u64> {
         .find_map(|pointer| payload.pointer(pointer).and_then(Value::as_u64))
 }
 
+fn first_boolish(payload: &Value, pointers: &[&str]) -> Option<bool> {
+    pointers.iter().find_map(|pointer| {
+        let value = payload.pointer(pointer)?;
+        match value {
+            Value::Bool(value) => Some(*value),
+            Value::Number(value) => value.as_u64().map(|number| number != 0),
+            Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "attached" => Some(true),
+                "0" | "false" | "no" | "detached" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+fn first_u64ish(payload: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers.iter().find_map(|pointer| {
+        let value = payload.pointer(pointer)?;
+        match value {
+            Value::Number(value) => value.as_u64(),
+            Value::String(value) => value.trim().parse::<u64>().ok(),
+            _ => None,
+        }
+    })
+}
+
 fn insert_string_if_missing(object: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if object.get(key).is_none()
         && let Some(value) = value
@@ -1415,6 +1538,14 @@ fn insert_string_if_missing(object: &mut Map<String, Value>, key: &str, value: O
 }
 
 fn insert_u64_if_missing(object: &mut Map<String, Value>, key: &str, value: Option<u64>) {
+    if object.get(key).is_none()
+        && let Some(value) = value
+    {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+fn insert_bool_if_missing(object: &mut Map<String, Value>, key: &str, value: Option<bool>) {
     if object.get(key).is_none()
         && let Some(value) = value
     {
@@ -1987,6 +2118,52 @@ mod tests {
         assert_eq!(
             event.payload["event_timestamp"],
             json!("2026-03-09T18:07:07.000Z")
+        );
+    }
+
+    #[test]
+    fn normalize_event_preserves_tmux_pane_metadata_in_payload_and_template_context() {
+        let event = normalize_event(IncomingEvent {
+            kind: "session-start".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "tool": "codex",
+                "tmux_session": "issue-180",
+                "tmux_window": "2",
+                "tmux_pane": "%11",
+                "tmux_pane_tty": "/dev/pts/42",
+                "tmux_attached": false,
+                "tmux_client_count": 0
+            }),
+        });
+        let context = event.template_context();
+
+        assert_eq!(event.kind, "session.started");
+        assert_eq!(event.payload["session_name"], json!("issue-180"));
+        assert_eq!(event.payload["tmux_session"], json!("issue-180"));
+        assert_eq!(event.payload["tmux_window"], json!("2"));
+        assert_eq!(event.payload["tmux_pane"], json!("%11"));
+        assert_eq!(event.payload["tmux_pane_tty"], json!("/dev/pts/42"));
+        assert_eq!(event.payload["tmux_attached"], json!(false));
+        assert_eq!(event.payload["tmux_client_count"], json!(0));
+        assert_eq!(
+            context.get("session").map(String::as_str),
+            Some("issue-180")
+        );
+        assert_eq!(
+            context.get("tmux_pane_tty").map(String::as_str),
+            Some("/dev/pts/42")
+        );
+        assert_eq!(
+            context.get("tmux_attached").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            context.get("tmux_client_count").map(String::as_str),
+            Some("0")
         );
     }
 
