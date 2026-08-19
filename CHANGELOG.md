@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.6.12 - 2026-08-19
+
+### Highlights
+
+- add durable event-ledger storage and compaction for auditable event history
+- add a GitHub Actions status monitor backed by the public GitHub Statuspage API, with baseline and deduplication handling
+- make runtime and tmux watch reconciliation converge safely across dead sessions, no-server states, same-name recreation, ownerless stale registrations, and orphaned registrations
+- add official opt-in support for GJC setup questions and document the permanent Discord community invite
+- harden config backup writes, candidate verification, retention labels, and cleanup against unsafe paths and malformed or lookalike entries
+- bound batched compact CI Discord messages to Discord's 2000-scalar limit
+
+### Upgrade notes
+
+- crate version is now `0.6.12`
+- existing route/config schema remains compatible; no migration required
+
 
 ### Added
 
