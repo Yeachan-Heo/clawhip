@@ -1785,9 +1785,27 @@ async fn fetch_ci_statuses(
         }
     }
 
-    let (workflow_runs, complete, attempts_by_run) =
+    let mut attempts_by_run = HashMap::new();
+    for (_, pr) in open_prs {
+        let pr_attempts =
+            fetch_workflow_attempts_by_head_sha(client, api_base, &github_repo, &pr.head_sha)
+                .await?;
+        for (run_id, attempt) in pr_attempts {
+            attempts_by_run
+                .entry(run_id)
+                .and_modify(|existing: &mut u32| *existing = (*existing).max(attempt))
+                .or_insert(attempt);
+        }
+    }
+    let (workflow_runs, complete, direct_attempts) =
         fetch_direct_workflow_runs(client, api_base, &github_repo, snapshot).await?;
     window_complete &= complete;
+    for (run_id, attempt) in direct_attempts {
+        attempts_by_run
+            .entry(run_id)
+            .and_modify(|existing: &mut u32| *existing = (*existing).max(attempt))
+            .or_insert(attempt);
+    }
     apply_workflow_run_attempts(&mut check_runs, &attempts_by_run);
     for workflow_run in workflow_runs {
         if workflow_run
@@ -1929,7 +1947,11 @@ async fn fetch_direct_workflow_runs(
     let mut window_complete = true;
     loop {
         let page_str = page.to_string();
-        let mut query = vec![("per_page", "100"), ("page", page_str.as_str())];
+        let mut query = vec![
+            ("per_page", "100"),
+            ("event", "push"),
+            ("page", page_str.as_str()),
+        ];
         if !snapshot.branch.is_empty() {
             query.push(("branch", snapshot.branch.as_str()));
         }
@@ -1996,6 +2018,46 @@ async fn fetch_direct_workflow_runs(
         window_complete,
         attempts_by_run,
     ))
+}
+
+async fn fetch_workflow_attempts_by_head_sha(
+    client: &reqwest::Client,
+    api_base: &str,
+    github_repo: &str,
+    head_sha: &str,
+) -> Result<HashMap<String, u32>> {
+    let mut attempts = HashMap::new();
+    let mut page = 1_usize;
+    loop {
+        let page_str = page.to_string();
+        let response = github_get(
+            client,
+            api_base,
+            &format!("repos/{github_repo}/actions/runs"),
+            &[
+                ("per_page", "100"),
+                ("head_sha", head_sha),
+                ("page", page_str.as_str()),
+            ],
+            &format!("workflow run attempts for {github_repo} sha {head_sha}"),
+        )
+        .await?;
+        let has_next = github_link_next(response.headers()).is_some();
+        let runs: GitHubWorkflowRunsResponse = response.json().await?;
+        let page_len = runs.workflow_runs.len();
+        for run in runs.workflow_runs {
+            let attempt = run_attempt_or_one(run.run_attempt);
+            attempts
+                .entry(run.id.to_string())
+                .and_modify(|existing: &mut u32| *existing = (*existing).max(attempt))
+                .or_insert(attempt);
+        }
+        if !has_next || page_len < CI_PAGE_SIZE || page >= MAX_CI_PAGES {
+            break;
+        }
+        page += 1;
+    }
+    Ok(attempts)
 }
 
 fn workflow_run_id(url: &str) -> Option<String> {
@@ -2885,13 +2947,17 @@ mod tests {
                     if check_polls <= 2 {
                         r#"{"check_runs":[{"id":11,"name":"CI","status":"completed","conclusion":"success","details_url":"https://github.com/org/repo/actions/runs/4242/jobs/11","head_sha":"prsha"}]}"#.to_string()
                     } else {
-                        r#"{"check_runs":[{"id":22,"name":"CI","status":"completed","conclusion":"failure","details_url":"https://github.com/org/repo/actions/runs/4242/attempts/2/jobs/22","head_sha":"prsha"}]}"#.to_string()
+                        r#"{"check_runs":[{"id":22,"name":"CI","status":"completed","conclusion":"failure","details_url":"https://github.com/org/repo/actions/runs/4242/jobs/22","head_sha":"prsha"}]}"#.to_string()
                     }
                 } else if request.contains("/actions/runs") {
-                    if check_polls <= 2 {
-                        r#"{"workflow_runs":[{"id":4242,"name":"CI","status":"completed","conclusion":"success","head_branch":"feat/pr","head_sha":"prsha","html_url":"https://github.com/org/repo/actions/runs/4242","run_attempt":1,"pull_requests":[{"number":42}]}]}"#.to_string()
+                    if request.contains("head_sha=prsha") {
+                        if check_polls <= 2 {
+                            r#"{"workflow_runs":[{"id":4242,"name":"CI","status":"completed","conclusion":"success","head_branch":"feat/pr","head_sha":"prsha","html_url":"https://github.com/org/repo/actions/runs/4242","run_attempt":1,"pull_requests":[{"number":42}]}]}"#.to_string()
+                        } else {
+                            r#"{"workflow_runs":[{"id":4242,"name":"CI","status":"completed","conclusion":"failure","head_branch":"feat/pr","head_sha":"prsha","html_url":"https://github.com/org/repo/actions/runs/4242","run_attempt":2,"pull_requests":[{"number":42}]}]}"#.to_string()
+                        }
                     } else {
-                        r#"{"workflow_runs":[{"id":4242,"name":"CI","status":"completed","conclusion":"failure","head_branch":"feat/pr","head_sha":"prsha","html_url":"https://github.com/org/repo/actions/runs/4242/attempts/2","run_attempt":2,"pull_requests":[{"number":42}]}]}"#.to_string()
+                        r#"{"workflow_runs":[]}"#.to_string()
                     }
                 } else {
                     "[]".to_string()
@@ -4269,6 +4335,7 @@ mod tests {
         let req = server.await.unwrap();
         assert!(req.contains("GET /repos/ultraworkers/claw-code/actions/runs?"));
         assert!(req.contains("branch=main"));
+        assert!(req.contains("event=push"));
         assert!(req.contains("per_page=100"));
     }
 
@@ -4292,28 +4359,30 @@ mod tests {
                 })
                 .to_string(),
                 json!({
-                    "workflow_runs": [
-                        {
-                            "id": 123_u64,
-                            "name": "CI",
-                            "status": "completed",
-                            "conclusion": "failure",
-                            "head_branch": "feat/pr",
-                            "head_sha": "prsha",
-                            "html_url": "https://github.com/org/repo/actions/runs/123",
-                            "pull_requests": [{"number": 42}]
-                        },
-                        {
-                            "id": 456_u64,
-                            "name": "Rust CI",
-                            "status": "completed",
-                            "conclusion": "failure",
-                            "head_branch": "main",
-                            "head_sha": "mainsha",
-                            "html_url": "https://github.com/org/repo/actions/runs/456",
-                            "pull_requests": []
-                        }
-                    ]
+                    "workflow_runs": [{
+                        "id": 123_u64,
+                        "name": "CI",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "head_branch": "feat/pr",
+                        "head_sha": "prsha",
+                        "html_url": "https://github.com/org/repo/actions/runs/123",
+                        "run_attempt": 1,
+                        "pull_requests": [{"number": 42}]
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "workflow_runs": [{
+                        "id": 456_u64,
+                        "name": "Rust CI",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "head_branch": "main",
+                        "head_sha": "mainsha",
+                        "html_url": "https://github.com/org/repo/actions/runs/456",
+                        "pull_requests": []
+                    }]
                 })
                 .to_string(),
             ];
@@ -4383,10 +4452,13 @@ mod tests {
         assert_eq!(direct.branch.as_deref(), Some("main"));
 
         let requests = server.await.unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(requests[0].contains("GET /repos/org/repo/commits/prsha/check-runs?"));
         assert!(requests[1].contains("GET /repos/org/repo/actions/runs?"));
-        assert!(requests[1].contains("branch=main"));
+        assert!(requests[1].contains("head_sha=prsha"));
+        assert!(requests[2].contains("GET /repos/org/repo/actions/runs?"));
+        assert!(requests[2].contains("branch=main"));
+        assert!(requests[2].contains("event=push"));
     }
 
     #[test]
