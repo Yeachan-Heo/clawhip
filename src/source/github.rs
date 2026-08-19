@@ -136,6 +136,16 @@ impl PendingCiDelivery {
                 .unwrap_or_default()
                 .to_string()
         };
+        let mut identities = identities;
+        if let Some(check_run_id) = payload
+            .and_then(|object| object.get("check_run_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            let identity = format!("check:{check_run_id}");
+            if !identities.iter().any(|existing| existing == &identity) {
+                identities.push(identity);
+            }
+        }
         Self {
             identities,
             kind: event.kind.clone(),
@@ -180,18 +190,33 @@ impl PendingCiDelivery {
     }
 
     fn same_event(&self, other: &Self) -> bool {
-        let self_unique = unique_pending_identities(&self.identities);
-        let other_unique = unique_pending_identities(&other.identities);
-        if !self_unique.is_empty() && !other_unique.is_empty() {
-            return self_unique
+        if self.kind != other.kind || self.conclusion != other.conclusion {
+            return false;
+        }
+        let self_checks = pending_check_identities(&self.identities);
+        let other_checks = pending_check_identities(&other.identities);
+        if !self_checks.is_empty() && !other_checks.is_empty() {
+            return self_checks
                 .iter()
-                .any(|identity| other_unique.iter().any(|candidate| candidate == identity));
+                .any(|identity| other_checks.iter().any(|candidate| candidate == identity));
+        }
+        let self_runs = pending_run_identities(&self.identities);
+        let other_runs = pending_run_identities(&other.identities);
+        if !self_checks.is_empty() {
+            return other_runs.is_empty() && self.fallback_matches(other);
+        }
+        if !other_checks.is_empty() {
+            return self_runs.is_empty() && self.fallback_matches(other);
         }
         if self.run_id.is_some() && other.run_id.is_some() {
             return self.run_id == other.run_id
                 && run_attempt_or_one(self.run_attempt) == run_attempt_or_one(other.run_attempt)
                 && self.workflow == other.workflow;
         }
+        self.fallback_matches(other)
+    }
+
+    fn fallback_matches(&self, other: &Self) -> bool {
         self.sha == other.sha
             && self.workflow == other.workflow
             && self.pr_number == other.pr_number
@@ -218,6 +243,12 @@ impl PendingCiDelivery {
                     "run_attempt".to_string(),
                     json!(run_attempt_or_one(self.run_attempt)),
                 );
+            }
+            if let Some(check_id) = pending_check_identities(&self.identities)
+                .first()
+                .and_then(|identity| identity.strip_prefix("check:"))
+            {
+                payload.insert("check_run_id".to_string(), json!(check_id));
             }
             payload.insert("run_job_count".to_string(), json!(self.run_job_count));
             payload.insert("run_all_terminal".to_string(), json!(self.run_all_terminal));
@@ -290,11 +321,19 @@ fn ci_baseline_repo_key(snapshot: &GitSnapshot, repo: &GitRepoMonitor) -> String
         .unwrap_or_else(|| format!("path:{}", repo.path))
 }
 
-fn unique_pending_identities(identities: &[String]) -> Vec<String> {
+fn pending_check_identities(identities: &[String]) -> Vec<&str> {
     identities
         .iter()
-        .filter(|identity| identity.starts_with("run:") || identity.starts_with("check:"))
-        .cloned()
+        .filter(|identity| identity.starts_with("check:"))
+        .map(String::as_str)
+        .collect()
+}
+
+fn pending_run_identities(identities: &[String]) -> Vec<&str> {
+    identities
+        .iter()
+        .filter(|identity| identity.starts_with("run:"))
+        .map(String::as_str)
         .collect()
 }
 
@@ -979,11 +1018,11 @@ impl GitHubCISnapshot {
     }
 
     fn dedupe_key(&self) -> String {
-        if let Some(run_id) = &self.run_id {
-            return format!("run:{run_id}:{}:{}", self.run_attempt(), self.workflow);
-        }
         if let Some(check_run_id) = &self.check_run_id {
             return format!("check:{check_run_id}");
+        }
+        if let Some(run_id) = &self.run_id {
+            return format!("run:{run_id}:{}:{}", self.run_attempt(), self.workflow);
         }
         self.fallback_identity()
     }
@@ -1468,6 +1507,7 @@ fn previous_snapshot_for_event<'a>(
 ) -> Option<&'a GitHubCISnapshot> {
     let payload = event.payload.as_object()?;
     let workflow = payload.get("workflow")?.as_str()?;
+    let check_run_id = payload.get("check_run_id").and_then(|value| value.as_str());
     let run_id = payload.get("run_id").and_then(|value| value.as_str());
     let run_attempt = payload
         .get("run_attempt")
@@ -1475,6 +1515,12 @@ fn previous_snapshot_for_event<'a>(
         .map(|value| value as u32)
         .unwrap_or(1);
     previous.values().find(|ci| {
+        if let Some(check_run_id) = check_run_id {
+            return ci.check_run_id.as_deref() == Some(check_run_id);
+        }
+        if ci.check_run_id.is_some() {
+            return false;
+        }
         if let Some(run_id) = run_id {
             return ci.run_id.as_deref() == Some(run_id)
                 && ci.run_attempt() == run_attempt_or_one(run_attempt);
@@ -1662,6 +1708,9 @@ fn collect_ci_events(
             if let Some(run_id) = &ci.run_id {
                 payload.insert("run_id".to_string(), json!(run_id));
                 payload.insert("run_attempt".to_string(), json!(ci.run_attempt()));
+            }
+            if let Some(check_run_id) = &ci.check_run_id {
+                payload.insert("check_run_id".to_string(), json!(check_run_id));
             }
             payload.insert("run_job_count".to_string(), json!(ci.run_job_count));
             payload.insert("run_all_terminal".to_string(), json!(ci.run_all_terminal));
@@ -3267,6 +3316,118 @@ mod tests {
         commit_ci_baseline(Some(&path), &right).unwrap();
         let loaded = load_ci_baseline(Some(&path));
         assert_eq!(loaded.repos["/repo"].pending.len(), 2);
+    }
+
+    fn check_job(run_id: u64, check_id: u64, workflow: &str, conclusion: &str) -> GitHubCISnapshot {
+        GitHubCISnapshot {
+            check_run_id: Some(check_id.to_string()),
+            workflow: workflow.into(),
+            conclusion: Some(conclusion.into()),
+            status: "completed".into(),
+            run_all_terminal: true,
+            run_job_count: 2,
+            ..run_snapshot(run_id, workflow, Some(conclusion), "main")
+        }
+    }
+
+    #[test]
+    fn issue_317_pending_keeps_distinct_check_jobs_in_one_run() {
+        let lint = check_job(4242, 11, "lint", "success");
+        let test = check_job(4242, 22, "test", "failure");
+        let current = run_map(&[lint.clone(), test.clone()]);
+        assert_eq!(current.len(), 2, "check jobs must not share a HashMap key");
+
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &current,
+            None,
+        );
+        assert_eq!(events.len(), 2, "both terminal jobs must publish");
+
+        let mut baseline = CIBaseline::default();
+        baseline.enqueue_pending("/repo", "/repo", &events, &current);
+        assert_eq!(baseline.repos["/repo"].pending.len(), 2);
+
+        let success = events
+            .iter()
+            .find(|event| event.canonical_kind() == "github.ci-passed")
+            .unwrap();
+        let failure = events
+            .iter()
+            .find(|event| event.canonical_kind() == "github.ci-failed")
+            .unwrap();
+        let pending_ok = PendingCiDelivery::from_event(success, lint.identities());
+        let pending_fail = PendingCiDelivery::from_event(failure, test.identities());
+        assert!(!pending_ok.same_event(&pending_fail));
+
+        let stale_ok = pending_ok.clone();
+        let mut flipped = check_job(4242, 11, "lint", "failure");
+        flipped.sha = lint.sha.clone();
+        let flip_events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &run_map(std::slice::from_ref(&lint)),
+            &run_map(std::slice::from_ref(&flipped)),
+            None,
+        );
+        assert_eq!(flip_events.len(), 1);
+        let pending_flip = PendingCiDelivery::from_event(&flip_events[0], flipped.identities());
+        assert!(!stale_ok.same_event(&pending_flip));
+        let mut dest = RepoCIBaseline::default();
+        dest.pending.push(stale_ok.clone());
+        merge_repo_baseline(
+            &mut dest,
+            RepoCIBaseline {
+                pending: vec![pending_flip.clone()],
+                ..RepoCIBaseline::default()
+            },
+        );
+        assert_eq!(dest.pending.len(), 2);
+
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.enqueue_pending("/repo", "/repo", &events, &current);
+        bump_pending_send_attempts(
+            &mut ci_baseline,
+            std::slice::from_ref(&pending_ok),
+            unix_now(),
+        );
+        let pending = &ci_baseline.repos["/repo"].pending;
+        let bumped = pending
+            .iter()
+            .find(|item| item.same_event(&pending_ok))
+            .unwrap();
+        let untouched = pending
+            .iter()
+            .find(|item| item.same_event(&pending_fail))
+            .unwrap();
+        assert_eq!(bumped.send_attempts, 1);
+        assert_eq!(untouched.send_attempts, 0);
+
+        ack_pending_deliveries(&mut ci_baseline, None, std::slice::from_ref(&pending_ok)).unwrap();
+        assert_eq!(ci_baseline.repos["/repo"].pending.len(), 1);
+        assert!(ci_baseline.repos["/repo"].pending[0].same_event(&pending_fail));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut persist = CIBaseline::default();
+        persist.enqueue_pending("/repo", "/repo", &events, &current);
+        persist.enqueue_pending(
+            "/repo",
+            "/repo",
+            &flip_events,
+            &run_map(std::slice::from_ref(&flipped)),
+        );
+        save_ci_baseline(&persist, Some(&path)).unwrap();
+        let restarted = load_ci_baseline(Some(&path));
+        assert_eq!(
+            restarted.repos["/repo"].pending.len(),
+            3,
+            "restart must keep both jobs and the changed conclusion"
+        );
     }
 
     #[test]
