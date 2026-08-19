@@ -829,7 +829,7 @@ fn unlock_baseline_file(file: &File) {
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     #[link_name = "LockFile"]
     fn lock_file(
         handle: *mut core::ffi::c_void,
