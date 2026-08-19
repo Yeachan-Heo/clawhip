@@ -835,8 +835,9 @@ fn persist_pending_send_attempts(
     items: &[PendingCiDelivery],
     now: u64,
 ) -> Result<()> {
-    bump_pending_send_attempts(ci_baseline, items, now);
-    *ci_baseline = commit_ci_baseline(path, ci_baseline)?;
+    let mut next = ci_baseline.clone();
+    bump_pending_send_attempts(&mut next, items, now);
+    *ci_baseline = commit_ci_baseline(path, &next)?;
     Ok(())
 }
 
@@ -1617,9 +1618,13 @@ fn collect_ci_events(
         let old = previous_snapshot(previous, ci);
         let changed = match old {
             Some(old) => {
-                old.status != ci.status
-                    || old.conclusion != ci.conclusion
-                    || old.run_all_terminal != ci.run_all_terminal
+                if ci.is_terminal() {
+                    !old.is_terminal() || old.conclusion != ci.conclusion
+                } else if ci.status != "completed" {
+                    old.status != ci.status || old.conclusion != ci.conclusion
+                } else {
+                    false
+                }
             }
             None => {
                 if ci.status != "completed" {
@@ -3397,6 +3402,86 @@ mod tests {
             stored[0].send_attempts >= 1,
             "durable attempt must be recorded before any send"
         );
+    }
+
+    #[test]
+    fn issue_317_failed_pre_send_persist_does_not_consume_retry_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"file").unwrap();
+        let bad_path = blocker.join("github-ci-baseline.json");
+        let run = run_snapshot(77, "CI", Some("success"), "main");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            None,
+        );
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.enqueue_pending(
+            "/repo",
+            "/repo",
+            &events,
+            &run_map(std::slice::from_ref(&run)),
+        );
+        let pending = ci_baseline.repos["/repo"].pending.clone();
+        assert!(
+            persist_pending_send_attempts(&mut ci_baseline, Some(&bad_path), &pending, unix_now())
+                .is_err()
+        );
+        assert_eq!(ci_baseline.repos["/repo"].pending[0].send_attempts, 0);
+        assert!(pending_due_for_send(
+            &ci_baseline.repos["/repo"].pending[0],
+            unix_now()
+        ));
+    }
+
+    #[test]
+    fn issue_317_in_progress_to_partial_complete_does_not_emit_until_all_jobs() {
+        let started = GitHubCISnapshot {
+            status: "in_progress".into(),
+            conclusion: None,
+            run_all_terminal: false,
+            run_job_count: 2,
+            ..run_snapshot(77, "CI", Some("success"), "main")
+        };
+        let partial = GitHubCISnapshot {
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            run_all_terminal: false,
+            run_job_count: 2,
+            ..run_snapshot(77, "CI", Some("success"), "main")
+        };
+        let complete = GitHubCISnapshot {
+            run_all_terminal: true,
+            run_job_count: 2,
+            ..run_snapshot(77, "CI", Some("success"), "main")
+        };
+        let repo = GitRepoMonitor::default();
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true,
+            &run_map(std::slice::from_ref(&started)),
+            &run_map(std::slice::from_ref(&partial)),
+            None,
+        );
+        assert!(
+            events.is_empty(),
+            "in-progress to completed-but-not-all-jobs must not publish"
+        );
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true,
+            &run_map(std::slice::from_ref(&partial)),
+            &run_map(std::slice::from_ref(&complete)),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.ci-passed");
     }
 
     #[test]
