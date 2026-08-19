@@ -588,14 +588,26 @@ impl CIBaseline {
     }
 }
 
+fn terminal_records_same_run(left: &TerminalRunRecord, right: &TerminalRunRecord) -> bool {
+    let left_unique: Vec<&str> = left.unique_identities().collect();
+    let right_unique: Vec<&str> = right.unique_identities().collect();
+    if !left_unique.is_empty() && !right_unique.is_empty() {
+        return left_unique
+            .iter()
+            .any(|identity| right_unique.contains(identity));
+    }
+    left.identities
+        .iter()
+        .any(|identity| right.contains_identity(identity))
+}
+
 fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
     for record in source.terminal_runs {
-        if let Some(existing) = dest.terminal_runs.iter_mut().find(|candidate| {
-            candidate
-                .identities
-                .iter()
-                .any(|identity| record.contains_identity(identity))
-        }) {
+        if let Some(existing) = dest
+            .terminal_runs
+            .iter_mut()
+            .find(|candidate| terminal_records_same_run(candidate, &record))
+        {
             for identity in record.identities {
                 if !existing.contains_identity(&identity) {
                     existing.identities.push(identity);
@@ -611,6 +623,7 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
             dest.terminal_runs.push_back(record);
         }
     }
+    cap_repo_baseline(dest);
     for delivery in source.pending {
         if let Some(existing) = dest
             .pending
@@ -796,6 +809,10 @@ async fn drain_pending_outbox(
     if due.is_empty() {
         return Ok(());
     }
+    if let Err(error) = persist_pending_send_attempts(ci_baseline, path, &due, now) {
+        eprintln!("clawhip source github CI baseline outbox attempt persist failed: {error}");
+        return Ok(());
+    }
     let mut sent = Vec::new();
     for delivery in &due {
         if send_event(tx, delivery.clone().into_event()).await.is_err() {
@@ -806,13 +823,20 @@ async fn drain_pending_outbox(
     if sent.is_empty() {
         return Ok(());
     }
-    bump_pending_send_attempts(ci_baseline, &sent, now);
-    if let Err(error) = commit_ci_baseline(path, ci_baseline) {
-        eprintln!("clawhip source github CI baseline outbox attempt persist failed: {error}");
-    }
     if let Err(error) = ack_pending_deliveries(ci_baseline, path, &sent) {
         eprintln!("clawhip source github CI baseline outbox ack failed: {error}");
     }
+    Ok(())
+}
+
+fn persist_pending_send_attempts(
+    ci_baseline: &mut CIBaseline,
+    path: Option<&Path>,
+    items: &[PendingCiDelivery],
+    now: u64,
+) -> Result<()> {
+    bump_pending_send_attempts(ci_baseline, items, now);
+    *ci_baseline = commit_ci_baseline(path, ci_baseline)?;
     Ok(())
 }
 
@@ -1177,23 +1201,34 @@ async fn poll_github(
                 PendingCiDelivery::from_event(event, identities)
             })
             .collect();
-        for event in ci_events {
-            send_event(tx, event).await?;
-        }
         if !delivered.is_empty() {
-            bump_pending_send_attempts(ci_baseline, &delivered, unix_now());
-            if let Err(error) = commit_ci_baseline(ci_baseline_path, ci_baseline) {
+            if let Err(error) =
+                persist_pending_send_attempts(ci_baseline, ci_baseline_path, &delivered, unix_now())
+            {
                 eprintln!(
                     "clawhip source github CI baseline outbox attempt persist failed for {}: {error}",
                     repo.path
                 );
+                state.insert(
+                    repo.path.clone(),
+                    GitHubRepoState {
+                        issues,
+                        prs,
+                        ci,
+                        ci_baseline_established,
+                    },
+                );
+                continue;
             }
-        }
-        if let Err(error) = ack_pending_deliveries(ci_baseline, ci_baseline_path, &delivered) {
-            eprintln!(
-                "clawhip source github CI baseline outbox ack failed for {}: {error}",
-                repo.path
-            );
+            for event in ci_events {
+                send_event(tx, event).await?;
+            }
+            if let Err(error) = ack_pending_deliveries(ci_baseline, ci_baseline_path, &delivered) {
+                eprintln!(
+                    "clawhip source github CI baseline outbox ack failed for {}: {error}",
+                    repo.path
+                );
+            }
         }
 
         state.insert(
@@ -1581,22 +1616,19 @@ fn collect_ci_events(
     for ci in current.values() {
         let old = previous_snapshot(previous, ci);
         let changed = match old {
-            Some(old) => old.status != ci.status || old.conclusion != ci.conclusion,
+            Some(old) => {
+                old.status != ci.status
+                    || old.conclusion != ci.conclusion
+                    || old.run_all_terminal != ci.run_all_terminal
+            }
             None => {
-                if !previous_ci_baseline_established {
-                    // First poll after startup or re-priming after a partial
-                    // poll: seed the snapshot. In-progress runs emit; terminal
-                    // runs are historical noise, not transitions (#317).
-                    ci.status != "completed"
-                } else if ci.is_terminal() {
-                    // Established monitor seeing a terminal run with no
-                    // in-process record: the pagination drift / cursor loss /
-                    // re-enrollment replay window. Suppress it when the
-                    // persisted baseline already observed it (#317).
-                    !repo_ci_baseline_is_suppressed(repo_ci_baseline, ci)
-                } else {
-                    // Established monitor seeing a genuinely new run start.
+                if ci.status != "completed" {
                     true
+                } else if ci.is_terminal() {
+                    previous_ci_baseline_established
+                        && !repo_ci_baseline_is_suppressed(repo_ci_baseline, ci)
+                } else {
+                    false
                 }
             }
         };
@@ -1837,10 +1869,11 @@ async fn fetch_check_runs(
                     .clone()
                     .unwrap_or_else(|| pr.url.clone());
                 let run_id = workflow_run_id(&url);
-                let (run_job_count, run_all_terminal) = run_id
+                let (run_job_count, summarized_terminal) = run_id
                     .as_deref()
                     .and_then(|id| run_summaries.get(id).copied())
                     .unwrap_or((1, check_run.status == "completed"));
+                let run_all_terminal = summarized_terminal && window_complete;
                 GitHubCISnapshot {
                     pr_number: Some(pr_number),
                     workflow: check_run.name,
@@ -2074,7 +2107,7 @@ fn classify_ci_event_kind(status: &str, conclusion: Option<&str>) -> &'static st
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -3253,8 +3286,8 @@ mod tests {
             sent += 1;
         }
         assert_eq!(
-            sent, 1,
-            "persistent ACK failure must not resend the full outbox every poll"
+            sent, 0,
+            "pre-send persist failure must not publish pending outbox events"
         );
         assert!(
             hits.load(Ordering::SeqCst) >= 6,
@@ -3333,6 +3366,248 @@ mod tests {
             !pending_due_for_send(&stored[0], unix_now()),
             "restart must honor persisted backoff after ACK removal fails"
         );
+    }
+
+    #[test]
+    fn issue_317_persist_retry_before_send_leaves_nonzero_attempt_without_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let run = run_snapshot(77, "CI", Some("success"), "main");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            None,
+        );
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.enqueue_pending(
+            "/repo",
+            "/repo",
+            &events,
+            &run_map(std::slice::from_ref(&run)),
+        );
+        save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
+        let pending = ci_baseline.repos["/repo"].pending.clone();
+        persist_pending_send_attempts(&mut ci_baseline, Some(&path), &pending, unix_now()).unwrap();
+        let stored = &load_ci_baseline(Some(&path)).repos["/repo"].pending;
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored[0].send_attempts >= 1,
+            "durable attempt must be recorded before any send"
+        );
+    }
+
+    #[test]
+    fn issue_317_pre_send_persist_failure_does_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"file").unwrap();
+        let bad_path = blocker.join("github-ci-baseline.json");
+        let run = run_snapshot(77, "CI", Some("success"), "main");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            None,
+        );
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.enqueue_pending(
+            "/repo",
+            "/repo",
+            &events,
+            &run_map(std::slice::from_ref(&run)),
+        );
+        assert!(
+            persist_pending_send_attempts(
+                &mut ci_baseline,
+                Some(&bad_path),
+                &events
+                    .iter()
+                    .map(|event| PendingCiDelivery::from_event(event, run.identities()))
+                    .collect::<Vec<_>>(),
+                unix_now()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn issue_317_merge_does_not_collapse_distinct_unique_fallback_overlap() {
+        let first = TerminalRunRecord::from_snapshot(&GitHubCISnapshot {
+            check_run_id: Some("111".into()),
+            run_id: None,
+            ..fallback_snapshot(58, "abcdef1234567890", "CI")
+        });
+        let second = TerminalRunRecord::from_snapshot(&GitHubCISnapshot {
+            check_run_id: Some("222".into()),
+            run_id: None,
+            conclusion: Some("failure".into()),
+            ..fallback_snapshot(58, "abcdef1234567890", "CI")
+        });
+        assert!(!terminal_records_same_run(&first, &second));
+        let mut dest = RepoCIBaseline::default();
+        dest.terminal_runs.push_back(first);
+        merge_repo_baseline(
+            &mut dest,
+            RepoCIBaseline {
+                terminal_runs: {
+                    let mut q = VecDeque::new();
+                    q.push_back(second);
+                    q
+                },
+                ..RepoCIBaseline::default()
+            },
+        );
+        assert_eq!(dest.terminal_runs.len(), 2);
+    }
+
+    #[test]
+    fn issue_317_disk_merge_evicts_oldest_beyond_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut disk = CIBaseline::default();
+        let mut on_disk = Vec::new();
+        for id in 0..200 {
+            let mut run = run_snapshot(id, "CI", Some("success"), "main");
+            run.created_at = Some(format!("2026-01-01T00:{:02}:{:02}Z", id / 60, id % 60));
+            on_disk.push(run);
+        }
+        disk.record_terminal_runs("/repo", "/repo", &run_map(&on_disk));
+        save_ci_baseline(&disk, Some(&path)).unwrap();
+
+        let mut incoming = CIBaseline::default();
+        let mut extra = Vec::new();
+        for id in 200..(MAX_BASELINE_RUNS_PER_REPO + 20) {
+            let mut run = run_snapshot(id as u64, "CI", Some("success"), "main");
+            run.created_at = Some(format!(
+                "2026-01-01T01:{:02}:{:02}Z",
+                (id - 200) / 60,
+                (id - 200) % 60
+            ));
+            extra.push(run);
+        }
+        incoming.record_terminal_runs("/repo", "/repo", &run_map(&extra));
+        commit_ci_baseline(Some(&path), &incoming).unwrap();
+        let loaded = load_ci_baseline(Some(&path));
+        let repo = &loaded.repos["/repo"];
+        assert_eq!(repo.terminal_runs.len(), MAX_BASELINE_RUNS_PER_REPO);
+        assert!(!repo.contains_identity("run:0"));
+        assert!(repo.contains_identity(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 19)));
+    }
+
+    #[test]
+    fn issue_317_incomplete_multi_job_does_not_emit_until_all_terminal() {
+        let partial = GitHubCISnapshot {
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            run_all_terminal: false,
+            run_job_count: 2,
+            ..run_snapshot(77, "CI", Some("success"), "main")
+        };
+        let complete = GitHubCISnapshot {
+            run_all_terminal: true,
+            run_job_count: 2,
+            ..run_snapshot(77, "CI", Some("success"), "main")
+        };
+        let repo = GitRepoMonitor::default();
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&partial)),
+            None,
+        );
+        assert!(
+            events.is_empty(),
+            "completed jobs in an incomplete workflow must not publish"
+        );
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true,
+            &run_map(std::slice::from_ref(&partial)),
+            &run_map(std::slice::from_ref(&complete)),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.ci-passed");
+    }
+
+    #[tokio::test]
+    async fn issue_317_incomplete_check_run_pages_are_not_all_terminal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut page_hits = 0_usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                if !request.contains("/check-runs") {
+                    let body = if request.contains("/actions/runs") {
+                        r#"{"workflow_runs":[]}"#
+                    } else {
+                        "[]"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
+                page_hits += 1;
+                let start = (page_hits - 1) * CI_PAGE_SIZE;
+                let runs: Vec<String> = (start..start + CI_PAGE_SIZE)
+                    .map(|id| {
+                        format!(
+                            r#"{{"id":{},"name":"CI","status":"completed","conclusion":"success","details_url":"https://github.com/org/repo/actions/runs/4242/jobs/{id}","head_sha":"prsha"}}"#,
+                            id + 1
+                        )
+                    })
+                    .collect();
+                let body = format!(r#"{{"check_runs":[{}]}}"#, runs.join(","));
+                let next = page_hits + 1;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nlink: <http://{addr}/repos/org/repo/commits/prsha/check-runs?page={next}>; rel=\"next\"\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                if page_hits >= MAX_CI_PAGES {
+                    break;
+                }
+            }
+        });
+
+        let pr = PullRequestSnapshot {
+            title: "PR".into(),
+            status: "open".into(),
+            url: "https://github.com/org/repo/pull/42".into(),
+            head_branch: "feat/pr".into(),
+            head_sha: "prsha".into(),
+        };
+        let client = build_github_client(None).unwrap();
+        let (runs, complete) =
+            fetch_check_runs(&client, &format!("http://{addr}"), "org/repo", 42, &pr)
+                .await
+                .unwrap();
+        assert!(!complete);
+        assert!(
+            runs.iter()
+                .all(|run| !run.run_all_terminal && !run.is_terminal()),
+            "incomplete check-run pagination must not infer run_all_terminal"
+        );
+        server.abort();
     }
 
     #[test]
