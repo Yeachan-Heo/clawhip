@@ -2946,7 +2946,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(rx.try_recv().is_err(), "restart prime must not replay attempt 1");
+        assert!(
+            rx.try_recv().is_err(),
+            "restart prime must not replay attempt 1"
+        );
         poll_once_with_baseline(
             &config,
             &client,
