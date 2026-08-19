@@ -766,6 +766,7 @@ fn merge_ci_baseline(dest: &mut CIBaseline, source: &CIBaseline) {
     }
 }
 
+#[derive(Debug)]
 struct BaselineLock {
     file: File,
 }
@@ -782,7 +783,10 @@ fn acquire_baseline_lock(path: &Path) -> Result<BaselineLock> {
         fs::create_dir_all(parent)?;
     }
     if lock_path.is_dir() {
-        let _ = fs::remove_dir_all(&lock_path);
+        return Err(
+            "GitHub CI baseline lock path is a leftover directory lock; stop older clawhip processes and remove it before retrying"
+                .into(),
+        );
     }
     let file = OpenOptions::new()
         .create(true)
@@ -3605,8 +3609,19 @@ mod tests {
         let path = dir.path().join("github-ci-baseline.json");
         let lock_path = path.with_extension("json.lock");
         fs::create_dir_all(&lock_path).unwrap();
-        fs::write(lock_path.join("owner"), b"stale-token").unwrap();
+        fs::write(lock_path.join("owner"), b"live-legacy-owner").unwrap();
 
+        let err = acquire_baseline_lock(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("leftover directory lock"),
+            "new acquire must fail closed on a live legacy directory lock: {err}"
+        );
+        assert!(
+            lock_path.is_dir(),
+            "new acquire must not delete a live legacy directory lock"
+        );
+
+        fs::remove_dir_all(&lock_path).unwrap();
         let overlapping = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(AtomicUsize::new(0));
         let errors = Arc::new(Mutex::new(Vec::new()));
