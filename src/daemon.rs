@@ -1,17 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
 
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router as AxumRouter};
-use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use std::time::Duration;
 
 use crate::Result;
 use crate::VERSION;
@@ -21,6 +13,7 @@ use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::gajae::{HandlerAction, HandlerLimits, HandlerOutcome};
+use crate::ledger::{EventLedger, LedgerQuery, SharedEventLedger};
 use crate::native_hooks::{
     NATIVE_NON_GIT_OUTCOME, NATIVE_NORMALIZATION_OUTCOME_FIELD,
     incoming_event_from_native_hook_json,
@@ -31,15 +24,58 @@ use crate::native_observability::{
 };
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
+
 use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
+use crate::source::tmux::{
+    AbsentRegistrationCandidate, prune_absent_dynamic_registrations, session_exists,
+};
+use crate::source::tmux::{
+    BoundedCategory, BoundedReason, LaneDeliveryMutation, LaneEvidenceMutation, LaneLaunchState,
+    LaneRegistrationInput, LaneRetirementMutation, LaneVerificationMutation, LaneVisibility,
+    LaneWorkflow, LaneWorkflowMutation, claim_lane, lane_detail_for_session, list_lane_snapshots,
+    record_lane_delivery, record_lane_verification, register_lane_registration,
+    retire_lane_if_absent, update_lane_evidence, update_lane_workflow,
+};
+
 use crate::source::{
-    GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
-    WorkspaceSource, list_active_tmux_registrations,
+    GitHubSource, GitHubStatusSource, GitMonitorLifecycleCounts, GitSource, RegisteredTmuxSession,
+    SharedGitMonitorDiagnostics, SharedTmuxRegistry, Source, SubscriptionSnapshot,
+    SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
+    default_registry_state_path, inspect_tmux_registry_state, list_active_tmux_registrations,
+    load_tmux_registry_state, new_shared_git_monitor_diagnostics,
+    register_runtime_tmux_registration, snapshot_git_monitor_diagnostics,
+    tmux_registry_diagnostics,
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
+use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
+
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router as AxumRouter};
+use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
+pub const LOCAL_CONTROL_HEADER: &str = "x-clawhip-local-control";
+const LOCAL_CONTROL_HEADER_VALUE: &str = "1";
+const LOCAL_CONTROL_REJECTED: &str = "local_control_rejected";
+
+static EVENT_LEDGER: OnceLock<std::sync::Mutex<Option<SharedEventLedger>>> = OnceLock::new();
+
+fn event_ledger_slot() -> &'static std::sync::Mutex<Option<SharedEventLedger>> {
+    EVENT_LEDGER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn shared_event_ledger() -> Option<SharedEventLedger> {
+    event_ledger_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
 const STALE_NATIVE_REPLAY_GRACE: Duration = Duration::from_secs(5 * 60);
 const STALE_NATIVE_REPLAY_REASON: &str = "stale_replay";
 const NATIVE_REPLAY_TIMESTAMP_POINTERS: &[&str] = &[
@@ -68,6 +104,23 @@ struct AppState {
     native_observability: SharedNativeHookObservability,
     cron_state_path: PathBuf,
     discord_watch_lock: Arc<Mutex<()>>,
+    subscriptions: SharedSubscriptionRegistry,
+    git_monitor_diagnostics: SharedGitMonitorDiagnostics,
+}
+
+type SharedSubscriptionRegistry = Arc<RwLock<BTreeMap<String, SubscriptionEntry>>>;
+
+struct SubscriptionEntry {
+    config: Arc<crate::config::SubscriptionConfig>,
+    snapshot: Arc<Mutex<SubscriptionSnapshot>>,
+    cancel: watch::Sender<bool>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AppState {
+    fn subscription_registry(&self) -> SharedSubscriptionRegistry {
+        self.subscriptions.clone()
+    }
 }
 
 pub async fn run(
@@ -101,12 +154,27 @@ pub async fn run(
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let tmux_registry_state_path = default_registry_state_path(&cron_state_path);
+    load_tmux_registry_state(&tmux_registry_state_path, &tmux_registry).await;
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
     let native_observability = new_shared_native_hook_observability();
+    let subscriptions = new_subscription_registry(config.as_ref(), tx.clone()).await;
+    let ledger_root = cron_state_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let ledger: SharedEventLedger = Arc::new(std::sync::Mutex::new(EventLedger::open(
+        config.ledger.clone(),
+        ledger_root,
+    )?));
+    if let Ok(mut slot) = event_ledger_slot().lock() {
+        *slot = Some(ledger.clone());
+    }
 
     let ci_batch_window = config.dispatch.ci_batch_window();
     let routine_batch_window = config.dispatch.routine_batch_window();
     let dispatcher_native_observability = native_observability.clone();
+    let dispatcher_ledger = ledger.clone();
+
     tokio::spawn(async move {
         let mut dispatcher = Dispatcher::new(
             rx,
@@ -116,15 +184,26 @@ pub async fn run(
             ci_batch_window,
             routine_batch_window,
             dispatcher_native_observability,
-        );
+        )
+        .with_ledger(dispatcher_ledger);
+
         if let Err(error) = dispatcher.run().await {
             eprintln!("clawhip dispatcher stopped: {error}");
         }
     });
-    spawn_source(GitSource::new(config.clone()), tx.clone());
-    spawn_source(GitHubSource::new(config.clone()), tx.clone());
+    let git_monitor_diagnostics = new_shared_git_monitor_diagnostics();
     spawn_source(
-        TmuxSource::new(config.clone(), tmux_registry.clone()),
+        GitSource::new(config.clone(), git_monitor_diagnostics.clone()),
+        tx.clone(),
+    );
+    spawn_source(GitHubSource::new(config.clone()), tx.clone());
+    spawn_source(GitHubStatusSource::new(config.clone()), tx.clone());
+    spawn_source(
+        TmuxSource::new(
+            config.clone(),
+            tmux_registry.clone(),
+            tmux_registry_state_path.clone(),
+        ),
         tx.clone(),
     );
     spawn_source(WorkspaceSource::new(config.clone()), tx.clone());
@@ -156,7 +235,25 @@ pub async fn run(
         .route("/github", post(post_github))
         .route("/api/update/status", get(update_status))
         .route("/api/update/approve", post(approve_update))
-        .route("/api/update/dismiss", post(dismiss_update));
+        .route("/api/update/dismiss", post(dismiss_update))
+        .route("/api/lane", get(list_lanes))
+        .route("/api/lane/claim", post(claim_lane_handler))
+        .route("/api/lane/evidence", post(update_lane_evidence_handler))
+        .route("/api/lane/workflow", post(update_lane_workflow_handler))
+        .route("/api/lane/detail/{session}", get(lane_detail_handler))
+        .route("/api/lane/register", post(register_lane_handler))
+        .route(
+            "/api/lane/verification",
+            post(record_lane_verification_handler),
+        )
+        .route("/api/lane/delivery", post(record_lane_delivery_handler))
+        .route("/api/lane/retire", post(retire_lane_handler))
+        .route("/api/subscriptions", get(list_subscriptions))
+        .route("/api/subscriptions/{name}", get(subscription_detail))
+        .route("/api/ledger/status", get(ledger_status))
+        .route("/api/ledger/query", get(ledger_query))
+        .route("/api/subscriptions/{name}/start", post(start_subscription))
+        .route("/api/subscriptions/{name}/stop", post(stop_subscription));
     let port = port_override.unwrap_or(config.daemon.port);
 
     let app = app.with_state(AppState {
@@ -168,6 +265,8 @@ pub async fn run(
         native_observability,
         cron_state_path,
         discord_watch_lock: Arc::new(Mutex::new(())),
+        subscriptions: subscriptions.clone(),
+        git_monitor_diagnostics,
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -176,12 +275,86 @@ pub async fn run(
         "clawhip daemon v{VERSION} listening on http://{} (token_source: {token_source})",
         local_addr
     );
+
     telemetry::emit(daemon_record(
         telemetry::reason::DAEMON_LISTENING,
         json!({"version": VERSION, "addr": local_addr.to_string(), "token_source": token_source}),
     ));
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(daemon_shutdown_signal())
+    .await?;
+    shutdown_subscriptions(&subscriptions).await;
     Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LedgerQueryParams {
+    repo: Option<String>,
+    worktree: Option<String>,
+    session_id: Option<String>,
+    event_type: Option<String>,
+    since: Option<i64>,
+    until: Option<i64>,
+    keywords: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn ledger_status(_peer: LoopbackLanePeer) -> impl IntoResponse {
+    let Some(ledger) = shared_event_ledger() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ledger_unavailable"})),
+        );
+    };
+    match ledger.lock() {
+        Ok(ledger) => (StatusCode::OK, Json(json!(ledger.status()))),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ledger_unavailable"})),
+        ),
+    }
+}
+
+async fn ledger_query(
+    _peer: LoopbackLanePeer,
+    Query(params): Query<LedgerQueryParams>,
+) -> impl IntoResponse {
+    let query = LedgerQuery {
+        repo: params.repo,
+        worktree: params.worktree,
+        session_id: params.session_id,
+        event_type: params.event_type,
+        since_unix: params.since,
+        until_unix: params.until,
+        keywords: params
+            .keywords
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        limit: params.limit,
+    };
+    let Some(ledger) = shared_event_ledger() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ledger_unavailable"})),
+        );
+    };
+    match ledger.lock() {
+        Ok(mut ledger) => (
+            StatusCode::OK,
+            Json(json!({"records": ledger.query(&query)})),
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ledger_unavailable"})),
+        ),
+    }
 }
 
 fn spawn_source<S>(source: S, tx: mpsc::Sender<IncomingEvent>)
@@ -285,11 +458,19 @@ fn event_record(
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.tmux_registry.read().await.len();
     let native_hooks = snapshot_shared(&state.native_observability);
+    let registry_state =
+        inspect_tmux_registry_state(&default_registry_state_path(&state.cron_state_path)).await;
+    let tmux = tmux_registry_diagnostics(&state.tmux_registry, registry_state).await;
+    let subscriptions = subscription_snapshots(&state.subscription_registry()).await;
+    let git_monitors = snapshot_git_monitor_diagnostics(&state.git_monitor_diagnostics);
     Json(health_payload(
         state.config.as_ref(),
         state.port,
         registered,
         native_hooks,
+        json!(tmux),
+        &subscriptions,
+        git_monitors,
     ))
 }
 
@@ -298,21 +479,43 @@ fn health_payload(
     port: u16,
     registered_tmux_sessions: usize,
     native_hooks: Value,
+    mut tmux: Value,
+    subscriptions: &[SubscriptionSnapshot],
+    git_monitors: GitMonitorLifecycleCounts,
 ) -> Value {
+    if let Some(diagnostics) = tmux.as_object_mut() {
+        diagnostics.insert(
+            "configured_monitor_count".to_string(),
+            json!(config.monitors.tmux.sessions.len()),
+        );
+        diagnostics.insert(
+            "registry_registration_count".to_string(),
+            json!(registered_tmux_sessions),
+        );
+    }
+    let subscription_degraded = subscriptions.iter().any(|subscription| {
+        subscription.enabled
+            && subscription.desired_running
+            && subscription.state == SubscriptionState::Exhausted
+    });
+    let git_degraded = git_monitors.degraded > 0 || git_monitors.quarantined > 0;
     json!({
-        "ok": true,
+        "ok": !subscription_degraded && !git_degraded,
         "version": VERSION,
         "token_source": config.discord_token_source(),
         "token_precedence_warning": config.discord_token_env_shadow().map(discord_token_shadow_warning),
         "webhook_routes_configured": config.has_webhook_routes(),
         "port": port,
-        "daemon_base_url": config.daemon.base_url,
         "configured_git_monitors": config.monitors.git.repos.len(),
+        "git_monitors": git_monitors,
         "configured_tmux_monitors": config.monitors.tmux.sessions.len(),
         "configured_workspace_monitors": config.monitors.workspace.len(),
+        "configured_github_status_monitor": config.monitors.github_status.enabled,
         "configured_cron_jobs": config.cron.jobs.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
+        "tmux": tmux,
         "native_hooks": native_hooks,
+        "subscriptions": {"configured": subscriptions.len(), "degraded": subscription_degraded},
     })
 }
 
@@ -320,6 +523,253 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     health(State(state)).await
 }
 
+async fn daemon_shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut signal) = signal(SignalKind::terminate()) {
+            signal.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+}
+
+async fn new_subscription_registry(
+    config: &AppConfig,
+    tx: mpsc::Sender<IncomingEvent>,
+) -> SharedSubscriptionRegistry {
+    let registry = Arc::new(RwLock::new(BTreeMap::new()));
+    for subscription in &config.subscriptions {
+        let config = Arc::new(subscription.clone());
+        let snapshot = Arc::new(Mutex::new(SubscriptionSnapshot::new(&config)));
+        let (cancel, receiver) = watch::channel(false);
+        let worker = config.enabled.then(|| {
+            spawn_subscription_worker(config.clone(), snapshot.clone(), receiver, tx.clone())
+        });
+        registry.write().await.insert(
+            config.name.clone(),
+            SubscriptionEntry {
+                config,
+                snapshot,
+                cancel,
+                worker,
+            },
+        );
+    }
+    registry
+}
+
+fn spawn_subscription_worker(
+    config: Arc<crate::config::SubscriptionConfig>,
+    snapshot: Arc<Mutex<SubscriptionSnapshot>>,
+    cancel: watch::Receiver<bool>,
+    tx: mpsc::Sender<IncomingEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        {
+            let mut status = snapshot.lock().await;
+            status.mark_started();
+            status.transition(SubscriptionState::Connecting, "connecting");
+        }
+        let cancellation = cancel.clone();
+        let result = SubscriptionWorker {
+            config,
+            snapshot: snapshot.clone(),
+            cancel,
+        }
+        .run(tx)
+        .await;
+        let mut status = snapshot.lock().await;
+        if result.is_err() {
+            if status.state != SubscriptionState::Exhausted {
+                status.transition(SubscriptionState::Exhausted, "worker_failed");
+            }
+        } else if *cancellation.borrow() {
+            status.transition(SubscriptionState::Stopped, "cancelled");
+        }
+    })
+}
+
+async fn subscription_snapshots(
+    registry: &SharedSubscriptionRegistry,
+) -> Vec<SubscriptionSnapshot> {
+    let snapshots: Vec<_> = registry
+        .read()
+        .await
+        .values()
+        .map(|entry| entry.snapshot.clone())
+        .collect();
+    let mut values = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        values.push(snapshot.lock().await.clone());
+    }
+    values
+}
+
+fn subscription_error(status: StatusCode, reason: &'static str) -> axum::response::Response {
+    (status, Json(json!({"ok": false, "reason": reason}))).into_response()
+}
+
+async fn list_subscriptions(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    Json(json!({"schema": "clawhip.subscriptions.v1", "subscriptions": subscription_snapshots(&state.subscription_registry()).await})).into_response()
+}
+
+async fn subscription_detail(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let snapshot = state
+        .subscription_registry()
+        .read()
+        .await
+        .get(&name)
+        .map(|entry| entry.snapshot.clone());
+    match snapshot {
+        Some(snapshot) => Json(json!({"schema": "clawhip.subscription.v1", "subscription": snapshot.lock().await.clone()})).into_response(),
+        None => subscription_error(StatusCode::NOT_FOUND, "unknown_subscription"),
+    }
+}
+
+async fn start_subscription(
+    _control: SubscriptionControlRequest,
+
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let registry_handle = state.subscription_registry();
+    let mut registry = registry_handle.write().await;
+    let Some(entry) = registry.get_mut(&name) else {
+        return subscription_error(StatusCode::NOT_FOUND, "unknown_subscription");
+    };
+    if !entry.config.enabled {
+        return subscription_error(StatusCode::CONFLICT, "disabled_subscription");
+    }
+    if entry
+        .worker
+        .as_ref()
+        .is_some_and(|worker| worker.is_finished())
+    {
+        entry.worker = None;
+    }
+    if entry.worker.is_some() {
+        return Json(json!({"ok": true, "name": name, "reason": "already_running"}))
+            .into_response();
+    }
+    let (cancel, receiver) = watch::channel(false);
+    entry.cancel = cancel;
+    {
+        let mut snapshot = entry.snapshot.lock().await;
+        snapshot.desired_running = true;
+        snapshot.transition(SubscriptionState::Starting, "start_requested");
+    }
+    entry.worker = Some(spawn_subscription_worker(
+        entry.config.clone(),
+        entry.snapshot.clone(),
+        receiver,
+        state.tx.clone(),
+    ));
+    Json(json!({"ok": true, "name": name, "reason": "started"})).into_response()
+}
+
+async fn stop_subscription_entry(
+    registry: &SharedSubscriptionRegistry,
+    name: &str,
+) -> std::result::Result<&'static str, (StatusCode, &'static str)> {
+    let (mut worker, snapshot) = {
+        let mut registry = registry.write().await;
+        let Some(entry) = registry.get_mut(name) else {
+            return Err((StatusCode::NOT_FOUND, "unknown_subscription"));
+        };
+        if !entry.config.enabled {
+            return Err((StatusCode::CONFLICT, "disabled_subscription"));
+        }
+        let snapshot = entry.snapshot.clone();
+        let Some(worker) = entry.worker.take() else {
+            let mut status = snapshot.lock().await;
+            status.desired_running = false;
+            status.transition(SubscriptionState::Stopped, "already_stopped");
+            return Ok("already_stopped");
+        };
+        let _ = entry.cancel.send(true);
+        {
+            let mut status = snapshot.lock().await;
+            status.desired_running = false;
+            status.transition(SubscriptionState::Stopping, "stop_requested");
+        }
+        (worker, snapshot)
+    };
+    let reason = if tokio::time::timeout(Duration::from_secs(5), &mut worker)
+        .await
+        .is_ok()
+    {
+        "stopped"
+    } else {
+        worker.abort();
+        let _ = worker.await;
+        "stop_timeout"
+    };
+    let mut status = snapshot.lock().await;
+    status.desired_running = false;
+    status.transition(SubscriptionState::Stopped, reason);
+    Ok(reason)
+}
+
+async fn stop_subscription(
+    _control: SubscriptionControlRequest,
+
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::response::Response {
+    match stop_subscription_entry(&state.subscription_registry(), &name).await {
+        Ok(reason) => Json(json!({"ok": true, "name": name, "reason": reason})).into_response(),
+        Err((status, reason)) => subscription_error(status, reason),
+    }
+}
+
+async fn shutdown_subscriptions(registry: &SharedSubscriptionRegistry) {
+    let workers: Vec<_> = {
+        let mut entries = registry.write().await;
+        let mut workers = Vec::new();
+        for entry in entries.values_mut() {
+            let _ = entry.cancel.send(true);
+            if let Some(worker) = entry.worker.take() {
+                workers.push((worker, entry.snapshot.clone()));
+            }
+        }
+        workers
+    };
+    for (mut worker, snapshot) in workers {
+        {
+            let mut snapshot = snapshot.lock().await;
+            snapshot.desired_running = false;
+            if snapshot.state != SubscriptionState::Exhausted {
+                snapshot.transition(SubscriptionState::Stopping, "shutdown_requested");
+            }
+        }
+        if tokio::time::timeout(Duration::from_secs(5), &mut worker)
+            .await
+            .is_err()
+        {
+            worker.abort();
+            let _ = worker.await;
+            let mut snapshot = snapshot.lock().await;
+            if snapshot.state != SubscriptionState::Exhausted {
+                snapshot.transition(SubscriptionState::Stopped, "shutdown_timeout");
+            }
+        }
+    }
+}
 async fn post_event(
     State(state): State<AppState>,
     Json(event): Json<IncomingEvent>,
@@ -902,15 +1352,64 @@ async fn expire_terminal_tmux_registration(state: &AppState, event: &IncomingEve
         return;
     }
 
-    let candidates = terminal_session_candidates(&event.payload);
-    if candidates.is_empty() {
+    let candidate_sessions = terminal_session_candidates(&event.payload);
+    if candidate_sessions.is_empty() {
         return;
     }
 
-    let mut registry = state.tmux_registry.write().await;
-    for session in candidates {
-        if registry.remove(&session).is_some() {
-            telemetry::emit(tmux_terminal_expiry_record(&session));
+    let observed_candidates = {
+        let snapshot = state.tmux_registry.read().await;
+        candidate_sessions
+            .iter()
+            .filter_map(|session| {
+                snapshot
+                    .get(session)
+                    .filter(|registration| {
+                        registration.lane.is_none()
+                            && registration.parent_process.is_none()
+                            && !registration.active_wrapper_monitor
+                    })
+                    .map(|registration| AbsentRegistrationCandidate {
+                        session: session.clone(),
+                        registration_generation: registration.registration_generation,
+                    })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut absent_candidates = Vec::new();
+    for candidate in observed_candidates {
+        match session_exists(&candidate.session).await {
+            Ok(false) => absent_candidates.push(candidate),
+            Ok(true) => {}
+            Err(error) => {
+                eprintln!(
+                    "clawhip tmux terminal expiry liveness probe failed for {}: {error}",
+                    candidate.session
+                );
+                return;
+            }
+        }
+    }
+    if absent_candidates.is_empty() {
+        return;
+    }
+
+    let registry_state_path = default_registry_state_path(&state.cron_state_path);
+    match prune_absent_dynamic_registrations(
+        &state.tmux_registry,
+        &registry_state_path,
+        &absent_candidates,
+    )
+    .await
+    {
+        Ok(removed) => {
+            if removed > 0 {
+                telemetry::emit(tmux_terminal_expiry_record(removed));
+            }
+        }
+
+        Err(error) => {
+            eprintln!("clawhip tmux registry expiry save failed: {error}");
         }
     }
 }
@@ -922,14 +1421,14 @@ fn is_terminal_session_event(kind: &str) -> bool {
     )
 }
 
-fn tmux_terminal_expiry_record(session: &str) -> serde_json::Map<String, Value> {
+fn tmux_terminal_expiry_record(removed_count: usize) -> serde_json::Map<String, Value> {
     let mut record = telemetry::record(
         telemetry::event_name::SOURCE_INVENTORY,
         "terminal_session_expired",
-        format!("source:tmux:{session}"),
+        "source:tmux:terminal",
     );
     record.insert("source".to_string(), json!("tmux"));
-    record.insert("session".to_string(), json!(session));
+    record.insert("removed_count".to_string(), json!(removed_count));
     record
 }
 
@@ -950,26 +1449,408 @@ async fn register_tmux(
     State(state): State<AppState>,
     Json(registration): Json<RegisteredTmuxSession>,
 ) -> impl IntoResponse {
-    state
-        .tmux_registry
-        .write()
-        .await
-        .insert(registration.session.clone(), registration.clone());
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"ok": true, "session": registration.session})),
+    let session = registration.session.clone();
+    let registry_state_path = default_registry_state_path(&state.cron_state_path);
+    match register_runtime_tmux_registration(
+        &state.tmux_registry,
+        &registry_state_path,
+        registration,
     )
-        .into_response()
+    .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"ok": true, "session": session})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_tmux(State(state): State<AppState>) -> impl IntoResponse {
-    match list_active_tmux_registrations(state.config.as_ref(), &state.tmux_registry).await {
+    match list_active_tmux_registrations(
+        state.config.as_ref(),
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+    )
+    .await
+    {
         Ok(registrations) => (StatusCode::OK, Json(json!(registrations))).into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"ok": false, "error": error.to_string()})),
         )
             .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LaneClaimDto {
+    session: String,
+    generation_id: String,
+    executor_id: String,
+    expected_revision: u64,
+}
+#[derive(serde::Deserialize)]
+struct LaneEvidenceDto {
+    session: String,
+    generation_id: String,
+    launch_operation_id: String,
+    expected_revision: u64,
+    launch_state: LaneLaunchState,
+    #[serde(default)]
+    failure_category: Option<String>,
+    executor_id: String,
+    worker_effect_kind: crate::source::tmux::WorkerEffectKind,
+}
+#[derive(serde::Deserialize)]
+struct LaneWorkflowDto {
+    session: String,
+    expected_revision: u64,
+    workflow: LaneWorkflow,
+    #[serde(default)]
+    quiesced: bool,
+    generation_id: String,
+}
+
+fn local_control_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"ok": false, "reason": LOCAL_CONTROL_REJECTED})),
+    )
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+        ip.is_loopback()
+            || matches!(ip, std::net::IpAddr::V6(ip) if ip.to_ipv4().is_some_and(|ip| ip.is_loopback()))
+    })
+}
+
+fn request_host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    reqwest::Url::parse(&format!("http://{host}"))
+        .ok()
+        .and_then(|url| url.host_str().map(is_loopback_host))
+        .unwrap_or(false)
+}
+
+fn origin_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return true;
+    };
+    origin
+        .to_str()
+        .ok()
+        .and_then(|origin| reqwest::Url::parse(origin).ok())
+        .and_then(|url| url.host_str().map(is_loopback_host))
+        .unwrap_or(false)
+}
+
+#[derive(Debug)]
+struct SubscriptionControlRequest;
+
+impl<S: Send + Sync> FromRequestParts<S> for SubscriptionControlRequest {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let peer_is_loopback = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|peer| {
+                peer.0.ip().is_loopback()
+                    || matches!(peer.0.ip(), std::net::IpAddr::V6(ip) if ip.to_ipv4().is_some_and(|ip| ip.is_loopback()))
+            });
+        let has_control_header = parts
+            .headers
+            .get(LOCAL_CONTROL_HEADER)
+            .is_some_and(|value| value.as_bytes() == LOCAL_CONTROL_HEADER_VALUE.as_bytes());
+        if peer_is_loopback
+            && has_control_header
+            && request_host_is_loopback(&parts.headers)
+            && origin_is_loopback(&parts.headers)
+        {
+            Ok(Self)
+        } else {
+            Err(local_control_error())
+        }
+    }
+}
+
+struct LoopbackLanePeer;
+impl<S: Send + Sync> FromRequestParts<S> for LoopbackLanePeer {
+    type Rejection = (StatusCode, Json<Value>);
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|peer| peer.0);
+        if peer.is_some_and(|peer| {
+            peer.ip().is_loopback() || peer.ip().to_string().starts_with("::ffff:127.")
+        }) {
+            Ok(Self)
+        } else {
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"ok": false, "error": "lane endpoints require a loopback peer"})),
+            ))
+        }
+    }
+}
+fn lane_error(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    let message = error.to_string();
+    if message == "lane runtime remains active" {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                json!({"ok": false, "error_code": "runtime-active", "error": "lane runtime remains active; quiesce it before retirement"}),
+            ),
+        );
+    }
+    let status = if message.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("conflict")
+        || message.contains("revision")
+        || message.contains("transition")
+        || message.contains("retained")
+        || message.contains("active")
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(json!({"ok": false, "error": "lane request rejected"})),
+    )
+}
+
+async fn list_lanes(_peer: LoopbackLanePeer, State(state): State<AppState>) -> impl IntoResponse {
+    Json(list_lane_snapshots(&state.tmux_registry, None).await).into_response()
+}
+async fn claim_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneClaimDto>,
+) -> impl IntoResponse {
+    let path = default_registry_state_path(&state.cron_state_path);
+    match claim_lane(
+        &state.tmux_registry,
+        &path,
+        &request.session,
+        &request.generation_id,
+        &request.executor_id,
+        request.expected_revision,
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn update_lane_evidence_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneEvidenceDto>,
+) -> impl IntoResponse {
+    let path = default_registry_state_path(&state.cron_state_path);
+    match update_lane_evidence(
+        &state.tmux_registry,
+        &path,
+        LaneEvidenceMutation {
+            session: request.session,
+            expected_revision: request.expected_revision,
+            generation_id: request.generation_id,
+            launch_operation_id: request.launch_operation_id,
+            launch_state: request.launch_state,
+            executor_id: request.executor_id,
+            worker_effect_kind: request.worker_effect_kind,
+            failure_category: request.failure_category.map(BoundedCategory::new),
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn update_lane_workflow_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneWorkflowDto>,
+) -> impl IntoResponse {
+    let path = default_registry_state_path(&state.cron_state_path);
+    match update_lane_workflow(
+        &state.tmux_registry,
+        &path,
+        LaneWorkflowMutation {
+            session: request.session,
+            generation_id: request.generation_id,
+            expected_revision: request.expected_revision,
+            workflow: request.workflow,
+            quiesced: request.quiesced,
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LaneVerificationDto {
+    session: String,
+    expected_revision: u64,
+    checked_at: String,
+    outcome: String,
+    #[serde(default)]
+    reason: Option<String>,
+    visibility: LaneVisibility,
+    generation_id: String,
+}
+#[derive(serde::Deserialize)]
+struct LaneDeliveryDto {
+    session: String,
+    expected_revision: u64,
+    #[serde(default)]
+    workflow: Option<LaneWorkflow>,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    delivered_at: Option<String>,
+    visibility: LaneVisibility,
+    #[serde(default)]
+    error_category: Option<String>,
+    #[serde(default)]
+    disposition: Option<String>,
+    generation_id: String,
+    #[serde(default)]
+    initial_kickoff: bool,
+    #[serde(default)]
+    kickoff_operation_id: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct LaneRetireDto {
+    session: String,
+    generation_id: String,
+    expected_revision: u64,
+}
+async fn lane_detail_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(session): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match lane_detail_for_session(&state.tmux_registry, &session).await {
+        Ok(detail) => Json(detail).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn register_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(input): Json<LaneRegistrationInput>,
+) -> impl IntoResponse {
+    match register_lane_registration(
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+        input,
+    )
+    .await
+    {
+        Ok(detail) => Json(detail).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn record_lane_verification_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneVerificationDto>,
+) -> impl IntoResponse {
+    match record_lane_verification(
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+        LaneVerificationMutation {
+            session: request.session,
+            expected_revision: request.expected_revision,
+            checked_at: request.checked_at,
+            outcome: request.outcome,
+            reason: request.reason.map(BoundedReason::new),
+            visibility: request.visibility,
+            generation_id: request.generation_id,
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn record_lane_delivery_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneDeliveryDto>,
+) -> impl IntoResponse {
+    match record_lane_delivery(
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+        LaneDeliveryMutation {
+            session: request.session,
+            expected_revision: request.expected_revision,
+            workflow: request.workflow,
+            message_id: request.message_id,
+            kind: request.kind,
+            delivered_at: request.delivered_at,
+            visibility: request.visibility,
+            error_category: request.error_category.map(BoundedCategory::new),
+            disposition: request.disposition,
+            generation_id: request.generation_id,
+            initial_kickoff: request.initial_kickoff,
+            kickoff_operation_id: request.kickoff_operation_id,
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
+    }
+}
+async fn retire_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<LaneRetireDto>,
+) -> impl IntoResponse {
+    match retire_lane_if_absent(
+        &state.tmux_registry,
+        &default_registry_state_path(&state.cron_state_path),
+        LaneRetirementMutation {
+            session: request.session,
+            generation_id: request.generation_id,
+            expected_revision: request.expected_revision,
+        },
+    )
+    .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => lane_error(error).into_response(),
     }
 }
 
@@ -1280,8 +2161,11 @@ mod tests {
     use crate::sink::SinkTarget;
     use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
+    use serial_test::serial;
+
     use std::fs;
     use tempfile::tempdir;
+
     use tokio::time::{Duration, timeout};
 
     fn native_hook_test_state() -> (AppState, mpsc::Receiver<IncomingEvent>) {
@@ -1296,9 +2180,137 @@ mod tests {
                 native_observability: new_shared_native_hook_observability(),
                 cron_state_path: PathBuf::from("cron-state.json"),
                 discord_watch_lock: Arc::new(Mutex::new(())),
+                subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+                git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             },
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn loopback_lane_peer_accepts_loopbacks_and_rejects_remote_or_missing_peer() {
+        for address in ["127.0.0.1:1", "[::1]:1", "[::ffff:127.0.0.1]:1"] {
+            let mut parts = axum::http::Request::new(()).into_parts().0;
+            parts
+                .extensions
+                .insert(ConnectInfo(address.parse::<SocketAddr>().unwrap()));
+            assert!(
+                LoopbackLanePeer::from_request_parts(&mut parts, &())
+                    .await
+                    .is_ok()
+            );
+        }
+        let mut remote = axum::http::Request::new(()).into_parts().0;
+        remote
+            .extensions
+            .insert(ConnectInfo("192.0.2.1:1".parse::<SocketAddr>().unwrap()));
+        assert!(
+            LoopbackLanePeer::from_request_parts(&mut remote, &())
+                .await
+                .is_err()
+        );
+        let mut missing = axum::http::Request::new(()).into_parts().0;
+        assert!(
+            LoopbackLanePeer::from_request_parts(&mut missing, &())
+                .await
+                .is_err()
+        );
+    }
+
+    fn subscription_control_parts(
+        peer: Option<&str>,
+        host: Option<&str>,
+        origin: Option<&str>,
+        control_header: Option<&str>,
+    ) -> axum::http::request::Parts {
+        let mut parts = axum::http::Request::new(()).into_parts().0;
+        if let Some(peer) = peer {
+            parts
+                .extensions
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        }
+        if let Some(host) = host {
+            parts
+                .headers
+                .insert(axum::http::header::HOST, host.parse().unwrap());
+        }
+        if let Some(origin) = origin {
+            parts
+                .headers
+                .insert(axum::http::header::ORIGIN, origin.parse().unwrap());
+        }
+        if let Some(value) = control_header {
+            parts
+                .headers
+                .insert(LOCAL_CONTROL_HEADER, value.parse().unwrap());
+        }
+        parts
+    }
+
+    #[tokio::test]
+    async fn subscription_control_requires_loopback_peer_header_host_and_origin() {
+        for (peer, host, origin, header) in [
+            (
+                Some("192.0.2.1:1"),
+                Some("127.0.0.1:25294"),
+                None,
+                Some("1"),
+            ),
+            (None, Some("127.0.0.1:25294"), None, Some("1")),
+            (Some("127.0.0.1:1"), Some("127.0.0.1:25294"), None, None),
+            (
+                Some("127.0.0.1:1"),
+                Some("example.invalid:25294"),
+                None,
+                Some("1"),
+            ),
+            (
+                Some("127.0.0.1:1"),
+                Some("127.0.0.1:25294"),
+                Some("https://example.invalid"),
+                Some("1"),
+            ),
+        ] {
+            let mut parts = subscription_control_parts(peer, host, origin, header);
+            let rejection = SubscriptionControlRequest::from_request_parts(&mut parts, &())
+                .await
+                .unwrap_err();
+            assert_eq!(rejection.0, StatusCode::FORBIDDEN);
+            assert_eq!(
+                (rejection.1).0["reason"],
+                Value::String(LOCAL_CONTROL_REJECTED.into())
+            );
+        }
+
+        let mut valid = subscription_control_parts(
+            Some("127.0.0.1:1"),
+            Some("127.0.0.1:25294"),
+            Some("http://127.0.0.1:3000"),
+            Some("1"),
+        );
+        assert!(
+            SubscriptionControlRequest::from_request_parts(&mut valid, &())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn bare_lane_registration_payload_matches_client_wire_schema() {
+        let input = LaneRegistrationInput {
+            registration: tmux_registration("lane"),
+            generation_id: "g".into(),
+            kickoff_operation_id: "k".into(),
+            launch_operation_id: "l".into(),
+            executor_id: "e".into(),
+            worker_effect_kind: crate::source::tmux::WorkerEffectKind::CommandSubmission,
+            thread_id: None,
+            expect_absent_or_retired: true,
+        };
+        let parsed: LaneRegistrationInput =
+            serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+        assert_eq!(parsed.generation_id, "g");
+        assert_eq!(parsed.registration.session, "lane");
     }
 
     fn app_state_with_config(config: AppConfig) -> (AppState, mpsc::Receiver<IncomingEvent>) {
@@ -1313,6 +2325,8 @@ mod tests {
                 native_observability: new_shared_native_hook_observability(),
                 cron_state_path: PathBuf::from("cron-state.json"),
                 discord_watch_lock: Arc::new(Mutex::new(())),
+                subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+                git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             },
             rx,
         )
@@ -1357,8 +2371,17 @@ mod tests {
                 pid: 4242,
                 name: Some("codex".into()),
             }),
+            registration_generation: 0,
             active_wrapper_monitor: true,
+            lane: None,
         }
+    }
+
+    fn ownerless_tmux_registration(session: &str) -> RegisteredTmuxSession {
+        let mut registration = tmux_registration(session);
+        registration.parent_process = None;
+        registration.active_wrapper_monitor = false;
+        registration
     }
 
     fn gajae_test_event() -> IncomingEvent {
@@ -1623,18 +2646,26 @@ mod tests {
             .insert(path[path.len() - 1].to_string(), Value::String(value));
     }
 
-    #[tokio::test]
-    async fn accepted_terminal_session_event_expires_matching_tmux_registration() {
+    #[cfg(unix)]
+    async fn assert_terminal_event_registry_presence(
+        tmux_bin: &std::path::Path,
+        expected_present: bool,
+    ) {
         let (tx, mut rx) = mpsc::channel(1);
         let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
         registry
             .write()
             .await
-            .insert("issue-221".into(), tmux_registration("issue-221"));
+            .insert("issue-221".into(), ownerless_tmux_registration("issue-221"));
         registry
             .write()
             .await
             .insert("still-active".into(), tmux_registration("still-active"));
+        let dir = tempdir().expect("tempdir");
+        let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
+        unsafe {
+            std::env::set_var("CLAWHIP_TMUX_BIN", tmux_bin);
+        }
         let state = AppState {
             config: Arc::new(AppConfig::default()),
             port: 25294,
@@ -1642,8 +2673,10 @@ mod tests {
             tmux_registry: registry.clone(),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
-            cron_state_path: PathBuf::from("cron-state.json"),
+            cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -1669,9 +2702,78 @@ mod tests {
             rx.recv().await.expect("queued event").kind,
             "session.finished"
         );
-        let registry = registry.read().await;
-        assert!(!registry.contains_key("issue-221"));
-        assert!(registry.contains_key("still-active"));
+        {
+            let registry = registry.read().await;
+            assert_eq!(registry.contains_key("issue-221"), expected_present);
+            assert!(registry.contains_key("still-active"));
+        }
+        unsafe {
+            match prior_tmux_bin {
+                Some(value) => std::env::set_var("CLAWHIP_TMUX_BIN", value),
+                None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn accepted_terminal_session_event_expires_matching_tmux_registration() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-expiry-stub.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then echo \"can't find session: issue-221\" >&2; exit 1; fi\nexit 1\n",
+
+        )
+        .expect("write tmux expiry stub");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux expiry stub");
+        assert_terminal_event_registry_presence(&stub, false).await;
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn accepted_terminal_session_event_preserves_live_tmux_registration() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-live-stub.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then exit 0; fi\nexit 0\n",
+        )
+        .expect("write tmux live stub");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux live stub");
+        assert_terminal_event_registry_presence(&stub, true).await;
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn accepted_terminal_session_event_preserves_registration_on_probe_error() {
+        let dir = tempdir().expect("tempdir");
+        let missing_tmux = dir.path().join("missing-tmux");
+        assert_terminal_event_registry_presence(&missing_tmux, true).await;
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn accepted_terminal_session_event_preserves_registration_on_unknown_probe_status() {
+        let dir = tempdir().expect("tempdir");
+        let stub = dir.path().join("tmux-unknown-stub.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"has-session\" ]; then echo \"tmux server unavailable\" >&2; exit 1; fi\nexit 1\n",
+        )
+        .expect("write tmux unknown stub");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux unknown stub");
+        assert_terminal_event_registry_presence(&stub, true).await;
     }
 
     #[tokio::test]
@@ -1691,6 +2793,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -1731,6 +2835,12 @@ mod tests {
             25294,
             3,
             snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
+            &[],
+            GitMonitorLifecycleCounts {
+                active: 1,
+                ..GitMonitorLifecycleCounts::default()
+            },
         );
 
         assert_eq!(payload["ok"], Value::Bool(true));
@@ -1738,11 +2848,288 @@ mod tests {
         assert_eq!(payload["token_source"], Value::String("config".to_string()));
         assert_eq!(payload["port"], Value::from(25294));
         assert_eq!(payload["configured_git_monitors"], Value::from(1));
+        assert_eq!(payload["git_monitors"]["active"], Value::from(1));
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
+        assert_eq!(payload["tmux"]["configured_monitor_count"], Value::from(1));
+        assert_eq!(
+            payload["tmux"]["registry_registration_count"],
+            Value::from(3)
+        );
         assert!(payload["native_hooks"]["totals"]["received"].is_number());
         assert_eq!(payload["token_precedence_warning"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn subscription_errors_are_safe_and_health_degrades_only_for_enabled_exhaustion() {
+        let response = subscription_error(StatusCode::NOT_FOUND, "unknown_subscription");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"ok": false, "reason": "unknown_subscription"})
+        );
+
+        let mut config = AppConfig::default();
+        config.providers.discord.bot_token = Some("secret-token".into());
+        let snapshot = SubscriptionSnapshot {
+            schema: "clawhip.subscription.v1",
+            name: "workflow-gate".into(),
+            enabled: true,
+            state: SubscriptionState::Exhausted,
+            desired_running: true,
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            last_connected_at: None,
+            last_event_enqueued_at: None,
+            last_state_transition_at: "2026-01-01T00:00:00Z".into(),
+            connection_attempts_total: 1,
+            connection_failures_total: 1,
+            reconnects_total: 0,
+            frames_received_total: 0,
+            frames_rejected_total: 0,
+            frames_matched_total: 0,
+            adapters_started_total: 0,
+            adapters_rejected_total: 0,
+            events_enqueued_total: 0,
+            last_reason_code: "retry_exhausted",
+        };
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            json!({}),
+            json!({}),
+            &[snapshot],
+            GitMonitorLifecycleCounts::default(),
+        );
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(payload["subscriptions"]["degraded"], Value::Bool(true));
+        assert!(!payload.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn health_payload_reports_each_git_monitor_lifecycle_independently() {
+        let cases = [
+            (
+                GitMonitorLifecycleCounts {
+                    active: 2,
+                    ..GitMonitorLifecycleCounts::default()
+                },
+                true,
+            ),
+            (
+                GitMonitorLifecycleCounts {
+                    degraded: 1,
+                    ..GitMonitorLifecycleCounts::default()
+                },
+                false,
+            ),
+            (
+                GitMonitorLifecycleCounts {
+                    quarantined: 3,
+                    ..GitMonitorLifecycleCounts::default()
+                },
+                false,
+            ),
+            (
+                GitMonitorLifecycleCounts {
+                    retired: 4,
+                    ..GitMonitorLifecycleCounts::default()
+                },
+                true,
+            ),
+        ];
+
+        for (counts, expected_ok) in cases {
+            let payload = health_payload(
+                &AppConfig::default(),
+                25294,
+                0,
+                json!({}),
+                json!({}),
+                &[],
+                counts,
+            );
+
+            assert_eq!(payload["ok"], Value::Bool(expected_ok));
+            assert_eq!(payload["git_monitors"]["active"], counts.active);
+            assert_eq!(payload["git_monitors"]["degraded"], counts.degraded);
+            assert_eq!(payload["git_monitors"]["quarantined"], counts.quarantined);
+            assert_eq!(payload["git_monitors"]["retired"], counts.retired);
+        }
+    }
+
+    fn subscription_test_config() -> crate::config::SubscriptionConfig {
+        crate::config::SubscriptionConfig {
+            name: "workflow-gate".into(),
+            enabled: true,
+            setup_owned: false,
+            kind: "websocket".into(),
+            endpoint_env: "!".into(),
+            max_frame_bytes: 65_536,
+            max_json_depth: 16,
+            filter: crate::config::SubscriptionFilterConfig {
+                discriminator_pointer: "/type".into(),
+                discriminator_equals: "workflow_gate".into(),
+                predicates: vec![],
+            },
+            projection: [("workflow_id".into(), "/workflow/id".into())]
+                .into_iter()
+                .collect(),
+            adapter: crate::config::SubscriptionAdapterConfig {
+                program: "/bin/true".into(),
+                args: vec![],
+                timeout_ms: 5_000,
+                max_stdin_bytes: 16_384,
+                max_stdout_bytes: 16_384,
+                max_stderr_bytes: 4_096,
+            },
+            reconnect: crate::config::SubscriptionReconnectConfig::default(),
+            routing: crate::config::SubscriptionRoutingConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_handlers_use_the_real_registry_and_keep_responses_redacted() {
+        let (state, _rx) = native_hook_test_state();
+        let enabled = Arc::new(subscription_test_config());
+        let enabled_snapshot = Arc::new(Mutex::new(SubscriptionSnapshot::new(&enabled)));
+        let (enabled_cancel, _) = watch::channel(false);
+        let mut disabled_config = subscription_test_config();
+        disabled_config.name = "disabled-gate".into();
+        disabled_config.enabled = false;
+        let disabled = Arc::new(disabled_config);
+        let disabled_snapshot = Arc::new(Mutex::new(SubscriptionSnapshot::new(&disabled)));
+        let (disabled_cancel, _) = watch::channel(false);
+        let registry = state.subscription_registry();
+        let mut entries = registry.write().await;
+        entries.insert(
+            enabled.name.clone(),
+            SubscriptionEntry {
+                config: enabled,
+                snapshot: enabled_snapshot,
+                cancel: enabled_cancel,
+                worker: None,
+            },
+        );
+        entries.insert(
+            disabled.name.clone(),
+            SubscriptionEntry {
+                config: disabled,
+                snapshot: disabled_snapshot,
+                cancel: disabled_cancel,
+                worker: None,
+            },
+        );
+        drop(entries);
+
+        let list = list_subscriptions(LoopbackLanePeer, State(state.clone())).await;
+        let list_body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+        let list_json: Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(list_json["subscriptions"].as_array().unwrap().len(), 2);
+        assert!(!list_json.to_string().contains("endpoint_env"));
+        assert!(!list_json.to_string().contains("/bin/true"));
+
+        let detail = subscription_detail(
+            LoopbackLanePeer,
+            State(state.clone()),
+            axum::extract::Path("workflow-gate".into()),
+        )
+        .await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let unknown = subscription_detail(
+            LoopbackLanePeer,
+            State(state.clone()),
+            axum::extract::Path("missing".into()),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let disabled_start = start_subscription(
+            SubscriptionControlRequest,
+            LoopbackLanePeer,
+            State(state.clone()),
+            axum::extract::Path("disabled-gate".into()),
+        )
+        .await;
+        assert_eq!(disabled_start.status(), StatusCode::CONFLICT);
+        let unknown_stop = stop_subscription(
+            SubscriptionControlRequest,
+            LoopbackLanePeer,
+            State(state),
+            axum::extract::Path("missing".into()),
+        )
+        .await;
+        assert_eq!(unknown_stop.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn subscription_worker_preserves_exhaustion_and_degrades_health() {
+        let config = Arc::new(subscription_test_config());
+        let snapshot = Arc::new(Mutex::new(SubscriptionSnapshot::new(&config)));
+        let (_cancel, receiver) = watch::channel(false);
+        let (tx, _rx) = mpsc::channel(1);
+
+        spawn_subscription_worker(config.clone(), snapshot.clone(), receiver, tx)
+            .await
+            .expect("worker joins");
+
+        let status = snapshot.lock().await.clone();
+        assert_eq!(status.state, SubscriptionState::Exhausted);
+        assert_eq!(status.last_reason_code, "endpoint_unavailable");
+        assert!(status.desired_running);
+        let payload = health_payload(
+            &AppConfig::default(),
+            25294,
+            0,
+            json!({}),
+            json!({}),
+            &[status],
+            GitMonitorLifecycleCounts::default(),
+        );
+        assert_eq!(payload["ok"], Value::Bool(false));
+        assert_eq!(payload["subscriptions"]["degraded"], Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn stopping_an_already_finished_subscription_worker_is_stable() {
+        let config = Arc::new(subscription_test_config());
+        let snapshot = Arc::new(Mutex::new(SubscriptionSnapshot::new(&config)));
+        let (cancel, _receiver) = watch::channel(false);
+        snapshot
+            .lock()
+            .await
+            .transition(SubscriptionState::Exhausted, "retry_exhausted");
+        let worker = tokio::spawn(async {});
+        tokio::task::yield_now().await;
+        assert!(worker.is_finished());
+        let registry: SharedSubscriptionRegistry = Arc::new(RwLock::new(BTreeMap::new()));
+        registry.write().await.insert(
+            config.name.clone(),
+            SubscriptionEntry {
+                config,
+                snapshot: snapshot.clone(),
+                cancel,
+                worker: Some(worker),
+            },
+        );
+
+        assert_eq!(
+            stop_subscription_entry(&registry, "workflow-gate")
+                .await
+                .expect("stop succeeds"),
+            "stopped"
+        );
+        let status = snapshot.lock().await.clone();
+        assert_eq!(status.state, SubscriptionState::Stopped);
+        assert!(!status.desired_running);
+        assert_eq!(status.last_reason_code, "stopped");
+        assert_eq!(
+            stop_subscription_entry(&registry, "workflow-gate")
+                .await
+                .expect("second stop succeeds"),
+            "already_stopped"
+        );
     }
 
     #[test]
@@ -1843,6 +3230,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -1882,6 +3271,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -1914,6 +3305,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let event = IncomingEvent::agent_started(
             "worker-1".into(),
@@ -1958,6 +3351,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -2013,6 +3408,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -2073,6 +3470,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = accept_event(
@@ -2131,6 +3530,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let event = |id: &str| IncomingEvent {
@@ -2187,6 +3588,8 @@ mod tests {
             native_observability: observability.clone(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -2215,6 +3618,8 @@ mod tests {
             native_observability: observability.clone(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let payload = json!({"provider": "codex", "event_name": "Bogus"});
 
@@ -2242,6 +3647,8 @@ mod tests {
             native_observability: observability.clone(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -2283,6 +3690,8 @@ mod tests {
             native_observability: observability.clone(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -2323,6 +3732,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let payload = json!({
             "provider": "codex",
@@ -2392,6 +3803,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let payload = json!({
             "provider": "claude-code",
@@ -2558,6 +3971,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -2581,8 +3996,33 @@ mod tests {
         assert!(rx.try_recv().is_err(), "non-git payload should not enqueue");
     }
 
+    #[serial]
     #[tokio::test]
     async fn list_tmux_returns_registered_sessions_with_metadata() {
+        // Use a stub tmux binary that reports issue-105 as a live session so
+        // the registration is not pruned by the orphaned-dynamic-cleanup path.
+        let stub = std::env::temp_dir().join(format!(
+            "clawhip-test-tmux-stub-list-{}",
+            std::process::id()
+        ));
+        tokio::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"list-sessions\" ]; then echo 'issue-105'; exit 0; fi\nif [ \"$1\" = \"has-session\" ]; then exit 0; fi\nexit 0\n",
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+        }
+        // Safety: set_var/remove_var are safe in single-threaded test context.
+        let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
+        unsafe {
+            std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
+        }
         let (tx, _rx) = mpsc::channel(1);
         let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
         registry.write().await.insert(
@@ -2602,18 +4042,27 @@ mod tests {
                     pid: 4242,
                     name: Some("codex".into()),
                 }),
-                active_wrapper_monitor: true,
+                registration_generation: 0,
+                active_wrapper_monitor: false,
+                lane: None,
             },
         );
+        registry.write().await.insert(
+            "stale-wrapper".into(),
+            ownerless_tmux_registration("stale-wrapper"),
+        );
+
         let state = AppState {
             config: Arc::new(AppConfig::default()),
             port: 25294,
             tx,
-            tmux_registry: registry,
+            tmux_registry: registry.clone(),
             pending_update: update::new_shared_pending_update(),
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = list_tmux(State(state)).await.into_response();
@@ -2637,6 +4086,15 @@ mod tests {
             registrations[0]["parent_process"]["name"],
             Value::from("codex")
         );
+        assert!(!registry.read().await.contains_key("stale-wrapper"));
+        // Safety: single-threaded test context; restore prior env state.
+        unsafe {
+            match &prior_tmux_bin {
+                Some(v) => std::env::set_var("CLAWHIP_TMUX_BIN", v),
+                None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+            }
+        }
+        let _ = tokio::fs::remove_file(&stub).await;
     }
 
     #[tokio::test]
@@ -2651,6 +4109,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -2682,6 +4142,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -2706,6 +4168,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = approve_update(State(state)).await.into_response();
@@ -2742,6 +4206,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = dismiss_update(State(state)).await.into_response();
@@ -2766,6 +4232,8 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+            git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
         };
 
         let response = dismiss_update(State(state)).await.into_response();

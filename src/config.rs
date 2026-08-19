@@ -1,11 +1,19 @@
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
-use std::io::{self, Write};
+#[cfg(unix)]
+use std::ffi::CString;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use time::{Date, Duration as TimeDuration, OffsetDateTime, PrimitiveDateTime, format_description};
 
 use crate::Result;
 use crate::events::MessageFormat;
@@ -35,6 +43,231 @@ pub struct AppConfig {
     pub update: crate::update::UpdateConfig,
     #[serde(default, skip_serializing_if = "GajaeConfig::is_empty")]
     pub gajae: GajaeConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<SubscriptionConfig>,
+    #[serde(default, skip_serializing_if = "LedgerConfig::is_empty")]
+    pub ledger: LedgerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionConfig {
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub setup_owned: bool,
+    pub kind: String,
+    pub endpoint_env: String,
+    #[serde(default = "default_subscription_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+    #[serde(default = "default_subscription_max_json_depth")]
+    pub max_json_depth: usize,
+    pub filter: SubscriptionFilterConfig,
+    pub projection: BTreeMap<String, String>,
+    pub adapter: SubscriptionAdapterConfig,
+    #[serde(default)]
+    pub reconnect: SubscriptionReconnectConfig,
+    #[serde(default)]
+    pub routing: SubscriptionRoutingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionFilterConfig {
+    pub discriminator_pointer: String,
+    pub discriminator_equals: String,
+    #[serde(default)]
+    pub predicates: Vec<SubscriptionPredicateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionPredicateConfig {
+    pub pointer: String,
+    pub equals: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionAdapterConfig {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_subscription_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_subscription_stdin_bytes")]
+    pub max_stdin_bytes: usize,
+    #[serde(default = "default_subscription_stdout_bytes")]
+    pub max_stdout_bytes: usize,
+    #[serde(default = "default_subscription_stderr_bytes")]
+    pub max_stderr_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionReconnectConfig {
+    #[serde(default = "default_subscription_initial_delay_ms")]
+    pub initial_delay_ms: u64,
+    #[serde(default = "default_subscription_max_delay_ms")]
+    pub max_delay_ms: u64,
+    #[serde(default = "default_subscription_max_attempts")]
+    pub max_attempts: u64,
+}
+impl Default for SubscriptionReconnectConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_ms: default_subscription_initial_delay_ms(),
+            max_delay_ms: default_subscription_max_delay_ms(),
+            max_attempts: default_subscription_max_attempts(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionRoutingConfig {
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub repo_name: Option<String>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+pub const GJC_QUESTION_SUBSCRIPTION_NAME: &str = "gjc-question";
+pub const GJC_QUESTION_ENDPOINT_ENV: &str = "GJC_QUESTION_WS";
+
+fn default_subscription_max_frame_bytes() -> usize {
+    65_536
+}
+fn default_subscription_max_json_depth() -> usize {
+    16
+}
+fn default_subscription_timeout_ms() -> u64 {
+    5_000
+}
+fn default_subscription_stdin_bytes() -> usize {
+    16_384
+}
+fn default_subscription_stdout_bytes() -> usize {
+    16_384
+}
+fn default_subscription_stderr_bytes() -> usize {
+    4_096
+}
+fn default_subscription_initial_delay_ms() -> u64 {
+    250
+}
+fn default_subscription_max_delay_ms() -> u64 {
+    5_000
+}
+fn default_subscription_max_attempts() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default = "default_ledger_raw_retention_days")]
+    pub raw_retention_days: u64,
+    #[serde(default = "default_ledger_summary_retention_days")]
+    pub summary_retention_days: u64,
+    #[serde(default = "default_ledger_compaction_interval_secs")]
+    pub compaction_interval_secs: u64,
+    #[serde(default = "default_ledger_max_records")]
+    pub max_records: usize,
+    #[serde(default = "default_ledger_max_record_bytes")]
+    pub max_record_bytes: usize,
+    #[serde(default = "default_ledger_max_keywords")]
+    pub max_keywords: usize,
+    #[serde(default = "default_ledger_max_keyword_bytes")]
+    pub max_keyword_bytes: usize,
+    #[serde(default = "default_ledger_max_query_results")]
+    pub max_query_results: usize,
+    #[serde(default = "default_ledger_max_records_per_compaction")]
+    pub max_records_per_compaction: usize,
+}
+
+impl Default for LedgerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            raw_retention_days: default_ledger_raw_retention_days(),
+            summary_retention_days: default_ledger_summary_retention_days(),
+            compaction_interval_secs: default_ledger_compaction_interval_secs(),
+            max_records: default_ledger_max_records(),
+            max_record_bytes: default_ledger_max_record_bytes(),
+            max_keywords: default_ledger_max_keywords(),
+            max_keyword_bytes: default_ledger_max_keyword_bytes(),
+            max_query_results: default_ledger_max_query_results(),
+            max_records_per_compaction: default_ledger_max_records_per_compaction(),
+        }
+    }
+}
+
+impl LedgerConfig {
+    fn is_empty(&self) -> bool {
+        !self.enabled && self.path.is_none() && self == &Self::default()
+    }
+}
+
+impl PartialEq for LedgerConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.path == other.path
+            && self.raw_retention_days == other.raw_retention_days
+            && self.summary_retention_days == other.summary_retention_days
+            && self.compaction_interval_secs == other.compaction_interval_secs
+            && self.max_records == other.max_records
+            && self.max_record_bytes == other.max_record_bytes
+            && self.max_keywords == other.max_keywords
+            && self.max_keyword_bytes == other.max_keyword_bytes
+            && self.max_query_results == other.max_query_results
+            && self.max_records_per_compaction == other.max_records_per_compaction
+    }
+}
+impl Eq for LedgerConfig {}
+
+fn default_ledger_raw_retention_days() -> u64 {
+    7
+}
+fn default_ledger_summary_retention_days() -> u64 {
+    90
+}
+fn default_ledger_compaction_interval_secs() -> u64 {
+    3_600
+}
+fn default_ledger_max_records() -> usize {
+    100_000
+}
+fn default_ledger_max_record_bytes() -> usize {
+    8 * 1024
+}
+fn default_ledger_max_keywords() -> usize {
+    16
+}
+fn default_ledger_max_keyword_bytes() -> usize {
+    48
+}
+fn default_ledger_max_query_results() -> usize {
+    200
+}
+fn default_ledger_max_records_per_compaction() -> usize {
+    5_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +530,10 @@ pub struct MonitorConfig {
     pub tmux: TmuxMonitorConfig,
     #[serde(default)]
     pub workspace: Vec<WorkspaceMonitor>,
+    /// Public GitHub Statuspage monitor for platform components (default: Actions).
+    /// Independent from websocket `[[subscriptions]]` and per-repo GitHub API monitors.
+    #[serde(default, skip_serializing_if = "GitHubStatusMonitorConfig::is_default")]
+    pub github_status: GitHubStatusMonitorConfig,
 }
 
 impl Default for MonitorConfig {
@@ -308,6 +545,7 @@ impl Default for MonitorConfig {
             git: GitMonitorConfig::default(),
             tmux: TmuxMonitorConfig::default(),
             workspace: Vec::new(),
+            github_status: GitHubStatusMonitorConfig::default(),
         }
     }
 }
@@ -343,6 +581,11 @@ pub struct GitRepoMonitor {
     /// Human-readable channel name hint for binding verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_name: Option<String>,
+    /// Marks git monitors created and owned by `clawhip setup --bind`.
+    /// Manual monitors default to false so binding drift audits do not infer
+    /// ownership from repo/channel metadata alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub setup_owned: bool,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
 }
@@ -360,6 +603,7 @@ impl Default for GitRepoMonitor {
             emit_pr_status: false,
             channel: None,
             channel_name: None,
+            setup_owned: false,
             mention: None,
             format: None,
         }
@@ -428,6 +672,59 @@ impl Default for WorkspaceMonitor {
             poll_interval_secs: None,
             debounce_ms: default_workspace_debounce_ms(),
         }
+    }
+}
+
+/// Monitor GitHub platform component/incident status via the public Statuspage API.
+///
+/// Uses machine-readable endpoints under `api_base` (default
+/// `https://www.githubstatus.com/api/v2`). No authentication is required or stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubStatusMonitorConfig {
+    /// When false (default), the monitor does not run.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Public Statuspage API base. Override only for tests or mirrors.
+    #[serde(default = "default_github_status_api_base")]
+    pub api_base: String,
+    /// Component names to watch (Statuspage `components[].name`). Default: `["Actions"]`.
+    #[serde(default = "default_github_status_components")]
+    pub components: Vec<String>,
+    /// Poll interval for the status monitor (independent of git/tmux poll interval).
+    #[serde(default = "default_github_status_poll_interval")]
+    pub poll_interval_secs: u64,
+    pub channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_name: Option<String>,
+    pub mention: Option<String>,
+    pub format: Option<MessageFormat>,
+}
+
+impl Default for GitHubStatusMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_base: default_github_status_api_base(),
+            components: default_github_status_components(),
+            poll_interval_secs: default_github_status_poll_interval(),
+            channel: None,
+            channel_name: None,
+            mention: None,
+            format: None,
+        }
+    }
+}
+
+impl GitHubStatusMonitorConfig {
+    fn is_default(&self) -> bool {
+        !self.enabled
+            && self.api_base == default_github_status_api_base()
+            && self.components == default_github_status_components()
+            && self.poll_interval_secs == default_github_status_poll_interval()
+            && self.channel.is_none()
+            && self.channel_name.is_none()
+            && self.mention.is_none()
+            && self.format.is_none()
     }
 }
 
@@ -604,6 +901,15 @@ fn default_poll_interval() -> u64 {
 }
 fn default_github_api_base() -> String {
     "https://api.github.com".to_string()
+}
+fn default_github_status_api_base() -> String {
+    "https://www.githubstatus.com/api/v2".to_string()
+}
+fn default_github_status_components() -> Vec<String> {
+    vec!["Actions".to_string()]
+}
+fn default_github_status_poll_interval() -> u64 {
+    60
 }
 fn default_remote() -> String {
     "origin".to_string()
@@ -797,12 +1103,210 @@ impl AppConfig {
         Ok(toml::to_string_pretty(self)?)
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    #[allow(dead_code)] // Retained for callers that do not need cleanup observation.
+    pub fn save_with_backup(&self, path: &Path) -> Result<()> {
+        self.save_with_backup_reporting(path).map(|_| ())
+    }
+
+    pub fn save_with_backup_reporting(&self, path: &Path) -> Result<CleanupSummary> {
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        self.save_with_backup_at(path, OffsetDateTime::now_utc(), &mut before_delete)
+    }
+
+    fn save_with_backup_at<F>(
+        &self,
+        path: &Path,
+        now: OffsetDateTime,
+        before_delete: &mut F,
+    ) -> Result<CleanupSummary>
+    where
+        F: FnMut(&BackupCandidate) -> Result<()>,
+    {
+        let mut before_rename = || Ok(());
+        let mut before_snapshot = || Ok(());
+        self.save_with_backup_at_hooks(
+            path,
+            now,
+            &mut before_rename,
+            &mut before_snapshot,
+            before_delete,
+        )
+    }
+
+    fn save_with_backup_at_hooks<F, G, H>(
+        &self,
+        path: &Path,
+        now: OffsetDateTime,
+        before_rename: &mut G,
+        before_snapshot: &mut H,
+        before_delete: &mut F,
+    ) -> Result<CleanupSummary>
+    where
+        F: FnMut(&BackupCandidate) -> Result<()>,
+        G: FnMut() -> Result<()>,
+        H: FnMut() -> Result<()>,
+    {
+        let mut after_preflight = |_: &BackupCandidate| Ok(());
+        self.save_with_backup_at_candidate_hooks(
+            path,
+            now,
+            before_rename,
+            before_snapshot,
+            before_delete,
+            &mut after_preflight,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_with_backup_at_candidate_hooks<F, G, H, P>(
+        &self,
+        path: &Path,
+        now: OffsetDateTime,
+        before_rename: &mut G,
+        before_snapshot: &mut H,
+        before_delete: &mut F,
+        after_preflight: &mut P,
+    ) -> Result<CleanupSummary>
+    where
+        F: FnMut(&BackupCandidate) -> Result<()>,
+        G: FnMut() -> Result<()>,
+        H: FnMut() -> Result<()>,
+        P: FnMut(&BackupCandidate) -> Result<()>,
+    {
+        let mut after_check = |_: &BackupCandidate| Ok(());
+        self.save_with_backup_at_all_candidate_hooks(
+            path,
+            now,
+            before_rename,
+            before_snapshot,
+            before_delete,
+            after_preflight,
+            &mut after_check,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_with_backup_at_all_candidate_hooks<F, G, H, P, A>(
+        &self,
+        path: &Path,
+        now: OffsetDateTime,
+        before_rename: &mut G,
+        before_snapshot: &mut H,
+        before_delete: &mut F,
+        after_preflight: &mut P,
+        after_check: &mut A,
+    ) -> Result<CleanupSummary>
+    where
+        F: FnMut(&BackupCandidate) -> Result<()>,
+        G: FnMut() -> Result<()>,
+        H: FnMut() -> Result<()>,
+        P: FnMut(&BackupCandidate) -> Result<()>,
+        A: FnMut(&BackupCandidate) -> Result<()>,
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "config path must have a UTF-8 filename".to_string())?;
+        let parent_dir = validate_config_parent_dir(parent, true)?;
+        revalidate_config_parent_dir(&parent_dir)?;
+        let serialized = self.to_pretty_toml()?;
+        let new_bytes = serialized.as_bytes();
+        let active = read_active_config_no_follow(path)?;
+
+        if active.bytes() == Some(new_bytes) {
+            revalidate_config_parent_dir(&parent_dir).map_err(|error| {
+                io::Error::other(format!(
+                    "config was already current; backup retention cleanup remains incomplete: {error}"
+                ))
+            })?;
+            let managed_dir =
+                validate_managed_backup_dir(&parent_dir.path, false).map_err(|error| {
+                    io::Error::other(format!(
+                        "config was already current; backup retention cleanup remains incomplete: {error}"
+                    ))
+                })?;
+            let protected_identities = active.identity().into_iter().collect::<Vec<_>>();
+            return cleanup_config_backups_with_hooks(
+                &parent_dir.path,
+                parent_dir.identity,
+                filename,
+                managed_dir.as_ref(),
+                &protected_identities,
+                now,
+                before_delete,
+                after_preflight,
+                after_check,
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "config was already current; backup retention cleanup remains incomplete: {error}"
+                ))
+            })
+            .map_err(Into::into);
         }
-        fs::write(path, self.to_pretty_toml()?)?;
-        Ok(())
+
+        revalidate_config_parent_dir(&parent_dir)?;
+        let managed_dir = validate_managed_backup_dir(&parent_dir.path, active.bytes().is_some())?;
+        if let Some(old_bytes) = active.bytes() {
+            let managed_dir = managed_dir
+                .as_ref()
+                .ok_or_else(|| "managed config backup directory was not created".to_string())?;
+            create_managed_snapshot_create_new(
+                managed_dir,
+                filename,
+                old_bytes,
+                now,
+                before_snapshot,
+            )?;
+        }
+
+        revalidate_config_parent_dir(&parent_dir)?;
+        commit_config_bytes_via_temp(
+            &parent_dir,
+            path,
+            filename,
+            new_bytes,
+            &active,
+            before_rename,
+        )?;
+
+        revalidate_config_parent_dir(&parent_dir).map_err(|error| {
+            io::Error::other(format!(
+                "config was saved; backup retention cleanup remains incomplete: {error}"
+            ))
+        })?;
+        let current_identity = current_active_config_identity(path).map_err(|error| {
+            io::Error::other(format!(
+                "config was saved; backup retention cleanup remains incomplete: {error}"
+            ))
+        })?;
+        let mut protected_identities = active.identity().into_iter().collect::<Vec<_>>();
+        if let Some(current_identity) = current_identity
+            && !protected_identities.contains(&current_identity)
+        {
+            protected_identities.push(current_identity);
+        }
+        cleanup_config_backups_with_hooks(
+            &parent_dir.path,
+            parent_dir.identity,
+            filename,
+            managed_dir.as_ref(),
+            &protected_identities,
+            now,
+            before_delete,
+            after_preflight,
+            after_check,
+        )
+        .map_err(|error| {
+            io::Error::other(format!(
+                "config was saved; backup retention cleanup remains incomplete: {error}"
+            ))
+        })
+        .map_err(Into::into)
     }
 
     pub fn effective_token(&self) -> Option<String> {
@@ -905,6 +1409,13 @@ impl AppConfig {
                     .as_ref()
                     .is_some_and(|channel| !channel.trim().is_empty())
             })
+            || (self.monitors.github_status.enabled
+                && self
+                    .monitors
+                    .github_status
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty()))
     }
 
     fn default_channel_can_fallback_to_discord(&self) -> bool {
@@ -918,9 +1429,89 @@ impl AppConfig {
                 .any(|route| route.event.trim() == "*" && route.filter.is_empty())
     }
 
+    fn validate_subscription_config(subscription: &SubscriptionConfig) -> Result<()> {
+        let name = &subscription.name;
+        let valid_name = !name.is_empty()
+            && name == name.trim()
+            && name.len() <= 63
+            && name.as_bytes()[0].is_ascii_lowercase()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if !valid_name || subscription.kind != "websocket" {
+            return Err("invalid_subscription_config".into());
+        }
+        let endpoint = &subscription.endpoint_env;
+        if endpoint.is_empty()
+            || endpoint.len() > 128
+            || (!endpoint.as_bytes()[0].is_ascii_uppercase() && endpoint.as_bytes()[0] != b'_')
+            || !endpoint
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err("invalid_subscription_config".into());
+        }
+        if !(1024..=1_048_576).contains(&subscription.max_frame_bytes)
+            || !(1..=16).contains(&subscription.max_json_depth)
+            || subscription.filter.discriminator_equals.is_empty()
+            || subscription.filter.discriminator_equals.len() > 128
+            || subscription.filter.predicates.len() > 8
+            || !(1..=16).contains(&subscription.projection.len())
+        {
+            return Err("invalid_subscription_config".into());
+        }
+        if !subscription.adapter.program.starts_with('/')
+            || subscription.adapter.program.len() > 4096
+            || subscription.adapter.args.len() > 16
+            || subscription.adapter.args.iter().any(|arg| arg.len() > 256)
+            || !(100..=30_000).contains(&subscription.adapter.timeout_ms)
+            || !(1..=65_536).contains(&subscription.adapter.max_stdin_bytes)
+            || !(1..=65_536).contains(&subscription.adapter.max_stdout_bytes)
+            || !(1..=16_384).contains(&subscription.adapter.max_stderr_bytes)
+            || !(1..=10).contains(&subscription.reconnect.max_attempts)
+            || !(10..=5_000).contains(&subscription.reconnect.initial_delay_ms)
+            || subscription.reconnect.max_delay_ms < subscription.reconnect.initial_delay_ms
+            || subscription.reconnect.max_delay_ms > 30_000
+        {
+            return Err("invalid_subscription_config".into());
+        }
+        if subscription.enabled
+            && !crate::source::subscription::is_regular_executable(&subscription.adapter.program)
+        {
+            return Err("invalid_subscription_config".into());
+        }
+        crate::source::subscription::validate_projection_policy(subscription)?;
+        crate::source::subscription::validate_filter_policy(subscription)?;
+
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.dispatch.ci_batch_window_secs == 0 {
             return Err("dispatch.ci_batch_window_secs must be at least 1".into());
+        }
+        if !(1..=3650).contains(&self.ledger.raw_retention_days)
+            || !(1..=3650).contains(&self.ledger.summary_retention_days)
+            || self.ledger.summary_retention_days < self.ledger.raw_retention_days
+            || !(1..=86_400).contains(&self.ledger.compaction_interval_secs)
+            || !(1..=10_000_000).contains(&self.ledger.max_records)
+            || !(512..=1_048_576).contains(&self.ledger.max_record_bytes)
+            || !(1..=64).contains(&self.ledger.max_keywords)
+            || !(8..=256).contains(&self.ledger.max_keyword_bytes)
+            || !(1..=10_000).contains(&self.ledger.max_query_results)
+            || !(1..=100_000).contains(&self.ledger.max_records_per_compaction)
+        {
+            return Err("invalid_ledger_config".into());
+        }
+        if self.subscriptions.len() > 32 {
+            return Err("invalid_subscription_config".into());
+        }
+        let mut subscription_names = std::collections::BTreeSet::new();
+        for subscription in &self.subscriptions {
+            Self::validate_subscription_config(subscription)?;
+            if !subscription_names.insert(subscription.name.trim().to_ascii_lowercase()) {
+                return Err("invalid_subscription_config".into());
+            }
         }
         if self.cron.poll_interval_secs == 0 {
             return Err("cron.poll_interval_secs must be at least 1".into());
@@ -1084,6 +1675,26 @@ impl AppConfig {
                 .into());
             }
         }
+        if self.monitors.github_status.enabled {
+            if self.monitors.github_status.poll_interval_secs == 0 {
+                return Err("monitors.github_status.poll_interval_secs must be at least 1".into());
+            }
+            if self.monitors.github_status.api_base.trim().is_empty() {
+                return Err("monitors.github_status.api_base must not be empty".into());
+            }
+            if self
+                .monitors
+                .github_status
+                .components
+                .iter()
+                .all(|name| name.trim().is_empty())
+            {
+                return Err(
+                    "monitors.github_status.components must list at least one component name"
+                        .into(),
+                );
+            }
+        }
 
         let mut cron_ids = std::collections::BTreeSet::new();
         for (index, job) in self.cron.jobs.iter().enumerate() {
@@ -1155,6 +1766,131 @@ impl AppConfig {
 
         Ok(())
     }
+    pub fn apply_gjc_question_setup(
+        &mut self,
+        channel: Option<String>,
+        mention: Option<String>,
+        fallback: bool,
+        repo: String,
+        adapter_program: String,
+    ) -> Result<()> {
+        let channel = normalize_text(channel).or_else(|| {
+            fallback
+                .then(|| normalize_text(self.defaults.channel.clone()))
+                .flatten()
+        });
+        let channel = channel.ok_or_else(|| {
+            "question setup requires --question-channel or --question-fallback with [defaults].channel"
+                .to_string()
+        })?;
+        let repo = normalize_text(Some(repo))
+            .ok_or_else(|| "question setup requires a non-empty repository identity".to_string())?;
+        let adapter_program = normalize_text(Some(adapter_program))
+            .ok_or_else(|| "question setup requires the clawhip executable path".to_string())?;
+        let mention = normalize_text(mention);
+
+        let subscription_matches = self
+            .subscriptions
+            .iter()
+            .enumerate()
+            .filter(|(_, subscription)| subscription.name == GJC_QUESTION_SUBSCRIPTION_NAME)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if subscription_matches.len() > 1 {
+            return Err("multiple setup-owned GJC question subscriptions found; clean up duplicates before updating".into());
+        }
+        if let Some(index) = subscription_matches.first()
+            && !self.subscriptions[*index].setup_owned
+        {
+            return Err("manual GJC question subscription ownership conflict; remove --question setup or mark the entry setup-owned".into());
+        }
+
+        let route_matches = self
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| {
+                route.event == "workflow.question"
+                    && route.filter.len() == 1
+                    && route.filter.get("repo_name") == Some(&repo)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if route_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned question routes found for repo '{repo}'; clean up duplicates before updating"
+            )
+            .into());
+        }
+
+        match route_matches.as_slice() {
+            [index] => {
+                let route = &mut self.routes[*index];
+                route.channel = Some(channel.clone());
+                route.mention = mention.clone();
+                route.format = Some(MessageFormat::Alert);
+            }
+            [] => {
+                let mut filter = BTreeMap::new();
+                filter.insert("repo_name".to_string(), repo.clone());
+                self.routes.push(RouteRule {
+                    event: "workflow.question".into(),
+                    filter,
+                    sink: default_sink_name(),
+                    channel: Some(channel),
+                    mention,
+                    format: Some(MessageFormat::Alert),
+                    ..RouteRule::default()
+                });
+            }
+            _ => unreachable!(),
+        }
+
+        let projection = [
+            ("question_id", "/question/id"),
+            ("summary", "/question/summary"),
+        ]
+        .into_iter()
+        .map(|(name, pointer)| (name.to_string(), pointer.to_string()))
+        .collect();
+        let subscription = SubscriptionConfig {
+            name: GJC_QUESTION_SUBSCRIPTION_NAME.into(),
+            enabled: true,
+            setup_owned: true,
+            kind: "websocket".into(),
+            endpoint_env: GJC_QUESTION_ENDPOINT_ENV.into(),
+            max_frame_bytes: default_subscription_max_frame_bytes(),
+            max_json_depth: default_subscription_max_json_depth(),
+            filter: SubscriptionFilterConfig {
+                discriminator_pointer: "/type".into(),
+                discriminator_equals: "question".into(),
+                predicates: vec![SubscriptionPredicateConfig {
+                    pointer: "/context/repo_name".into(),
+                    equals: repo.clone(),
+                }],
+            },
+            projection,
+            adapter: SubscriptionAdapterConfig {
+                program: adapter_program,
+                args: vec!["subscribe".into(), "adapter".into(), "question".into()],
+                timeout_ms: default_subscription_timeout_ms(),
+                max_stdin_bytes: default_subscription_stdin_bytes(),
+                max_stdout_bytes: default_subscription_stdout_bytes(),
+                max_stderr_bytes: default_subscription_stderr_bytes(),
+            },
+            reconnect: SubscriptionReconnectConfig::default(),
+            routing: SubscriptionRoutingConfig {
+                tool: Some("gjc".into()),
+                ..SubscriptionRoutingConfig::default()
+            },
+        };
+        match subscription_matches.as_slice() {
+            [index] => self.subscriptions[*index] = subscription,
+            [] => self.subscriptions.push(subscription),
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 
     pub fn scaffold_webhook_quickstart(&mut self, webhook: String) -> Result<()> {
         let webhook = normalize_text(Some(webhook)).ok_or_else(|| {
@@ -1200,23 +1936,7 @@ impl AppConfig {
         }
     }
 
-    /// Scaffold or update a repo→channel route with a binding-verify hint.
-    ///
-    /// Creates a `[[routes]]` entry shaped as:
-    ///
-    /// ```toml
-    /// [[routes]]
-    /// event = "*"
-    /// filter = { repo = "<repo>" }
-    /// sink = "discord"
-    /// channel = "<channel_id>"
-    /// channel_name = "<live_name>"  # hint, used by verify-bindings
-    /// ```
-    ///
-    /// If an existing route matches the exact `(event="*", filter={repo=...},
-    /// sink="discord")` shape, its channel and channel_name are updated in place
-    /// instead of appending a duplicate.
-    pub fn apply_repo_binding(
+    pub fn apply_repo_channel_route_binding(
         &mut self,
         repo: &str,
         channel_id: &str,
@@ -1228,19 +1948,38 @@ impl AppConfig {
             .ok_or_else(|| "repo binding requires a non-empty channel id".to_string())?;
         let channel_name = channel_name.and_then(|value| normalize_text(Some(value.to_string())));
 
-        let existing = self
+        let route_matches = self
             .routes
-            .iter_mut()
-            .find(|route| is_repo_binding_route(route, &repo));
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| is_repo_binding_route(route, &repo))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if route_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned routes found for repo '{repo}'; clean up duplicates before updating binding"
+            )
+            .into());
+        }
+        if self.routes.iter().any(|route| {
+            !is_repo_binding_route(route, &repo)
+                && route.event == "*"
+                && route.effective_sink() == "discord"
+                && route.filter.len() == 1
+                && route.filter.get("repo").is_some_and(|value| value == &repo)
+        }) {
+            return Err(format!("manual_route_conflict for repo '{repo}'").into());
+        }
 
-        match existing {
-            Some(route) => {
+        match route_matches.as_slice() {
+            [index] => {
+                let route = &mut self.routes[*index];
                 route.channel = Some(channel_id);
                 route.thread = None;
                 route.channel_name = channel_name;
                 route.webhook = None;
             }
-            None => {
+            [] => {
                 let mut filter = BTreeMap::new();
                 filter.insert("repo".to_string(), repo);
                 self.routes.push(RouteRule {
@@ -1260,7 +1999,156 @@ impl AppConfig {
                     gajae: None,
                 });
             }
+            _ => unreachable!(),
         }
+
+        Ok(())
+    }
+
+    pub fn apply_repo_channel_binding(
+        &mut self,
+        repo: &str,
+        channel_id: &str,
+        channel_name: Option<&str>,
+        checkout_path: &str,
+    ) -> Result<()> {
+        let repo = normalize_text(Some(repo.to_string()))
+            .ok_or_else(|| "repo binding requires a non-empty repo name".to_string())?;
+        let channel_id = normalize_text(Some(channel_id.to_string()))
+            .ok_or_else(|| "repo binding requires a non-empty channel id".to_string())?;
+        let channel_name = channel_name.and_then(|value| normalize_text(Some(value.to_string())));
+        let checkout_path = normalize_text(Some(checkout_path.to_string()))
+            .ok_or_else(|| "repo binding requires a non-empty checkout path".to_string())?;
+        let monitor_name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+        let github_repo = is_owner_repo(&repo).then_some(repo.clone());
+
+        let route_matches = self
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| is_repo_binding_route(route, &repo))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if route_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned routes found for repo '{repo}'; clean up duplicates before updating binding"
+            )
+            .into());
+        }
+        if self.routes.iter().any(|route| {
+            !is_repo_binding_route(route, &repo)
+                && route.event == "*"
+                && route.effective_sink() == "discord"
+                && route.filter.len() == 1
+                && route.filter.get("repo").is_some_and(|value| value == &repo)
+        }) {
+            return Err(format!("manual_route_conflict for repo '{repo}'").into());
+        }
+
+        let requested_owner_repo = github_repo.as_deref();
+        if self.monitors.git.repos.iter().any(|monitor| {
+            monitor.channel.as_deref() == Some(channel_id.as_str())
+                && monitor.github_repo.is_none()
+                && monitor.name.as_deref() != Some(monitor_name.as_str())
+        }) {
+            return Err("manual_monitor_conflict".into());
+        }
+
+        let monitor_matches = self
+            .monitors
+            .git
+            .repos
+            .iter()
+            .enumerate()
+            .filter(|(_, monitor)| {
+                let path_matches = monitor.path.trim() == checkout_path;
+                let github_repo_matches = requested_owner_repo
+                    .is_some_and(|repo| monitor.github_repo.as_deref() == Some(repo));
+                let name_matches = monitor.name.as_deref() == Some(monitor_name.as_str())
+                    && requested_owner_repo.is_none_or(|repo| {
+                        monitor
+                            .github_repo
+                            .as_deref()
+                            .is_none_or(|existing| existing.trim().is_empty() || existing == repo)
+                    });
+
+                path_matches || github_repo_matches || name_matches
+            })
+            .map(|(index, monitor)| {
+                if is_setup_owned_git_monitor(monitor) {
+                    Ok(index)
+                } else if monitor.channel.as_deref() == Some(channel_id.as_str())
+                    && monitor.github_repo.is_none()
+                {
+                    Err("manual_monitor_conflict".to_string())
+                } else {
+                    Err(format!(
+                        "git monitor conflict for repo '{repo}'; existing monitor is not setup-owned"
+                    ))
+                }
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|message| -> Box<dyn std::error::Error + Send + Sync> { message.into() })?;
+        if monitor_matches.len() > 1 {
+            return Err(format!(
+                "multiple setup-owned git monitors found for repo '{repo}'; clean up duplicates before updating binding"
+            )
+            .into());
+        }
+
+        match route_matches.as_slice() {
+            [index] => {
+                let route = &mut self.routes[*index];
+                route.channel = Some(channel_id.clone());
+                route.thread = None;
+                route.channel_name = channel_name.clone();
+                route.webhook = None;
+            }
+            [] => {
+                let mut filter = BTreeMap::new();
+                filter.insert("repo".to_string(), repo.clone());
+                self.routes.push(RouteRule {
+                    event: "*".to_string(),
+                    filter,
+                    sink: default_sink_name(),
+                    channel: Some(channel_id.clone()),
+                    thread: None,
+                    channel_name: channel_name.clone(),
+                    webhook: None,
+                    slack_webhook: None,
+                    local_path: None,
+                    mention: None,
+                    allow_dynamic_tokens: false,
+                    format: None,
+                    template: None,
+                    gajae: None,
+                });
+            }
+            _ => unreachable!(),
+        }
+
+        match monitor_matches.as_slice() {
+            [index] => {
+                let monitor = &mut self.monitors.git.repos[*index];
+                monitor.path = checkout_path;
+                monitor.name = Some(monitor_name);
+                monitor.github_repo = github_repo;
+                monitor.channel = Some(channel_id);
+                monitor.channel_name = channel_name;
+                monitor.setup_owned = true;
+            }
+            [] => self.monitors.git.repos.push(GitRepoMonitor {
+                path: checkout_path,
+                name: Some(monitor_name),
+                github_repo,
+                channel: Some(channel_id),
+                channel_name,
+                setup_owned: true,
+                ..GitRepoMonitor::default()
+            }),
+            _ => unreachable!(),
+        }
+
         Ok(())
     }
 
@@ -1327,8 +2215,9 @@ impl AppConfig {
                     self.scaffold_webhook_quickstart(webhook)?;
                 }
                 "6" => {
-                    self.save(path)?;
+                    let cleanup = self.save_with_backup_reporting(path)?;
                     println!("Saved {}", path.display());
+                    print_cleanup_summary(cleanup);
                     break;
                 }
                 "7" => {
@@ -1375,7 +2264,7 @@ impl AppConfig {
     fn print_template_hint(&self) {
         println!("Advanced routes and monitors are still edited manually in the config file.");
         println!(
-            "Sections: [providers.discord], [dispatch], [daemon], [cron], [[cron.jobs]], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
+            "Sections: [providers.discord], [dispatch], [daemon], [ledger], [cron], [[cron.jobs]], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
         );
         println!(
             "Routes may set either channel = \"...\" or webhook = \"https://discord.com/api/webhooks/...\"."
@@ -1500,15 +2389,1529 @@ impl AppConfig {
 fn is_repo_binding_route(route: &RouteRule, repo: &str) -> bool {
     route.event == "*"
         && route.sink.trim() == "discord"
-        && route.slack_webhook.is_none()
+        && route.effective_sink() == "discord"
         && route.filter.len() == 1
+        && route.filter.get("repo").is_some_and(|value| value == repo)
         && route
-            .filter
-            .get("repo")
-            .map(|value| value == repo)
-            .unwrap_or(false)
+            .channel
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && route.thread.is_none()
+        && route.webhook.is_none()
+        && route.slack_webhook.is_none()
+        && route.local_path.is_none()
+        && route.mention.is_none()
+        && route.template.is_none()
+        && route.gajae.is_none()
+        && !route.allow_dynamic_tokens
+        && route.format.is_none()
 }
 
+fn is_owner_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty())
+}
+
+fn is_setup_owned_git_monitor(monitor: &GitRepoMonitor) -> bool {
+    monitor.setup_owned
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug)]
+enum ActiveConfigState {
+    Absent,
+    Present {
+        identity: Option<FileIdentity>,
+        bytes: Vec<u8>,
+    },
+}
+
+impl ActiveConfigState {
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Absent => None,
+            Self::Present { bytes, .. } => Some(bytes),
+        }
+    }
+
+    fn identity(&self) -> Option<FileIdentity> {
+        match self {
+            Self::Absent => None,
+            Self::Present { identity, .. } => *identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigParentDir {
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedBackupDir {
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BackupOrigin {
+    RootLegacy,
+    Managed,
+}
+
+impl BackupOrigin {
+    fn retention_rank(self) -> u8 {
+        match self {
+            Self::RootLegacy => 0,
+            Self::Managed => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CleanupSummary {
+    pub classified: usize,
+    pub deleted: usize,
+    pub preserved: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BackupCandidate {
+    origin: BackupOrigin,
+    /// Absolute path retained for adversarial test hooks and diagnostics.
+    #[allow(dead_code)]
+    path: PathBuf,
+    entry_name: String,
+    created_at: OffsetDateTime,
+    identity: FileIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidatePreserveReason {
+    NonRegular,
+    IdentityChanged,
+    MultipleLinks,
+    ProtectedIdentity,
+    Unreadable,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    CompatibilityProbeUnavailable,
+    #[cfg(target_os = "linux")]
+    ReadLeaseContended,
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    UnsupportedPlatform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateDeletionOutcome {
+    Deleted,
+    Disappeared,
+    Preserved(CandidatePreserveReason),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateNameState {
+    Missing,
+    NonRegular,
+    Regular { identity: FileIdentity, nlink: u64 },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum CandidateReadability {
+    Readable { descriptor: File },
+    Preserved(CandidatePreserveReason),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppleCandidateReadability {
+    Readable,
+    Preserved(CandidatePreserveReason),
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FORCE_FACCESSAT2_ENOSYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_FACCESSAT2_EPERM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_PROC_FD_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_PROC_FD_REOPEN_EAGAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn metadata_identity(metadata: &Metadata) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+#[cfg(unix)]
+struct BoundDir {
+    file: File,
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+impl BoundDir {
+    fn open_verified(path: &Path, expected: Option<FileIdentity>) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| {
+                format!(
+                    "failed to open directory for contained IO {}: {error}",
+                    path.display()
+                )
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to stat directory for contained IO {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "path is not a regular directory for contained IO: {}",
+                path.display()
+            )
+            .into());
+        }
+        let identity = metadata_identity(&metadata).ok_or_else(|| {
+            format!(
+                "directory identity unavailable for contained IO: {}",
+                path.display()
+            )
+        })?;
+        if expected.is_some_and(|expected| expected != identity) {
+            return Err(format!("directory changed during use: {}", path.display()).into());
+        }
+        Ok(Self { file, identity })
+    }
+
+    fn revalidate(&self, expected: Option<FileIdentity>) -> Result<()> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|error| format!("failed to revalidate bound directory: {error}"))?;
+        let identity = metadata_identity(&metadata);
+        if !metadata.is_dir()
+            || identity != Some(self.identity)
+            || expected.is_some_and(|expected| Some(expected) != identity)
+        {
+            return Err("bound directory changed during use".to_string().into());
+        }
+        Ok(())
+    }
+
+    fn fd(&self) -> libc::c_int {
+        self.file.as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+fn openat_exclusive_write(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn openat_path_nofollow(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), flags, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "macos")]
+fn apple_candidate_open_flags() -> libc::c_int {
+    libc::O_EVTONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+}
+
+#[cfg(target_os = "macos")]
+fn openat_event_nofollow(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let fd = unsafe { libc::openat(dir.fd(), c_name.as_ptr(), apple_candidate_open_flags(), 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "macos")]
+fn apple_candidate_open_error_needs_state_check(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES)
+            | Some(libc::EPERM)
+            | Some(libc::ELOOP)
+            | Some(libc::ENXIO)
+            | Some(libc::ENODEV)
+            | Some(libc::EOPNOTSUPP)
+            | Some(libc::EAGAIN)
+            | Some(libc::EBUSY)
+            | Some(libc::EISDIR)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn classify_apple_user_access(user_access: u32) -> AppleCandidateReadability {
+    if user_access & libc::R_OK as u32 != 0 {
+        AppleCandidateReadability::Readable
+    } else {
+        AppleCandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn classify_apple_readability_error(
+    error: io::Error,
+) -> std::result::Result<AppleCandidateReadability, io::Error> {
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EOPNOTSUPP)
+    ) {
+        Ok(AppleCandidateReadability::Preserved(
+            CandidatePreserveReason::CompatibilityProbeUnavailable,
+        ))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apple_candidate_readability(
+    file: &File,
+) -> std::result::Result<AppleCandidateReadability, io::Error> {
+    #[repr(C)]
+    struct UserAccessBuffer {
+        length: u32,
+        user_access: u32,
+    }
+
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_USERACCESS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buffer = UserAccessBuffer {
+        length: 0,
+        user_access: 0,
+    };
+    let rc = unsafe {
+        libc::fgetattrlist(
+            file.as_raw_fd(),
+            (&mut attributes as *mut libc::attrlist).cast::<libc::c_void>(),
+            (&mut buffer as *mut UserAccessBuffer).cast::<libc::c_void>(),
+            std::mem::size_of::<UserAccessBuffer>(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return classify_apple_readability_error(io::Error::last_os_error());
+    }
+    if (buffer.length as usize) < std::mem::size_of::<UserAccessBuffer>() {
+        return Ok(AppleCandidateReadability::Preserved(
+            CandidatePreserveReason::CompatibilityProbeUnavailable,
+        ));
+    }
+    Ok(classify_apple_user_access(buffer.user_access))
+}
+
+#[cfg(target_os = "linux")]
+fn classify_candidate_path_open_error(
+    error: io::Error,
+) -> std::result::Result<CandidateDeletionOutcome, io::Error> {
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(CandidateDeletionOutcome::Disappeared)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_candidate_readability_error(
+    error: io::Error,
+) -> std::result::Result<CandidateReadability, io::Error> {
+    if error.raw_os_error() == Some(libc::EACCES) {
+        Ok(CandidateReadability::Preserved(
+            CandidatePreserveReason::Unreadable,
+        ))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_proc_fd_reopen_error(
+    error: io::Error,
+) -> std::result::Result<CandidateReadability, io::Error> {
+    match error.raw_os_error() {
+        Some(libc::EACCES) | Some(libc::EPERM) => Ok(CandidateReadability::Preserved(
+            CandidatePreserveReason::Unreadable,
+        )),
+        Some(libc::EAGAIN) => Ok(CandidateReadability::Preserved(
+            CandidatePreserveReason::ReadLeaseContended,
+        )),
+        _ => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_proc_fd_dir_error(
+    error: io::Error,
+) -> std::result::Result<CandidateReadability, io::Error> {
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::ENOTDIR) | Some(libc::EACCES) | Some(libc::EPERM)
+    ) {
+        Ok(CandidateReadability::Preserved(
+            CandidatePreserveReason::CompatibilityProbeUnavailable,
+        ))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn faccessat2_read_access(file: &File) -> std::result::Result<(), io::Error> {
+    #[cfg(test)]
+    if FORCE_FACCESSAT2_ENOSYS.with(std::cell::Cell::get) {
+        return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+    }
+    #[cfg(test)]
+    if FORCE_FACCESSAT2_EPERM.with(std::cell::Cell::get) {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+
+    const EMPTY_PATH: &[u8] = b"\0";
+    let flags = libc::AT_EMPTY_PATH | libc::AT_EACCESS;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            file.as_raw_fd(),
+            EMPTY_PATH.as_ptr().cast::<libc::c_char>(),
+            libc::R_OK,
+            flags,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_readability_via_proc_fd(
+    file: &File,
+) -> std::result::Result<CandidateReadability, io::Error> {
+    // Reopen the already-held O_PATH object, not the mutable candidate pathname.
+    // Each proc-fd descriptor is identity-checked so path substitution fails closed.
+    #[cfg(test)]
+    if FORCE_PROC_FD_UNAVAILABLE.with(std::cell::Cell::get) {
+        return classify_proc_fd_dir_error(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let proc_fd_dir = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open("/proc/self/fd")
+    {
+        Ok(dir) => dir,
+        Err(error) => return classify_proc_fd_dir_error(error),
+    };
+    let fd_name = CString::new(file.as_raw_fd().to_string()).expect("fd contains no NUL");
+    let anchored_fd = unsafe {
+        libc::openat(
+            proc_fd_dir.as_raw_fd(),
+            fd_name.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if anchored_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let anchored = unsafe { File::from_raw_fd(anchored_fd) };
+    let original_metadata = file.metadata()?;
+    let anchored_metadata = anchored.metadata()?;
+    if !anchored_metadata.is_file()
+        || metadata_identity(&anchored_metadata) != metadata_identity(&original_metadata)
+    {
+        return Err(io::Error::other(
+            "proc fd readability check anchored a different backup candidate",
+        ));
+    }
+
+    #[cfg(test)]
+    if FORCE_PROC_FD_REOPEN_EAGAIN.with(std::cell::Cell::get) {
+        return classify_proc_fd_reopen_error(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let reopened_fd = unsafe { libc::openat(proc_fd_dir.as_raw_fd(), fd_name.as_ptr(), flags, 0) };
+    if reopened_fd < 0 {
+        return classify_proc_fd_reopen_error(io::Error::last_os_error());
+    }
+    let reopened = unsafe { File::from_raw_fd(reopened_fd) };
+    let reopened_metadata = reopened.metadata()?;
+    if !reopened_metadata.is_file()
+        || metadata_identity(&reopened_metadata) != metadata_identity(&original_metadata)
+    {
+        return Err(io::Error::other(
+            "proc fd readability check reopened a different backup candidate",
+        ));
+    }
+    Ok(CandidateReadability::Readable {
+        descriptor: reopened,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_readability(file: &File) -> std::result::Result<CandidateReadability, io::Error> {
+    match faccessat2_read_access(file) {
+        Ok(()) => candidate_readability_via_proc_fd(file),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) => {
+            candidate_readability_via_proc_fd(file)
+        }
+        Err(error) => classify_candidate_readability_error(error),
+    }
+}
+
+#[cfg(unix)]
+fn fstatat_regular_identity(
+    dir: &BoundDir,
+    name: &str,
+) -> std::result::Result<Option<(FileIdentity, u64)>, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir.fd(),
+            c_name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Ok(None);
+    }
+    Ok(Some((
+        FileIdentity {
+            device: st.st_dev as u64,
+            inode: st.st_ino as u64,
+        },
+        st.st_nlink as u64,
+    )))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fstatat_candidate_state(
+    dir: &BoundDir,
+    name: &str,
+) -> std::result::Result<CandidateNameState, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir.fd(),
+            c_name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(CandidateNameState::Missing);
+        }
+        return Err(error);
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Ok(CandidateNameState::NonRegular);
+    }
+    Ok(CandidateNameState::Regular {
+        identity: FileIdentity {
+            device: st.st_dev as u64,
+            inode: st.st_ino as u64,
+        },
+        nlink: st.st_nlink as u64,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn candidate_name_state_outcome(
+    state: CandidateNameState,
+    expected_identity: FileIdentity,
+    protected_identities: &[FileIdentity],
+) -> Option<CandidateDeletionOutcome> {
+    match state {
+        CandidateNameState::Missing => Some(CandidateDeletionOutcome::Disappeared),
+        CandidateNameState::NonRegular => Some(CandidateDeletionOutcome::Preserved(
+            CandidatePreserveReason::NonRegular,
+        )),
+        CandidateNameState::Regular { identity, nlink } => {
+            if identity != expected_identity {
+                Some(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::IdentityChanged,
+                ))
+            } else if nlink != 1 {
+                Some(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::MultipleLinks,
+                ))
+            } else if protected_identities.contains(&identity) {
+                Some(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::ProtectedIdentity,
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn renameat_names(dir: &BoundDir, old: &str, new: &str) -> std::result::Result<(), io::Error> {
+    let c_old = CString::new(old).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let c_new = CString::new(new).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let rc = unsafe { libc::renameat(dir.fd(), c_old.as_ptr(), dir.fd(), c_new.as_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlinkat_name(dir: &BoundDir, name: &str) -> std::result::Result<(), io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let rc = unsafe { libc::unlinkat(dir.fd(), c_name.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn commit_config_bytes_via_temp<G>(
+    parent_dir: &ConfigParentDir,
+    path: &Path,
+    filename: &str,
+    new_bytes: &[u8],
+    active: &ActiveConfigState,
+    before_rename: &mut G,
+) -> Result<()>
+where
+    G: FnMut() -> Result<()>,
+{
+    let temp_name = format!(".{filename}.tmp.{}", std::process::id());
+
+    #[cfg(unix)]
+    {
+        let dir = BoundDir::open_verified(&parent_dir.path, parent_dir.identity)?;
+        let mut temp = match openat_exclusive_write(&dir, &temp_name) {
+            Ok(temp) => temp,
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Err(
+                    format!("config temp collision at {temp_name}; config was not saved").into(),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create config temp {temp_name}; config was not saved: {error}"
+                )
+                .into());
+            }
+        };
+        if let Err(error) = temp.write_all(new_bytes) {
+            let _ = unlinkat_name(&dir, &temp_name);
+            return Err(format!(
+                "failed to write config temp {temp_name}; config was not saved: {error}"
+            )
+            .into());
+        }
+        let temp_identity = metadata_identity(&temp.metadata().map_err(|error| {
+            let _ = unlinkat_name(&dir, &temp_name);
+            format!("failed to identity config temp {temp_name}; config was not saved: {error}")
+        })?)
+        .ok_or_else(|| {
+            let _ = unlinkat_name(&dir, &temp_name);
+            format!("config temp identity unavailable for {temp_name}; config was not saved")
+        })?;
+        before_rename().inspect_err(|_| {
+            let _ = unlinkat_name(&dir, &temp_name);
+        })?;
+        dir.revalidate(parent_dir.identity).inspect_err(|_| {
+            let _ = unlinkat_name(&dir, &temp_name);
+        })?;
+        revalidate_active_config(path, active).inspect_err(|_| {
+            let _ = unlinkat_name(&dir, &temp_name);
+        })?;
+        match fstatat_regular_identity(&dir, &temp_name) {
+            Ok(Some((identity, _))) if identity == temp_identity => {}
+            Ok(_) => {
+                let _ = unlinkat_name(&dir, &temp_name);
+                return Err(format!(
+                    "config temp path changed before commit at {temp_name}; config was not saved"
+                )
+                .into());
+            }
+            Err(error) => {
+                let _ = unlinkat_name(&dir, &temp_name);
+                return Err(format!(
+                    "failed to revalidate config temp {temp_name}; config was not saved: {error}"
+                )
+                .into());
+            }
+        }
+        if let Err(error) = renameat_names(&dir, &temp_name, filename) {
+            let _ = unlinkat_name(&dir, &temp_name);
+            return Err(format!(
+                "failed to commit config via {temp_name}; config was not saved: {error}"
+            )
+            .into());
+        }
+        match fstatat_regular_identity(&dir, filename) {
+            Ok(Some((identity, _))) if identity == temp_identity => Ok(()),
+            Ok(_) => Err(format!(
+                "config commit identity mismatch at {}; config path may be unsafe",
+                path.display()
+            )
+            .into()),
+            Err(error) => Err(format!(
+                "failed to verify committed config at {}; config path may be unsafe: {error}",
+                path.display()
+            )
+            .into()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let temp_path = parent_dir.path.join(&temp_name);
+        let mut temp = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp) => temp,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "config temp collision at {}; config was not saved",
+                    temp_path.display()
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create config temp {}; config was not saved: {error}",
+                    temp_path.display()
+                )
+                .into());
+            }
+        };
+        temp.write_all(new_bytes).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            format!(
+                "failed to write config temp {}; config was not saved: {error}",
+                temp_path.display()
+            )
+        })?;
+        before_rename().inspect_err(|_| {
+            let _ = fs::remove_file(&temp_path);
+        })?;
+        revalidate_config_parent_dir(parent_dir).inspect_err(|_| {
+            let _ = fs::remove_file(&temp_path);
+        })?;
+        revalidate_active_config(path, active).inspect_err(|_| {
+            let _ = fs::remove_file(&temp_path);
+        })?;
+        fs::rename(&temp_path, path).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            format!(
+                "failed to commit config via {}; config was not saved: {error}",
+                temp_path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn config_parent_dir_from_metadata(path: PathBuf, metadata: Metadata) -> Result<ConfigParentDir> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "config parent path must be a regular directory, not a symlink: {}",
+            path.display()
+        )
+        .into());
+    }
+    let identity = metadata_identity(&metadata);
+    Ok(ConfigParentDir { path, identity })
+}
+
+fn validate_config_parent_dir(parent: &Path, create: bool) -> Result<ConfigParentDir> {
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => config_parent_dir_from_metadata(parent.to_path_buf(), metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+            fs::create_dir_all(parent)?;
+            let metadata = fs::symlink_metadata(parent)?;
+            config_parent_dir_from_metadata(parent.to_path_buf(), metadata)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn revalidate_config_parent_dir(parent_dir: &ConfigParentDir) -> Result<()> {
+    let metadata = fs::symlink_metadata(&parent_dir.path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || parent_dir
+            .identity
+            .is_some_and(|identity| metadata_identity(&metadata) != Some(identity))
+    {
+        return Err(format!(
+            "config parent directory changed during use: {}",
+            parent_dir.path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn read_active_config_no_follow(path: &Path) -> Result<ActiveConfigState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ActiveConfigState::Absent);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "active config path must be a regular non-symlink file: {}",
+            path.display()
+        )
+        .into());
+    }
+    let identity = metadata_identity(&metadata);
+    let mut file = File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || identity.is_some_and(|identity| metadata_identity(&opened_metadata) != Some(identity))
+    {
+        return Err(format!(
+            "active config changed while it was being opened: {}",
+            path.display()
+        )
+        .into());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(ActiveConfigState::Present { identity, bytes })
+}
+
+fn revalidate_active_config(path: &Path, active: &ActiveConfigState) -> Result<()> {
+    match active {
+        ActiveConfigState::Absent => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(format!(
+                "active config appeared before replacement; config was not saved: {}",
+                path.display()
+            )
+            .into()),
+            Err(error) => Err(error.into()),
+        },
+        ActiveConfigState::Present { identity, .. } => {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || identity.is_some_and(|identity| metadata_identity(&metadata) != Some(identity))
+            {
+                return Err(format!(
+                    "active config changed before replacement; config was not saved: {}",
+                    path.display()
+                )
+                .into());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn current_active_config_identity(path: &Path) -> Result<Option<FileIdentity>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "saved config is not a regular non-symlink file: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(metadata_identity(&metadata))
+}
+
+fn managed_backup_dir_from_metadata(path: PathBuf, metadata: Metadata) -> Result<ManagedBackupDir> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "managed config backup path must be a regular directory, not a symlink: {}",
+            path.display()
+        )
+        .into());
+    }
+    let identity = metadata_identity(&metadata);
+    Ok(ManagedBackupDir { path, identity })
+}
+
+fn validate_managed_backup_dir(parent: &Path, create: bool) -> Result<Option<ManagedBackupDir>> {
+    let path = parent.join(".clawhip-config-backups");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => managed_backup_dir_from_metadata(path, metadata).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !create => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            managed_backup_dir_from_metadata(path, metadata).map(Some)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn revalidate_managed_backup_dir(managed_dir: &ManagedBackupDir) -> Result<()> {
+    let metadata = fs::symlink_metadata(&managed_dir.path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || managed_dir
+            .identity
+            .is_some_and(|identity| metadata_identity(&metadata) != Some(identity))
+    {
+        return Err(format!(
+            "managed config backup directory changed during use: {}",
+            managed_dir.path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn sha256_first8(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")[..8].to_string()
+}
+
+fn utc_backup_timestamp(now: OffsetDateTime) -> Result<String> {
+    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z")?;
+    Ok(now.format(&format)?)
+}
+
+fn create_managed_snapshot_create_new<H>(
+    managed_dir: &ManagedBackupDir,
+    filename: &str,
+    old_bytes: &[u8],
+    now: OffsetDateTime,
+    before_create: &mut H,
+) -> Result<()>
+where
+    H: FnMut() -> Result<()>,
+{
+    let timestamp = utc_backup_timestamp(now)?;
+    let entry_name = format!("{filename}.{timestamp}.{}.bak", sha256_first8(old_bytes));
+
+    #[cfg(unix)]
+    {
+        let dir = BoundDir::open_verified(&managed_dir.path, managed_dir.identity)?;
+        before_create()?;
+        dir.revalidate(managed_dir.identity)?;
+        let mut backup = match openat_exclusive_write(&dir, &entry_name) {
+            Ok(backup) => backup,
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Err(format!(
+                    "config backup collision at {}; config was not saved",
+                    managed_dir.path.join(&entry_name).display()
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create config backup {}; config was not saved: {error}",
+                    managed_dir.path.join(&entry_name).display()
+                )
+                .into());
+            }
+        };
+        backup.write_all(old_bytes).map_err(|error| {
+            let _ = unlinkat_name(&dir, &entry_name);
+            format!(
+                "failed to write config backup {}; config was not saved: {error}",
+                managed_dir.path.join(&entry_name).display()
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        revalidate_managed_backup_dir(managed_dir)?;
+        before_create()?;
+        revalidate_managed_backup_dir(managed_dir)?;
+        let backup_path = managed_dir.path.join(&entry_name);
+        let mut backup = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(backup) => backup,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "config backup collision at {}; config was not saved",
+                    backup_path.display()
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create config backup {}; config was not saved: {error}",
+                    backup_path.display()
+                )
+                .into());
+            }
+        };
+        backup.write_all(old_bytes).map_err(|error| {
+            format!(
+                "failed to write config backup {}; config was not saved: {error}",
+                backup_path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn parse_managed_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
+    let prefix = format!("{filename}.");
+    let rest = name.strip_prefix(&prefix)?.strip_suffix(".bak")?;
+    let (timestamp, hash) = rest.split_once('.')?;
+    if hash.len() != 8 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z").ok()?;
+    PrimitiveDateTime::parse(timestamp, &format)
+        .ok()
+        .map(|value| value.assume_utc())
+}
+
+fn parse_compact_backup_timestamp_seconds(value: &str) -> Option<OffsetDateTime> {
+    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z").ok()?;
+    PrimitiveDateTime::parse(value, &format)
+        .ok()
+        .map(|timestamp| timestamp.assume_utc())
+}
+
+fn parse_compact_backup_timestamp_minutes(value: &str) -> Option<OffsetDateTime> {
+    let format = format_description::parse("[year][month][day]T[hour][minute]Z").ok()?;
+    PrimitiveDateTime::parse(value, &format)
+        .ok()
+        .map(|timestamp| timestamp.assume_utc())
+}
+
+fn parse_compact_backup_date(value: &str) -> Option<OffsetDateTime> {
+    let format = format_description::parse("[year][month][day]").ok()?;
+    Date::parse(value, &format)
+        .ok()
+        .map(|date| date.midnight().assume_utc())
+}
+
+/// Root backup labels are preserved because no historical clawhip producer proves
+/// their provenance. An owner-approved compatibility boundary is required before
+/// labeled root backups become prune-eligible.
+fn valid_legacy_backup_label_prefix(prefix: &str) -> bool {
+    prefix.is_empty()
+}
+
+fn parse_root_legacy_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
+    let prefix = format!("{filename}.bak-");
+    let suffix = name.strip_prefix(&prefix)?;
+    for (length, parser) in [
+        (
+            16,
+            parse_compact_backup_timestamp_seconds as fn(&str) -> Option<OffsetDateTime>,
+        ),
+        (14, parse_compact_backup_timestamp_minutes),
+        (8, parse_compact_backup_date),
+    ] {
+        if suffix.len() < length {
+            continue;
+        }
+        let (label_prefix, timestamp) = suffix.split_at(suffix.len() - length);
+        if let Some(created_at) = parser(timestamp) {
+            return valid_legacy_backup_label_prefix(label_prefix).then_some(created_at);
+        }
+    }
+    None
+}
+
+fn parse_duplicated_legacy_backup_name(name: &str, filename: &str) -> Option<OffsetDateTime> {
+    let prefix = format!("config.{filename}.bak-");
+    let timestamp = name.strip_prefix(&prefix)?;
+    let format = format_description::parse("[year]-[month]-[day]-[hour][minute]").ok()?;
+    PrimitiveDateTime::parse(timestamp, &format)
+        .ok()
+        .map(|value| value.assume_utc())
+}
+
+fn safe_cleanup_file_identity(metadata: &Metadata) -> Option<FileIdentity> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        metadata_identity(metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        Some(FileIdentity {})
+    }
+}
+
+fn collect_cleanup_candidates(
+    parent_dir: &ConfigParentDir,
+    filename: &str,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+) -> Result<Vec<BackupCandidate>> {
+    revalidate_config_parent_dir(parent_dir)?;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&parent_dir.path)? {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        let Some(created_at) = parse_root_legacy_backup_name(entry_name, filename)
+            .or_else(|| parse_duplicated_legacy_backup_name(entry_name, filename))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(identity) = safe_cleanup_file_identity(&metadata) else {
+            continue;
+        };
+        if protected_identities.contains(&identity) {
+            continue;
+        }
+        candidates.push(BackupCandidate {
+            origin: BackupOrigin::RootLegacy,
+            path,
+            entry_name: entry_name.to_string(),
+            created_at,
+            identity,
+        });
+    }
+
+    if let Some(managed_dir) = managed_dir {
+        revalidate_managed_backup_dir(managed_dir)?;
+        for entry in fs::read_dir(&managed_dir.path)? {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            let Some(entry_name) = entry_name.to_str() else {
+                continue;
+            };
+            let Some(created_at) = parse_managed_backup_name(entry_name, filename) else {
+                continue;
+            };
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let Some(identity) = safe_cleanup_file_identity(&metadata) else {
+                continue;
+            };
+            if protected_identities.contains(&identity) {
+                continue;
+            }
+            candidates.push(BackupCandidate {
+                origin: BackupOrigin::Managed,
+                path,
+                entry_name: entry_name.to_string(),
+                created_at,
+                identity,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+fn delete_verified_candidate<P, A>(
+    candidate: &BackupCandidate,
+    parent_dir: &ConfigParentDir,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+    after_preflight: &mut P,
+    after_check: &mut A,
+) -> Result<CandidateDeletionOutcome>
+where
+    P: FnMut(&BackupCandidate) -> Result<()>,
+    A: FnMut(&BackupCandidate) -> Result<()>,
+{
+    #[cfg(unix)]
+    {
+        let (dir_path, expected_identity) = match candidate.origin {
+            BackupOrigin::RootLegacy => {
+                revalidate_config_parent_dir(parent_dir)?;
+                (parent_dir.path.as_path(), parent_dir.identity)
+            }
+            BackupOrigin::Managed => {
+                revalidate_config_parent_dir(parent_dir)?;
+                let managed_dir = managed_dir.ok_or_else(|| {
+                    "managed backup candidate has no validated directory".to_string()
+                })?;
+                revalidate_managed_backup_dir(managed_dir)?;
+                (managed_dir.path.as_path(), managed_dir.identity)
+            }
+        };
+        let dir = BoundDir::open_verified(dir_path, expected_identity)?;
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if let Some(outcome) = candidate_name_state_outcome(
+                fstatat_candidate_state(&dir, &candidate.entry_name)?,
+                candidate.identity,
+                protected_identities,
+            ) {
+                return Ok(outcome);
+            }
+
+            after_preflight(candidate)?;
+            #[cfg(target_os = "linux")]
+            let file = match openat_path_nofollow(&dir, &candidate.entry_name) {
+                Ok(file) => file,
+                Err(error) => return Ok(classify_candidate_path_open_error(error)?),
+            };
+            #[cfg(target_os = "macos")]
+            let file = match openat_event_nofollow(&dir, &candidate.entry_name) {
+                Ok(file) => file,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    return Ok(CandidateDeletionOutcome::Disappeared);
+                }
+                Err(error) if apple_candidate_open_error_needs_state_check(&error) => {
+                    if let Some(outcome) = candidate_name_state_outcome(
+                        fstatat_candidate_state(&dir, &candidate.entry_name)?,
+                        candidate.identity,
+                        protected_identities,
+                    ) {
+                        return Ok(outcome);
+                    }
+                    if matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
+                        return Ok(CandidateDeletionOutcome::Preserved(
+                            CandidatePreserveReason::Unreadable,
+                        ));
+                    }
+                    return Err(error.into());
+                }
+                Err(error) => return Err(error.into()),
+            };
+
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Ok(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::NonRegular,
+                ));
+            }
+            if metadata.nlink() != 1 {
+                return Ok(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::MultipleLinks,
+                ));
+            }
+            let identity = metadata_identity(&metadata)
+                .ok_or_else(|| "backup candidate descriptor identity unavailable".to_string())?;
+            if identity != candidate.identity {
+                return Ok(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::IdentityChanged,
+                ));
+            }
+            if protected_identities.contains(&identity) {
+                return Ok(CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::ProtectedIdentity,
+                ));
+            }
+            #[cfg(target_os = "macos")]
+            match apple_candidate_readability(&file)? {
+                AppleCandidateReadability::Readable => {}
+                AppleCandidateReadability::Preserved(reason) => {
+                    return Ok(CandidateDeletionOutcome::Preserved(reason));
+                }
+            }
+            #[cfg(target_os = "linux")]
+            let _readable_descriptor = match candidate_readability(&file)? {
+                CandidateReadability::Readable { descriptor } => descriptor,
+                CandidateReadability::Preserved(reason) => {
+                    return Ok(CandidateDeletionOutcome::Preserved(reason));
+                }
+            };
+
+            after_check(candidate)?;
+            if let Some(outcome) = candidate_name_state_outcome(
+                fstatat_candidate_state(&dir, &candidate.entry_name)?,
+                identity,
+                protected_identities,
+            ) {
+                return Ok(outcome);
+            }
+            #[cfg(target_os = "macos")]
+            match apple_candidate_readability(&file)? {
+                AppleCandidateReadability::Readable => {}
+                AppleCandidateReadability::Preserved(reason) => {
+                    return Ok(CandidateDeletionOutcome::Preserved(reason));
+                }
+            }
+            #[cfg(target_os = "linux")]
+            let _final_readable_descriptor = match candidate_readability(&file)? {
+                CandidateReadability::Readable { descriptor } => descriptor,
+                CandidateReadability::Preserved(reason) => {
+                    return Ok(CandidateDeletionOutcome::Preserved(reason));
+                }
+            };
+            match unlinkat_name(&dir, &candidate.entry_name) {
+                Ok(()) => Ok(CandidateDeletionOutcome::Deleted),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    Ok(CandidateDeletionOutcome::Disappeared)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (
+                dir,
+                candidate,
+                protected_identities,
+                after_preflight,
+                after_check,
+            );
+            Ok(CandidateDeletionOutcome::Preserved(
+                CandidatePreserveReason::UnsupportedPlatform,
+            ))
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Same-object unlink is unavailable without directory-relative primitives.
+        // Fail closed: preserve the candidate rather than unlinking by path alone.
+        let _ = (
+            candidate,
+            parent_dir,
+            managed_dir,
+            protected_identities,
+            after_preflight,
+            after_check,
+        );
+        Ok(CandidateDeletionOutcome::Preserved(
+            CandidatePreserveReason::UnsupportedPlatform,
+        ))
+    }
+}
+
+#[cfg(test)]
+fn cleanup_config_backups_with<F>(
+    parent: &Path,
+    expected_parent_identity: Option<FileIdentity>,
+    filename: &str,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+    now: OffsetDateTime,
+    before_delete: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&BackupCandidate) -> Result<()>,
+{
+    let mut after_preflight = |_: &BackupCandidate| Ok(());
+    let mut after_check = |_: &BackupCandidate| Ok(());
+    cleanup_config_backups_with_hooks(
+        parent,
+        expected_parent_identity,
+        filename,
+        managed_dir,
+        protected_identities,
+        now,
+        before_delete,
+        &mut after_preflight,
+        &mut after_check,
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cleanup_config_backups_with_hooks<F, P, A>(
+    parent: &Path,
+    expected_parent_identity: Option<FileIdentity>,
+    filename: &str,
+    managed_dir: Option<&ManagedBackupDir>,
+    protected_identities: &[FileIdentity],
+    now: OffsetDateTime,
+    before_delete: &mut F,
+    after_preflight: &mut P,
+    after_delete_check: &mut A,
+) -> Result<CleanupSummary>
+where
+    F: FnMut(&BackupCandidate) -> Result<()>,
+    P: FnMut(&BackupCandidate) -> Result<()>,
+    A: FnMut(&BackupCandidate) -> Result<()>,
+{
+    let parent_dir = validate_config_parent_dir(parent, false)?;
+    if expected_parent_identity.is_some_and(|identity| parent_dir.identity != Some(identity)) {
+        return Err(format!(
+            "config parent directory changed during use: {}",
+            parent.display()
+        )
+        .into());
+    }
+    let cutoff = now - TimeDuration::days(30);
+    let mut candidates =
+        collect_cleanup_candidates(&parent_dir, filename, managed_dir, protected_identities)?;
+    candidates.sort_by(|left, right| {
+        (
+            left.created_at,
+            left.origin.retention_rank(),
+            left.entry_name.as_str(),
+        )
+            .cmp(&(
+                right.created_at,
+                right.origin.retention_rank(),
+                right.entry_name.as_str(),
+            ))
+    });
+    let classified = candidates.len();
+    let keep_from = classified.saturating_sub(10);
+    let mut deleted = 0;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if index < keep_from && candidate.created_at <= cutoff {
+            before_delete(candidate)?;
+            match delete_verified_candidate(
+                candidate,
+                &parent_dir,
+                managed_dir,
+                protected_identities,
+                after_preflight,
+                after_delete_check,
+            )? {
+                CandidateDeletionOutcome::Deleted => {
+                    deleted += 1;
+                }
+                CandidateDeletionOutcome::Disappeared | CandidateDeletionOutcome::Preserved(_) => {}
+            }
+        }
+    }
+    Ok(CleanupSummary {
+        classified,
+        deleted,
+        preserved: classified - deleted,
+    })
+}
+
+fn print_cleanup_summary(summary: CleanupSummary) {
+    if summary.classified > 0 {
+        println!(
+            "Config backup cleanup: {} classified, {} deleted, {} preserved",
+            summary.classified, summary.deleted, summary.preserved
+        );
+    }
+}
 fn is_canonical_quickstart_route(route: &RouteRule) -> bool {
     route.event == "*"
         && route.filter.is_empty()
@@ -1568,6 +3971,76 @@ fn normalize_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_bounded_test_child(
+        test_name: &str,
+        child_env: &str,
+        child_marker: &str,
+        drop_privileges: bool,
+    ) {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration as StdDuration, Instant};
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(child_env, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if drop_privileges && unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                let stdout = stdout_reader.join().unwrap();
+                let stderr = stderr_reader.join().unwrap();
+                panic!(
+                    "test child timed out and was killed/reaped with {status}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        };
+        let stdout = stdout_reader.join().unwrap();
+        let stderr = stderr_reader.join().unwrap();
+        let stdout_text = String::from_utf8_lossy(&stdout);
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        assert!(
+            status.success(),
+            "test child failed with {status}\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
+        );
+        assert!(
+            stdout_text.contains(child_marker),
+            "test child did not execute the requested scenario\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
+        );
+    }
 
     #[test]
     fn discord_token_source_prefers_env_over_config() {
@@ -1790,6 +4263,127 @@ thread = "123456789012345678"
 
         assert!(config.validate().is_ok());
         assert_eq!(config.webhook_route_count(), 1);
+    }
+
+    #[test]
+    fn gjc_question_setup_is_idempotent_and_preserves_workflow_route() {
+        let mut config = AppConfig {
+            routes: vec![RouteRule {
+                event: "workflow.gate".into(),
+                channel: Some("workflow-channel".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        config
+            .apply_gjc_question_setup(
+                Some("question-channel".into()),
+                Some("<@123>".into()),
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap();
+        config
+            .apply_gjc_question_setup(
+                Some("updated-question-channel".into()),
+                None,
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap();
+
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, GJC_QUESTION_SUBSCRIPTION_NAME);
+        assert!(config.subscriptions[0].setup_owned);
+        assert_eq!(config.routes.len(), 2);
+        assert_eq!(config.routes[0].event, "workflow.gate");
+        let question = config
+            .routes
+            .iter()
+            .find(|route| route.event == "workflow.question")
+            .expect("question route");
+        assert_eq!(
+            question.filter.get("repo_name").map(String::as_str),
+            Some("owner/repo")
+        );
+        assert_eq!(
+            question.channel.as_deref(),
+            Some("updated-question-channel")
+        );
+        assert_eq!(question.mention, None);
+        assert_eq!(config.subscriptions[0].routing.repo_name, None);
+        assert_eq!(
+            config.subscriptions[0].filter.predicates,
+            vec![SubscriptionPredicateConfig {
+                pointer: "/context/repo_name".into(),
+                equals: "owner/repo".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn gjc_question_setup_requires_explicit_or_default_channel() {
+        let mut config = AppConfig::default();
+        let error = config
+            .apply_gjc_question_setup(
+                None,
+                None,
+                true,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--question-channel"));
+        assert!(config.subscriptions.is_empty());
+        assert!(config.routes.is_empty());
+    }
+
+    #[test]
+    fn gjc_question_setup_rejects_manual_subscription_without_mutation() {
+        let mut config = AppConfig::default();
+        config
+            .apply_gjc_question_setup(
+                Some("question-channel".into()),
+                None,
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap();
+        config.subscriptions[0].setup_owned = false;
+        config.subscriptions[0].adapter.args = vec!["manual-adapter".into()];
+        let before = config.to_pretty_toml().unwrap();
+
+        let error = config
+            .apply_gjc_question_setup(
+                Some("new-channel".into()),
+                None,
+                false,
+                "owner/repo".into(),
+                "/usr/bin/clawhip".into(),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ownership conflict"));
+        assert_eq!(config.to_pretty_toml().unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_config_without_gjc_subscription_remains_valid_and_unchanged() {
+        let config: AppConfig = toml::from_str(
+            "[[routes]]\nevent = \"custom\"\nsink = \"localfile\"\nlocal_path = \"/tmp/events.jsonl\"\n",
+        )
+        .unwrap();
+        assert!(config.subscriptions.is_empty());
+        assert!(config.validate().is_ok());
+        let serialized = config.to_pretty_toml().unwrap();
+        assert!(!serialized.contains("gjc-question"));
+        assert!(!serialized.contains("[[subscriptions]]"));
     }
 
     #[test]
@@ -2505,5 +5099,1973 @@ name = "general"
         assert!(toml.contains("[discord_watch]"));
         assert!(toml.contains("pending_mentions_threshold = 7"));
         assert!(toml.contains("doctrine_template = \"Sweep <#{channel_id}>\""));
+    }
+
+    #[test]
+    fn repo_channel_route_binding_keeps_legacy_bind_route_only() {
+        let mut config = AppConfig::default();
+
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].channel.as_deref(), Some("123"));
+        assert_eq!(config.routes[0].channel_name.as_deref(), Some("dev"));
+        assert!(config.monitors.git.repos.is_empty());
+    }
+
+    #[test]
+    fn repo_channel_binding_allows_branch_specific_manual_route() {
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), "owner/repo".to_string());
+        filter.insert("branch".to_string(), "main".to_string());
+        let mut config = AppConfig {
+            routes: vec![RouteRule {
+                event: "git.push".into(),
+                filter,
+                channel: Some("manual".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        config
+            .apply_repo_channel_route_binding("owner/repo", "123", Some("dev"))
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 2);
+        assert!(config.monitors.git.repos.is_empty());
+    }
+
+    #[test]
+    fn repo_channel_binding_create_is_idempotent_and_adds_monitor() {
+        let mut config = AppConfig::default();
+
+        config
+            .apply_repo_channel_binding("owner/repo", "123", Some("#dev"), "/work/repo")
+            .unwrap();
+        config
+            .apply_repo_channel_binding("owner/repo", "123", Some("dev"), "/work/repo")
+            .unwrap();
+
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(
+            config.routes[0].filter.get("repo").map(String::as_str),
+            Some("owner/repo")
+        );
+        assert_eq!(config.routes[0].channel.as_deref(), Some("123"));
+        assert_eq!(config.routes[0].channel_name.as_deref(), Some("dev"));
+        assert_eq!(config.monitors.git.repos.len(), 1);
+        let monitor = &config.monitors.git.repos[0];
+        assert_eq!(monitor.path, "/work/repo");
+        assert_eq!(monitor.name.as_deref(), Some("repo"));
+        assert_eq!(monitor.github_repo.as_deref(), Some("owner/repo"));
+        assert_eq!(monitor.channel.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn repo_channel_binding_updates_setup_owned_monitor_and_preserves_options() {
+        let mut filter = BTreeMap::new();
+        filter.insert("repo".to_string(), "owner/repo".to_string());
+        let mut config = AppConfig {
+            routes: vec![RouteRule {
+                event: "*".into(),
+                filter,
+                channel: Some("old".into()),
+                channel_name: Some("dev".into()),
+                ..RouteRule::default()
+            }],
+            monitors: MonitorConfig {
+                git: GitMonitorConfig {
+                    repos: vec![GitRepoMonitor {
+                        path: "/old/repo".into(),
+                        name: Some("repo".into()),
+                        remote: "upstream".into(),
+                        github_repo: Some("owner/repo".into()),
+                        emit_commits: false,
+                        emit_branch_changes: false,
+                        emit_issue_opened: false,
+                        emit_pr_status: true,
+                        channel: Some("old".into()),
+                        channel_name: Some("#DEV".into()),
+                        setup_owned: true,
+                        mention: Some("<@1>".into()),
+                        format: Some(MessageFormat::Raw),
+                    }],
+                },
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        config
+            .apply_repo_channel_binding("owner/repo", "new", Some("dev"), "/new/repo")
+            .unwrap();
+
+        assert_eq!(config.routes[0].channel.as_deref(), Some("new"));
+        let monitor = &config.monitors.git.repos[0];
+        assert_eq!(monitor.path, "/new/repo");
+        assert_eq!(monitor.remote, "upstream");
+        assert!(!monitor.emit_commits);
+        assert!(!monitor.emit_branch_changes);
+        assert!(!monitor.emit_issue_opened);
+        assert!(monitor.emit_pr_status);
+        assert_eq!(monitor.mention.as_deref(), Some("<@1>"));
+        assert_eq!(monitor.format, Some(MessageFormat::Raw));
+        assert_eq!(monitor.channel.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn repo_channel_binding_manual_monitor_conflict_does_not_mutate() {
+        let mut config = AppConfig {
+            monitors: MonitorConfig {
+                git: GitMonitorConfig {
+                    repos: vec![GitRepoMonitor {
+                        path: "/manual".into(),
+                        name: Some("manual".into()),
+                        channel: Some("123".into()),
+                        channel_name: None,
+                        ..GitRepoMonitor::default()
+                    }],
+                },
+                ..MonitorConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let before = config.to_pretty_toml().unwrap();
+
+        let error = config
+            .apply_repo_channel_binding("owner/repo", "123", Some("dev"), "/work/repo")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("manual_monitor_conflict"));
+        assert_eq!(config.to_pretty_toml().unwrap(), before);
+    }
+
+    #[test]
+    fn save_with_backup_skips_new_and_identical_then_backs_up_changed_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = AppConfig::default();
+
+        config.save_with_backup(&path).unwrap();
+        assert!(!dir.path().join(".clawhip-config-backups").exists());
+        config.save_with_backup(&path).unwrap();
+        assert!(!dir.path().join(".clawhip-config-backups").exists());
+
+        config.defaults.channel = Some("alerts".into());
+        config.save_with_backup(&path).unwrap();
+
+        let backups = fs::read_dir(dir.path().join(".clawhip-config-backups"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(backups.len(), 1);
+        let backup = fs::read_to_string(backups[0].path()).unwrap();
+        assert!(!backup.contains("alerts"));
+    }
+
+    #[test]
+    fn backup_filename_parsers_accept_unlabeled_root_families_and_preserve_labels() {
+        let expected = parse_compact_backup_timestamp_seconds("20260708T072000Z").unwrap();
+        assert_eq!(
+            parse_root_legacy_backup_name("config.toml.bak-20260708T072000Z", "config.toml"),
+            Some(expected)
+        );
+        assert!(
+            parse_duplicated_legacy_backup_name(
+                "config.config.toml.bak-2026-04-10-0206",
+                "config.toml"
+            )
+            .is_some()
+        );
+        assert!(
+            parse_duplicated_legacy_backup_name(
+                "config.custom.name.toml.bak-2026-04-10-0206",
+                "custom.name.toml"
+            )
+            .is_some()
+        );
+
+        for name in [
+            "config.toml.bak-gajae-runtime-rename-20260708T072000Z",
+            "config.toml.bak-release-radar-20260708T0720Z",
+            "config.toml.bak-gp-mention-20260708",
+            "config.toml.bak-label_with_underscore-20260708T072000Z",
+            "config.toml.bak-label-20260708T072000Z",
+            "config.toml.bak-label-20260708T072000",
+            "config.toml.bak-20260708T07200Z",
+            "config.toml.bak-20260708-extra",
+            "config.config.toml.bak-2026-04-10-0206-extra",
+            "other.toml.bak-20260708T072000Z",
+        ] {
+            assert!(
+                parse_root_legacy_backup_name(name, "config.toml").is_none()
+                    && parse_duplicated_legacy_backup_name(name, "config.toml").is_none(),
+                "unexpected recognized backup: {name}"
+            );
+        }
+        assert!(
+            parse_managed_backup_name("config.toml.20260708T072000Z.abcdef12.bak", "config.toml")
+                .is_some()
+        );
+        assert!(
+            parse_managed_backup_name("config.toml.20260708T072000Z.abcdef1g.bak", "config.toml")
+                .is_none()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn backup_retention_combines_legacy_and_managed_with_deterministic_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let backups_dir = parent.join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let managed_dir = validate_managed_backup_dir(parent, false).unwrap().unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let tie = now - TimeDuration::days(50);
+        let root_tie = format!("config.toml.bak-{}", utc_backup_timestamp(tie).unwrap());
+        let managed_tie = format!(
+            "config.toml.{}.abcdef12.bak",
+            utc_backup_timestamp(tie).unwrap()
+        );
+        fs::write(parent.join(&root_tie), "root").unwrap();
+        fs::write(backups_dir.join(&managed_tie), "managed").unwrap();
+        let mut later_names = Vec::new();
+        for index in 0..9 {
+            let created_at = tie + TimeDuration::seconds(index + 1);
+            let name = format!(
+                "config.toml.{}.{:08x}.bak",
+                utc_backup_timestamp(created_at).unwrap(),
+                index
+            );
+            fs::write(backups_dir.join(&name), "later").unwrap();
+            later_names.push(name);
+        }
+
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            Some(&managed_dir),
+            &[],
+            now,
+            &mut before_delete,
+        )
+        .unwrap();
+        assert!(!parent.join(&root_tie).exists());
+        assert!(backups_dir.join(&managed_tie).exists());
+        assert!(
+            later_names
+                .iter()
+                .all(|name| backups_dir.join(name).exists())
+        );
+
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            Some(&managed_dir),
+            &[],
+            now,
+            &mut before_delete,
+        )
+        .unwrap();
+        assert!(backups_dir.join(&managed_tie).exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn backup_retention_deletes_exact_cutoff_but_keeps_just_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let exact_cutoff = format!(
+            "config.toml.bak-{}",
+            utc_backup_timestamp(now - TimeDuration::days(30)).unwrap()
+        );
+        let just_newer = format!(
+            "config.toml.bak-{}",
+            utc_backup_timestamp(now - TimeDuration::days(30) + TimeDuration::seconds(1)).unwrap()
+        );
+        fs::write(parent.join(&exact_cutoff), "cutoff").unwrap();
+        fs::write(parent.join(&just_newer), "recent").unwrap();
+        for index in 0..10 {
+            let name = format!(
+                "config.toml.bak-{}",
+                utc_backup_timestamp(now - TimeDuration::days(20 - index)).unwrap()
+            );
+            fs::write(parent.join(name), "later").unwrap();
+        }
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        let summary = cleanup_config_backups_with_hooks(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            now,
+            &mut before_delete,
+            &mut |_: &BackupCandidate| Ok(()),
+            &mut |_: &BackupCandidate| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            summary,
+            CleanupSummary {
+                classified: 12,
+                deleted: 1,
+                preserved: 11,
+            }
+        );
+        assert!(!parent.join(exact_cutoff).exists());
+        assert!(parent.join(just_newer).exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn backup_retention_deletes_stale_duplicated_legacy_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let duplicated = parent.join("config.config.toml.bak-2000-01-01-0000");
+        fs::write(&duplicated, "duplicated").unwrap();
+        for day in 2..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "later",
+            )
+            .unwrap();
+        }
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut no_delete,
+        )
+        .unwrap();
+
+        assert!(!duplicated.exists());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn backup_initial_save_succeeds_without_identity_cleanup_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        AppConfig::default().save_with_backup(&path).unwrap();
+        assert!(path.is_file());
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[test]
+    fn backup_cleanup_counts_candidates_without_supported_descriptor_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "candidate",
+            )
+            .unwrap();
+        }
+        let oldest = parent.join("config.toml.bak-20000101");
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        let summary = cleanup_config_backups_with_hooks(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+            &mut |_: &BackupCandidate| Ok(()),
+            &mut |_: &BackupCandidate| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            CleanupSummary {
+                classified: 11,
+                deleted: 0,
+                preserved: 11,
+            }
+        );
+        assert_eq!(fs::read_to_string(oldest).unwrap(), "candidate");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_preserves_unknown_symlink_directory_and_hardlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let active = parent.join("config.toml");
+        fs::write(&active, "active").unwrap();
+        let unknown = parent.join("config.toml.bak-not-a-date");
+        fs::write(&unknown, "unknown").unwrap();
+        let directory = parent.join("config.toml.bak-20200101");
+        fs::create_dir(&directory).unwrap();
+        let outside = parent.join("outside");
+        fs::write(&outside, "outside").unwrap();
+        let symlink_path = parent.join("config.toml.bak-20190101");
+        symlink(&outside, &symlink_path).unwrap();
+        let hardlink_path = parent.join("config.toml.bak-20180101");
+        fs::hard_link(&active, &hardlink_path).unwrap();
+
+        let protected = current_active_config_identity(&active)
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &protected,
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+        )
+        .unwrap();
+
+        assert!(unknown.exists());
+        assert!(directory.is_dir());
+        assert!(
+            symlink_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(hardlink_path.exists());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_rejects_active_and_managed_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.toml");
+        fs::write(&outside, "outside").unwrap();
+        let active = dir.path().join("config.toml");
+        symlink(&outside, &active).unwrap();
+        let error = AppConfig::default()
+            .save_with_backup(&active)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("regular non-symlink"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+
+        fs::remove_file(&active).unwrap();
+        fs::create_dir(&active).unwrap();
+        let directory_error = AppConfig::default()
+            .save_with_backup(&active)
+            .unwrap_err()
+            .to_string();
+        assert!(directory_error.contains("regular non-symlink"));
+        fs::remove_dir(&active).unwrap();
+        AppConfig::default().save_with_backup(&active).unwrap();
+        let outside_dir = dir.path().join("outside-backups");
+        fs::create_dir(&outside_dir).unwrap();
+        let managed_path = dir.path().join(".clawhip-config-backups");
+        symlink(&outside_dir, &managed_path).unwrap();
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let error = changed.save_with_backup(&active).unwrap_err().to_string();
+        assert!(error.contains("regular directory"));
+        assert!(fs::read_dir(outside_dir).unwrap().next().is_none());
+        assert!(!fs::read_to_string(&active).unwrap().contains("alerts"));
+
+        fs::remove_file(&managed_path).unwrap();
+        fs::write(&managed_path, "not a directory").unwrap();
+        let error = changed.save_with_backup(&active).unwrap_err().to_string();
+        assert!(error.contains("regular directory"));
+        assert!(!fs::read_to_string(&active).unwrap().contains("alerts"));
+
+        let outside_parent = dir.path().join("outside-parent");
+        fs::create_dir(&outside_parent).unwrap();
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&outside_parent, &linked_parent).unwrap();
+        let linked_config = linked_parent.join("config.toml");
+        let error = AppConfig::default()
+            .save_with_backup(&linked_config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config parent path must be a regular directory"));
+        assert!(fs::read_dir(outside_parent).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn save_with_backup_collision_is_precommit_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let backups_dir = dir.path().join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let collision = backups_dir.join(format!(
+            "config.toml.{}.{}.bak",
+            utc_backup_timestamp(now).unwrap(),
+            sha256_first8(&old_bytes)
+        ));
+        fs::write(&collision, "sentinel").unwrap();
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+
+        let error = changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config backup collision"));
+        assert!(error.contains("config was not saved"));
+        assert_eq!(fs::read_to_string(collision).unwrap(), "sentinel");
+        assert_eq!(fs::read(&path).unwrap(), old_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_reports_postcommit_cleanup_failure_and_retries_on_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        fs::write(dir.path().join("config.toml.bak-20100101"), "stale root").unwrap();
+        for index in 0..10 {
+            let name = format!("config.toml.bak-201001{:02}", index + 2);
+            fs::write(dir.path().join(name), "retained").unwrap();
+        }
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let mut fail_once =
+            |_: &BackupCandidate| -> Result<()> { Err("injected cleanup failure".into()) };
+
+        let error = changed
+            .save_with_backup_at(&path, now, &mut fail_once)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config was saved; backup retention cleanup remains incomplete"));
+        assert!(fs::read_to_string(&path).unwrap().contains("alerts"));
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            changed
+                .save_with_backup_at(&path, now, &mut no_delete)
+                .unwrap();
+            assert!(!dir.path().join("config.toml.bak-20100101").exists());
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            changed
+                .save_with_backup_at(&path, now, &mut no_delete)
+                .unwrap();
+            assert!(dir.path().join("config.toml.bak-20100101").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_revalidates_managed_directory_before_unlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let backups_dir = parent.join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let managed_dir = validate_managed_backup_dir(parent, false).unwrap().unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        for index in 0..11 {
+            let name = format!(
+                "config.toml.{}.{:08x}.bak",
+                utc_backup_timestamp(now - TimeDuration::days(60 - index)).unwrap(),
+                index
+            );
+            fs::write(backups_dir.join(name), "managed").unwrap();
+        }
+        let outside = parent.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let outside_name = format!(
+            "config.toml.{}.abcdef12.bak",
+            utc_backup_timestamp(now - TimeDuration::days(90)).unwrap()
+        );
+        fs::write(outside.join(&outside_name), "outside").unwrap();
+        let moved = parent.join("moved-backups");
+        let mut swapped = false;
+        let mut swap_manager = |_: &BackupCandidate| -> Result<()> {
+            if !swapped {
+                fs::rename(&backups_dir, &moved)?;
+                symlink(&outside, &backups_dir)?;
+                swapped = true;
+            }
+            Ok(())
+        };
+
+        let error = cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            Some(&managed_dir),
+            &[],
+            now,
+            &mut swap_manager,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("managed config backup directory changed"));
+        assert_eq!(
+            fs::read_to_string(outside.join(outside_name)).unwrap(),
+            "outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_preserves_old_active_hardlink_legacy_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let alias = dir.path().join("config.toml.bak-20000101");
+        fs::hard_link(&path, &alias).unwrap();
+        for day in 2..=11 {
+            fs::write(
+                dir.path().join(format!("config.toml.bak-200001{day:02}")),
+                "later",
+            )
+            .unwrap();
+        }
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+
+        changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+
+        assert_eq!(fs::read(alias).unwrap(), old_bytes);
+        assert!(fs::read_to_string(path).unwrap().contains("alerts"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_symlink_collision_does_not_follow_outside_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let backups_dir = dir.path().join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let outside = dir.path().join("outside-backup");
+        fs::write(&outside, "outside").unwrap();
+        let collision = backups_dir.join(format!(
+            "config.toml.{}.{}.bak",
+            utc_backup_timestamp(now).unwrap(),
+            sha256_first8(&old_bytes)
+        ));
+        symlink(&outside, &collision).unwrap();
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+
+        let error = changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config backup collision"));
+        assert_eq!(fs::read_to_string(outside).unwrap(), "outside");
+        assert_eq!(fs::read(path).unwrap(), old_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_skips_non_utf8_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = b"config.toml.bak-label-".to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"-20100101");
+        let path = dir.path().join(OsString::from_vec(bytes));
+        fs::write(&path, "unknown").unwrap();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+
+        cleanup_config_backups_with(
+            dir.path(),
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut no_delete,
+        )
+        .unwrap();
+
+        assert!(fs::symlink_metadata(path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_noop_cleanup_failure_reports_current_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let config = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        config
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original = fs::read(&path).unwrap();
+        for day in 1..=11 {
+            fs::write(
+                dir.path().join(format!("config.toml.bak-200001{day:02}")),
+                "stale",
+            )
+            .unwrap();
+        }
+        let mut fail = |_: &BackupCandidate| -> Result<()> { Err("injected no-op failure".into()) };
+
+        let error = config
+            .save_with_backup_at(&path, now, &mut fail)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "config was already current; backup retention cleanup remains incomplete"
+            )
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_path_open_errors_preserve_only_disappearance() {
+        assert_eq!(
+            classify_candidate_path_open_error(io::Error::from_raw_os_error(libc::ENOENT)).unwrap(),
+            CandidateDeletionOutcome::Disappeared
+        );
+
+        for code in [
+            libc::EINTR,
+            libc::EACCES,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::ESTALE,
+            libc::EINVAL,
+        ] {
+            let error =
+                classify_candidate_path_open_error(io::Error::from_raw_os_error(code)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_readability_errors_preserve_only_attributable_denials() {
+        assert!(matches!(
+            classify_candidate_readability_error(io::Error::from_raw_os_error(libc::EACCES))
+                .unwrap(),
+            CandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
+        ));
+        for code in [
+            libc::ENOSYS,
+            libc::EINVAL,
+            libc::EINTR,
+            libc::EPERM,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::ESTALE,
+        ] {
+            let error = classify_candidate_readability_error(io::Error::from_raw_os_error(code))
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+
+        for code in [libc::EACCES, libc::EPERM] {
+            assert!(matches!(
+                classify_proc_fd_reopen_error(io::Error::from_raw_os_error(code)).unwrap(),
+                CandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
+            ));
+        }
+        assert!(matches!(
+            classify_proc_fd_reopen_error(io::Error::from_raw_os_error(libc::EAGAIN)).unwrap(),
+            CandidateReadability::Preserved(CandidatePreserveReason::ReadLeaseContended)
+        ));
+        for code in [
+            libc::ENOENT,
+            libc::EINVAL,
+            libc::EINTR,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::ESTALE,
+        ] {
+            let error =
+                classify_proc_fd_reopen_error(io::Error::from_raw_os_error(code)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+
+        for code in [libc::ENOENT, libc::ENOTDIR, libc::EACCES, libc::EPERM] {
+            assert!(matches!(
+                classify_proc_fd_dir_error(io::Error::from_raw_os_error(code)).unwrap(),
+                CandidateReadability::Preserved(
+                    CandidatePreserveReason::CompatibilityProbeUnavailable
+                )
+            ));
+        }
+        for code in [
+            libc::EINVAL,
+            libc::EINTR,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::ESTALE,
+        ] {
+            let error = classify_proc_fd_dir_error(io::Error::from_raw_os_error(code)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn faccessat2_compatibility_fallback_deletes_readable_and_preserves_unsafe_candidates() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        const CHILD_ENV: &str = "CLAWHIP_TEST_FACCESSAT2_COMPAT_CHILD";
+        const CHILD_OK: &str = "CLAWHIP_FACCESSAT2_COMPAT_CHILD_OK";
+        const TEST_NAME: &str = "config::tests::faccessat2_compatibility_fallback_deletes_readable_and_preserves_unsafe_candidates";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            FORCE_FACCESSAT2_ENOSYS.with(|force| force.set(true));
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path();
+            let parent_dir = validate_config_parent_dir(parent, false).unwrap();
+            let outside = parent.join("outside-sentinel");
+            fs::write(&outside, "outside").unwrap();
+            let make_candidate = |path: &Path| {
+                let metadata = fs::symlink_metadata(path).unwrap();
+                BackupCandidate {
+                    origin: BackupOrigin::RootLegacy,
+                    path: path.to_path_buf(),
+                    entry_name: path.file_name().unwrap().to_str().unwrap().to_string(),
+                    created_at: OffsetDateTime::now_utc(),
+                    identity: metadata_identity(&metadata).unwrap(),
+                }
+            };
+
+            let readable = parent.join("config.toml.bak-20000101");
+            fs::write(&readable, "readable").unwrap();
+            let readable_candidate = make_candidate(&readable);
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let readable_outcome = delete_verified_candidate(
+                &readable_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(readable_outcome, CandidateDeletionOutcome::Deleted);
+            assert!(!readable.exists());
+
+            let unreadable = parent.join("config.toml.bak-20000102");
+            fs::write(&unreadable, "unreadable").unwrap();
+            let unreadable_bytes = fs::read(&unreadable).unwrap();
+            let unreadable_candidate = make_candidate(&unreadable);
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let unreadable_outcome = delete_verified_candidate(
+                &unreadable_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                unreadable_outcome,
+                CandidateDeletionOutcome::Preserved(CandidatePreserveReason::Unreadable)
+            );
+            assert!(unreadable.exists());
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::read(&unreadable).unwrap(), unreadable_bytes);
+
+            let special = parent.join("config.toml.bak-20000103");
+            let moved = parent.join("moved-special-original");
+            fs::write(&special, "special-original").unwrap();
+            let special_candidate = make_candidate(&special);
+            let mut replace_with_fifo = |_: &BackupCandidate| -> Result<()> {
+                fs::rename(&special, &moved)?;
+                let special_name = CString::new(special.as_os_str().as_bytes()).unwrap();
+                let rc = unsafe { libc::mkfifo(special_name.as_ptr(), 0o600) };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                Ok(())
+            };
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let special_outcome = delete_verified_candidate(
+                &special_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut replace_with_fifo,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                special_outcome,
+                CandidateDeletionOutcome::Preserved(CandidatePreserveReason::NonRegular)
+            );
+            assert!(
+                fs::symlink_metadata(&special)
+                    .unwrap()
+                    .file_type()
+                    .is_fifo()
+            );
+            assert_eq!(fs::read_to_string(&moved).unwrap(), "special-original");
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+
+            let no_proc = parent.join("config.toml.bak-20000104");
+            fs::write(&no_proc, "no-proc").unwrap();
+            let no_proc_candidate = make_candidate(&no_proc);
+            FORCE_PROC_FD_UNAVAILABLE.with(|force| force.set(true));
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let no_proc_outcome = delete_verified_candidate(
+                &no_proc_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                no_proc_outcome,
+                CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::CompatibilityProbeUnavailable
+                )
+            );
+            assert!(no_proc.exists());
+
+            let save_root = parent.join("no-proc-save");
+            fs::create_dir(&save_root).unwrap();
+            let config_path = save_root.join("config.toml");
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            let initial = AppConfig::default();
+            let mut no_delete_hook = |_: &BackupCandidate| Ok(());
+            initial
+                .save_with_backup_at(&config_path, now, &mut no_delete_hook)
+                .unwrap();
+            for day in 1..=11 {
+                fs::write(
+                    save_root.join(format!("config.toml.bak-200001{day:02}")),
+                    format!("legacy-{day}"),
+                )
+                .unwrap();
+            }
+            let preserved = save_root.join("config.toml.bak-20000101");
+            let mut changed = AppConfig::default();
+            changed.defaults.channel = Some("alerts".into());
+            changed
+                .save_with_backup_at(&config_path, now, &mut no_delete_hook)
+                .unwrap();
+            let changed_bytes = fs::read(&config_path).unwrap();
+            changed
+                .save_with_backup_at(&config_path, now, &mut no_delete_hook)
+                .unwrap();
+            assert_eq!(fs::read(&config_path).unwrap(), changed_bytes);
+            assert!(preserved.exists());
+            FORCE_PROC_FD_UNAVAILABLE.with(|force| force.set(false));
+
+            FORCE_FACCESSAT2_ENOSYS.with(|force| force.set(false));
+            FORCE_FACCESSAT2_EPERM.with(|force| force.set(true));
+            let eperm_readable = parent.join("config.toml.bak-20000105");
+            fs::write(&eperm_readable, "eperm-readable").unwrap();
+            let eperm_readable_candidate = make_candidate(&eperm_readable);
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let eperm_readable_outcome = delete_verified_candidate(
+                &eperm_readable_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(eperm_readable_outcome, CandidateDeletionOutcome::Deleted);
+            assert!(!eperm_readable.exists());
+
+            let eperm_unreadable = parent.join("config.toml.bak-20000106");
+            fs::write(&eperm_unreadable, "eperm-unreadable").unwrap();
+            let eperm_unreadable_candidate = make_candidate(&eperm_unreadable);
+            fs::set_permissions(&eperm_unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let eperm_unreadable_outcome = delete_verified_candidate(
+                &eperm_unreadable_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                eperm_unreadable_outcome,
+                CandidateDeletionOutcome::Preserved(CandidatePreserveReason::Unreadable)
+            );
+            assert!(eperm_unreadable.exists());
+            fs::set_permissions(&eperm_unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let eperm_no_proc = parent.join("config.toml.bak-20000107");
+            fs::write(&eperm_no_proc, "eperm-no-proc").unwrap();
+            let eperm_no_proc_candidate = make_candidate(&eperm_no_proc);
+            FORCE_PROC_FD_UNAVAILABLE.with(|force| force.set(true));
+            let mut no_preflight = |_: &BackupCandidate| Ok(());
+            let mut no_after_check = |_: &BackupCandidate| Ok(());
+            let eperm_no_proc_outcome = delete_verified_candidate(
+                &eperm_no_proc_candidate,
+                &parent_dir,
+                None,
+                &[],
+                &mut no_preflight,
+                &mut no_after_check,
+            )
+            .unwrap();
+            assert_eq!(
+                eperm_no_proc_outcome,
+                CandidateDeletionOutcome::Preserved(
+                    CandidatePreserveReason::CompatibilityProbeUnavailable
+                )
+            );
+            assert!(eperm_no_proc.exists());
+            FORCE_PROC_FD_UNAVAILABLE.with(|force| force.set(false));
+            FORCE_FACCESSAT2_EPERM.with(|force| force.set(false));
+
+            let lease_root = parent.join("lease-save");
+            fs::create_dir(&lease_root).unwrap();
+            let lease_config_path = lease_root.join("config.toml");
+            let lease_initial = AppConfig::default();
+            let mut lease_delete_hook = |_: &BackupCandidate| Ok(());
+            lease_initial
+                .save_with_backup_at(&lease_config_path, now, &mut lease_delete_hook)
+                .unwrap();
+            for day in 1..=11 {
+                fs::write(
+                    lease_root.join(format!("config.toml.bak-200002{day:02}")),
+                    format!("lease-{day}"),
+                )
+                .unwrap();
+            }
+            let lease_candidate = lease_root.join("config.toml.bak-20000201");
+            FORCE_PROC_FD_REOPEN_EAGAIN.with(|force| force.set(true));
+            let mut lease_changed = AppConfig::default();
+            lease_changed.defaults.channel = Some("lease-alerts".into());
+            lease_changed
+                .save_with_backup_at(&lease_config_path, now, &mut lease_delete_hook)
+                .unwrap();
+            let lease_changed_bytes = fs::read(&lease_config_path).unwrap();
+            lease_changed
+                .save_with_backup_at(&lease_config_path, now, &mut lease_delete_hook)
+                .unwrap();
+            assert_eq!(fs::read(&lease_config_path).unwrap(), lease_changed_bytes);
+            assert!(lease_candidate.exists());
+            FORCE_PROC_FD_REOPEN_EAGAIN.with(|force| force.set(false));
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+
+            println!("{CHILD_OK}");
+            return;
+        }
+
+        run_bounded_test_child(TEST_NAME, CHILD_ENV, CHILD_OK, true);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn backup_cleanup_rechecks_readability_after_permission_change() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        const CHILD_ENV: &str = "CLAWHIP_TEST_PERMISSION_REVOCATION_CHILD";
+        const CHILD_OK: &str = "CLAWHIP_PERMISSION_REVOCATION_CHILD_OK";
+        const TEST_NAME: &str =
+            "config::tests::backup_cleanup_rechecks_readability_after_permission_change";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("config-root");
+            fs::create_dir(&parent).unwrap();
+            let path = parent.join("config.toml");
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            let initial = AppConfig::default();
+            let mut no_delete = |_: &BackupCandidate| Ok(());
+            initial
+                .save_with_backup_at(&path, now, &mut no_delete)
+                .unwrap();
+            for day in 1..=11 {
+                fs::write(
+                    parent.join(format!("config.toml.bak-200001{day:02}")),
+                    format!("original-{day}"),
+                )
+                .unwrap();
+            }
+            let target = parent.join("config.toml.bak-20000101");
+            let target_bytes = fs::read(&target).unwrap();
+            let target_metadata = fs::metadata(&target).unwrap();
+            let target_identity = (target_metadata.dev(), target_metadata.ino());
+            let outside = root.path().join("outside-sentinel");
+            fs::write(&outside, "outside").unwrap();
+
+            let mut changed = AppConfig::default();
+            changed.defaults.channel = Some("alerts".into());
+            let expected_config = changed.to_pretty_toml().unwrap().into_bytes();
+            let mut before_rename = || Ok(());
+            let mut before_snapshot = || Ok(());
+            let mut before_delete = |_: &BackupCandidate| Ok(());
+            let mut after_preflight = |_: &BackupCandidate| Ok(());
+            let mut revoked = false;
+            let mut after_check = |candidate: &BackupCandidate| -> Result<()> {
+                if candidate.path == target && !revoked {
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o000))?;
+                    revoked = true;
+                }
+                Ok(())
+            };
+            changed
+                .save_with_backup_at_all_candidate_hooks(
+                    &path,
+                    now,
+                    &mut before_rename,
+                    &mut before_snapshot,
+                    &mut before_delete,
+                    &mut after_preflight,
+                    &mut after_check,
+                )
+                .unwrap();
+
+            assert!(revoked);
+            assert_eq!(fs::read(&path).unwrap(), expected_config);
+            let changed_bytes = fs::read(&path).unwrap();
+            changed
+                .save_with_backup_at(&path, now, &mut no_delete)
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), changed_bytes);
+            let preserved_metadata = fs::metadata(&target).unwrap();
+            assert_eq!(
+                (preserved_metadata.dev(), preserved_metadata.ino()),
+                target_identity
+            );
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), target_bytes);
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+            println!("{CHILD_OK}");
+            return;
+        }
+
+        run_bounded_test_child(TEST_NAME, CHILD_ENV, CHILD_OK, true);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_candidate_descriptor_is_event_only_and_fail_closed() {
+        let flags = apple_candidate_open_flags();
+        assert_eq!(flags & libc::O_EVTONLY, libc::O_EVTONLY);
+        assert_eq!(flags & libc::O_NONBLOCK, libc::O_NONBLOCK);
+        assert_eq!(flags & libc::O_NOFOLLOW, libc::O_NOFOLLOW);
+        assert_eq!(flags & libc::O_CLOEXEC, libc::O_CLOEXEC);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_eq!(
+            classify_apple_user_access(libc::R_OK as u32),
+            AppleCandidateReadability::Readable
+        );
+        assert_eq!(
+            classify_apple_user_access(0),
+            AppleCandidateReadability::Preserved(CandidatePreserveReason::Unreadable)
+        );
+        for code in [libc::EACCES, libc::EPERM, libc::EOPNOTSUPP] {
+            assert_eq!(
+                classify_apple_readability_error(io::Error::from_raw_os_error(code)).unwrap(),
+                AppleCandidateReadability::Preserved(
+                    CandidatePreserveReason::CompatibilityProbeUnavailable
+                )
+            );
+        }
+        for code in [
+            libc::EBADF,
+            libc::EINTR,
+            libc::EINVAL,
+            libc::ENOMEM,
+            libc::EIO,
+        ] {
+            let error =
+                classify_apple_readability_error(io::Error::from_raw_os_error(code)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+        for code in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::ELOOP,
+            libc::ENXIO,
+            libc::ENODEV,
+            libc::EOPNOTSUPP,
+            libc::EAGAIN,
+            libc::EBUSY,
+            libc::EISDIR,
+        ] {
+            assert!(apple_candidate_open_error_needs_state_check(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [
+            libc::EINTR,
+            libc::EBADF,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EIO,
+            libc::EINVAL,
+            libc::ENOTDIR,
+        ] {
+            assert!(!apple_candidate_open_error_needs_state_check(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn save_with_backup_preserves_fifo_replacement_after_preflight_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        const CHILD_ENV: &str = "CLAWHIP_TEST_FIFO_REPLACEMENT_CHILD";
+        const CHILD_OK: &str = "CLAWHIP_FIFO_REPLACEMENT_CHILD_OK";
+        const TEST_NAME: &str = "config::tests::save_with_backup_preserves_fifo_replacement_after_preflight_without_blocking";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("config-root");
+            fs::create_dir(&parent).unwrap();
+            let path = parent.join("config.toml");
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            let original = AppConfig::default();
+            let mut no_delete = |_: &BackupCandidate| Ok(());
+            original
+                .save_with_backup_at(&path, now, &mut no_delete)
+                .unwrap();
+            for day in 1..=11 {
+                fs::write(
+                    parent.join(format!("config.toml.bak-200001{day:02}")),
+                    format!("original-{day}"),
+                )
+                .unwrap();
+            }
+            let target = parent.join("config.toml.bak-20000101");
+            let moved = parent.join("moved-original");
+            let outside = root.path().join("outside-sentinel");
+            fs::write(&outside, "outside").unwrap();
+
+            let mut changed = AppConfig::default();
+            changed.defaults.channel = Some("alerts".into());
+            let expected_config = changed.to_pretty_toml().unwrap().into_bytes();
+            let mut before_rename = || Ok(());
+            let mut before_snapshot = || Ok(());
+            let mut before_delete = |_: &BackupCandidate| Ok(());
+            let mut after_preflight = |candidate: &BackupCandidate| -> Result<()> {
+                if candidate.path == target {
+                    fs::rename(&target, &moved)?;
+                    let target_name = CString::new(target.as_os_str().as_bytes()).unwrap();
+                    let rc = unsafe { libc::mkfifo(target_name.as_ptr(), 0o600) };
+                    if rc != 0 {
+                        return Err(io::Error::last_os_error().into());
+                    }
+                }
+                Ok(())
+            };
+
+            changed
+                .save_with_backup_at_candidate_hooks(
+                    &path,
+                    now,
+                    &mut before_rename,
+                    &mut before_snapshot,
+                    &mut before_delete,
+                    &mut after_preflight,
+                )
+                .unwrap();
+
+            assert_eq!(fs::read(&path).unwrap(), expected_config);
+            assert!(
+                fs::symlink_metadata(&target).unwrap().file_type().is_fifo(),
+                "FIFO replacement was not preserved"
+            );
+            assert_eq!(fs::read_to_string(&moved).unwrap(), "original-1");
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+            println!("{CHILD_OK}");
+            return;
+        }
+
+        run_bounded_test_child(TEST_NAME, CHILD_ENV, CHILD_OK, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_skips_candidate_replaced_after_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "original",
+            )
+            .unwrap();
+        }
+        let target = parent.join("config.toml.bak-20000101");
+        let moved = parent.join("replaced-original");
+        let mut replaced = false;
+        let mut replace_candidate = |candidate: &BackupCandidate| -> Result<()> {
+            if !replaced && candidate.path == target {
+                fs::rename(&target, &moved)?;
+                fs::write(&target, "replacement")?;
+                replaced = true;
+            }
+            Ok(())
+        };
+
+        cleanup_config_backups_with(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut replace_candidate,
+        )
+        .unwrap();
+
+        assert!(replaced);
+        assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(moved).unwrap(), "original");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn backup_cleanup_does_not_report_concurrently_disappeared_candidate_as_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "original",
+            )
+            .unwrap();
+        }
+        let target = parent.join("config.toml.bak-20000101");
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        let mut removed = false;
+        let mut remove_candidate = |candidate: &BackupCandidate| -> Result<()> {
+            if candidate.path == target && !removed {
+                fs::remove_file(&target)?;
+                removed = true;
+            }
+            Ok(())
+        };
+        let summary = cleanup_config_backups_with_hooks(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+            &mut remove_candidate,
+            &mut |_: &BackupCandidate| Ok(()),
+        )
+        .unwrap();
+
+        assert!(removed);
+        assert_eq!(
+            summary,
+            CleanupSummary {
+                classified: 11,
+                deleted: 0,
+                preserved: 11,
+            }
+        );
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_cleanup_revalidates_config_parent_before_root_unlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("config-root");
+        fs::create_dir(&parent).unwrap();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "root",
+            )
+            .unwrap();
+        }
+        let outside = dir.path().join("outside-root");
+        fs::create_dir(&outside).unwrap();
+        let oldest_name = "config.toml.bak-20000101";
+        fs::write(outside.join(oldest_name), "outside").unwrap();
+        let moved = dir.path().join("moved-root");
+        let mut swapped = false;
+        let mut swap_parent = |_: &BackupCandidate| -> Result<()> {
+            if !swapped {
+                fs::rename(&parent, &moved)?;
+                symlink(&outside, &parent)?;
+                swapped = true;
+            }
+            Ok(())
+        };
+
+        let error = cleanup_config_backups_with(
+            &parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut swap_parent,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("config parent directory changed"));
+        assert_eq!(
+            fs::read_to_string(outside.join(oldest_name)).unwrap(),
+            "outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_rejects_active_replacement_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let moved = dir.path().join("original-config");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let mut replace_active = || -> Result<()> {
+            fs::rename(&path, &moved)?;
+            fs::write(&path, "replacement")?;
+            Ok(())
+        };
+        let mut before_snapshot = || Ok(());
+
+        let error = changed
+            .save_with_backup_at_hooks(
+                &path,
+                now,
+                &mut replace_active,
+                &mut before_snapshot,
+                &mut no_delete,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("active config changed before replacement"));
+        assert!(error.contains("config was not saved"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(fs::read(moved).unwrap(), original_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_rejects_exact_pid_temp_preplacement_without_touching_outside() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let outside = dir.path().join("outside-sentinel");
+        fs::write(&outside, "sentinel").unwrap();
+        let temp_name = format!(".config.toml.tmp.{}", std::process::id());
+        let temp_path = dir.path().join(&temp_name);
+        symlink(&outside, &temp_path).unwrap();
+
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let error = changed
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("config temp collision") || error.contains("config was not saved"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "sentinel");
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert!(
+            temp_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_rejects_post_write_temp_replacement_before_rename() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let outside = dir.path().join("outside-sentinel");
+        fs::write(&outside, "sentinel").unwrap();
+        let temp_name = format!(".config.toml.tmp.{}", std::process::id());
+        let temp_path = dir.path().join(&temp_name);
+        let moved_temp = dir.path().join("moved-temp");
+
+        let mut replace_temp = || -> Result<()> {
+            if temp_path.exists() {
+                fs::rename(&temp_path, &moved_temp)?;
+            }
+            symlink(&outside, &temp_path)?;
+            Ok(())
+        };
+        let mut before_snapshot = || Ok(());
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+
+        let error = changed
+            .save_with_backup_at_hooks(
+                &path,
+                now,
+                &mut replace_temp,
+                &mut before_snapshot,
+                &mut no_delete,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("config temp path changed before commit")
+                || error.contains("config was not saved")
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "sentinel");
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert!(!fs::read_to_string(&path).unwrap().contains("alerts"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn backup_cleanup_preserves_candidate_replaced_after_final_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for day in 1..=11 {
+            fs::write(
+                parent.join(format!("config.toml.bak-200001{day:02}")),
+                "original",
+            )
+            .unwrap();
+        }
+        let target = parent.join("config.toml.bak-20000101");
+        let moved = parent.join("replaced-original");
+        let mut replaced = false;
+        let mut before_delete = |_: &BackupCandidate| Ok(());
+        let mut after_preflight = |_: &BackupCandidate| Ok(());
+        let mut after_check = |candidate: &BackupCandidate| -> Result<()> {
+            if !replaced && candidate.path == target {
+                fs::rename(&target, &moved)?;
+                fs::write(&target, "replacement")?;
+                replaced = true;
+            }
+            Ok(())
+        };
+
+        cleanup_config_backups_with_hooks(
+            parent,
+            None,
+            "config.toml",
+            None,
+            &[],
+            OffsetDateTime::now_utc(),
+            &mut before_delete,
+            &mut after_preflight,
+            &mut after_check,
+        )
+        .unwrap();
+
+        assert!(replaced);
+        assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(moved).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_with_backup_managed_snapshot_stays_in_bound_dir_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = AppConfig::default();
+        let mut no_delete = |_: &BackupCandidate| Ok(());
+        original
+            .save_with_backup_at(&path, now, &mut no_delete)
+            .unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let backups_dir = dir.path().join(".clawhip-config-backups");
+        fs::create_dir(&backups_dir).unwrap();
+        let outside = dir.path().join("outside-backups");
+        fs::create_dir(&outside).unwrap();
+        let moved = dir.path().join("moved-backups");
+        let mut swapped = false;
+        let mut before_snapshot = || -> Result<()> {
+            if !swapped {
+                fs::rename(&backups_dir, &moved)?;
+                symlink(&outside, &backups_dir)?;
+                swapped = true;
+            }
+            Ok(())
+        };
+        let mut before_rename = || Ok(());
+        let mut changed = AppConfig::default();
+        changed.defaults.channel = Some("alerts".into());
+        let result = changed.save_with_backup_at_hooks(
+            &path,
+            now,
+            &mut before_rename,
+            &mut before_snapshot,
+            &mut no_delete,
+        );
+
+        assert!(swapped);
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "managed snapshot must not write outside swapped directory"
+        );
+        let managed_entries = fs::read_dir(&moved)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(managed_entries.len(), 1);
+        assert_eq!(fs::read(managed_entries[0].path()).unwrap(), original_bytes);
+        match result {
+            Ok(_) => {
+                assert!(fs::read_to_string(&path).unwrap().contains("alerts"));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("config was saved")
+                        || message.contains("config was not saved")
+                        || message.contains("managed config backup directory")
+                );
+                // Snapshot containment is the contract under test; path-based
+                // post-commit cleanup may observe the swapped managed path.
+                let _ = message;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod subscription_config_tests {
+    use super::AppConfig;
+
+    #[test]
+    fn rejects_unknown_subscription_and_endpoint_fields() {
+        let config = r#"
+[[subscriptions]]
+name = "gjc-workflow-gate"
+enabled = false
+kind = "websocket"
+endpoint_env = "GJC_WS_URL"
+endpoint = "wss://secret.invalid"
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+[subscriptions.adapter]
+program = "/bin/true"
+"#;
+        assert!(toml::from_str::<AppConfig>(config).is_err());
+    }
+
+    #[test]
+    fn rejects_subscription_names_with_surrounding_whitespace() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[[subscriptions]]
+name = " workflow-gate "
+enabled = false
+kind = "websocket"
+endpoint_env = "WORKFLOW_GATE_URL"
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+[subscriptions.adapter]
+program = "/bin/true"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "invalid_subscription_config"
+        );
+    }
+
+    #[test]
+    fn documented_workflow_gate_and_question_subscriptions_parse_and_validate() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[providers.discord]
+token = "fixture-token"
+[[subscriptions]]
+name = "gjc-workflow-gate"
+enabled = false
+kind = "websocket"
+endpoint_env = "GJC_WORKFLOW_GATE_WS"
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+[[subscriptions.filter.predicates]]
+pointer = "/gate/state"
+equals = "ready"
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+gate_state = "/gate/state"
+[subscriptions.adapter]
+program = "/bin/true"
+[subscriptions.routing]
+tool = "gjc"
+project = "my-project"
+
+[[subscriptions]]
+name = "gjc-question"
+enabled = false
+kind = "websocket"
+endpoint_env = "GJC_QUESTION_WS"
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "question"
+[subscriptions.projection]
+question_id = "/question/id"
+summary = "/question/summary"
+[subscriptions.adapter]
+program = "/bin/true"
+
+[[routes]]
+event = "workflow.gate"
+sink = "discord"
+channel = "WORKFLOW_GATE_CHANNEL_ID"
+format = "alert"
+
+[[routes]]
+event = "workflow.question"
+sink = "discord"
+channel = "QUESTIONS_CHANNEL_ID"
+format = "compact"
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ledger_config_tests {
+    use super::AppConfig;
+
+    #[test]
+    fn old_config_defaults_ledger_off() {
+        let config: AppConfig = toml::from_str("[daemon]\nport = 9876\n").unwrap();
+        assert!(!config.ledger.enabled);
+    }
+
+    #[test]
+    fn parses_and_validates_ledger_limits() {
+        let config: AppConfig = toml::from_str(
+            r#"[ledger]
+enabled = true
+raw_retention_days = 7
+summary_retention_days = 30
+compaction_interval_secs = 60
+max_records = 1000
+max_record_bytes = 4096
+max_keywords = 8
+max_keyword_bytes = 32
+max_query_results = 50
+max_records_per_compaction = 100
+
+[[routes]]
+event = "*"
+sink = "localfile"
+local_path = "/tmp/clawhip-ledger-test.jsonl"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.ledger.enabled);
+    }
+
+    #[test]
+    fn rejects_summary_retention_shorter_than_raw() {
+        let mut config = AppConfig::default();
+        config.ledger.raw_retention_days = 30;
+        config.ledger.summary_retention_days = 7;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("ledger")
+        );
+    }
+
+    #[test]
+    fn github_status_monitor_parses_and_validates_without_secrets() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[monitors.github_status]
+enabled = true
+api_base = "https://www.githubstatus.com/api/v2"
+components = ["Actions"]
+poll_interval_secs = 90
+channel = "1480171113253175356"
+channel_name = "gajae-code-dev"
+format = "alert"
+
+[[routes]]
+event = "github.actions-*"
+sink = "discord"
+channel = "1480171113253175356"
+channel_name = "gajae-code-dev"
+format = "alert"
+
+[providers.discord]
+token = "test-token"
+"#,
+        )
+        .expect("github_status config parses");
+        config.validate().expect("github_status config validates");
+        assert!(config.monitors.github_status.enabled);
+        assert_eq!(
+            config.monitors.github_status.api_base,
+            "https://www.githubstatus.com/api/v2"
+        );
+        assert_eq!(config.monitors.github_status.components, vec!["Actions"]);
+        assert_eq!(config.monitors.github_status.poll_interval_secs, 90);
+        assert_eq!(
+            config.monitors.github_status.channel_name.as_deref(),
+            Some("gajae-code-dev")
+        );
+        // Ensure disabled-by-default keeps old configs valid.
+        let old: AppConfig = toml::from_str(
+            r#"
+[[routes]]
+event = "custom"
+sink = "localfile"
+local_path = "/tmp/clawhip/events.jsonl"
+"#,
+        )
+        .expect("old config");
+        assert!(!old.monitors.github_status.enabled);
+        assert!(old.validate().is_ok());
+    }
+
+    #[test]
+    fn github_status_monitor_rejects_empty_components_when_enabled() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[monitors.github_status]
+enabled = true
+components = ["", "  "]
+poll_interval_secs = 60
+
+[[routes]]
+event = "*"
+sink = "localfile"
+local_path = "/tmp/clawhip/events.jsonl"
+"#,
+        )
+        .expect("parses");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("monitors.github_status.components"),
+            "unexpected error: {err}"
+        );
     }
 }

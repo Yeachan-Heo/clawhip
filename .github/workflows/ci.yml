@@ -13,7 +13,7 @@ jobs:
   check:
     name: Check
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,7 +35,7 @@ jobs:
           fi
 
           if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the runner."
             exit 1
           fi
 
@@ -44,7 +44,7 @@ jobs:
           elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             apt_get=(sudo apt-get)
           else
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the runner or configure passwordless sudo."
             exit 1
           fi
 
@@ -62,7 +62,7 @@ jobs:
   test:
     name: Test
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -84,7 +84,7 @@ jobs:
           fi
 
           if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the runner."
             exit 1
           fi
 
@@ -93,7 +93,7 @@ jobs:
           elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             apt_get=(sudo apt-get)
           else
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the runner or configure passwordless sudo."
             exit 1
           fi
 
@@ -108,10 +108,20 @@ jobs:
           done
       - run: cargo test
 
+  windows-backup-cleanup:
+    name: Windows backup cleanup
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test config_backup_cleanup
+
   clippy:
     name: Clippy
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -135,7 +145,7 @@ jobs:
           fi
 
           if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the runner."
             exit 1
           fi
 
@@ -144,7 +154,7 @@ jobs:
           elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             apt_get=(sudo apt-get)
           else
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the runner or configure passwordless sudo."
             exit 1
           fi
 
@@ -162,7 +172,7 @@ jobs:
   fmt:
     name: Format
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -185,7 +195,7 @@ jobs:
           fi
 
           if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the runner."
             exit 1
           fi
 
@@ -194,7 +204,7 @@ jobs:
           elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             apt_get=(sudo apt-get)
           else
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the runner or configure passwordless sudo."
             exit 1
           fi
 
@@ -213,7 +223,7 @@ jobs:
     name: Build
     needs: [check, test, clippy, fmt]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -235,7 +245,7 @@ jobs:
           fi
 
           if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the self-hosted runner."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get is unavailable. Install build-essential and xz-utils on the runner."
             exit 1
           fi
 
@@ -244,7 +254,7 @@ jobs:
           elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             apt_get=(sudo apt-get)
           else
-            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the self-hosted runner or configure passwordless sudo."
+            echo "::error::Missing required native build tools (${missing[*]}) and apt-get cannot run with root privileges. Install build-essential and xz-utils on the runner or configure passwordless sudo."
             exit 1
           fi
 

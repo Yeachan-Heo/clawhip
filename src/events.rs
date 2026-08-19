@@ -134,7 +134,10 @@ impl IncomingEvent {
             mention: None,
             format: None,
             template: None,
-            payload: json!({ "message": message }),
+            payload: json!({
+                "event_id": Uuid::new_v4().to_string(),
+                "message": message,
+            }),
         }
     }
 
@@ -520,6 +523,80 @@ impl IncomingEvent {
         }
     }
 
+    /// GitHub Actions (or other watched Statuspage component) status transition.
+    pub fn github_actions_status(
+        component: String,
+        old_status: String,
+        new_status: String,
+        url: String,
+        channel: Option<String>,
+    ) -> Self {
+        Self {
+            kind: "github.actions-status".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "component": component,
+                "old_status": old_status,
+                "new_status": new_status,
+                "url": url,
+                "provider": "github-statuspage",
+            }),
+        }
+    }
+
+    /// GitHub platform incident lifecycle update for watched Statuspage components.
+    #[allow(clippy::too_many_arguments)]
+    pub fn github_actions_incident(
+        incident_id: String,
+        name: String,
+        status: String,
+        impact: String,
+        change: String,
+        old_status: Option<String>,
+        update_id: Option<String>,
+        update_status: Option<String>,
+        update_body: Option<String>,
+        affected_components: Vec<String>,
+        url: String,
+        channel: Option<String>,
+    ) -> Self {
+        let mut payload = Map::new();
+        payload.insert("incident_id".to_string(), json!(incident_id));
+        payload.insert("name".to_string(), json!(name));
+        payload.insert("status".to_string(), json!(status));
+        payload.insert("impact".to_string(), json!(impact));
+        payload.insert("change".to_string(), json!(change));
+        payload.insert("url".to_string(), json!(url));
+        payload.insert("provider".to_string(), json!("github-statuspage"));
+        payload.insert(
+            "affected_components".to_string(),
+            json!(affected_components),
+        );
+        if let Some(old_status) = old_status {
+            payload.insert("old_status".to_string(), json!(old_status));
+        }
+        if let Some(update_id) = update_id {
+            payload.insert("update_id".to_string(), json!(update_id));
+        }
+        if let Some(update_status) = update_status {
+            payload.insert("update_status".to_string(), json!(update_status));
+        }
+        if let Some(update_body) = update_body {
+            payload.insert("update_body".to_string(), json!(update_body));
+        }
+        Self {
+            kind: "github.actions-incident".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: Value::Object(payload),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gajae_release_hold(
         repo: String,
@@ -760,6 +837,51 @@ impl IncomingEvent {
         }
 
         self
+    }
+
+    /// Constructs a route-neutral event after a subscription adapter has passed its restricted output checks.
+    pub fn subscription(
+        kind: String,
+        payload: Value,
+        routing: &RoutingMetadata,
+        name: &str,
+    ) -> Self {
+        let mut event = Self {
+            kind,
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload,
+        }
+        .with_routing_metadata(routing);
+        if let Some(object) = event.payload.as_object_mut() {
+            object.insert("event_id".to_string(), json!(Uuid::new_v4().to_string()));
+            object.insert(
+                "correlation_id".to_string(),
+                json!(Uuid::new_v4().to_string()),
+            );
+            object.insert(
+                "first_seen_at".to_string(),
+                json!(
+                    OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_default()
+                ),
+            );
+            object.insert("contract_event".to_string(), json!(event.kind.clone()));
+            object.insert("subscription_name".to_string(), json!(name));
+            object.insert("subscription_transport".to_string(), json!("websocket"));
+            object.insert(
+                "subscription_received_at".to_string(),
+                json!(
+                    OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        event
     }
 
     pub fn canonical_kind(&self) -> &str {
@@ -1076,8 +1198,11 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
             .flatten()
     });
     let event_timestamp = first_string(payload, &["/event_timestamp", "/timestamp"]);
-    let event_id =
-        first_string(payload, &["/event_id"]).unwrap_or_else(|| Uuid::new_v4().to_string());
+    let prior_generated_event_id = first_string(payload, &["/_clawhip_generated_event_id"]);
+    let supplied_event_id = first_string(payload, &["/event_id"]);
+    let event_id_generated = supplied_event_id.is_none()
+        || supplied_event_id.as_deref() == prior_generated_event_id.as_deref();
+    let event_id = supplied_event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let correlation_id = first_string(payload, &["/correlation_id"])
         .or_else(|| {
             [
@@ -1228,7 +1353,12 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
         .or_insert_with(|| json!(canonical_kind));
 
     insert_string_if_missing(object, "tool", tool);
-    insert_string_if_missing(object, "event_id", Some(event_id));
+    insert_string_if_missing(object, "event_id", Some(event_id.clone()));
+    if event_id_generated {
+        object.insert("_clawhip_generated_event_id".to_string(), json!(event_id));
+    } else {
+        object.remove("_clawhip_generated_event_id");
+    }
     insert_string_if_missing(object, "correlation_id", Some(correlation_id));
     insert_string_if_missing(object, "first_seen_at", Some(first_seen_at));
     if (canonical_kind.starts_with("agent.") || canonical_kind.starts_with("session."))

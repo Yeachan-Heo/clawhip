@@ -5,13 +5,22 @@ use crate::events::IncomingEvent;
 
 pub mod git;
 pub mod github;
+pub mod github_status;
+pub mod subscription;
 pub mod tmux;
 pub mod workspace;
 
-pub use git::GitSource;
+pub use git::{
+    GitMonitorLifecycleCounts, GitSource, SharedGitMonitorDiagnostics,
+    new_shared_git_monitor_diagnostics, snapshot_git_monitor_diagnostics,
+};
 pub use github::GitHubSource;
+pub use github_status::GitHubStatusSource;
+pub use subscription::{SubscriptionSnapshot, SubscriptionState, SubscriptionWorker};
 pub use tmux::{
-    RegisteredTmuxSession, SharedTmuxRegistry, TmuxSource, list_active_tmux_registrations,
+    RegisteredTmuxSession, SharedTmuxRegistry, TmuxSource, default_registry_state_path,
+    inspect_tmux_registry_state, list_active_tmux_registrations, load_tmux_registry_state,
+    register_runtime_tmux_registration, tmux_registry_diagnostics,
 };
 pub use workspace::WorkspaceSource;
 

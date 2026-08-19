@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -9,17 +11,32 @@ use crate::Result;
 use crate::cli::{TmuxNewArgs, TmuxWatchArgs, TmuxWrapperFormat};
 use crate::client::DaemonClient;
 use crate::config::AppConfig;
+use crate::discord::{DiscordClient, DiscordLaneDisposition};
 use crate::events::RoutingMetadata;
 use crate::router::resolve_tmux_session_channel_with_metadata;
+use crate::sink::SinkTarget;
+use crate::telemetry;
+
 use crate::source::tmux::{
-    ParentProcessInfo, RegisteredTmuxSession, RegistrationSource, content_hash,
-    current_timestamp_rfc3339, monitor_registered_session, session_exists, tmux_bin,
+    BoundedCategory, LaneDeliveryMutation, LaneEvidence, LaneEvidenceMutation, LaneLaunchState,
+    LaneRegistrationInput, LaneVisibility, LaneWorkflow, ParentProcessInfo, RegisteredTmuxSession,
+    RegistrationSource, WorkerEffectKind, content_hash, current_timestamp_rfc3339,
+    monitor_registered_session, session_exists, tmux_bin,
 };
 
 pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
+    if args.thread.is_some() {
+        let requested_session = args.session.clone();
+        let attach = args.attach;
+        launch_lane_session(args, config).await?;
+        if attach {
+            attach_lane_session(&requested_session).await?;
+        }
+        return Ok(());
+    }
+
     launch_session(&args).await?;
     let monitor_args = TmuxMonitorArgs::from_new_args(&args, config);
-
     if args.follow {
         let monitor = register_and_start_monitor(monitor_args, config).await?;
         if args.attach {
@@ -124,7 +141,9 @@ impl TmuxMonitorArgs {
             registered_at: self.registered_at,
             registration_source: self.registration_source,
             parent_process: self.parent_process,
+            registration_generation: 0,
             active_wrapper_monitor,
+            lane: None,
         }
     }
 }
@@ -283,6 +302,1069 @@ async fn launch_session(args: &TmuxNewArgs) -> Result<()> {
     Ok(())
 }
 
+fn lane_effect_kind(args: &TmuxNewArgs) -> WorkerEffectKind {
+    if args.command.is_empty() {
+        WorkerEffectKind::SessionCreation
+    } else {
+        WorkerEffectKind::CommandSubmission
+    }
+}
+
+fn new_lane_evidence(args: &TmuxNewArgs) -> LaneEvidence {
+    LaneEvidence {
+        lane_version: 1,
+        generation_id: uuid::Uuid::new_v4().to_string(),
+        kickoff_operation_id: uuid::Uuid::new_v4().to_string(),
+        launch_operation_id: uuid::Uuid::new_v4().to_string(),
+        executor_id: uuid::Uuid::new_v4().to_string(),
+        worker_effect_kind: lane_effect_kind(args),
+        launch_state: LaneLaunchState::Ready,
+        workflow: Default::default(),
+        revision: 0,
+        quiesced: false,
+        thread_id: args.thread.clone(),
+        kickoff_message_id: None,
+        kickoff_delivered_at: None,
+        visibility: Some(LaneVisibility::Unverified),
+        verification: None,
+        last_failure: None,
+        latest_update_message_id: None,
+        latest_update_kind: None,
+        latest_update_delivered_at: None,
+        delivery_retry_count: 0,
+        delivery_disposition: None,
+    }
+}
+
+fn validate_lane_args(args: &TmuxNewArgs) -> Result<()> {
+    let thread = args
+        .thread
+        .as_deref()
+        .ok_or("lane launch requires a thread")?;
+    if thread.trim().is_empty() {
+        return Err("lane thread must not be empty".into());
+    }
+    if args
+        .kickoff
+        .as_ref()
+        .is_some_and(|message| message.chars().count() > 2_000)
+    {
+        return Err("lane kickoff exceeds 2000 Unicode scalars".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub(crate) struct LaneInspectionResult {
+    pub derived_status: Option<String>,
+    pub observation_reason: Option<String>,
+    pub worker_started: Option<bool>,
+    pub evidence_commit: bool,
+    pub repair_needed: bool,
+    pub healthy: bool,
+    pub exit_category: Option<String>,
+    pub runtime: &'static str,
+}
+
+fn overlay_from_snapshot(snapshot: &crate::source::tmux::LaneSnapshot) -> LaneInspectionResult {
+    LaneInspectionResult {
+        derived_status: snapshot.derived_status.clone(),
+        observation_reason: snapshot
+            .observation_reason
+            .as_ref()
+            .map(|reason| reason.as_str().to_string()),
+        worker_started: snapshot.worker_started,
+        evidence_commit: snapshot.evidence_commit,
+        repair_needed: snapshot.repair_needed,
+        healthy: snapshot.healthy,
+        exit_category: snapshot
+            .exit_category
+            .as_ref()
+            .map(|category| category.as_str().to_string()),
+        runtime: "unknown",
+    }
+}
+
+fn r2_overlay(
+    kind: WorkerEffectKind,
+    reason: &str,
+    identity_conflict: bool,
+) -> LaneInspectionResult {
+    let status = if identity_conflict {
+        "identity-conflict"
+    } else if matches!(kind, WorkerEffectKind::CommandSubmission) {
+        "launch-commit-ambiguous"
+    } else {
+        "session-creation-effect-uncommitted"
+    };
+    LaneInspectionResult {
+        derived_status: Some(status.into()),
+        observation_reason: Some(reason.into()),
+        worker_started: None,
+        evidence_commit: false,
+        repair_needed: true,
+        healthy: false,
+        exit_category: Some(reason.into()),
+        runtime: match reason {
+            "session-missing" => "tmux-missing",
+            "session-liveness-unavailable" => "unknown",
+            _ => "live",
+        },
+    }
+}
+
+fn kickoff_failure_overlay(
+    category: &BoundedCategory,
+    disposition: DiscordLaneDisposition,
+) -> LaneInspectionResult {
+    LaneInspectionResult {
+        derived_status: Some(
+            match disposition {
+                DiscordLaneDisposition::AmbiguousAcceptance => "kickoff-ambiguous",
+                DiscordLaneDisposition::DefinitiveFailure => "kickoff-failed",
+            }
+            .into(),
+        ),
+        observation_reason: Some(category.as_str().into()),
+        worker_started: None,
+        evidence_commit: true,
+        repair_needed: true,
+        healthy: false,
+        exit_category: Some(category.as_str().into()),
+        runtime: "tmux-missing",
+    }
+}
+
+fn durable_launch_state_name(state: LaneLaunchState) -> &'static str {
+    match state {
+        LaneLaunchState::Ready => "ready",
+        LaneLaunchState::Claimed => "claimed",
+        LaneLaunchState::IdentityVerified => "identity-markers-verified",
+        LaneLaunchState::Launched => "launched",
+        LaneLaunchState::NoWorkerEffect => "launch-failed-no-worker-effect",
+
+        LaneLaunchState::CommandSubmitAmbiguous => "blocked-command-submit-ambiguous",
+        LaneLaunchState::SessionCreationAmbiguous => "blocked-session-creation-ambiguous",
+    }
+}
+
+fn lane_result_json(
+    snapshot: &crate::source::tmux::LaneSnapshot,
+    overlay: &LaneInspectionResult,
+    thread: Option<&str>,
+) -> serde_json::Value {
+    let mut result = serde_json::json!({
+        "session": snapshot.session,
+        "worker_effect_kind": snapshot.worker_effect_kind,
+        "generation_id": snapshot.generation_id,
+        "kickoff_operation_id": snapshot.kickoff_operation_id,
+        "launch_operation_id": snapshot.launch_operation_id,
+        "executor_id": snapshot.executor_id,
+        "durable_launch_state": durable_launch_state_name(snapshot.durable_launch_state),
+        "derived_status": overlay.derived_status,
+        "observation_reason": overlay.observation_reason,
+        "worker_started": overlay.worker_started,
+        "evidence_commit": overlay.evidence_commit,
+        "repair_needed": overlay.repair_needed,
+        "healthy": overlay.healthy,
+        "exit_category": overlay.exit_category,
+    });
+    if let Some(thread) = thread {
+        result["thread_id"] = serde_json::json!(telemetry::safe_target_id(
+            &SinkTarget::DiscordThread(thread.to_owned()),
+        ));
+        result["kickoff_message_id"] = serde_json::json!(snapshot.kickoff_message_id);
+        result["kickoff_delivered_at"] = serde_json::json!(snapshot.kickoff_delivered_at);
+        result["watch_registered"] = serde_json::json!(true);
+        result["visibility"] = serde_json::json!(snapshot.visibility);
+        result["workflow"] = serde_json::json!(snapshot.workflow);
+        result["runtime"] = serde_json::json!(overlay.runtime);
+    }
+    result
+}
+
+fn emit_lane_result(
+    args: &TmuxNewArgs,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+    overlay: &LaneInspectionResult,
+) {
+    if args.json {
+        println!(
+            "{}",
+            lane_result_json(snapshot, overlay, args.thread.as_deref())
+        );
+    } else {
+        let worker = match overlay.worker_started {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        };
+        let exit = overlay.exit_category.as_deref().unwrap_or("success");
+        println!(
+            "session={} status={} worker_started={} exit={}",
+            snapshot.session,
+            overlay.derived_status.as_deref().unwrap_or("—"),
+            worker,
+            exit
+        );
+    }
+}
+
+fn claim_response_loss_matches(
+    detail: &crate::source::tmux::LaneDetail,
+    lane: &LaneEvidence,
+    expected_revision: u64,
+) -> bool {
+    let snapshot = &detail.snapshot;
+    snapshot.generation_id == lane.generation_id
+        && snapshot.kickoff_operation_id == lane.kickoff_operation_id
+        && snapshot.launch_operation_id == lane.launch_operation_id
+        && snapshot.executor_id == lane.executor_id
+        && snapshot.worker_effect_kind == lane.worker_effect_kind
+        && detail.thread_id == lane.thread_id
+        && snapshot.durable_launch_state == LaneLaunchState::Claimed
+        && snapshot.revision == expected_revision.saturating_add(1)
+}
+
+fn register_response_loss_matches(
+    detail: &crate::source::tmux::LaneDetail,
+    lane: &LaneEvidence,
+) -> bool {
+    let snapshot = &detail.snapshot;
+    snapshot.generation_id == lane.generation_id
+        && snapshot.kickoff_operation_id == lane.kickoff_operation_id
+        && snapshot.launch_operation_id == lane.launch_operation_id
+        && snapshot.executor_id == lane.executor_id
+        && snapshot.worker_effect_kind == lane.worker_effect_kind
+        && detail.thread_id == lane.thread_id
+        && snapshot.durable_launch_state == LaneLaunchState::Ready
+        && snapshot.revision == 0
+        && snapshot.workflow == LaneWorkflow::Active
+        && snapshot.visibility == Some(LaneVisibility::Unverified)
+        && snapshot.kickoff_message_id.is_none()
+        && snapshot.kickoff_delivered_at.is_none()
+        && snapshot.latest_update_message_id.is_none()
+        && snapshot.latest_update_kind.is_none()
+        && snapshot.latest_update_delivered_at.is_none()
+        && detail.last_error.is_none()
+        && !detail.quiesced
+}
+
+fn kickoff_receipt_response_loss_matches(
+    detail: &crate::source::tmux::LaneDetail,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+    message_id: Option<&str>,
+    delivered_at: Option<&str>,
+    visibility: LaneVisibility,
+    category: Option<&str>,
+    disposition: &str,
+) -> bool {
+    detail.snapshot.generation_id == snapshot.generation_id
+        && detail.snapshot.kickoff_operation_id == snapshot.kickoff_operation_id
+        && detail.snapshot.revision == snapshot.revision.saturating_add(1)
+        && detail.kickoff_message_id.as_deref() == message_id
+        && detail.kickoff_delivered_at.as_deref() == delivered_at
+        && detail.snapshot.visibility == Some(visibility)
+        && detail.last_error.as_ref().map(BoundedCategory::as_str) == category
+        && detail
+            .snapshot
+            .exit_category
+            .as_ref()
+            .map(BoundedCategory::as_str)
+            == category
+        && match (category, disposition) {
+            (None, "accepted") => true,
+            (Some(category), "ambiguous-acceptance") => {
+                detail.snapshot.derived_status.as_deref() == Some("kickoff-ambiguous")
+                    && detail
+                        .snapshot
+                        .observation_reason
+                        .as_ref()
+                        .is_some_and(|reason| reason.as_str() == category)
+            }
+            (Some(category), "definitive-failure") => {
+                detail.snapshot.derived_status.as_deref() == Some("kickoff-failed")
+                    && detail
+                        .snapshot
+                        .observation_reason
+                        .as_ref()
+                        .is_some_and(|reason| reason.as_str() == category)
+            }
+            _ => false,
+        }
+}
+
+fn committed_transition_matches(
+    expected: &crate::source::tmux::LaneSnapshot,
+    expected_state: LaneLaunchState,
+    expected_category: Option<&str>,
+    actual: &crate::source::tmux::LaneSnapshot,
+) -> bool {
+    actual.generation_id == expected.generation_id
+        && actual.launch_operation_id == expected.launch_operation_id
+        && actual.executor_id == expected.executor_id
+        && actual.worker_effect_kind == expected.worker_effect_kind
+        && actual.revision == expected.revision.saturating_add(1)
+        && actual.durable_launch_state == expected_state
+        && match expected_category {
+            Some(category) => {
+                actual
+                    .exit_category
+                    .as_ref()
+                    .is_some_and(|actual| actual.as_str() == category)
+                    || actual
+                        .observation_reason
+                        .as_ref()
+                        .is_some_and(|actual| actual.as_str() == category)
+            }
+            None => true,
+        }
+}
+
+async fn transition_lane(
+    client: &DaemonClient,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+    launch_state: LaneLaunchState,
+    failure_category: Option<&str>,
+) -> Result<crate::source::tmux::LaneSnapshot> {
+    let input = LaneEvidenceMutation {
+        session: snapshot.session.clone(),
+        expected_revision: snapshot.revision,
+        generation_id: snapshot.generation_id.clone(),
+        launch_operation_id: snapshot.launch_operation_id.clone(),
+        launch_state,
+        failure_category: failure_category.map(BoundedCategory::new),
+        executor_id: snapshot.executor_id.clone(),
+        worker_effect_kind: snapshot.worker_effect_kind,
+    };
+    match client.update_lane_evidence(&input).await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => match client.lane_detail(&snapshot.session).await {
+            Ok(detail)
+                if committed_transition_matches(
+                    snapshot,
+                    launch_state,
+                    failure_category,
+                    &detail.snapshot,
+                ) =>
+            {
+                Ok(detail.snapshot)
+            }
+            _ => Err(error),
+        },
+    }
+}
+
+async fn finalize_existing_lane(args: &TmuxNewArgs, client: &DaemonClient) -> Result<()> {
+    let snapshot = client.lane_detail(&args.session).await?.snapshot;
+    if !matches!(
+        snapshot.durable_launch_state,
+        LaneLaunchState::IdentityVerified
+    ) {
+        if snapshot.durable_launch_state == LaneLaunchState::Launched && args.attach {
+            match inspect_lane_markers(&args.session, &snapshot).await {
+                LaneInspection::Exact => {}
+                LaneInspection::CommandTerminal(category) => {
+                    let overlay = r2_overlay(WorkerEffectKind::CommandSubmission, category, false);
+                    emit_lane_result(args, &snapshot, &overlay);
+                    return Err("retained lane ownership proof is not exact".into());
+                }
+                LaneInspection::Observed(reason, conflict) => {
+                    let overlay = r2_overlay(snapshot.worker_effect_kind, reason, conflict);
+                    emit_lane_result(args, &snapshot, &overlay);
+                    return Err("retained lane ownership proof is not exact".into());
+                }
+            }
+        }
+        let overlay = overlay_from_snapshot(&snapshot);
+        emit_lane_result(args, &snapshot, &overlay);
+        return if snapshot.worker_started == Some(true) {
+            Ok(())
+        } else {
+            Err("lane launch is retained without a confirmed worker".into())
+        };
+    }
+    match inspect_lane_markers(&args.session, &snapshot).await {
+        LaneInspection::Exact => {
+            let finalized =
+                transition_lane(client, &snapshot, LaneLaunchState::Launched, None).await?;
+            emit_lane_result(args, &finalized, &overlay_from_snapshot(&finalized));
+            Ok(())
+        }
+        LaneInspection::CommandTerminal(category) => {
+            let terminal = transition_lane(
+                client,
+                &snapshot,
+                LaneLaunchState::CommandSubmitAmbiguous,
+                Some(category),
+            )
+            .await?;
+            emit_lane_result(args, &terminal, &overlay_from_snapshot(&terminal));
+            Err("lane command submission proof is not exact".into())
+        }
+        LaneInspection::Observed(reason, conflict) => {
+            let overlay = r2_overlay(snapshot.worker_effect_kind, reason, conflict);
+            emit_lane_result(args, &snapshot, &overlay);
+            Err("lane worker proof is not exact".into())
+        }
+    }
+}
+
+fn delivery_failure_visibility(disposition: DiscordLaneDisposition) -> LaneVisibility {
+    match disposition {
+        DiscordLaneDisposition::DefinitiveFailure => LaneVisibility::DeliveryFailed,
+        DiscordLaneDisposition::AmbiguousAcceptance => LaneVisibility::Unverified,
+    }
+}
+fn discord_lane_category(error: &crate::discord::DiscordLaneError) -> BoundedCategory {
+    use crate::discord::DiscordLaneErrorCategory::*;
+    let category = match error.category {
+        ContentTooLong => "payload-too-large",
+
+        BadRequest => "bad-request",
+        Unauthorized => "unauthorized",
+        Forbidden => "forbidden",
+        NotFound => "not-found",
+        RateLimited => "rate-limited",
+        ArchivedOrNotWritable => "archived-or-not-writable",
+        Timeout => "timeout",
+        Transport => "transport",
+        MalformedSuccess => "malformed-success",
+        EmptyMessageId => "empty-message-id",
+        MissingMessageId => "missing-message-id",
+    };
+    BoundedCategory::new(category)
+}
+
+async fn deliver_kickoff(
+    args: &TmuxNewArgs,
+    client: &DaemonClient,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+    message: &str,
+    config: &AppConfig,
+) -> Result<crate::source::tmux::LaneSnapshot> {
+    let discord = DiscordClient::from_config(Arc::new(config.clone()))?;
+    match discord
+        .send_thread_with_receipt(
+            args.thread.as_deref().expect("validated lane thread"),
+            message,
+        )
+        .await
+    {
+        Ok(receipt) => {
+            let message_id = receipt.message_id;
+            let delivered_at = receipt.timestamp.to_string();
+            let mutation = LaneDeliveryMutation {
+                session: snapshot.session.clone(),
+                expected_revision: snapshot.revision,
+                workflow: None,
+                message_id: Some(message_id.clone()),
+                kind: Some("kickoff".into()),
+                delivered_at: Some(delivered_at.clone()),
+                visibility: LaneVisibility::Visible,
+                error_category: None,
+                disposition: Some("accepted".into()),
+                generation_id: snapshot.generation_id.clone(),
+                initial_kickoff: true,
+                kickoff_operation_id: Some(snapshot.kickoff_operation_id.clone()),
+            };
+            match client.record_lane_delivery(&mutation).await {
+                Ok(next) => Ok(next),
+                Err(error) => match client.lane_detail(&snapshot.session).await {
+                    Ok(detail)
+                        if kickoff_receipt_response_loss_matches(
+                            &detail,
+                            snapshot,
+                            Some(&message_id),
+                            Some(&delivered_at),
+                            LaneVisibility::Visible,
+                            None,
+                            "accepted",
+                        ) =>
+                    {
+                        Ok(detail.snapshot)
+                    }
+                    _ => Err(error),
+                },
+            }
+        }
+        Err(error) => {
+            let category = discord_lane_category(&error);
+            let visibility = delivery_failure_visibility(error.disposition);
+            let disposition = match error.disposition {
+                DiscordLaneDisposition::DefinitiveFailure => "definitive-failure",
+                DiscordLaneDisposition::AmbiguousAcceptance => "ambiguous-acceptance",
+            };
+            let mutation = LaneDeliveryMutation {
+                session: snapshot.session.clone(),
+                expected_revision: snapshot.revision,
+                workflow: None,
+                message_id: None,
+                kind: Some("kickoff".into()),
+                delivered_at: None,
+                visibility,
+                error_category: Some(category.clone()),
+                disposition: Some(disposition.into()),
+                generation_id: snapshot.generation_id.clone(),
+                initial_kickoff: true,
+                kickoff_operation_id: Some(snapshot.kickoff_operation_id.clone()),
+            };
+            let persisted = match client.record_lane_delivery(&mutation).await {
+                Ok(next) => next,
+                Err(error) => match client.lane_detail(&snapshot.session).await {
+                    Ok(detail)
+                        if kickoff_receipt_response_loss_matches(
+                            &detail,
+                            snapshot,
+                            None,
+                            None,
+                            visibility,
+                            Some(category.as_str()),
+                            disposition,
+                        ) =>
+                    {
+                        detail.snapshot
+                    }
+                    _ => return Err(error),
+                },
+            };
+            let overlay = kickoff_failure_overlay(&category, error.disposition);
+            emit_lane_result(args, &persisted, &overlay);
+            Err("lane kickoff delivery was not confirmed".into())
+        }
+    }
+}
+
+async fn launch_lane_session(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
+    validate_lane_args(&args)?;
+    let client = DaemonClient::from_config(config);
+    if let Ok(detail) = client.lane_detail(&args.session).await
+        && detail.snapshot.workflow != LaneWorkflow::Retired
+    {
+        if args.thread.as_deref() != detail.thread_id.as_deref() {
+            return Err("lane thread target conflicts with retained lane".into());
+        }
+        return finalize_existing_lane(&args, &client).await;
+    }
+    let registration = TmuxMonitorArgs::from_new_args(&args, config).into_registration(false);
+    let lane = new_lane_evidence(&args);
+    let input = LaneRegistrationInput {
+        registration,
+        generation_id: lane.generation_id.clone(),
+        kickoff_operation_id: lane.kickoff_operation_id.clone(),
+        launch_operation_id: lane.launch_operation_id.clone(),
+        executor_id: lane.executor_id.clone(),
+        worker_effect_kind: lane.worker_effect_kind,
+        thread_id: lane.thread_id.clone(),
+        expect_absent_or_retired: true,
+    };
+    let mut snapshot = match client.register_lane(&input).await {
+        Ok(detail) => detail.snapshot,
+        Err(error) => match client.lane_detail(&args.session).await {
+            Ok(detail) if register_response_loss_matches(&detail, &lane) => detail.snapshot,
+
+            _ => return Err(error),
+        },
+    };
+    if let Some(kickoff) = args.kickoff.as_deref() {
+        snapshot = deliver_kickoff(&args, &client, &snapshot, kickoff, config).await?;
+    }
+    snapshot = match client
+        .claim_lane(
+            &args.session,
+            &lane.generation_id,
+            &lane.executor_id,
+            snapshot.revision,
+        )
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(error) => match client.lane_detail(&args.session).await {
+            Ok(detail) if claim_response_loss_matches(&detail, &lane, snapshot.revision) => {
+                detail.snapshot
+            }
+            _ => return Err(error),
+        },
+    };
+    if snapshot.durable_launch_state != LaneLaunchState::Claimed {
+        return finalize_existing_lane(&args, &client).await;
+    }
+    match create_detached_lane_session(&args).await {
+        DetachedSessionOutcome::PreExecutionFailure => {
+            let state = if matches!(
+                snapshot.worker_effect_kind,
+                WorkerEffectKind::CommandSubmission
+            ) {
+                LaneLaunchState::NoWorkerEffect
+            } else {
+                LaneLaunchState::SessionCreationAmbiguous
+            };
+            let category = if matches!(
+                snapshot.worker_effect_kind,
+                WorkerEffectKind::CommandSubmission
+            ) {
+                "session-create-failed"
+            } else {
+                "owner-aborted-before-r2"
+            };
+            let terminal = transition_lane(&client, &snapshot, state, Some(category)).await?;
+            emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
+            return Err("lane tmux session creation failed".into());
+        }
+        DetachedSessionOutcome::DefinitiveFailure => {
+            let (state, category) = if matches!(
+                snapshot.worker_effect_kind,
+                WorkerEffectKind::CommandSubmission
+            ) {
+                (LaneLaunchState::NoWorkerEffect, "session-create-failed")
+            } else {
+                (
+                    LaneLaunchState::SessionCreationAmbiguous,
+                    "owner-aborted-before-r2",
+                )
+            };
+            let terminal = transition_lane(&client, &snapshot, state, Some(category)).await?;
+            emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
+            return Err("lane tmux session creation failed".into());
+        }
+        DetachedSessionOutcome::PossiblyExecuted => {
+            let terminal = transition_lane(
+                &client,
+                &snapshot,
+                LaneLaunchState::SessionCreationAmbiguous,
+                Some("owner-aborted-before-r2"),
+            )
+            .await?;
+            emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
+            return Err("lane tmux session creation outcome is ambiguous".into());
+        }
+        DetachedSessionOutcome::Created => {}
+    }
+    let identity_category = match write_lane_identity_markers(
+        &args.session,
+        &snapshot.generation_id,
+        &snapshot.launch_operation_id,
+    )
+    .await
+    {
+        IdentityProof::Exact => None,
+        IdentityProof::SetFailed => Some("identity-marker-set-failed"),
+        IdentityProof::ReadFailed => Some("identity-marker-read-failed"),
+        IdentityProof::Mismatch => Some("identity-marker-mismatch"),
+    };
+    if let Some(category) = identity_category {
+        let terminal = transition_lane(
+            &client,
+            &snapshot,
+            LaneLaunchState::SessionCreationAmbiguous,
+            Some(category),
+        )
+        .await?;
+        emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
+        return Err("lane tmux identity marker proof failed".into());
+    }
+    snapshot = match transition_lane(&client, &snapshot, LaneLaunchState::IdentityVerified, None)
+        .await
+    {
+        Ok(committed) => committed,
+        Err(_) => match client.lane_detail(&args.session).await {
+            Ok(detail)
+                if committed_transition_matches(
+                    &snapshot,
+                    LaneLaunchState::IdentityVerified,
+                    None,
+                    &detail.snapshot,
+                ) =>
+            {
+                detail.snapshot
+            }
+            Ok(detail)
+                if detail.snapshot.generation_id == snapshot.generation_id
+                    && detail.snapshot.kickoff_operation_id == snapshot.kickoff_operation_id
+                    && detail.snapshot.launch_operation_id == snapshot.launch_operation_id
+                    && detail.snapshot.executor_id == snapshot.executor_id
+                    && detail.snapshot.worker_effect_kind == snapshot.worker_effect_kind
+                    && detail.thread_id == args.thread
+                    && detail.snapshot.durable_launch_state == LaneLaunchState::Claimed
+                    && detail.snapshot.revision == snapshot.revision =>
+            {
+                let terminal = transition_lane(
+                    &client,
+                    &detail.snapshot,
+                    LaneLaunchState::SessionCreationAmbiguous,
+                    Some("r1-to-r2-persistence-failed-after-create"),
+                )
+                .await?;
+                emit_lane_result(&args, &terminal, &overlay_from_snapshot(&terminal));
+                return Err("lane r1-to-r2 persistence failed after session creation".into());
+            }
+            _ => return Err("lane r1-to-r2 persistence outcome is unavailable".into()),
+        },
+    };
+    if snapshot.durable_launch_state == LaneLaunchState::Launched {
+        emit_lane_result(&args, &snapshot, &overlay_from_snapshot(&snapshot));
+        return Ok(());
+    }
+    match snapshot.worker_effect_kind {
+        WorkerEffectKind::SessionCreation => {
+            finalize_session_creation_owner(&args, &client, &snapshot).await
+        }
+        WorkerEffectKind::CommandSubmission => {
+            finalize_command_owner(&args, &client, &snapshot).await
+        }
+    }
+}
+const LANE_GENERATION_OPTION: &str = "@clawhip_lane_generation";
+const LANE_LAUNCH_OPERATION_OPTION: &str = "@clawhip_lane_launch_operation";
+const LANE_COMMAND_SUBMITTED_OPTION: &str = "@clawhip_lane_command_submitted";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityProof {
+    Exact,
+    SetFailed,
+    ReadFailed,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarkerRead {
+    Exact(String),
+    Missing,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaneInspection {
+    Exact,
+    CommandTerminal(&'static str),
+    Observed(&'static str, bool),
+}
+
+fn normalize_lane_marker(value: &[u8]) -> String {
+    String::from_utf8_lossy(value).trim().to_string()
+}
+
+fn classify_submitted_value(value: Option<&str>, launch_operation_id: &str) -> LaneInspection {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value == launch_operation_id => LaneInspection::Exact,
+        Some(_) => LaneInspection::Observed("submitted-marker-mismatch", false),
+        None => LaneInspection::Observed("submitted-marker-missing", false),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerSetOutcome {
+    Confirmed,
+    PossiblyExecuted,
+    PreExecutionFailure,
+}
+
+async fn set_lane_marker(session: &str, option: &str, value: &str) -> MarkerSetOutcome {
+    let mut command = Command::new(tmux_bin());
+    command.args(["set-option", "-t", session, option, value]);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return MarkerSetOutcome::PreExecutionFailure,
+    };
+    match child.wait_with_output().await {
+        Ok(output) if output.status.success() => MarkerSetOutcome::Confirmed,
+        Ok(_) | Err(_) => MarkerSetOutcome::PossiblyExecuted,
+    }
+}
+
+async fn read_lane_marker(session: &str, option: &str) -> MarkerRead {
+    match Command::new(tmux_bin())
+        .args(["show-options", "-v", "-t", session, option])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let value = normalize_lane_marker(&output.stdout);
+            if value.is_empty() {
+                MarkerRead::Missing
+            } else {
+                MarkerRead::Exact(value)
+            }
+        }
+        Ok(output)
+            if tmux_stderr(&output.stderr).contains("invalid option")
+                || tmux_stderr(&output.stderr).contains("not found") =>
+        {
+            MarkerRead::Missing
+        }
+        _ => MarkerRead::Unreadable,
+    }
+}
+
+async fn write_lane_identity_markers(
+    session: &str,
+    generation_id: &str,
+    operation_id: &str,
+) -> IdentityProof {
+    if matches!(
+        set_lane_marker(session, LANE_GENERATION_OPTION, generation_id).await,
+        MarkerSetOutcome::PreExecutionFailure
+    ) {
+        return IdentityProof::SetFailed;
+    }
+    match read_lane_marker(session, LANE_GENERATION_OPTION).await {
+        MarkerRead::Unreadable => return IdentityProof::ReadFailed,
+        MarkerRead::Exact(value) if value == generation_id => {}
+        MarkerRead::Missing | MarkerRead::Exact(_) => return IdentityProof::Mismatch,
+    }
+    if matches!(
+        set_lane_marker(session, LANE_LAUNCH_OPERATION_OPTION, operation_id).await,
+        MarkerSetOutcome::PreExecutionFailure
+    ) {
+        return IdentityProof::SetFailed;
+    }
+    match read_lane_marker(session, LANE_LAUNCH_OPERATION_OPTION).await {
+        MarkerRead::Unreadable => IdentityProof::ReadFailed,
+        MarkerRead::Exact(value) if value == operation_id => IdentityProof::Exact,
+        MarkerRead::Missing | MarkerRead::Exact(_) => IdentityProof::Mismatch,
+    }
+}
+
+async fn inspect_lane_markers(
+    session: &str,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+) -> LaneInspection {
+    match session_exists(session).await {
+        Err(_) => return LaneInspection::Observed("session-liveness-unavailable", false),
+        Ok(false) => return LaneInspection::Observed("session-missing", false),
+        Ok(true) => {}
+    }
+    match read_lane_marker(session, LANE_GENERATION_OPTION).await {
+        MarkerRead::Unreadable => return LaneInspection::Observed("identity-unreadable", false),
+        MarkerRead::Exact(value) if value == snapshot.generation_id => {}
+        MarkerRead::Missing | MarkerRead::Exact(_) => {
+            return LaneInspection::Observed("identity-mismatch", true);
+        }
+    }
+
+    match read_lane_marker(session, LANE_LAUNCH_OPERATION_OPTION).await {
+        MarkerRead::Unreadable => return LaneInspection::Observed("identity-unreadable", false),
+        MarkerRead::Exact(value) if value == snapshot.launch_operation_id => {}
+        MarkerRead::Missing | MarkerRead::Exact(_) => {
+            return LaneInspection::Observed("identity-mismatch", true);
+        }
+    }
+    match read_lane_marker(session, LANE_COMMAND_SUBMITTED_OPTION).await {
+        MarkerRead::Exact(value) => {
+            match classify_submitted_value(Some(&value), &snapshot.launch_operation_id) {
+                LaneInspection::Exact => LaneInspection::Exact,
+                LaneInspection::Observed("submitted-marker-mismatch", _)
+                    if matches!(
+                        snapshot.worker_effect_kind,
+                        WorkerEffectKind::CommandSubmission
+                    ) =>
+                {
+                    LaneInspection::CommandTerminal("submitted-marker-mismatch")
+                }
+                LaneInspection::Observed(reason, _) => LaneInspection::Observed(reason, false),
+                _ => unreachable!("submitted classifier is exhaustive"),
+            }
+        }
+        MarkerRead::Unreadable
+            if matches!(
+                snapshot.worker_effect_kind,
+                WorkerEffectKind::CommandSubmission
+            ) =>
+        {
+            LaneInspection::CommandTerminal("submitted-marker-read-failed")
+        }
+        MarkerRead::Unreadable => LaneInspection::Observed("submitted-marker-unreadable", false),
+        MarkerRead::Missing
+            if matches!(
+                snapshot.worker_effect_kind,
+                WorkerEffectKind::CommandSubmission
+            ) =>
+        {
+            LaneInspection::CommandTerminal("submitted-marker-missing")
+        }
+        MarkerRead::Missing => LaneInspection::Observed("submitted-marker-missing", false),
+    }
+}
+
+/// Read-only R2 inspector for lane status. It performs one sequential
+/// liveness/G/L/submitted observation and never writes options or effects.
+pub(crate) async fn inspect_lane_r2(
+    session: &str,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+) -> LaneInspectionResult {
+    match inspect_lane_markers(session, snapshot).await {
+        LaneInspection::Exact => {
+            let mut result = overlay_from_snapshot(snapshot);
+            result.runtime = "live";
+            result
+        }
+        LaneInspection::CommandTerminal(category) => {
+            r2_overlay(WorkerEffectKind::CommandSubmission, category, false)
+        }
+        LaneInspection::Observed(reason, conflict) => {
+            r2_overlay(snapshot.worker_effect_kind, reason, conflict)
+        }
+    }
+}
+
+async fn finalize_command_owner(
+    args: &TmuxNewArgs,
+    client: &DaemonClient,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+) -> Result<()> {
+    let command = build_command_to_send(args).unwrap_or_default();
+    if submit_lane_command_once(&args.session, &command)
+        .await
+        .is_err()
+    {
+        let terminal = transition_lane(
+            client,
+            snapshot,
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some("submission-attempt-error"),
+        )
+        .await?;
+        emit_lane_result(args, &terminal, &overlay_from_snapshot(&terminal));
+        return Err("lane command submission outcome is ambiguous".into());
+    }
+    let set_result = set_lane_marker(
+        &args.session,
+        LANE_COMMAND_SUBMITTED_OPTION,
+        &snapshot.launch_operation_id,
+    )
+    .await;
+    if matches!(set_result, MarkerSetOutcome::PreExecutionFailure) {
+        let terminal = transition_lane(
+            client,
+            snapshot,
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some("submitted-marker-set-failed"),
+        )
+        .await?;
+        emit_lane_result(args, &terminal, &overlay_from_snapshot(&terminal));
+        return Err("lane command submission marker failed".into());
+    }
+
+    match read_lane_marker(&args.session, LANE_COMMAND_SUBMITTED_OPTION).await {
+        MarkerRead::Exact(value) if value == snapshot.launch_operation_id => {
+            let finalized =
+                transition_lane(client, snapshot, LaneLaunchState::Launched, None).await?;
+            emit_lane_result(args, &finalized, &overlay_from_snapshot(&finalized));
+            Ok(())
+        }
+        MarkerRead::Unreadable => {
+            command_marker_terminal(args, client, snapshot, "submitted-marker-read-failed").await
+        }
+        MarkerRead::Missing => {
+            command_marker_terminal(args, client, snapshot, "submitted-marker-missing").await
+        }
+        MarkerRead::Exact(_) => {
+            command_marker_terminal(args, client, snapshot, "submitted-marker-mismatch").await
+        }
+    }
+}
+
+async fn command_marker_terminal(
+    args: &TmuxNewArgs,
+    client: &DaemonClient,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+    category: &str,
+) -> Result<()> {
+    let terminal = transition_lane(
+        client,
+        snapshot,
+        LaneLaunchState::CommandSubmitAmbiguous,
+        Some(category),
+    )
+    .await?;
+    emit_lane_result(args, &terminal, &overlay_from_snapshot(&terminal));
+    Err("lane command submission proof is not exact".into())
+}
+
+async fn finalize_session_creation_owner(
+    args: &TmuxNewArgs,
+    client: &DaemonClient,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+) -> Result<()> {
+    if matches!(
+        set_lane_marker(
+            &args.session,
+            LANE_COMMAND_SUBMITTED_OPTION,
+            &snapshot.launch_operation_id
+        )
+        .await,
+        MarkerSetOutcome::PreExecutionFailure
+    ) {
+        return session_uncommitted(args, snapshot, "submitted-marker-set-failed");
+    }
+    match read_lane_marker(&args.session, LANE_COMMAND_SUBMITTED_OPTION).await {
+        MarkerRead::Exact(value) if value == snapshot.launch_operation_id => {
+            let finalized =
+                transition_lane(client, snapshot, LaneLaunchState::Launched, None).await?;
+            emit_lane_result(args, &finalized, &overlay_from_snapshot(&finalized));
+            Ok(())
+        }
+        MarkerRead::Unreadable => {
+            session_uncommitted(args, snapshot, "submitted-marker-unreadable")
+        }
+        MarkerRead::Missing => session_uncommitted(args, snapshot, "submitted-marker-missing"),
+        MarkerRead::Exact(_) => session_uncommitted(args, snapshot, "submitted-marker-mismatch"),
+    }
+}
+
+fn session_uncommitted(
+    args: &TmuxNewArgs,
+    snapshot: &crate::source::tmux::LaneSnapshot,
+    reason: &str,
+) -> Result<()> {
+    let overlay = r2_overlay(WorkerEffectKind::SessionCreation, reason, false);
+    emit_lane_result(args, snapshot, &overlay);
+    Err("lane session creation proof is not exact".into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetachedSessionOutcome {
+    Created,
+    DefinitiveFailure,
+    PossiblyExecuted,
+    PreExecutionFailure,
+}
+
+fn detached_session_outcome_from_wait(
+    result: std::io::Result<std::process::ExitStatus>,
+) -> DetachedSessionOutcome {
+    match result {
+        Ok(status) if status.success() => DetachedSessionOutcome::Created,
+        Ok(_) => DetachedSessionOutcome::DefinitiveFailure,
+        Err(_) => DetachedSessionOutcome::PossiblyExecuted,
+    }
+}
+
+async fn create_detached_lane_session(args: &TmuxNewArgs) -> DetachedSessionOutcome {
+    let mut command = Command::new(tmux_bin());
+    command
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(&args.session);
+    if let Some(window_name) = &args.window_name {
+        command.arg("-n").arg(window_name);
+    }
+    if let Some(cwd) = &args.cwd {
+        command.arg("-c").arg(cwd);
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return DetachedSessionOutcome::PreExecutionFailure,
+    };
+    detached_session_outcome_from_wait(child.wait_with_output().await.map(|output| output.status))
+}
+
+async fn submit_lane_command_once(session: &str, command: &str) -> Result<()> {
+    // Once a send-keys invocation starts its outcome is ambiguous on failure.
+    send_command_to_session(session, command).await
+}
+
 async fn send_command_to_session(session: &str, command: &str) -> Result<()> {
     send_literal_keys(session, command).await?;
     send_enter_key(session, "Enter").await
@@ -423,17 +1505,21 @@ fn tmux_stderr(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
 }
 
+async fn attach_lane_session(session: &str) -> Result<()> {
+    attach_session(&format!("={session}")).await
+}
+
 async fn attach_session(session: &str) -> Result<()> {
-    let output = Command::new(tmux_bin())
+    let status = Command::new(tmux_bin())
         .arg("attach-session")
         .arg("-t")
         .arg(session)
-        .output()
+        .status()
         .await?;
-    if output.status.success() {
+    if status.success() {
         Ok(())
     } else {
-        Err(tmux_stderr(&output.stderr).into())
+        Err(format!("tmux attach session '{session}' failed").into())
     }
 }
 
@@ -441,6 +1527,7 @@ fn default_keyword_window_secs() -> u64 {
     30
 }
 
+#[cfg(unix)]
 fn current_parent_process_info() -> Option<ParentProcessInfo> {
     let pid = std::os::unix::process::parent_id();
     if pid == 0 {
@@ -453,6 +1540,11 @@ fn current_parent_process_info() -> Option<ParentProcessInfo> {
         .filter(|value| !value.is_empty());
 
     Some(ParentProcessInfo { pid, name })
+}
+
+#[cfg(not(unix))]
+fn current_parent_process_info() -> Option<ParentProcessInfo> {
+    None
 }
 
 fn format_watch_audit_log(registration: &RegisteredTmuxSession) -> String {
@@ -530,6 +1622,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: None,
+            thread: None,
+            kickoff: None,
+            json: false,
+
             command: vec![
                 "zsh".into(),
                 "-c".into(),
@@ -560,6 +1656,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: Some("/bin/zsh".into()),
+            thread: None,
+            kickoff: None,
+            json: false,
+
             command: vec!["source ~/.zshrc && omx --madmax".into()],
         };
 
@@ -586,6 +1686,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: None,
+            thread: None,
+            kickoff: None,
+            json: false,
+
             command: vec!["source ~/.zshrc && omx --madmax".into()],
         };
 
@@ -612,6 +1716,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: None,
+            thread: None,
+            kickoff: None,
+            json: false,
+
             command: vec!["false".into()],
         };
 
@@ -735,7 +1843,9 @@ mod tests {
                 pid: 42,
                 name: Some("codex".into()),
             }),
+            registration_generation: 0,
             active_wrapper_monitor: true,
+            lane: None,
         });
 
         assert!(log.contains("session=issue-105"));
@@ -766,6 +1876,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: None,
+            thread: None,
+            kickoff: None,
+            json: false,
+
             command: vec!["codex".into()],
         };
         let config = AppConfig {
@@ -816,6 +1930,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: None,
+            thread: None,
+            kickoff: None,
+            json: false,
+
             command: vec!["codex".into()],
         };
         let repo_name = repo
@@ -876,6 +1994,9 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: None,
+            thread: None,
+            kickoff: None,
+            json: false,
             command: vec!["codex".into()],
         };
         let config = AppConfig {
@@ -1002,6 +2123,252 @@ mod tests {
         assert!(
             metadata.worktree_path.as_deref() != metadata.repo_path.as_deref(),
             "worktree_path and repo_path must differ for a worktree checkout"
+        );
+    }
+    #[test]
+    fn submitted_marker_normalization_canonicalizes_absent_unset_and_empty() {
+        assert_eq!(
+            classify_submitted_value(None, "L"),
+            LaneInspection::Observed("submitted-marker-missing", false)
+        );
+        assert_eq!(
+            classify_submitted_value(Some(""), "L"),
+            LaneInspection::Observed("submitted-marker-missing", false)
+        );
+        assert_eq!(
+            classify_submitted_value(Some(" \n"), "L"),
+            LaneInspection::Observed("submitted-marker-missing", false)
+        );
+        assert_eq!(
+            classify_submitted_value(Some("other"), "L"),
+            LaneInspection::Observed("submitted-marker-mismatch", false)
+        );
+        assert_eq!(
+            classify_submitted_value(Some("L"), "L"),
+            LaneInspection::Exact
+        );
+    }
+
+    #[test]
+    fn durable_launch_state_mapper_uses_canonical_terminal_names() {
+        assert_eq!(
+            durable_launch_state_name(LaneLaunchState::NoWorkerEffect),
+            "launch-failed-no-worker-effect"
+        );
+        assert_eq!(
+            durable_launch_state_name(LaneLaunchState::SessionCreationAmbiguous),
+            "blocked-session-creation-ambiguous"
+        );
+        assert_eq!(
+            durable_launch_state_name(LaneLaunchState::CommandSubmitAmbiguous),
+            "blocked-command-submit-ambiguous"
+        );
+    }
+
+    #[test]
+    fn kickoff_failure_overlay_uses_timeout_for_ambiguous_evidence() {
+        let category = BoundedCategory::new("timeout");
+        let overlay =
+            kickoff_failure_overlay(&category, DiscordLaneDisposition::AmbiguousAcceptance);
+        assert_eq!(overlay.derived_status.as_deref(), Some("kickoff-ambiguous"));
+        assert_eq!(overlay.observation_reason.as_deref(), Some("timeout"));
+        assert_eq!(overlay.exit_category.as_deref(), Some("timeout"));
+        assert!(overlay.evidence_commit);
+        assert_eq!(overlay.worker_started, None);
+    }
+
+    #[test]
+    fn kickoff_failure_overlay_uses_malformed_success_for_definitive_evidence() {
+        let category = BoundedCategory::new("malformed-success");
+        let overlay = kickoff_failure_overlay(&category, DiscordLaneDisposition::DefinitiveFailure);
+        assert_eq!(overlay.derived_status.as_deref(), Some("kickoff-failed"));
+        assert_eq!(
+            overlay.observation_reason.as_deref(),
+            Some("malformed-success")
+        );
+        assert_eq!(overlay.exit_category.as_deref(), Some("malformed-success"));
+        assert!(overlay.evidence_commit);
+        assert!(!overlay.healthy);
+    }
+
+    fn response_loss_snapshot(
+        state: LaneLaunchState,
+        category: Option<&str>,
+    ) -> crate::source::tmux::LaneSnapshot {
+        crate::source::tmux::LaneSnapshot {
+            session: "lane".into(),
+            generation_id: "G".into(),
+            kickoff_operation_id: "K".into(),
+            launch_operation_id: "L".into(),
+            executor_id: "E".into(),
+            worker_effect_kind: WorkerEffectKind::CommandSubmission,
+            durable_launch_state: state,
+            derived_status: None,
+            observation_reason: category.map(crate::source::tmux::BoundedReason::new),
+            worker_started: None,
+            evidence_commit: false,
+            repair_needed: true,
+            healthy: false,
+            exit_category: category.map(BoundedCategory::new),
+            workflow: LaneWorkflow::Active,
+            visibility: None,
+            revision: 2,
+            kickoff_message_id: None,
+            kickoff_delivered_at: None,
+            latest_update_message_id: None,
+            latest_update_kind: None,
+            latest_update_delivered_at: None,
+        }
+    }
+    fn response_loss_expected_snapshot() -> crate::source::tmux::LaneSnapshot {
+        let mut snapshot = response_loss_snapshot(LaneLaunchState::Claimed, None);
+        snapshot.revision = 1;
+        snapshot
+    }
+
+    #[test]
+    fn response_loss_matchers_reject_stale_or_progressed_rows() {
+        let lane = LaneEvidence {
+            lane_version: 1,
+            generation_id: "G".into(),
+            kickoff_operation_id: "K".into(),
+            launch_operation_id: "L".into(),
+            executor_id: "E".into(),
+            worker_effect_kind: WorkerEffectKind::CommandSubmission,
+            launch_state: LaneLaunchState::Ready,
+            workflow: LaneWorkflow::Active,
+            revision: 0,
+            quiesced: false,
+            thread_id: None,
+            kickoff_message_id: None,
+            kickoff_delivered_at: None,
+            visibility: Some(LaneVisibility::Unverified),
+            verification: None,
+            last_failure: None,
+            latest_update_message_id: None,
+            latest_update_kind: None,
+            latest_update_delivered_at: None,
+            delivery_retry_count: 0,
+            delivery_disposition: None,
+        };
+        let mut ready = response_loss_snapshot(LaneLaunchState::Ready, None);
+        ready.revision = 0;
+        ready.visibility = Some(LaneVisibility::Unverified);
+        let detail = crate::source::tmux::LaneDetail {
+            snapshot: ready.clone(),
+            thread_id: None,
+            kickoff_message_id: None,
+            kickoff_delivered_at: None,
+            verification: None,
+            latest_update_message_id: None,
+            latest_update_kind: None,
+            latest_update_delivered_at: None,
+            last_error: None,
+            quiesced: false,
+        };
+        assert!(register_response_loss_matches(&detail, &lane));
+        let stale = crate::source::tmux::LaneDetail {
+            snapshot: response_loss_snapshot(LaneLaunchState::Ready, None),
+            ..detail.clone()
+        };
+        assert!(!register_response_loss_matches(&stale, &lane));
+        let progressed = crate::source::tmux::LaneDetail {
+            snapshot: response_loss_snapshot(LaneLaunchState::IdentityVerified, None),
+            ..detail
+        };
+        assert!(!claim_response_loss_matches(&progressed, &lane, 1));
+    }
+
+    #[test]
+    fn detached_session_wait_classifies_result_loss_as_ambiguous() {
+        let result = Err(std::io::Error::other("wait result lost"));
+        assert_eq!(
+            detached_session_outcome_from_wait(result),
+            DetachedSessionOutcome::PossiblyExecuted
+        );
+    }
+
+    #[test]
+    fn typed_effect_outcomes_keep_post_spawn_ambiguity_distinct() {
+        assert_ne!(
+            DetachedSessionOutcome::PreExecutionFailure,
+            DetachedSessionOutcome::PossiblyExecuted
+        );
+        assert_ne!(
+            DetachedSessionOutcome::DefinitiveFailure,
+            DetachedSessionOutcome::PossiblyExecuted
+        );
+        assert_ne!(
+            MarkerSetOutcome::PreExecutionFailure,
+            MarkerSetOutcome::PossiblyExecuted
+        );
+    }
+
+    #[test]
+    fn response_loss_accepts_same_immutable_committed_transition() {
+        let snapshot = response_loss_snapshot(
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some("submission-attempt-error"),
+        );
+        assert!(committed_transition_matches(
+            &response_loss_expected_snapshot(),
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some("submission-attempt-error"),
+            &snapshot
+        ));
+    }
+
+    #[test]
+    fn response_loss_rejects_uncommitted_or_different_terminal_category() {
+        let claimed = response_loss_snapshot(LaneLaunchState::Claimed, None);
+        assert!(!committed_transition_matches(
+            &response_loss_expected_snapshot(),
+            LaneLaunchState::Launched,
+            None,
+            &claimed
+        ));
+        let different = response_loss_snapshot(
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some("submitted-marker-missing"),
+        );
+        assert!(!committed_transition_matches(
+            &response_loss_expected_snapshot(),
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some("submission-attempt-error"),
+            &different
+        ));
+        let mut progressed = response_loss_snapshot(
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some("submission-attempt-error"),
+        );
+        progressed.revision = 3;
+        assert!(!committed_transition_matches(
+            &response_loss_expected_snapshot(),
+            LaneLaunchState::CommandSubmitAmbiguous,
+            Some("submission-attempt-error"),
+            &progressed
+        ));
+    }
+
+    #[test]
+    fn kickoff_failure_partitions_definitive_and_ambiguous_visibility() {
+        assert_eq!(
+            delivery_failure_visibility(DiscordLaneDisposition::DefinitiveFailure),
+            LaneVisibility::DeliveryFailed,
+        );
+        assert_eq!(
+            delivery_failure_visibility(DiscordLaneDisposition::AmbiguousAcceptance),
+            LaneVisibility::Unverified,
+        );
+    }
+    #[test]
+    fn lane_result_json_delegates_thread_id_to_canonical_safe_target() {
+        let snapshot = response_loss_snapshot(LaneLaunchState::Launched, None);
+        let result = lane_result_json(&snapshot, &overlay_from_snapshot(&snapshot), Some("1"));
+
+        assert_eq!(
+            result["thread_id"],
+            telemetry::safe_target_id(&SinkTarget::DiscordThread("1".into()))
         );
     }
 }

@@ -15,6 +15,8 @@ mod gajae;
 mod gateway_allowlist;
 mod hooks;
 mod keyword_window;
+mod lane;
+mod ledger;
 mod lifecycle;
 mod memory;
 mod native_hooks;
@@ -29,8 +31,10 @@ mod slack;
 mod source;
 mod telemetry;
 mod tmux_wrapper;
+
 mod update;
 
+use std::io::Read;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -39,10 +43,11 @@ use tokio::runtime::Builder;
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs,
     GajaeCheckpointCommands, GajaeCommands, GajaeMutationPlanCommands, GajaeProfileCommands,
-    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, MemoryCommands,
-    NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, TmuxCommands, UpdateCommands,
-    VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, LedgerCommands,
+    MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands,
+    TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
+
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, SetupEdits};
 use crate::discord::DiscordClient;
@@ -85,9 +90,36 @@ fn prepare_event(event: IncomingEvent) -> Result<IncomingEvent> {
     Ok(event)
 }
 
+fn run_subscription_adapter(kind: &str) -> Result<()> {
+    if kind != "question" {
+        return Err(format!("unsupported subscription adapter '{kind}'").into());
+    }
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let payload: serde_json::Value = serde_json::from_str(&input)
+        .map_err(|_| "subscription adapter received malformed projection")?;
+    if !payload.is_object() {
+        return Err("subscription adapter projection must be an object".into());
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "workflow.question",
+            "payload": payload,
+        })
+    );
+    Ok(())
+}
+
+fn load_config_for_cli(config_path: &std::path::Path) -> Result<Arc<AppConfig>> {
+    AppConfig::load_or_default(config_path)
+        .map(Arc::new)
+        .map_err(|_| "config_invalid".into())
+}
+
 async fn real_main(cli: Cli) -> Result<()> {
     let config_path = cli.config_path();
-    let config = Arc::new(AppConfig::load_or_default(&config_path)?);
+    let config = load_config_for_cli(&config_path)?;
     let cron_state_path = crate::cron::default_state_path(&config_path);
 
     match cli.command.unwrap_or(Commands::Start {
@@ -99,6 +131,87 @@ async fn real_main(cli: Cli) -> Result<()> {
             let client = DaemonClient::from_config(config.as_ref());
             let health = client.health().await?;
             println!("{}", serde_json::to_string_pretty(&health)?);
+            Ok(())
+        }
+        Commands::Subscribe { command } => match command {
+            SubscribeCommands::Adapter { kind } => run_subscription_adapter(&kind),
+            command => {
+                let client = DaemonClient::from_config(config.as_ref());
+                match command {
+                    SubscribeCommands::Validate => {
+                        config.validate()?;
+                        println!("Subscription configuration is valid.");
+                    }
+                    SubscribeCommands::List => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.list_subscriptions().await?)?
+                    ),
+                    SubscribeCommands::Status { name } => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.subscription_status(&name).await?)?
+                    ),
+                    SubscribeCommands::Start { name } => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.start_subscription(&name).await?)?
+                    ),
+                    SubscribeCommands::Stop { name } => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.stop_subscription(&name).await?)?
+                    ),
+                    SubscribeCommands::Adapter { .. } => unreachable!(),
+                }
+                Ok(())
+            }
+        },
+        Commands::Ledger { command } => {
+            match command {
+                LedgerCommands::Status => {
+                    let client = DaemonClient::from_config(config.as_ref());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.ledger_status().await?)?
+                    );
+                }
+                LedgerCommands::Query(args) => {
+                    let mut params = Vec::<(&str, String)>::new();
+                    if let Some(value) = args.repo {
+                        params.push(("repo", value));
+                    }
+                    if let Some(value) = args.worktree {
+                        params.push(("worktree", value));
+                    }
+                    if let Some(value) = args.session_id {
+                        params.push(("session_id", value));
+                    }
+                    if let Some(value) = args.event_type {
+                        params.push(("event_type", value));
+                    }
+                    if let Some(value) = args.since {
+                        params.push(("since", value.to_string()));
+                    }
+                    if let Some(value) = args.until {
+                        params.push(("until", value.to_string()));
+                    }
+                    if !args.keywords.is_empty() {
+                        params.push(("keywords", args.keywords.join(",")));
+                    }
+                    if let Some(value) = args.limit {
+                        params.push(("limit", value.to_string()));
+                    }
+                    let client = DaemonClient::from_config(config.as_ref());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&client.ledger_query(&params).await?)?
+                    );
+                }
+                LedgerCommands::Verify => {
+                    let root = cron_state_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let ledger = crate::ledger::EventLedger::open(config.ledger.clone(), root)?;
+                    println!("{}", serde_json::to_string_pretty(&ledger.verify()?)?);
+                }
+            }
             Ok(())
         }
         Commands::Deliver(args) => crate::hooks::prompt_deliver::run(args).await,
@@ -243,6 +356,19 @@ async fn real_main(cli: Cli) -> Result<()> {
             remove_systemd,
             remove_config,
         } => lifecycle::uninstall(remove_systemd, remove_config),
+        Commands::Lane { command } => match command {
+            LaneCommands::Status { session, json } => lane::status(config, session, json).await,
+            LaneCommands::VerifyThread { session, json } => {
+                lane::verify_thread(config, session, json).await
+            }
+            LaneCommands::Update {
+                session,
+                message,
+                kind,
+                workflow,
+                json,
+            } => lane::update(config, session, message, kind, workflow, json).await,
+        },
         Commands::Tmux { command } => match command {
             TmuxCommands::Keyword {
                 session,
@@ -276,7 +402,12 @@ async fn real_main(cli: Cli) -> Result<()> {
             TmuxCommands::List => {
                 let client = DaemonClient::from_config(config.as_ref());
                 let registrations = client.list_tmux().await?;
-                render_tmux_list(&registrations);
+                let health = if registrations.is_empty() {
+                    client.health().await.ok()
+                } else {
+                    None
+                };
+                render_tmux_list(&registrations, health.as_ref());
                 Ok(())
             }
         },
@@ -310,7 +441,7 @@ async fn real_main(cli: Cli) -> Result<()> {
         },
         Commands::Config { command } => match command.unwrap_or(ConfigCommand::Interactive) {
             ConfigCommand::Interactive => {
-                let mut editable = AppConfig::load_or_default(&config_path)?;
+                let mut editable = (*load_config_for_cli(&config_path)?).clone();
                 editable.run_interactive_editor(&config_path)
             }
             ConfigCommand::Show => {
@@ -509,8 +640,184 @@ fn parse_expect_name_overrides(
     Ok(map)
 }
 
+fn parse_bind_overrides(entries: &[String]) -> Result<Vec<(String, String)>> {
+    let mut repos = std::collections::HashSet::new();
+    let mut binds = Vec::new();
+    for entry in entries {
+        let (repo, channel_id) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("--bind must be REPO=CHANNEL_ID, got '{entry}'"))?;
+        let repo = repo.trim();
+        let channel_id = channel_id.trim();
+        if repo.is_empty() {
+            return Err(format!("--bind '{entry}' has an empty repo name").into());
+        }
+        if channel_id.is_empty() {
+            return Err(format!("--bind '{entry}' has an empty channel id").into());
+        }
+        if !repos.insert(repo.to_string()) {
+            return Err(format!("--bind has duplicate entries for repo '{repo}'").into());
+        }
+        binds.push((repo.to_string(), channel_id.to_string()));
+    }
+    Ok(binds)
+}
+
+fn parse_bind_checkout_overrides(
+    entries: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for entry in entries {
+        let (repo, path) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("--bind-checkout must be REPO=PATH, got '{entry}'"))?;
+        let repo = repo.trim();
+        let path = path.trim();
+        if repo.is_empty() {
+            return Err(format!("--bind-checkout '{entry}' has an empty repo name").into());
+        }
+        if path.is_empty() {
+            return Err(format!("--bind-checkout '{entry}' has an empty checkout path").into());
+        }
+        if map.insert(repo.to_string(), path.to_string()).is_some() {
+            return Err(format!("--bind-checkout has duplicate entries for repo '{repo}'").into());
+        }
+    }
+    Ok(map)
+}
+
+fn validate_bind_checkout_repos(
+    checkout_map: &std::collections::HashMap<String, String>,
+    binds: &[(String, String)],
+) -> Result<()> {
+    let bind_repos: std::collections::HashSet<&str> =
+        binds.iter().map(|(repo, _)| repo.as_str()).collect();
+    for repo in checkout_map.keys() {
+        if !bind_repos.contains(repo.as_str()) {
+            return Err(
+                format!("--bind-checkout repo '{repo}' must also be present in --bind").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_bind_checkout_path(
+    repo: &str,
+    explicit: &std::collections::HashMap<String, String>,
+    bind_count: usize,
+    config: &AppConfig,
+) -> Result<Option<String>> {
+    if let Some(path) = explicit.get(repo) {
+        return Ok(Some(path.clone()));
+    }
+    if let Some(path) = existing_setup_monitor_checkout_path(config, repo)? {
+        return Ok(Some(path));
+    }
+    if bind_count == 1
+        && let Some(path) = infer_cwd_checkout_path(repo)?
+    {
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+fn existing_setup_monitor_checkout_path(config: &AppConfig, repo: &str) -> Result<Option<String>> {
+    let matches = config
+        .monitors
+        .git
+        .repos
+        .iter()
+        .filter(|monitor| {
+            monitor.setup_owned
+                && (monitor.github_repo.as_deref() == Some(repo)
+                    || (monitor.github_repo.is_none() && monitor.name.as_deref() == Some(repo)))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [monitor] => Ok(Some(monitor.path.clone())),
+        _ => Err(format!(
+            "bind {repo}: multiple setup-owned git monitors already exist; pass --bind-checkout {repo}=PATH after cleanup"
+        )
+        .into()),
+    }
+}
+
+fn infer_cwd_checkout_path(repo: &str) -> Result<Option<String>> {
+    let cwd = std::env::current_dir()?;
+    let inside = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&cwd)
+        .output();
+    let Ok(inside) = inside else {
+        return Ok(None);
+    };
+    if !inside.status.success() || String::from_utf8_lossy(&inside.stdout).trim() != "true" {
+        return Ok(None);
+    }
+
+    let top_level = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&cwd)
+        .output()?;
+    if !top_level.status.success() {
+        return Ok(None);
+    }
+
+    let remote = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(&cwd)
+        .output()?;
+    if !remote.status.success() {
+        return Ok(None);
+    }
+    let remote = String::from_utf8_lossy(&remote.stdout);
+    if remote_repo_identity(remote.trim()).as_deref() != Some(repo) {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        String::from_utf8_lossy(&top_level.stdout)
+            .trim()
+            .to_string(),
+    ))
+}
+
+fn remote_repo_identity(remote: &str) -> Option<String> {
+    let mut value = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    if let Some((_, path)) = value.rsplit_once(':') {
+        if !path.contains('/') && value.contains("://") {
+            return None;
+        }
+        value = path;
+    } else if let Some((_, path)) = value.split_once("://") {
+        value = path.split_once('/').map(|(_, rest)| rest)?;
+    }
+    let mut parts = value.rsplit('/');
+    let repo = parts.next()?.trim();
+    let owner = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn current_setup_repo_identity() -> Result<String> {
+    let cwd = std::env::current_dir()?;
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(cwd)
+        .output()?;
+    if !output.status.success() {
+        return Err("question setup could not resolve the current repository remote".into());
+    }
+    remote_repo_identity(String::from_utf8_lossy(&output.stdout).trim())
+        .ok_or_else(|| "question setup could not resolve owner/repo from remote.origin.url".into())
+}
+
 async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()> {
-    let mut editable = AppConfig::load_or_default(config_path)?;
+    let mut editable = (*load_config_for_cli(config_path)?).clone();
 
     let standard_edits = SetupEdits {
         webhook: args.webhook,
@@ -520,8 +827,18 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
         daemon_base_url: args.daemon_base_url,
     };
 
+    let binds = parse_bind_overrides(&args.bind)?;
+    let checkout_map = parse_bind_checkout_overrides(&args.bind_checkout)?;
+    validate_bind_checkout_repos(&checkout_map, &binds)?;
+    let expect_map = parse_expect_name_overrides(&args.expect_name)?;
+
     // Must have at least one meaningful action.
-    if standard_edits.is_empty() && args.bind.is_empty() && !args.verify_bindings {
+    let question_setup_requested = args.question_channel.is_some() || args.question_fallback;
+    if standard_edits.is_empty()
+        && binds.is_empty()
+        && !args.verify_bindings
+        && !question_setup_requested
+    {
         return Err("setup requires at least one non-empty setup flag".into());
     }
 
@@ -530,23 +847,26 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
         editable.apply_setup_edits(standard_edits)?;
     }
 
+    if question_setup_requested || args.question_mention.is_some() {
+        let repo = current_setup_repo_identity()?;
+        let adapter_program = std::env::current_exe()?.to_string_lossy().into_owned();
+        editable.apply_gjc_question_setup(
+            args.question_channel,
+            args.question_mention,
+            args.question_fallback,
+            repo,
+            adapter_program,
+        )?;
+    }
+
     // Process --bind entries: resolve each channel against Discord and write a
-    // repo binding route with a channel_name hint.
-    if !args.bind.is_empty() {
+    // route binding. Git monitor onboarding is conditional: it is added or
+    // updated only when a checkout is explicit, already known, or safely inferred.
+    let mut monitored_bind_repos = std::collections::HashSet::new();
+    if !binds.is_empty() {
         let client = DiscordClient::from_config(Arc::new(editable.clone()))?;
 
-        // Collect expected-name overrides (repo -> name). Hard-fails on
-        // malformed input so a typo like `--expect-name clawhip` cannot
-        // silently bypass the name-match guard.
-        let expect_map = parse_expect_name_overrides(&args.expect_name)?;
-
-        for entry in &args.bind {
-            let (repo, channel_id) = entry
-                .split_once('=')
-                .ok_or_else(|| format!("--bind must be REPO=CHANNEL_ID, got '{entry}'"))?;
-            let repo = repo.trim();
-            let channel_id = channel_id.trim();
-
+        for (repo, channel_id) in &binds {
             let lookup = client.lookup_channel(channel_id).await;
             match &lookup {
                 binding_verify::ChannelLookup::Found { name, .. } => {
@@ -562,8 +882,24 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
                         }
                     }
 
+                    let checkout_path =
+                        resolve_bind_checkout_path(repo, &checkout_map, binds.len(), &editable)?;
                     println!("bind: {repo} -> {channel_id} (#{live_name})");
-                    editable.apply_repo_binding(repo, channel_id, name.as_deref())?;
+                    if let Some(checkout_path) = checkout_path.as_deref() {
+                        editable.apply_repo_channel_binding(
+                            repo,
+                            channel_id,
+                            name.as_deref(),
+                            checkout_path,
+                        )?;
+                        monitored_bind_repos.insert(repo.as_str());
+                    } else {
+                        editable.apply_repo_channel_route_binding(
+                            repo,
+                            channel_id,
+                            name.as_deref(),
+                        )?;
+                    }
                 }
                 binding_verify::ChannelLookup::NotFound => {
                     return Err(
@@ -593,32 +929,70 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
 
     editable.validate()?;
 
+    let drift_audit = binding_verify::audit_route_monitor_drift(&editable);
+    if !monitored_bind_repos.is_empty() {
+        let bind_repos = monitored_bind_repos;
+        let affected_errors = drift_audit
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.severity == "error" && bind_repos.contains(finding.repo.as_str())
+            })
+            .collect::<Vec<_>>();
+        if !affected_errors.is_empty() {
+            eprint!("{drift_audit}");
+            return Err("setup aborted: route/monitor drift check failed for bound repo(s)".into());
+        }
+    }
+
     // Optional full binding audit before saving.
     if args.verify_bindings {
         let client = DiscordClient::from_config(Arc::new(editable.clone()))?;
         let audit = binding_verify::verify(&client, &editable).await;
         print!("{audit}");
-        if !audit.all_ok() {
+        print!("{drift_audit}");
+        if !audit.all_ok() || !drift_audit.ok {
             return Err("setup aborted: binding verification failed (see above)".into());
         }
     }
 
-    editable.save(config_path)?;
+    let cleanup = editable.save_with_backup_reporting(config_path)?;
     println!("Saved {}", config_path.display());
+    if cleanup.classified > 0 {
+        println!(
+            "Config backup cleanup: {} classified, {} deleted, {} preserved",
+            cleanup.classified, cleanup.deleted, cleanup.preserved
+        );
+    }
     Ok(())
+}
+
+fn verify_bindings_json(
+    audit: &binding_verify::BindingAudit,
+    drift_audit: &binding_verify::BindingDriftAudit,
+) -> serde_json::Value {
+    serde_json::json!({
+        "verdicts": &audit.verdicts,
+        "drift_audit": drift_audit,
+    })
 }
 
 async fn run_verify_bindings(config: Arc<AppConfig>, args: VerifyBindingsArgs) -> Result<()> {
     let client = DiscordClient::from_config(config.clone())?;
     let audit = binding_verify::verify(&client, &config).await;
+    let drift_audit = binding_verify::audit_route_monitor_drift(&config);
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&audit)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&verify_bindings_json(&audit, &drift_audit))?
+        );
     } else {
         print!("{audit}");
+        print!("{drift_audit}");
     }
 
-    if !audit.all_ok() {
+    if !audit.all_ok() || !drift_audit.ok {
         std::process::exit(1);
     }
     Ok(())
@@ -667,13 +1041,25 @@ fn run_explain(config: &AppConfig, args: ExplainArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
-    print!("{}", format_tmux_list(registrations));
+fn render_tmux_list(
+    registrations: &[crate::source::RegisteredTmuxSession],
+    health: Option<&serde_json::Value>,
+) {
+    print!("{}", format_tmux_list_with_health(registrations, health));
 }
 
+#[cfg(test)]
 fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> String {
+    format_tmux_list_with_health(registrations, None)
+}
+
+fn format_tmux_list_with_health(
+    registrations: &[crate::source::RegisteredTmuxSession],
+    health: Option<&serde_json::Value>,
+) -> String {
     if registrations.is_empty() {
-        return "No active tmux watches found\n".to_string();
+        let detail = tmux_empty_list_detail(health);
+        return format!("No active tmux watches found{detail}\n");
     }
 
     let mut output =
@@ -710,12 +1096,84 @@ fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> S
     output
 }
 
+fn tmux_empty_list_detail(health: Option<&serde_json::Value>) -> String {
+    let Some(tmux) = health.and_then(|health| health.get("tmux")) else {
+        return String::new();
+    };
+    let registry_state = tmux.get("registry_state");
+    if registry_state
+        .and_then(|state| state.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("ignored-invalid")
+    {
+        let path = registry_state
+            .and_then(|state| state.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("tmux-watch-registry.json");
+        return format!("; ignored invalid registry state at {path}");
+    }
+    if let Some(error) = tmux
+        .get("live_probe")
+        .and_then(|probe| probe.get("error"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return format!("; live tmux probe failed: {error}");
+    }
+    let live_count = tmux
+        .get("live_probe")
+        .and_then(|probe| probe.get("count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if live_count > 0 {
+        return format!(
+            "; {live_count} live tmux session(s) exist but no clawhip watch routes are registered"
+        );
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_tmux_list, parse_expect_name_overrides};
+    use super::{
+        format_tmux_list, load_config_for_cli, parse_bind_checkout_overrides, parse_bind_overrides,
+        parse_expect_name_overrides, validate_bind_checkout_repos, verify_bindings_json,
+    };
+    use crate::binding_verify::{BindingAudit, BindingDriftAudit};
     use crate::events::RoutingMetadata;
     use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
+    use std::fs;
 
+    #[test]
+    fn cli_config_errors_are_bounded_without_source_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"[[subscriptions]]
+name = "safe-subscription"
+enabled = false
+kind = "websocket"
+endpoint_env = "SAFE_ENDPOINT"
+endpoint = "wss://private.invalid?token=secret-token"
+
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+
+[subscriptions.adapter]
+program = "/bin/true"
+"#,
+        )
+        .unwrap();
+
+        let error = load_config_for_cli(&path).unwrap_err().to_string();
+        assert_eq!(error, "config_invalid");
+        assert!(!error.contains("secret-token"));
+        assert!(!error.contains("private.invalid"));
+    }
     #[test]
     fn parse_expect_name_overrides_accepts_well_formed_entries() {
         let entries = vec![
@@ -800,6 +1258,86 @@ mod tests {
     }
 
     #[test]
+    fn parse_bind_checkout_overrides_accepts_well_formed_entries() {
+        let entries = vec![
+            "clawhip=/work/clawhip".to_string(),
+            "oh-my-codex=../omx".to_string(),
+        ];
+        let map = parse_bind_checkout_overrides(&entries).expect("valid entries");
+        assert_eq!(
+            map.get("clawhip").map(String::as_str),
+            Some("/work/clawhip")
+        );
+        assert_eq!(map.get("oh-my-codex").map(String::as_str), Some("../omx"));
+    }
+
+    #[test]
+    fn parse_bind_checkout_overrides_rejects_duplicate_repo() {
+        let entries = vec![
+            "clawhip=/work/clawhip".to_string(),
+            "clawhip=/tmp/clawhip".to_string(),
+        ];
+        let error = parse_bind_checkout_overrides(&entries).expect_err("duplicate repo must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate entries for repo 'clawhip'")
+        );
+    }
+
+    #[test]
+    fn parse_bind_checkout_overrides_rejects_malformed_or_empty_parts() {
+        let missing_equals = parse_bind_checkout_overrides(&["clawhip".to_string()])
+            .expect_err("missing equals must fail");
+        assert!(missing_equals.to_string().contains("REPO=PATH"));
+
+        let empty_repo = parse_bind_checkout_overrides(&["=/work/clawhip".to_string()])
+            .expect_err("empty repo must fail");
+        assert!(empty_repo.to_string().contains("empty repo name"));
+
+        let empty_path = parse_bind_checkout_overrides(&["clawhip=   ".to_string()])
+            .expect_err("empty path must fail");
+        assert!(empty_path.to_string().contains("empty checkout path"));
+    }
+
+    #[test]
+    fn bind_checkout_repos_must_also_be_bound() {
+        let binds = parse_bind_overrides(&["clawhip=123".to_string()]).expect("valid bind");
+        let checkout_map = parse_bind_checkout_overrides(&["oh-my-codex=/work/omx".to_string()])
+            .expect("valid checkout");
+        let error = validate_bind_checkout_repos(&checkout_map, &binds)
+            .expect_err("unmatched checkout repo must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("repo 'oh-my-codex' must also be present in --bind")
+        );
+    }
+
+    #[test]
+    fn bind_checkout_repos_accept_matching_bind() {
+        let binds = parse_bind_overrides(&["clawhip=123".to_string()]).expect("valid bind");
+        let checkout_map = parse_bind_checkout_overrides(&["clawhip=/work/clawhip".to_string()])
+            .expect("valid checkout");
+        validate_bind_checkout_repos(&checkout_map, &binds).expect("matching repo is valid");
+    }
+
+    #[test]
+    fn verify_bindings_json_preserves_top_level_verdicts() {
+        let audit = BindingAudit { verdicts: vec![] };
+        let drift = BindingDriftAudit {
+            ok: true,
+            findings: vec![],
+        };
+
+        let json = verify_bindings_json(&audit, &drift);
+
+        assert!(json.get("verdicts").is_some());
+        assert!(json.get("drift_audit").is_some());
+        assert!(json.get("channel_audit").is_none());
+    }
+
+    #[test]
     fn format_tmux_list_renders_metadata_columns() {
         let output = format_tmux_list(&[RegisteredTmuxSession {
             session: "issue-105".into(),
@@ -816,7 +1354,9 @@ mod tests {
                 pid: 4242,
                 name: Some("codex".into()),
             }),
+            registration_generation: 0,
             active_wrapper_monitor: true,
+            lane: None,
         }]);
 
         assert!(output.contains(

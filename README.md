@@ -325,14 +325,32 @@ clawhip setup \
   --daemon-base-url "http://127.0.0.1:25294"
 ```
 
-`clawhip setup` stays non-interactive and intentionally limited to five presets only:
+`clawhip setup` stays non-interactive and intentionally limited to the supported presets:
 - Discord webhook quickstart route
 - Discord bot token
 - Default channel
 - Default message format
 - Daemon base URL
+- Official GJC question subscription and repository-scoped route (channel, mention, fallback)
 
-Advanced routes and monitor definitions are still edited manually in the config file or revisited through the bounded `clawhip config` editor surface.
+
+To opt into the official GJC question bridge from a repository checkout, provide a destination channel (or explicitly reuse the configured default channel):
+
+```bash
+clawhip setup \
+  --question-channel "QUESTIONS_CHANNEL_ID" \
+  --question-mention "<@OPERATOR_ID>"
+
+# Equivalent fallback form when [defaults].channel is already configured.
+clawhip setup --question-fallback
+```
+
+This setup path converges the setup-owned `gjc-question` websocket subscription and one
+`workflow.question` route filtered by the current repository identity. It never edits an
+existing `workflow.gate` route. Re-running setup updates those same named entries instead of
+duplicating them. Question setup only owns the destination channel, optional mention, and
+fallback-to-default choice; the subscription endpoint remains `GJC_QUESTION_WS` and is read
+only by the daemon environment.
 
 Route example:
 
@@ -959,3 +977,127 @@ clawhip includes a [`geobench`](https://github.com/NomaDamas/geobench) product s
 
 - Spec: [`geobench/clawhip.yaml`](geobench/clawhip.yaml)
 - Runbook: [`docs/geobench.md`](docs/geobench.md)
+
+## GitHub Actions platform status monitor
+
+Poll the public GitHub Statuspage machine-readable API for GitHub Actions (and optionally other components) without using GitHub API tokens or websocket subscriptions.
+
+This is a daemon monitor (`monitors.github_status`), **not** a `[[subscriptions]]` websocket worker. Keep it separate from GJC workflow-gate / question subscriptions.
+
+Official public endpoints (no auth, no secrets):
+
+- `https://www.githubstatus.com/api/v2/summary.json`
+- `https://www.githubstatus.com/api/v2/status.json`
+- `https://www.githubstatus.com/api/v2/components.json`
+- `https://www.githubstatus.com/api/v2/incidents.json`
+
+`status.github.com` serves the same Statuspage surface; clawhip defaults to the `www.githubstatus.com` API base.
+
+```toml
+[monitors.github_status]
+enabled = true
+# Public Statuspage API; no token. Override only for tests/mirrors.
+api_base = "https://www.githubstatus.com/api/v2"
+components = ["Actions"]
+poll_interval_secs = 60
+# Optional direct channel; prefer an explicit route for gajae-code dev.
+# channel = "YOUR_GAJAE_CODE_DEV_CHANNEL_ID"
+# channel_name = "gajae-code-dev"
+format = "alert"
+
+[[routes]]
+event = "github.actions-*"
+sink = "discord"
+channel = "YOUR_GAJAE_CODE_DEV_CHANNEL_ID"
+channel_name = "gajae-code-dev"
+format = "alert"
+```
+
+Events:
+
+- `github.actions-status` — watched component transitions among `degraded_performance`, `partial_outage`, `major_outage`, `under_maintenance`, and recovery to `operational`
+- `github.actions-incident` — incident opened / update / resolved for incidents that affect a watched component
+
+Anti-spam:
+
+- first successful poll establishes a baseline and emits nothing
+- stable component status and identical incident update IDs do not re-alert
+- only lifecycle deltas (status change, new update id, resolve) emit
+
+## Websocket subscriptions
+
+Subscriptions are daemon-owned, guarded local ingress for a configured websocket event stream. Keep endpoint credentials outside the TOML file: the configuration names an environment variable, and `clawhip subscribe`, health, and API responses never print that name, its value, the endpoint URL, adapter arguments, adapter stderr, frames, or adapter output.
+
+Set the endpoint only in the daemon environment, then keep the subscription policy and route ownership in `~/.clawhip/config.toml`:
+
+```bash
+export GJC_WORKFLOW_GATE_WS='wss://localhost:9443/gjc-events'
+clawhip subscribe validate
+clawhip start
+```
+
+```toml
+[[subscriptions]]
+name = "gjc-workflow-gate"
+enabled = true
+kind = "websocket"
+endpoint_env = "GJC_WORKFLOW_GATE_WS"
+
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "workflow_gate"
+
+[[subscriptions.filter.predicates]]
+pointer = "/gate/state"
+equals = "ready"
+
+[subscriptions.projection]
+workflow_id = "/workflow/id"
+gate_state = "/gate/state"
+
+[subscriptions.adapter]
+program = "/absolute/path/to/gjc-workflow-gate-adapter"
+args = []
+
+[subscriptions.routing]
+tool = "gjc"
+project = "my-project"
+
+[[routes]]
+event = "workflow.gate"
+sink = "discord"
+channel = "WORKFLOW_GATE_CHANNEL_ID"
+format = "alert"
+```
+
+A separate `question` subscription remains explicit and route-owned; it must not share a workflow-gate filter or silently inherit its channel:
+
+```toml
+[[subscriptions]]
+name = "gjc-question"
+enabled = true
+kind = "websocket"
+endpoint_env = "GJC_QUESTION_WS"
+
+[subscriptions.filter]
+discriminator_pointer = "/type"
+discriminator_equals = "question"
+
+[subscriptions.projection]
+question_id = "/question/id"
+summary = "/question/summary"
+
+[subscriptions.adapter]
+program = "<path-to-clawhip>"
+args = ["subscribe", "adapter", "question"]
+
+[[routes]]
+event = "workflow.question"
+sink = "discord"
+channel = "QUESTIONS_CHANNEL_ID"
+format = "compact"
+```
+
+Use `clawhip subscribe list`, `clawhip subscribe status <name>`, `clawhip subscribe start <name>`, and `clawhip subscribe stop <name>` only against a loopback daemon. The daemon also enforces the loopback peer and numeric loopback `Host` checks. `start` and `stop` additionally require the fixed `x-clawhip-local-control: 1` request header (sent automatically by `clawhip`) and reject non-loopback `Origin` headers; this is a local browser-CSRF and DNS-rebinding guard, not a credential. Redirects are not followed. `start` and `stop` are idempotent and return a reason code. Enabled subscriptions reconnect with their configured bounded backoff; daemon shutdown cancels workers and waits a bounded time before aborting remaining work.
+
+Adapters receive only the selected projection on stdin and must emit exactly one bounded JSON object with `type` and object `payload` on stdout. They run with a cleared environment; do not depend on inherited credentials or emit logs on stdout. Route channels belong in `[[routes]]`, not in subscription frames or adapter output.

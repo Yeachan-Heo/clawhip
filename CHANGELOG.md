@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+## 0.6.12 - 2026-08-19
+
+### Highlights
+
+- add durable event-ledger storage and compaction for auditable event history
+- add a GitHub Actions status monitor backed by the public GitHub Statuspage API, with baseline and deduplication handling
+- make runtime and tmux watch reconciliation converge safely across dead sessions, no-server states, same-name recreation, ownerless stale registrations, and orphaned registrations
+- add official opt-in support for GJC setup questions and document the permanent Discord community invite
+- harden config backup writes, candidate verification, retention labels, and cleanup against unsafe paths and malformed or lookalike entries
+- bound batched compact CI Discord messages to Discord's 2000-scalar limit
+
+### Upgrade notes
+
+- crate version is now `0.6.12`
+- existing route/config schema remains compatible; no migration required
+
+
+### Added
+
+- add `monitors.github_status` poller for GitHub Actions platform incidents via the public Statuspage API (`www.githubstatus.com/api/v2`), emitting `github.actions-status` and `github.actions-incident` with baseline/dedupe anti-spam; independent from websocket `[[subscriptions]]`
+### Fixed
+
+- config saves retire only strictly recognized stale legacy root-level snapshots alongside managed backups under the shared newest-10-or-newer-than-30-days retention policy. On Unix, temp commit, managed snapshot creation, and candidate deletion use directory-handle-relative exclusive/no-follow primitives so preplaced temp collisions, post-write temp replacement, managed-directory path swaps, and post-check candidate replacement cannot redirect writes or unlinks outside the validated objects; on platforms without those primitives, saves continue while cleanup preserves every candidate. Unknown, malformed, symlinked, directory, and unsafe linked entries remain untouched. No config schema migration or startup cleanup is required.
+- restrict root-level config-backup cleanup to a finite set of evidenced clawhip labels, preserve lookalikes and unknown labels, and report public-safe classified/deleted/preserved counts after config saves.
+
 ## 0.6.11 - 2026-06-16
 
 ### Highlights

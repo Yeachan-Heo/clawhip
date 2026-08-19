@@ -54,6 +54,11 @@ pub enum Commands {
     },
     /// Check daemon health/status.
     Status,
+    /// Inspect, validate, and control daemon-owned websocket subscriptions through the local daemon.
+    Subscribe {
+        #[command(subcommand)]
+        command: SubscribeCommands,
+    },
     #[command(
         about = "Scaffold common setup presets without editing advanced routes or monitors",
         long_about = "Scaffold the bounded quickstart preset catalog.\n\nAdvanced routes and monitors still require manual config editing or the bounded clawhip config editor."
@@ -85,6 +90,16 @@ pub enum Commands {
         #[command(subcommand)]
         command: AgentCommands,
     },
+    /// Inspect and update retained Discord-thread lane evidence through the local daemon.
+    #[command(
+        about = "Inspect, verify, and update retained Discord-thread lane evidence",
+        long_about = "Inspect, verify, and update retained Discord-thread lane evidence. Lane commands resolve targets only from daemon-owned retained records and never accept raw Discord thread IDs."
+    )]
+    Lane {
+        #[command(subcommand)]
+        command: LaneCommands,
+    },
+
     /// Send tmux-related events to the local daemon or launch/register tmux sessions.
     Tmux {
         #[command(subcommand)]
@@ -143,6 +158,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: MemoryCommands,
     },
+    /// Query, verify, and inspect the durable public-safe event ledger.
+    Ledger {
+        #[command(subcommand)]
+        command: LedgerCommands,
+    },
+
     /// Install and manage provider-native hook forwarding for Codex and Claude Code.
     Hooks {
         #[command(subcommand)]
@@ -237,6 +258,10 @@ pub struct SetupArgs {
     /// resolved (missing, forbidden, or no bot token). Repeatable.
     #[arg(long = "bind", value_name = "REPO=CHANNEL_ID")]
     pub bind: Vec<String>,
+    /// Bind a repo to a checkout path for setup-owned git monitoring. Format: `repo=path`.
+    /// Repeatable. Every repo named here must also be present in `--bind`.
+    #[arg(long = "bind-checkout", value_name = "REPO=PATH")]
+    pub bind_checkout: Vec<String>,
     /// When combined with `--bind`, refuse unless the live channel name
     /// matches the expected name. Format: `repo=expected_name`. Repeatable.
     #[arg(long = "expect-name", value_name = "REPO=NAME")]
@@ -245,6 +270,16 @@ pub struct SetupArgs {
     /// before writing the config. Fails the command if any binding drifts.
     #[arg(long = "verify-bindings", default_value_t = false)]
     pub verify_bindings: bool,
+    /// Opt in to the official GJC question subscription and route questions to this channel.
+    /// The value is a Discord channel ID. Use --question-fallback to reuse [defaults].channel.
+    #[arg(long = "question-channel")]
+    pub question_channel: Option<String>,
+    /// Mention to prepend to question notifications created by official GJC setup.
+    #[arg(long = "question-mention")]
+    pub question_mention: Option<String>,
+    /// Use the configured default channel when no --question-channel is supplied.
+    #[arg(long = "question-fallback", default_value_t = false)]
+    pub question_fallback: bool,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -329,6 +364,22 @@ fn normalize_emit_key(key: &str) -> &str {
 
 fn parse_emit_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SubscribeCommands {
+    /// Adapt the official GJC question projection into a restricted clawhip event.
+    Adapter { kind: String },
+    /// Validate configured subscriptions without exposing endpoint environment details.
+    Validate,
+    /// List public-safe subscription lifecycle snapshots from the local daemon.
+    List,
+    /// Show one public-safe subscription lifecycle snapshot.
+    Status { name: String },
+    /// Request the configured subscription worker be running.
+    Start { name: String },
+    /// Request the configured subscription worker stop.
+    Stop { name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -695,6 +746,79 @@ pub enum UpdateCommands {
     /// Show the current pending-update status from the daemon.
     Status,
 }
+#[derive(Debug, Clone, Subcommand)]
+pub enum LaneCommands {
+    /// List retained lane snapshots with daemon-owned evidence and local best-effort tmux/marker observation.
+    #[command(
+        about = "List retained lane status",
+        long_about = "List retained lane status by combining daemon-owned lane evidence with local best-effort tmux liveness and R2 marker observation. Routine output redacts Discord targets."
+    )]
+    Status {
+        /// Limit status to one retained lane session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Emit explicit JSON nulls for absent lane fields.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe a stored thread target without changing workflow or sending a message.
+    #[command(
+        name = "verify-thread",
+        about = "Verify stored Discord thread evidence",
+        long_about = "Verify the stored Discord thread target for a retained session. A stored kickoff receipt is fetched exactly; otherwise at most one message is observed. Empty history remains unverified."
+    )]
+    VerifyThread {
+        /// Retained lane session whose stored thread target will be probed.
+        #[arg(long)]
+        session: String,
+        /// Emit explicit JSON nulls for absent verification fields.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deliver a bounded lifecycle update to a stored thread target.
+    #[command(
+        about = "Send a lifecycle update to a stored Discord thread",
+        long_about = "Send a lifecycle update only to the stored target for a retained session. An explicit workflow change is persisted before delivery; failed delivery does not revert it."
+    )]
+    Update {
+        /// Retained lane session whose stored thread target receives the update.
+        #[arg(long)]
+        session: String,
+        /// Lifecycle message to deliver; limited to 2,000 Unicode scalar values.
+        #[arg(long)]
+        message: String,
+        /// Audit and delivery label for the lifecycle message.
+        #[arg(long, value_enum)]
+        kind: LaneUpdateKind,
+        /// Optional durable workflow transition to persist before delivery.
+        #[arg(long, value_enum)]
+        workflow: Option<LaneWorkflowArg>,
+        /// Emit explicit JSON nulls for absent receipt and verification fields.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LaneUpdateKind {
+    Kickoff,
+    Progress,
+    Blocked,
+    PrOpen,
+    Handoff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LaneWorkflowArg {
+    Active,
+    NeedsReview,
+    NeedsQa,
+    PrOpen,
+    AwaitingCi,
+    AwaitingHuman,
+    Retired,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TmuxCommands {
     Keyword {
@@ -775,6 +899,16 @@ pub struct TmuxNewArgs {
     pub retry_enter_delay_ms: u64,
     #[arg(long)]
     pub shell: Option<String>,
+    /// Optional stored Discord thread target for the lane-aware launch path.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Initial Discord message; requires --thread and is limited to 2,000 Unicode scalar values.
+    #[arg(long, requires = "thread")]
+    pub kickoff: Option<String>,
+    /// Emit lane launch evidence as JSON without changing legacy non-lane output.
+    #[arg(long)]
+    pub json: bool,
+
     #[arg(last = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
@@ -795,6 +929,44 @@ pub struct TmuxWatchArgs {
     pub format: Option<TmuxWrapperFormat>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub retry_enter: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum LedgerCommands {
+    /// Show bounded ledger health and retention counters from the daemon.
+    Status,
+    /// Query public-safe ledger records through indexed filters.
+    Query(LedgerQueryArgs),
+    /// Verify retained ledger files and public-safe schema invariants locally.
+    Verify,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LedgerQueryArgs {
+    /// Match an exact repository identity.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Match an exact worktree path.
+    #[arg(long)]
+    pub worktree: Option<String>,
+    /// Match an exact agent or workspace session id.
+    #[arg(long)]
+    pub session_id: Option<String>,
+    /// Match an exact canonical event type.
+    #[arg(long)]
+    pub event_type: Option<String>,
+    /// Include records at or after this Unix timestamp.
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Include records at or before this Unix timestamp.
+    #[arg(long)]
+    pub until: Option<i64>,
+    /// Require all comma-delimited normalized keywords.
+    #[arg(long, value_delimiter = ',')]
+    pub keywords: Vec<String>,
+    /// Maximum records to return, capped by ledger.max_query_results.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1210,6 +1382,24 @@ mod tests {
         assert_eq!(args.bind[1], "oh-my-codex=1480171106324189335");
         assert_eq!(args.expect_name.len(), 1);
         assert_eq!(args.expect_name[0], "clawhip=clawhip-dev");
+        assert!(args.bind_checkout.is_empty());
+    }
+
+    #[test]
+    fn parses_setup_bind_checkout_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "setup",
+            "--bind",
+            "clawhip=1480171113253175356",
+            "--bind-checkout",
+            "clawhip=/work/clawhip",
+        ]);
+        let Commands::Setup(args) = cli.command.expect("setup command") else {
+            panic!("expected Setup");
+        };
+        assert_eq!(args.bind, vec!["clawhip=1480171113253175356"]);
+        assert_eq!(args.bind_checkout, vec!["clawhip=/work/clawhip"]);
     }
 
     #[test]
@@ -1340,6 +1530,7 @@ mod tests {
         assert!(help.contains("Advanced routes and monitors still require manual config editing"));
         assert!(help.contains("--default-format <DEFAULT_FORMAT>"));
         assert!(help.contains("--daemon-base-url <DAEMON_BASE_URL>"));
+        assert!(help.contains("--bind-checkout <REPO=PATH>"));
     }
 
     #[test]
@@ -1924,6 +2115,119 @@ mod tests {
         assert_eq!(args.project.as_deref(), Some("clawhip"));
         assert!(args.write);
         assert!(args.force);
+    }
+    #[test]
+    fn parses_lane_update_with_optional_workflow() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "lane",
+            "update",
+            "--session",
+            "issue-285",
+            "--message",
+            "handoff ready",
+            "--kind",
+            "handoff",
+            "--workflow",
+            "awaiting-human",
+            "--json",
+        ]);
+
+        let Commands::Lane {
+            command:
+                LaneCommands::Update {
+                    session,
+                    message,
+                    kind,
+                    workflow,
+                    json,
+                },
+        } = cli.command.expect("lane command")
+        else {
+            panic!("expected lane update command");
+        };
+        assert_eq!(session, "issue-285");
+        assert_eq!(message, "handoff ready");
+        assert_eq!(kind, LaneUpdateKind::Handoff);
+        assert_eq!(workflow, Some(LaneWorkflowArg::AwaitingHuman));
+        assert!(json);
+    }
+
+    #[test]
+    fn lane_commands_require_their_contractual_arguments() {
+        assert!(Cli::try_parse_from(["clawhip", "lane", "verify-thread"]).is_err());
+        assert!(
+            Cli::try_parse_from(["clawhip", "lane", "update", "--session", "issue-285"]).is_err()
+        );
+    }
+
+    #[test]
+    fn lane_help_describes_all_subcommands() {
+        let mut root = Cli::command();
+        let lane = root.find_subcommand_mut("lane").expect("lane command");
+        let lane_help = lane.render_long_help().to_string();
+        assert!(lane_help.contains("status"));
+        assert!(lane_help.contains("verify-thread"));
+        assert!(lane_help.contains("update"));
+
+        let status = lane
+            .find_subcommand_mut("status")
+            .expect("lane status command");
+        let status_help = status.render_long_help().to_string();
+        assert!(status_help.contains("daemon-owned lane evidence"));
+        assert!(status_help.contains("local best-effort tmux liveness"));
+        assert!(status_help.contains("R2 marker observation"));
+    }
+    #[test]
+    fn parses_lane_aware_tmux_new_flags_without_changing_legacy_defaults() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "tmux",
+            "new",
+            "--session",
+            "issue-285",
+            "--thread",
+            "123",
+            "--kickoff",
+            "Starting work",
+            "--json",
+        ]);
+        let Commands::Tmux {
+            command: TmuxCommands::New(args),
+        } = cli.command.expect("tmux command")
+        else {
+            panic!("expected tmux new command");
+        };
+        assert_eq!(args.thread.as_deref(), Some("123"));
+        assert_eq!(args.kickoff.as_deref(), Some("Starting work"));
+        assert!(args.json);
+
+        let legacy = Cli::parse_from(["clawhip", "tmux", "new", "--session", "legacy"]);
+        let Commands::Tmux {
+            command: TmuxCommands::New(args),
+        } = legacy.command.expect("legacy tmux command")
+        else {
+            panic!("expected tmux new command");
+        };
+        assert_eq!(args.thread, None);
+        assert_eq!(args.kickoff, None);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn tmux_new_kickoff_requires_thread() {
+        assert!(
+            Cli::try_parse_from([
+                "clawhip",
+                "tmux",
+                "new",
+                "--session",
+                "issue-285",
+                "--kickoff",
+                "Starting work",
+            ])
+            .is_err()
+        );
     }
 }
 
