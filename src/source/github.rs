@@ -403,7 +403,10 @@ impl TerminalRunRecord {
     }
 
     fn eviction_key(&self) -> (u8, String, u64, String) {
-        let created_rank = u8::from(self.created_at.is_none());
+        // Unknown-age legacy receipts sort first so they evict before
+        // timestamped records. Tie-break by created_at, then run_id, then
+        // identity so mixed load/commit is deterministic.
+        let created_rank = u8::from(self.created_at.is_some());
         let created = self.created_at.clone().unwrap_or_default();
         let run_num = self
             .run_id
@@ -1782,9 +1785,10 @@ async fn fetch_ci_statuses(
         }
     }
 
-    let (workflow_runs, complete) =
+    let (workflow_runs, complete, attempts_by_run) =
         fetch_direct_workflow_runs(client, api_base, &github_repo, snapshot).await?;
     window_complete &= complete;
+    apply_workflow_run_attempts(&mut check_runs, &attempts_by_run);
     for workflow_run in workflow_runs {
         if workflow_run
             .run_id
@@ -1879,6 +1883,7 @@ async fn fetch_check_runs(
                     .and_then(|id| run_summaries.get(id).copied())
                     .unwrap_or((1, check_run.status == "completed"));
                 let run_all_terminal = summarized_terminal && window_complete;
+                let run_attempt = run_attempt_from_url(&url);
                 GitHubCISnapshot {
                     pr_number: Some(pr_number),
                     workflow: check_run.name,
@@ -1888,7 +1893,7 @@ async fn fetch_check_runs(
                     url,
                     branch: Some(pr.head_branch.clone()),
                     run_id,
-                    run_attempt: 1,
+                    run_attempt,
                     check_run_id: (check_run.id != 0).then(|| check_run.id.to_string()),
                     created_at: check_run.started_at.or(check_run.completed_at),
                     run_job_count,
@@ -1918,17 +1923,13 @@ async fn fetch_direct_workflow_runs(
     api_base: &str,
     github_repo: &str,
     snapshot: &GitSnapshot,
-) -> Result<(Vec<GitHubCISnapshot>, bool)> {
+) -> Result<(Vec<GitHubCISnapshot>, bool, HashMap<String, u32>)> {
     let mut all_runs = Vec::new();
     let mut page = 1_usize;
     let mut window_complete = true;
     loop {
         let page_str = page.to_string();
-        let mut query = vec![
-            ("per_page", "100"),
-            ("event", "push"),
-            ("page", page_str.as_str()),
-        ];
+        let mut query = vec![("per_page", "100"), ("page", page_str.as_str())];
         if !snapshot.branch.is_empty() {
             query.push(("branch", snapshot.branch.as_str()));
         }
@@ -1959,6 +1960,14 @@ async fn fetch_direct_workflow_runs(
         }
     }
 
+    let mut attempts_by_run = HashMap::new();
+    for run in &all_runs {
+        let attempt = run_attempt_or_one(run.run_attempt);
+        attempts_by_run
+            .entry(run.id.to_string())
+            .and_modify(|existing: &mut u32| *existing = (*existing).max(attempt))
+            .or_insert(attempt);
+    }
     Ok((
         all_runs
             .into_iter()
@@ -1985,6 +1994,7 @@ async fn fetch_direct_workflow_runs(
             })
             .collect(),
         window_complete,
+        attempts_by_run,
     ))
 }
 
@@ -1994,6 +2004,33 @@ fn workflow_run_id(url: &str) -> Option<String> {
         .and_then(|tail| tail.split('/').next())
         .filter(|part| !part.is_empty())
         .map(ToString::to_string)
+}
+
+fn run_attempt_from_url(url: &str) -> u32 {
+    url.split("/attempts/")
+        .nth(1)
+        .and_then(|tail| tail.split('/').next())
+        .and_then(|part| part.parse::<u32>().ok())
+        .filter(|attempt| *attempt >= 1)
+        .unwrap_or(1)
+}
+
+fn apply_workflow_run_attempts(
+    snapshots: &mut HashMap<String, GitHubCISnapshot>,
+    attempts: &HashMap<String, u32>,
+) {
+    if attempts.is_empty() {
+        return;
+    }
+    let existing: Vec<GitHubCISnapshot> = snapshots.drain().map(|(_, snapshot)| snapshot).collect();
+    for mut snapshot in existing {
+        if let Some(run_id) = &snapshot.run_id
+            && let Some(&attempt) = attempts.get(run_id)
+        {
+            snapshot.run_attempt = snapshot.run_attempt.max(attempt);
+        }
+        snapshots.insert(snapshot.dedupe_key(), snapshot);
+    }
 }
 
 fn build_github_client(token: Option<String>) -> Result<reqwest::Client> {
@@ -2782,6 +2819,161 @@ mod tests {
         assert!(!repo.contains_identity("run:19"));
         assert!(repo.contains_identity("run:20"));
         assert!(repo.contains_identity(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 19)));
+    }
+
+    #[test]
+    fn issue_317_mixed_legacy_eviction_keeps_timestamped_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut records = Vec::new();
+        for id in 0..MAX_BASELINE_RUNS_PER_REPO {
+            records.push(format!(r#"{{"identities":["run:{id}"],"run_id":"{id}"}}"#));
+        }
+        let payload = format!(r#"{{"/repo":{{"terminal_runs":[{}]}}}}"#, records.join(","));
+        std::fs::write(&path, payload).unwrap();
+
+        let mut incoming = CIBaseline::default();
+        let mut fresh = run_snapshot(9_999, "CI", Some("success"), "main");
+        fresh.created_at = Some("2026-08-19T12:00:00Z".into());
+        incoming.record_terminal_runs("/repo", "/repo", &run_map(std::slice::from_ref(&fresh)));
+        commit_ci_baseline(Some(&path), &incoming).unwrap();
+
+        let loaded = load_ci_baseline(Some(&path));
+        let repo = &loaded.repos["/repo"];
+        assert_eq!(repo.terminal_runs.len(), MAX_BASELINE_RUNS_PER_REPO);
+        assert!(
+            repo.contains_identity("run:9999"),
+            "timestamped receipt must outrank unknown-age legacy records"
+        );
+        assert!(!repo.contains_identity("run:0"));
+
+        let restarted = load_ci_baseline(Some(&path));
+        assert!(restarted.repos["/repo"].contains_identity("run:9999"));
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&fresh)),
+            restarted.repos.get("/repo"),
+        );
+        assert!(
+            events.is_empty(),
+            "restart must still suppress the retained timestamped receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_317_pr_check_rerun_attempt_is_distinct_on_production_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut check_polls = 0_u32;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if request.contains("/pulls") {
+                    r#"[{"number":42,"title":"PR","state":"open","html_url":"https://github.com/org/repo/pull/42","head":{"ref":"feat/pr","sha":"prsha"}}]"#.to_string()
+                } else if request.contains("/check-runs") {
+                    check_polls += 1;
+                    if check_polls <= 2 {
+                        r#"{"check_runs":[{"id":11,"name":"CI","status":"completed","conclusion":"success","details_url":"https://github.com/org/repo/actions/runs/4242/jobs/11","head_sha":"prsha"}]}"#.to_string()
+                    } else {
+                        r#"{"check_runs":[{"id":22,"name":"CI","status":"completed","conclusion":"failure","details_url":"https://github.com/org/repo/actions/runs/4242/attempts/2/jobs/22","head_sha":"prsha"}]}"#.to_string()
+                    }
+                } else if request.contains("/actions/runs") {
+                    if check_polls <= 2 {
+                        r#"{"workflow_runs":[{"id":4242,"name":"CI","status":"completed","conclusion":"success","head_branch":"feat/pr","head_sha":"prsha","html_url":"https://github.com/org/repo/actions/runs/4242","run_attempt":1,"pull_requests":[{"number":42}]}]}"#.to_string()
+                    } else {
+                        r#"{"workflow_runs":[{"id":4242,"name":"CI","status":"completed","conclusion":"failure","head_branch":"feat/pr","head_sha":"prsha","html_url":"https://github.com/org/repo/actions/runs/4242/attempts/2","run_attempt":2,"pull_requests":[{"number":42}]}]}"#.to_string()
+                    }
+                } else {
+                    "[]".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let baseline_path = dir.path().join("github-ci-baseline.json");
+        let mut config = AppConfig::default();
+        config.monitors.github_api_base = format!("http://{addr}");
+        config.monitors.git.repos = vec![GitRepoMonitor {
+            path: "/tmp/pr-rerun".into(),
+            name: Some("repo".into()),
+            github_repo: Some("org/repo".into()),
+            emit_pr_status: true,
+            emit_issue_opened: false,
+            emit_commits: false,
+            emit_branch_changes: false,
+            ..GitRepoMonitor::default()
+        }];
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = HashMap::new();
+        let mut baseline = CIBaseline::default();
+        poll_once_with_baseline(
+            &config,
+            &client,
+            &mut state,
+            &mut baseline,
+            Some(&baseline_path),
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "first poll primes attempt 1");
+
+        let mut state = HashMap::new();
+        let mut baseline = load_ci_baseline(Some(&baseline_path));
+        poll_once_with_baseline(
+            &config,
+            &client,
+            &mut state,
+            &mut baseline,
+            Some(&baseline_path),
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "restart prime must not replay attempt 1");
+        poll_once_with_baseline(
+            &config,
+            &client,
+            &mut state,
+            &mut baseline,
+            Some(&baseline_path),
+            &tx,
+        )
+        .await
+        .unwrap();
+        let mut delivered = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            delivered.push(event);
+        }
+        assert_eq!(delivered.len(), 1, "attempt 2 must deliver exactly once");
+        assert_eq!(delivered[0].canonical_kind(), "github.ci-failed");
+        assert_eq!(delivered[0].payload["run_id"], json!("4242"));
+        assert_eq!(delivered[0].payload["run_attempt"], json!(2));
+        let stored = load_ci_baseline(Some(&baseline_path));
+        let repo = stored
+            .repos
+            .values()
+            .find(|repo| repo.contains_identity("run:4242") || repo.contains_identity("run:4242:2"))
+            .expect("repo baseline");
+        assert!(repo.contains_identity("run:4242"));
+        assert!(repo.contains_identity("run:4242:2"));
+        server.abort();
     }
 
     #[test]
@@ -4074,7 +4266,6 @@ mod tests {
         let req = server.await.unwrap();
         assert!(req.contains("GET /repos/ultraworkers/claw-code/actions/runs?"));
         assert!(req.contains("branch=main"));
-        assert!(req.contains("event=push"));
         assert!(req.contains("per_page=100"));
     }
 
@@ -4193,7 +4384,6 @@ mod tests {
         assert!(requests[0].contains("GET /repos/org/repo/commits/prsha/check-runs?"));
         assert!(requests[1].contains("GET /repos/org/repo/actions/runs?"));
         assert!(requests[1].contains("branch=main"));
-        assert!(requests[1].contains("event=push"));
     }
 
     #[test]
