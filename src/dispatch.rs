@@ -1139,6 +1139,7 @@ fn sink_target_key(target: &SinkTarget) -> String {
         SinkTarget::DiscordThread(thread) => format!("discord-thread:{thread}"),
         SinkTarget::DiscordWebhook(webhook) => format!("discord-webhook:{webhook}"),
         SinkTarget::SlackWebhook(webhook) => format!("slack-webhook:{webhook}"),
+        SinkTarget::HttpEndpoint(endpoint) => format!("http-endpoint:{endpoint}"),
         SinkTarget::LocalFile(path) => format!("localfile:{path}"),
     }
 }
@@ -1156,10 +1157,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::config::{AppConfig, RouteRule};
+    use crate::config::{AppConfig, HttpConfig, ProvidersConfig, RouteRule};
     use crate::native_observability::new_shared_native_hook_observability;
     use crate::render::DefaultRenderer;
-    use crate::sink::{DiscordSink, SlackSink};
+    use crate::sink::{DiscordSink, HttpSink, SlackSink};
     use tempfile::tempdir;
 
     fn dummy_queued_delivery() -> QueuedRoutineDelivery {
@@ -1507,6 +1508,88 @@ mod tests {
             request.contains("\"text\":\"🚨 tmux session issue-28 hit keyword 'error': boom\"")
         );
         assert!(request.contains("\"blocks\""));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_fans_out_to_signed_http_and_discord() {
+        use tokio::time::{Duration, timeout};
+
+        let (http_endpoint, mut http_requests, http_server) = spawn_webhook_collector(1).await;
+        let (discord_webhook, mut discord_requests, discord_server) =
+            spawn_webhook_collector(1).await;
+        let config = AppConfig {
+            providers: ProvidersConfig {
+                http: HttpConfig {
+                    endpoint: Some(http_endpoint),
+                    hmac_secret_env: Some("HERMES_CLAWHIP_HMAC_SECRET".into()),
+                },
+                ..ProvidersConfig::default()
+            },
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "http".into(),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "discord".into(),
+                    webhook: Some(discord_webhook),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let router = Router::new(Arc::new(config));
+        let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
+        sinks.insert(
+            "http".into(),
+            Box::new(HttpSink::new(b"shared-secret").unwrap()),
+        );
+        sinks.insert(
+            "discord".into(),
+            Box::new(DiscordSink::from_config(Arc::new(AppConfig::default())).unwrap()),
+        );
+        let mut dispatcher = Dispatcher::new(
+            rx,
+            router,
+            Box::new(DefaultRenderer),
+            sinks,
+            Duration::from_secs(30),
+            None,
+            new_shared_native_hook_observability(),
+        );
+        let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
+
+        tx.send(IncomingEvent::tmux_keyword(
+            "issue-301".into(),
+            "error".into(),
+            "boom".into(),
+            None,
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        let http_request = timeout(Duration::from_secs(2), http_requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let discord_request = timeout(Duration::from_secs(2), discord_requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        http_server.await.unwrap();
+        discord_server.await.unwrap();
+
+        let lower_http = http_request.to_ascii_lowercase();
+        assert!(lower_http.contains("x-hub-signature-256: sha256="));
+        assert!(lower_http.contains("x-request-id:"));
+        assert!(http_request.contains("\"schema\":\"clawhip.http-event.v1\""));
+        assert!(http_request.contains("\"type\":\"tmux.keyword\""));
+        assert!(discord_request.contains("\"content\":\"tmux:issue-301 matched 'error' => boom\""));
     }
 
     #[tokio::test]

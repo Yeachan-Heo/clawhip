@@ -251,6 +251,9 @@ impl DiscordClient {
                 SinkTarget::SlackWebhook(_) => {
                     return Err("cannot send Slack webhook via Discord client".into());
                 }
+                SinkTarget::HttpEndpoint(_) => {
+                    return Err("cannot send HTTP target via Discord client".into());
+                }
                 SinkTarget::LocalFile(_) => {
                     return Err("cannot send localfile target via Discord client".into());
                 }
@@ -981,6 +984,7 @@ fn target_rate_limit_key(target: &SinkTarget) -> String {
         SinkTarget::DiscordThread(thread_id) => format!("discord:thread:{thread_id}"),
         SinkTarget::DiscordWebhook(webhook_url) => format!("discord:webhook:{webhook_url}"),
         SinkTarget::SlackWebhook(webhook_url) => format!("slack:webhook:{webhook_url}"),
+        SinkTarget::HttpEndpoint(endpoint) => format!("http:endpoint:{endpoint}"),
         SinkTarget::LocalFile(path) => format!("localfile:{path}"),
     }
 }

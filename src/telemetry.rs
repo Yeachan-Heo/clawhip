@@ -17,6 +17,9 @@ pub mod event_name {
     pub const DISCORD_SEND_ATTEMPT: &str = "discord_send_attempt";
     pub const DISCORD_SEND_FAILURE: &str = "discord_send_failure";
     pub const DISCORD_SEND_SUCCESS: &str = "discord_send_success";
+    pub const HTTP_SEND_ATTEMPT: &str = "http_send_attempt";
+    pub const HTTP_SEND_FAILURE: &str = "http_send_failure";
+    pub const HTTP_SEND_SUCCESS: &str = "http_send_success";
     pub const CIRCUIT_TRANSITION: &str = "circuit_transition";
     pub const DLQ_BURY: &str = "dlq_bury";
     pub const SOURCE_DEGRADED: &str = "source_degraded";
@@ -43,6 +46,10 @@ pub mod reason {
     pub const DISCORD_RETRY: &str = "discord_retry";
     pub const DISCORD_EXHAUSTED: &str = "discord_exhausted";
     pub const DISCORD_SUCCESS: &str = "discord_success";
+    pub const HTTP_PRE_SEND: &str = "http_pre_send";
+    pub const HTTP_TRANSPORT_ERROR: &str = "http_transport_error";
+    pub const HTTP_STATUS_ERROR: &str = "http_status_error";
+    pub const HTTP_SUCCESS: &str = "http_success";
     pub const CIRCUIT_OPEN: &str = "circuit_open";
     pub const CIRCUIT_TRANSITION: &str = "circuit_transition";
     pub const DLQ_WRITE: &str = "dlq_write";
@@ -114,22 +121,29 @@ pub fn safe_target_id(target: &SinkTarget) -> String {
         SinkTarget::SlackWebhook(webhook_url) => {
             format!("slack:webhook:{}", redacted_url_fingerprint(webhook_url))
         }
+        SinkTarget::HttpEndpoint(endpoint) => {
+            format!("http:endpoint:{}", redacted_url_fingerprint(endpoint))
+        }
         SinkTarget::LocalFile(path) => format!("localfile:{:016x}", fingerprint(path)),
     }
 }
 
 pub fn redacted_url_fingerprint(url: &str) -> String {
-    let host = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("unknown-host")
-        .trim()
-        .split('@')
-        .next_back()
-        .unwrap_or("unknown-host");
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            let host = parsed.host_str()?;
+            let host = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
+            Some(match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| "unknown-host".to_string());
     format!("{host}/redacted/{:016x}", fingerprint(url))
 }
 
@@ -217,6 +231,28 @@ mod tests {
 
         assert!(safe.starts_with("localfile:"));
         assert!(!safe.contains("/tmp/clawhip/events.jsonl"));
+    }
+
+    #[test]
+    fn http_target_id_redacts_endpoint_path_and_query() {
+        let endpoint = "https://controller.example/webhooks/clawhip?token=secret";
+        let safe = safe_target_id(&SinkTarget::HttpEndpoint(endpoint.into()));
+
+        assert!(safe.starts_with("http:endpoint:controller.example/redacted/"));
+        assert!(!safe.contains("clawhip"));
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains(endpoint));
+    }
+
+    #[test]
+    fn http_target_id_does_not_treat_query_as_host() {
+        let endpoint = "https://controller.example?token=secret";
+        let safe = safe_target_id(&SinkTarget::HttpEndpoint(endpoint.into()));
+
+        assert!(safe.starts_with("http:endpoint:controller.example/redacted/"));
+        assert!(!safe.contains("token"));
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains(endpoint));
     }
 
     #[test]

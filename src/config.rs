@@ -5,6 +5,7 @@ use std::env;
 use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
+use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
@@ -316,6 +317,8 @@ pub struct ProvidersConfig {
     pub discord: DiscordConfig,
     #[serde(default)]
     pub slack: SlackConfig,
+    #[serde(default, skip_serializing_if = "HttpConfig::is_empty")]
+    pub http: HttpConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -328,6 +331,14 @@ pub struct DiscordConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlackConfig {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, alias = "secret_env", skip_serializing_if = "Option::is_none")]
+    pub hmac_secret_env: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -347,7 +358,7 @@ impl DiscordConfig {
 
 impl ProvidersConfig {
     fn is_empty(&self) -> bool {
-        self.discord.is_empty() && self.slack.is_empty()
+        self.discord.is_empty() && self.slack.is_empty() && self.http.is_empty()
     }
 }
 
@@ -476,6 +487,20 @@ impl SlackConfig {
     }
 }
 
+impl HttpConfig {
+    pub fn endpoint(&self) -> Option<&str> {
+        non_empty_trimmed(self.endpoint.as_deref())
+    }
+
+    pub fn hmac_secret_env(&self) -> Option<&str> {
+        non_empty_trimmed(self.hmac_secret_env.as_deref())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.endpoint().is_none() && self.hmac_secret_env().is_none()
+    }
+}
+
 impl RouteRule {
     pub fn effective_sink(&self) -> &str {
         let sink = self.sink.trim();
@@ -513,7 +538,9 @@ impl RouteRule {
     }
 
     fn has_any_webhook_target(&self) -> bool {
-        self.discord_webhook_target().is_some() || self.slack_webhook_target().is_some()
+        self.discord_webhook_target().is_some()
+            || self.slack_webhook_target().is_some()
+            || self.effective_sink() == "http"
     }
 }
 
@@ -1051,6 +1078,47 @@ fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
     })
 }
 
+pub(crate) fn validate_http_endpoint(endpoint: &str) -> Result<()> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|_| "providers.http.endpoint must be an absolute http:// or https:// URL")?;
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("providers.http.endpoint must not contain credentials".into());
+    }
+    if url.fragment().is_some() {
+        return Err("providers.http.endpoint must not contain a fragment".into());
+    }
+    if url.host_str().is_none() {
+        return Err("providers.http.endpoint must include a host".into());
+    }
+
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if url_host_is_loopback(&url) => Ok(()),
+        "http" => Err("plain HTTP providers.http.endpoint must use a loopback host".into()),
+        _ => Err("providers.http.endpoint must use http:// or https://".into()),
+    }
+}
+
+fn url_host_is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.") {
+        return true;
+    }
+
+    host.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+fn valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
+        && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
+}
+
 fn discord_token_from_env_with<F>(mut get_env: F) -> Option<String>
 where
     F: FnMut(&str) -> Option<String>,
@@ -1376,6 +1444,12 @@ impl AppConfig {
         self.webhook_route_count() > 0
     }
 
+    pub fn has_http_routes(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|route| route.effective_sink() == "http")
+    }
+
     fn has_localfile_routes(&self) -> bool {
         self.routes.iter().any(|route| {
             route.effective_sink() == "localfile" && route.local_file_target().is_some()
@@ -1557,12 +1631,34 @@ impl AppConfig {
             }
         }
 
+        if self.has_http_routes() || !self.providers.http.is_empty() {
+            let endpoint = self.providers.http.endpoint().ok_or_else(|| {
+                "providers.http.endpoint is required when the HTTP sink is configured".to_string()
+            })?;
+            validate_http_endpoint(endpoint)?;
+
+            let secret_env = self.providers.http.hmac_secret_env().ok_or_else(|| {
+                "providers.http.hmac_secret_env is required when the HTTP sink is configured"
+                    .to_string()
+            })?;
+            if !valid_env_var_name(secret_env) {
+                return Err(
+                    "providers.http.hmac_secret_env must be a valid environment variable name"
+                        .into(),
+                );
+            }
+        }
+
         for (index, route) in self.routes.iter().enumerate() {
             let sink = route.effective_sink();
             let has_channel = normalize_secret(route.channel.clone()).is_some();
+            let has_thread_field = normalize_secret(route.thread.clone()).is_some();
             let has_thread = route.discord_thread_target().is_some();
             let has_discord_webhook = route.discord_webhook_target().is_some();
             let has_slack_webhook = route.slack_webhook_target().is_some();
+            let has_webhook_field = normalize_secret(route.webhook.clone()).is_some();
+            let has_slack_webhook_field = normalize_secret(route.slack_webhook.clone()).is_some();
+            let has_local_path = normalize_secret(route.local_path.clone()).is_some();
             if let Some(gajae) = &route.gajae {
                 let subcommand = gajae.subcommand.trim();
                 if subcommand.is_empty() {
@@ -1579,7 +1675,7 @@ impl AppConfig {
                     format!("route #{} ({}) must set a sink", index + 1, route.event).into(),
                 );
             }
-            if !matches!(sink, "discord" | "slack" | "localfile") {
+            if !matches!(sink, "discord" | "slack" | "http" | "localfile") {
                 return Err(format!(
                     "route #{} ({}) uses unsupported sink '{}'",
                     index + 1,
@@ -1649,6 +1745,21 @@ impl AppConfig {
                         .into());
                     }
                 }
+                "http" => {
+                    if has_channel
+                        || has_thread_field
+                        || has_webhook_field
+                        || has_slack_webhook_field
+                        || has_local_path
+                    {
+                        return Err(format!(
+                            "route #{} ({}) cannot set channel/thread/webhook/local_path fields when sink = \"http\"",
+                            index + 1,
+                            route.event
+                        )
+                        .into());
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -1669,7 +1780,7 @@ impl AppConfig {
                 && !self.has_webhook_routes()
             {
                 return Err(format!(
-                    "workspace monitor #{} has no channel and no default Discord destination",
+                    "workspace monitor #{} has no route or default destination",
                     index + 1
                 )
                 .into());
@@ -1718,7 +1829,7 @@ impl AppConfig {
                 && !self.discord_watch.enabled
             {
                 return Err(
-                    "missing Discord delivery config: configure [providers.discord].token (or legacy [discord].token), at least one route webhook, or a localfile route"
+                    "missing delivery config: configure [providers.discord].token (or legacy [discord].token), at least one Discord/Slack/HTTP webhook route, or a localfile route"
                         .into(),
                 );
             }
@@ -2253,6 +2364,14 @@ impl AppConfig {
             self.defaults.channel.as_deref().unwrap_or("<unset>")
         );
         println!("  Webhook routes: {}", self.routes_with_webhooks());
+        println!(
+            "  HTTP sink: {}",
+            if self.providers.http.is_empty() {
+                "<unset>"
+            } else {
+                "configured"
+            }
+        );
         println!("  Default format: {}", self.defaults.format.as_str());
         println!("  Routes: {}", self.routes.len());
         println!("  Git monitors: {}", self.monitors.git.repos.len());
@@ -2264,10 +2383,10 @@ impl AppConfig {
     fn print_template_hint(&self) {
         println!("Advanced routes and monitors are still edited manually in the config file.");
         println!(
-            "Sections: [providers.discord], [dispatch], [daemon], [ledger], [cron], [[cron.jobs]], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
+            "Sections: [providers.discord], [providers.http], [dispatch], [daemon], [ledger], [cron], [[cron.jobs]], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
         );
         println!(
-            "Routes may set either channel = \"...\" or webhook = \"https://discord.com/api/webhooks/...\"."
+            "Routes may target Discord/Slack webhooks, sink = \"http\" with [providers.http], or sink = \"localfile\"."
         );
         println!(
             r#"Webhook example: [[routes]] event = "tmux.keyword" webhook = "https://discord.com/api/webhooks/...""#
@@ -2282,6 +2401,9 @@ impl AppConfig {
             normalize_secret(self.providers.discord.bot_token.clone());
         self.providers.discord.legacy_default_channel =
             normalize_text(self.providers.discord.legacy_default_channel.clone());
+        self.providers.http.endpoint = normalize_text(self.providers.http.endpoint.clone());
+        self.providers.http.hmac_secret_env =
+            normalize_text(self.providers.http.hmac_secret_env.clone());
         self.defaults.channel = normalize_text(self.defaults.channel.clone());
         self.monitors.github_token = normalize_secret(self.monitors.github_token.clone());
 
@@ -2291,6 +2413,7 @@ impl AppConfig {
             route.channel_name = normalize_text(route.channel_name.clone());
             route.webhook = normalize_text(route.webhook.clone());
             route.slack_webhook = normalize_text(route.slack_webhook.clone());
+            route.local_path = normalize_text(route.local_path.clone());
             route.mention = normalize_text(route.mention.clone());
             route.template = normalize_text(route.template.clone());
             if let Some(gajae) = &mut route.gajae {
@@ -4176,6 +4299,30 @@ mod tests {
     }
 
     #[test]
+    fn config_without_http_provider_remains_backward_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[providers.discord]
+token = "bot-token"
+
+[[routes]]
+event = "git.commit"
+channel = "ops"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert!(config.providers.http.is_empty());
+        assert!(config.validate().is_ok());
+        assert!(!config.to_pretty_toml().unwrap().contains("providers.http"));
+    }
+
+    #[test]
     fn load_or_default_rejects_conflicting_legacy_and_provider_discord() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -4402,6 +4549,169 @@ thread = "123456789012345678"
     }
 
     #[test]
+    fn http_only_route_satisfies_delivery_validation_without_discord() {
+        let config = AppConfig {
+            providers: ProvidersConfig {
+                http: HttpConfig {
+                    endpoint: Some("http://127.0.0.1:8644/webhooks/clawhip-controller".into()),
+                    hmac_secret_env: Some("HERMES_CLAWHIP_HMAC_SECRET".into()),
+                },
+                ..ProvidersConfig::default()
+            },
+            routes: vec![RouteRule {
+                event: "*".into(),
+                sink: "http".into(),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
+        assert!(config.has_http_routes());
+        assert_eq!(config.webhook_route_count(), 1);
+    }
+
+    #[test]
+    fn load_or_default_parses_http_provider_and_secret_env_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[providers.http]
+endpoint = "http://127.0.0.1:8644/webhooks/clawhip-controller"
+secret_env = "HERMES_CLAWHIP_HMAC_SECRET"
+
+[[routes]]
+event = "*"
+sink = "http"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(
+            config.providers.http.endpoint(),
+            Some("http://127.0.0.1:8644/webhooks/clawhip-controller")
+        );
+        assert_eq!(
+            config.providers.http.hmac_secret_env(),
+            Some("HERMES_CLAWHIP_HMAC_SECRET")
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn http_endpoint_policy_allows_loopback_http_and_https() {
+        for endpoint in [
+            "http://127.0.0.1:8644/webhooks/clawhip-controller",
+            "http://[::1]:8644/webhooks/clawhip-controller",
+            "http://localhost:8644/webhooks/clawhip-controller",
+            "https://controller.example/webhooks/clawhip-controller",
+        ] {
+            assert!(
+                validate_http_endpoint(endpoint).is_ok(),
+                "endpoint should be allowed: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_endpoint_policy_rejects_non_loopback_plain_http_and_credentials() {
+        let non_loopback = validate_http_endpoint(
+            "http://controller.example/webhooks/clawhip-controller?token=secret",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(non_loopback.contains("loopback"));
+        assert!(!non_loopback.contains("controller.example"));
+        assert!(!non_loopback.contains("secret"));
+
+        let credentials = validate_http_endpoint(
+            "https://user:password@controller.example/webhooks/clawhip-controller",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(credentials.contains("must not contain credentials"));
+        assert!(!credentials.contains("password"));
+        assert!(!credentials.contains("controller.example"));
+    }
+
+    #[test]
+    fn http_route_requires_complete_provider_config() {
+        let missing_endpoint = AppConfig {
+            providers: ProvidersConfig {
+                http: HttpConfig {
+                    endpoint: None,
+                    hmac_secret_env: Some("HERMES_CLAWHIP_HMAC_SECRET".into()),
+                },
+                ..ProvidersConfig::default()
+            },
+            routes: vec![RouteRule {
+                event: "*".into(),
+                sink: "http".into(),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        assert!(
+            missing_endpoint
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("providers.http.endpoint is required")
+        );
+
+        let invalid_env = AppConfig {
+            providers: ProvidersConfig {
+                http: HttpConfig {
+                    endpoint: Some("https://controller.example/webhook".into()),
+                    hmac_secret_env: Some("NOT VALID".into()),
+                },
+                ..ProvidersConfig::default()
+            },
+            routes: vec![RouteRule {
+                event: "*".into(),
+                sink: "http".into(),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        assert!(
+            invalid_env
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("valid environment variable name")
+        );
+    }
+
+    #[test]
+    fn http_route_rejects_transport_specific_target_fields() {
+        let config = AppConfig {
+            providers: ProvidersConfig {
+                http: HttpConfig {
+                    endpoint: Some("https://controller.example/webhook".into()),
+                    hmac_secret_env: Some("HERMES_CLAWHIP_HMAC_SECRET".into()),
+                },
+                ..ProvidersConfig::default()
+            },
+            routes: vec![RouteRule {
+                event: "*".into(),
+                sink: "http".into(),
+                webhook: Some("https://must-not-be-used.example/secret".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot set channel/thread/webhook/local_path"));
+        assert!(!error.contains("must-not-be-used"));
+    }
+
+    #[test]
     fn localfile_route_does_not_bypass_missing_token_for_discord_channel_route() {
         let config = AppConfig {
             routes: vec![
@@ -4457,6 +4767,7 @@ thread = "123456789012345678"
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                http: HttpConfig::default(),
             },
             routes: vec![RouteRule {
                 event: "tmux.keyword".into(),
@@ -4532,6 +4843,7 @@ thread = "123456789012345678"
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                http: HttpConfig::default(),
             },
             daemon: DaemonConfig {
                 base_url: "http://127.0.0.1:25294".into(),
@@ -4890,6 +5202,7 @@ message = " ping "
                     legacy_default_channel: None,
                 },
                 slack: SlackConfig::default(),
+                http: HttpConfig::default(),
             },
             cron: CronConfig {
                 poll_interval_secs: 30,
