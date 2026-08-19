@@ -612,11 +612,13 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
         }
     }
     for delivery in source.pending {
-        if !dest
+        if let Some(existing) = dest
             .pending
-            .iter()
-            .any(|existing| existing.same_event(&delivery))
+            .iter_mut()
+            .find(|existing| existing.same_event(&delivery))
         {
+            merge_pending_retry_state(existing, &delivery);
+        } else {
             dest.pending.push(delivery);
         }
     }
@@ -721,6 +723,15 @@ fn pending_due_for_send(pending: &PendingCiDelivery, now: u64) -> bool {
         None => true,
         Some(timestamp) => now.saturating_sub(timestamp) >= PENDING_RETRY_BACKOFF_SECS,
     }
+}
+
+fn merge_pending_retry_state(dest: &mut PendingCiDelivery, source: &PendingCiDelivery) {
+    dest.send_attempts = dest.send_attempts.max(source.send_attempts);
+    dest.last_sent_unix = match (dest.last_sent_unix, source.last_sent_unix) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
 }
 
 fn write_ci_baseline_atomic(baseline: &CIBaseline, path: &Path) -> Result<()> {
@@ -1159,10 +1170,24 @@ async fn poll_github(
 
         let delivered: Vec<PendingCiDelivery> = ci_events
             .iter()
-            .map(|event| PendingCiDelivery::from_event(event, Vec::new()))
+            .map(|event| {
+                let identities = previous_snapshot_for_event(&ci, event)
+                    .map(GitHubCISnapshot::identities)
+                    .unwrap_or_default();
+                PendingCiDelivery::from_event(event, identities)
+            })
             .collect();
         for event in ci_events {
             send_event(tx, event).await?;
+        }
+        if !delivered.is_empty() {
+            bump_pending_send_attempts(ci_baseline, &delivered, unix_now());
+            if let Err(error) = commit_ci_baseline(ci_baseline_path, ci_baseline) {
+                eprintln!(
+                    "clawhip source github CI baseline outbox attempt persist failed for {}: {error}",
+                    repo.path
+                );
+            }
         }
         if let Err(error) = ack_pending_deliveries(ci_baseline, ci_baseline_path, &delivered) {
             eprintln!(
@@ -3236,6 +3261,78 @@ mod tests {
             "ACK failure must not abort polling of remaining repositories"
         );
         server.abort();
+    }
+
+    #[test]
+    fn issue_317_merge_pending_keeps_monotonic_retry_state() {
+        let run = run_snapshot(77, "CI", Some("success"), "main");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            None,
+        );
+        let mut older = PendingCiDelivery::from_event(&events[0], run.identities());
+        older.send_attempts = 0;
+        older.last_sent_unix = Some(10);
+        let mut newer = older.clone();
+        newer.send_attempts = 2;
+        newer.last_sent_unix = Some(50);
+        let mut dest = RepoCIBaseline::default();
+        dest.pending.push(older);
+        merge_repo_baseline(
+            &mut dest,
+            RepoCIBaseline {
+                pending: vec![newer],
+                ..RepoCIBaseline::default()
+            },
+        );
+        assert_eq!(dest.pending.len(), 1);
+        assert_eq!(dest.pending[0].send_attempts, 2);
+        assert_eq!(dest.pending[0].last_sent_unix, Some(50));
+    }
+
+    #[test]
+    fn issue_317_restart_after_ack_failure_honors_persisted_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let run = run_snapshot(77, "CI", Some("success"), "main");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            None,
+        );
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.enqueue_pending(
+            "/repo",
+            "/repo",
+            &events,
+            &run_map(std::slice::from_ref(&run)),
+        );
+        save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
+        let pending = ci_baseline.repos["/repo"].pending.clone();
+        bump_pending_send_attempts(&mut ci_baseline, &pending, unix_now());
+        commit_ci_baseline(Some(&path), &ci_baseline).unwrap();
+
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"file").unwrap();
+        let bad_path = blocker.join("github-ci-baseline.json");
+        assert!(ack_pending_deliveries(&mut ci_baseline, Some(&bad_path), &pending).is_err());
+
+        let restarted = load_ci_baseline(Some(&path));
+        let stored = &restarted.repos["/repo"].pending;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].send_attempts, 1);
+        assert!(stored[0].last_sent_unix.is_some());
+        assert!(
+            !pending_due_for_send(&stored[0], unix_now()),
+            "restart must honor persisted backoff after ACK removal fails"
+        );
     }
 
     #[test]
