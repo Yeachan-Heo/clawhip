@@ -40,8 +40,8 @@ use crate::source::{
     GitHubSource, GitHubStatusSource, GitMonitorLifecycleCounts, GitSource, RegisteredTmuxSession,
     SharedGitMonitorDiagnostics, SharedTmuxRegistry, Source, SubscriptionSnapshot,
     SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
-    default_registry_state_path, inspect_tmux_registry_state, list_active_tmux_registrations,
-    load_tmux_registry_state, new_shared_git_monitor_diagnostics,
+    default_github_ci_baseline_path, default_registry_state_path, inspect_tmux_registry_state,
+    list_active_tmux_registrations, load_tmux_registry_state, new_shared_git_monitor_diagnostics,
     register_runtime_tmux_registration, snapshot_git_monitor_diagnostics,
     tmux_registry_diagnostics,
 };
@@ -205,7 +205,13 @@ pub async fn run(
         GitSource::new(config.clone(), git_monitor_diagnostics.clone()),
         tx.clone(),
     );
-    spawn_source(GitHubSource::new(config.clone()), tx.clone());
+    spawn_source(
+        GitHubSource::with_ci_baseline_path(
+            config.clone(),
+            default_github_ci_baseline_path(&cron_state_path),
+        ),
+        tx.clone(),
+    );
     spawn_source(GitHubStatusSource::new(config.clone()), tx.clone());
     spawn_source(
         TmuxSource::new(

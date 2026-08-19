@@ -14,7 +14,7 @@ pub use git::{
     GitMonitorLifecycleCounts, GitSource, SharedGitMonitorDiagnostics,
     new_shared_git_monitor_diagnostics, snapshot_git_monitor_diagnostics,
 };
-pub use github::GitHubSource;
+pub use github::{GitHubSource, default_github_ci_baseline_path};
 pub use github_status::GitHubStatusSource;
 pub use subscription::{SubscriptionSnapshot, SubscriptionState, SubscriptionWorker};
 pub use tmux::{

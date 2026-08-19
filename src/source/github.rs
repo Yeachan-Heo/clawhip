@@ -1,9 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -17,11 +19,17 @@ use crate::telemetry;
 
 pub struct GitHubSource {
     config: Arc<AppConfig>,
+    ci_baseline_path: Option<PathBuf>,
 }
 
 impl GitHubSource {
-    pub fn new(config: Arc<AppConfig>) -> Self {
-        Self { config }
+    /// Restarts and re-enrollments reuse a persisted terminal-run baseline so
+    /// historical workflow results never replay as fresh events (#317).
+    pub fn with_ci_baseline_path(config: Arc<AppConfig>, ci_baseline_path: PathBuf) -> Self {
+        Self {
+            config,
+            ci_baseline_path: Some(ci_baseline_path),
+        }
     }
 }
 
@@ -39,6 +47,8 @@ impl Source for GitHubSource {
                 None
             }
         };
+        let ci_baseline_path = self.ci_baseline_path.clone();
+        let mut ci_baseline = load_ci_baseline(ci_baseline_path.as_deref());
         let mut state = HashMap::new();
 
         loop {
@@ -47,6 +57,8 @@ impl Source for GitHubSource {
                 github_client.as_ref(),
                 &tx,
                 &mut state,
+                &mut ci_baseline,
+                ci_baseline_path.as_deref(),
             )
             .await;
             sleep(Duration::from_secs(
@@ -55,6 +67,126 @@ impl Source for GitHubSource {
             .await;
         }
     }
+}
+
+/// Persisted terminal-run identity per monitored repo. Survives restart and
+/// re-enrollment so historical workflow runs cannot replay as fresh events
+/// (#317). Bounded: at most [`MAX_BASELINE_RUNS_PER_REPO`] identities per repo.
+#[derive(Default)]
+struct CIBaseline {
+    repos: HashMap<String, RepoCIBaseline>,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct RepoCIBaseline {
+    /// Terminal run identities observed for this repo, oldest evicted first.
+    #[serde(default)]
+    terminal_runs: VecDeque<String>,
+}
+
+const MAX_BASELINE_RUNS_PER_REPO: usize = 256;
+
+/// Beside the cron state file, matching `tmux-watch-registry.json` and
+/// `discord-watch-state.json`.
+pub fn default_github_ci_baseline_path(cron_state_path: &Path) -> PathBuf {
+    cron_state_path.with_file_name("github-ci-baseline.json")
+}
+
+fn baseline_identity(ci: &GitHubCISnapshot) -> String {
+    // Prefer the immutable GitHub run id; fall back to the dedupe key so
+    // check-run snapshots without a run id still dedupe by sha+workflow.
+    ci.run_id
+        .as_ref()
+        .map(|run_id| format!("run:{run_id}"))
+        .unwrap_or_else(|| ci.dedupe_key())
+}
+
+fn repo_ci_baseline_is_suppressed(
+    repo_ci_baseline: Option<&RepoCIBaseline>,
+    dedupe_key: &str,
+) -> bool {
+    let Some(baseline) = repo_ci_baseline else {
+        return false;
+    };
+    baseline.terminal_runs.iter().any(|identity| {
+        identity == dedupe_key || {
+            // Persisted identities are run-id based; a terminal snapshot keyed
+            // by `run:<id>:<workflow>` must still match its persisted
+            // `run:<id>` identity.
+            identity
+                .strip_prefix("run:")
+                .is_some_and(|id| dedupe_key.starts_with(&format!("run:{id}:")))
+        }
+    })
+}
+
+impl CIBaseline {
+    /// Records terminal-run identities for one repo. Returns whether the
+    /// persisted state changed (bounded, oldest entries evicted first).
+    fn record_terminal_runs(
+        &mut self,
+        repo_path: &str,
+        current: &HashMap<String, GitHubCISnapshot>,
+    ) -> bool {
+        let repo_baseline = self.repos.entry(repo_path.to_string()).or_default();
+        let mut dirty = repo_baseline.terminal_runs.is_empty();
+        for ci in current.values() {
+            if !ci.is_terminal() {
+                continue;
+            }
+            let identity = baseline_identity(ci);
+            if !repo_baseline.terminal_runs.contains(&identity) {
+                repo_baseline.terminal_runs.push_back(identity);
+                dirty = true;
+            }
+        }
+        while repo_baseline.terminal_runs.len() > MAX_BASELINE_RUNS_PER_REPO {
+            repo_baseline.terminal_runs.pop_front();
+            dirty = true;
+        }
+        dirty
+    }
+}
+
+fn load_ci_baseline(path: Option<&Path>) -> CIBaseline {
+    let Some(path) = path else {
+        return CIBaseline::default();
+    };
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return CIBaseline::default(),
+        Err(error) => {
+            eprintln!(
+                "clawhip source github CI baseline '{}' unreadable; starting a fresh baseline: {error}",
+                path.display()
+            );
+            return CIBaseline::default();
+        }
+    };
+    match serde_json::from_str::<HashMap<String, RepoCIBaseline>>(&raw) {
+        Ok(repos) => CIBaseline { repos },
+        Err(error) => {
+            eprintln!(
+                "clawhip source github CI baseline '{}' invalid; starting a fresh baseline: {error}",
+                path.display()
+            );
+            CIBaseline::default()
+        }
+    }
+}
+
+fn save_ci_baseline(baseline: &CIBaseline, path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_string(&baseline.repos)?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, payload.as_bytes())?;
+    fs::rename(&temp_path, path)?;
+    Ok(())
 }
 
 struct GitHubRepoState {
@@ -112,6 +244,12 @@ impl GitHubCISnapshot {
     fn event_kind(&self) -> &'static str {
         classify_ci_event_kind(&self.status, self.conclusion.as_deref())
     }
+
+    /// A terminal run will never change state again, so its identity can be
+    /// persisted and suppressed on later re-observation (#317).
+    fn is_terminal(&self) -> bool {
+        self.status == "completed"
+    }
 }
 
 async fn run_github_poll_cycle(
@@ -119,8 +257,19 @@ async fn run_github_poll_cycle(
     github_client: Option<&reqwest::Client>,
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut HashMap<String, GitHubRepoState>,
+    ci_baseline: &mut CIBaseline,
+    ci_baseline_path: Option<&Path>,
 ) {
-    if let Err(error) = poll_github(config, github_client, tx, state).await {
+    if let Err(error) = poll_github(
+        config,
+        github_client,
+        tx,
+        state,
+        ci_baseline,
+        ci_baseline_path,
+    )
+    .await
+    {
         telemetry::emit(source_record(
             telemetry::event_name::SOURCE_DEGRADED,
             "source_poll_failed",
@@ -166,6 +315,8 @@ async fn poll_github(
     github_client: Option<&reqwest::Client>,
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut HashMap<String, GitHubRepoState>,
+    ci_baseline: &mut CIBaseline,
+    ci_baseline_path: Option<&Path>,
 ) -> Result<()> {
     for repo in &config.monitors.git.repos {
         if !repo.emit_issue_opened && !repo.emit_pr_status {
@@ -221,6 +372,7 @@ async fn poll_github(
             previous,
             &prs,
             tx,
+            ci_baseline.repos.get(&repo.path),
         )
         .await
         {
@@ -239,6 +391,7 @@ async fn poll_github(
             }
         };
 
+        let repo_baseline_dirty = ci_baseline.record_terminal_runs(&repo.path, &ci);
         state.insert(
             repo.path.clone(),
             GitHubRepoState {
@@ -248,6 +401,18 @@ async fn poll_github(
                 ci_baseline_established,
             },
         );
+        if repo_baseline_dirty && let Err(error) = save_ci_baseline(ci_baseline, ci_baseline_path) {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "ci_baseline_persist_failed",
+                Some(&repo.path),
+                Some(error.to_string()),
+            ));
+            eprintln!(
+                "clawhip source github CI baseline persist failed for {}: {error}",
+                repo.path
+            );
+        }
     }
 
     Ok(())
@@ -363,6 +528,7 @@ async fn poll_pull_requests(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_ci_statuses(
     config: &AppConfig,
     github_client: Option<&reqwest::Client>,
@@ -371,6 +537,7 @@ async fn poll_ci_statuses(
     previous: Option<&GitHubRepoState>,
     prs: &HashMap<u64, PullRequestSnapshot>,
     tx: &mpsc::Sender<IncomingEvent>,
+    repo_ci_baseline: Option<&RepoCIBaseline>,
 ) -> Result<(HashMap<String, GitHubCISnapshot>, bool)> {
     if !repo.emit_pr_status {
         return Ok((
@@ -413,6 +580,7 @@ async fn poll_ci_statuses(
                     previous.ci_baseline_established,
                     &previous.ci,
                     &ci,
+                    repo_ci_baseline,
                 ) {
                     send_event(tx, event).await?;
                 }
@@ -430,11 +598,13 @@ async fn poll_ci_statuses(
                 "clawhip source GitHub CI polling failed for {}: {error}",
                 repo.path
             );
+            // Keep the last snapshot for diffing but drop the established flag:
+            // the failed poll may be a partial view (pagination/cursor loss), and
+            // treating it as complete would replay whatever the next full poll
+            // returns — including terminal runs already delivered before (#317).
             Ok((
                 previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
-                previous
-                    .map(|entry| entry.ci_baseline_established)
-                    .unwrap_or(false),
+                false,
             ))
         }
     }
@@ -548,12 +718,29 @@ fn collect_ci_events(
     previous_ci_baseline_established: bool,
     previous: &HashMap<String, GitHubCISnapshot>,
     current: &HashMap<String, GitHubCISnapshot>,
+    repo_ci_baseline: Option<&RepoCIBaseline>,
 ) -> Vec<IncomingEvent> {
     let mut events = Vec::new();
     for (key, ci) in current {
         let changed = match previous.get(key) {
             Some(old) => old.status != ci.status || old.conclusion != ci.conclusion,
-            None => previous_ci_baseline_established || ci.status != "completed",
+            None => {
+                if !previous_ci_baseline_established {
+                    // First poll after startup or re-priming after a partial
+                    // poll: seed the snapshot. In-progress runs emit; terminal
+                    // runs are historical noise, not transitions (#317).
+                    ci.status != "completed"
+                } else if ci.is_terminal() {
+                    // Established monitor seeing a terminal run with no
+                    // in-process record: the pagination drift / cursor loss /
+                    // re-enrollment replay window. Suppress it when the
+                    // persisted baseline already observed it (#317).
+                    !repo_ci_baseline_is_suppressed(repo_ci_baseline, key)
+                } else {
+                    // Established monitor seeing a genuinely new run start.
+                    true
+                }
+            }
         };
         if !changed {
             continue;
@@ -1050,6 +1237,428 @@ mod tests {
         }
     }
 
+    fn run_snapshot(
+        run_id: u64,
+        workflow: &str,
+        conclusion: Option<&str>,
+        branch: &str,
+    ) -> GitHubCISnapshot {
+        GitHubCISnapshot {
+            pr_number: None,
+            workflow: workflow.into(),
+            status: "completed".into(),
+            conclusion: conclusion.map(ToString::to_string),
+            sha: format!("sha-{run_id}"),
+            url: format!("https://github.com/org/repo/actions/runs/{run_id}"),
+            branch: Some(branch.into()),
+            run_id: Some(run_id.to_string()),
+            run_job_count: 1,
+            run_all_terminal: true,
+        }
+    }
+
+    fn run_map(runs: &[GitHubCISnapshot]) -> HashMap<String, GitHubCISnapshot> {
+        runs.iter()
+            .map(|run| (run.dedupe_key(), run.clone()))
+            .collect()
+    }
+
+    /// Simulates one monitor poll: fetch -> diff against in-process previous
+    /// state -> record terminal identities into the shared baseline.
+    async fn poll_once_with_baseline(
+        config: &AppConfig,
+        client: &reqwest::Client,
+        state: &mut HashMap<String, GitHubRepoState>,
+        ci_baseline: &mut CIBaseline,
+        ci_baseline_path: Option<&Path>,
+        tx: &mpsc::Sender<IncomingEvent>,
+    ) -> Result<()> {
+        poll_github(
+            config,
+            Some(client),
+            tx,
+            state,
+            ci_baseline,
+            ci_baseline_path,
+        )
+        .await
+    }
+
+    #[test]
+    fn issue_317_bounded_baseline_suppresses_historical_terminal_runs_after_monitor_restart() {
+        // Deterministic replay of the #317 burst: historical success/failure/
+        // cancelled runs already observed by a previous daemon process.
+        let historical_runs = [
+            run_snapshot(27620587146, "CI", Some("success"), "main"),
+            run_snapshot(24244183277, "CI", Some("failure"), "main"),
+            run_snapshot(29691404856, "CI", Some("cancelled"), "main"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+
+        // --- First daemon process: observe and persist the baseline.
+        let mut ci_baseline = load_ci_baseline(Some(&path));
+        assert!(ci_baseline.record_terminal_runs("/repo", &run_map(&historical_runs)));
+        save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
+
+        // --- Daemon restart: state HashMap is empty, baseline reloads from disk.
+        let restarted = load_ci_baseline(Some(&path));
+        let repo_baseline = restarted.repos.get("/repo").expect("persisted repo");
+
+        // Bounded: only terminal identities, at most MAX_BASELINE_RUNS_PER_REPO.
+        assert_eq!(repo_baseline.terminal_runs.len(), 3);
+        for run in &historical_runs {
+            assert!(
+                repo_ci_baseline_is_suppressed(restarted.repos.get("/repo"), &run.dedupe_key()),
+                "historical terminal run {} must be suppressed after restart",
+                run.run_id.as_deref().unwrap_or("?")
+            );
+        }
+
+        // --- Re-observation with an empty in-process previous (pagination
+        // drift / cursor loss / re-enrollment) emits nothing.
+        let repo = GitRepoMonitor::default();
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true, // established monitor — old code emitted here (#317)
+            &HashMap::new(),
+            &run_map(&historical_runs),
+            restarted.repos.get("/repo"),
+        );
+        assert!(
+            events.is_empty(),
+            "historical terminal runs must not replay after restart; got {} events",
+            events.len()
+        );
+
+        // --- Genuinely new terminal runs are still delivered.
+        let new_run = run_snapshot(32205447861, "CI", Some("success"), "main");
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&new_run)),
+            restarted.repos.get("/repo"),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.ci-passed");
+    }
+
+    #[test]
+    fn issue_317_baseline_is_bounded_and_atomic_persistence_is_fail_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+
+        // Bounded growth: recording far more terminal runs than the cap keeps
+        // at most MAX_BASELINE_RUNS_PER_REPO identities (newest retained).
+        let mut ci_baseline = CIBaseline::default();
+        for id in 0..(MAX_BASELINE_RUNS_PER_REPO + 64) {
+            let runs = [run_snapshot(id as u64, "CI", Some("success"), "main")];
+            ci_baseline.record_terminal_runs("/repo", &run_map(&runs));
+        }
+        let repo_baseline = ci_baseline.repos.get("/repo").unwrap();
+        assert_eq!(
+            repo_baseline.terminal_runs.len(),
+            MAX_BASELINE_RUNS_PER_REPO
+        );
+        assert!(
+            repo_baseline
+                .terminal_runs
+                .contains(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 63))
+        );
+        assert!(!repo_baseline.terminal_runs.contains(&"run:0".to_string()));
+
+        // Atomic persistence round-trips through a temp file + rename.
+        save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
+        let reloaded = load_ci_baseline(Some(&path));
+        assert_eq!(
+            reloaded.repos.get("/repo").unwrap().terminal_runs.len(),
+            MAX_BASELINE_RUNS_PER_REPO
+        );
+        assert!(!dir.path().join("github-ci-baseline.json.tmp").exists());
+
+        // Corrupt persisted state is a fail-safe fresh baseline, not a crash
+        // and not a silent skip: replay is still suppressed by first-poll
+        // baseline priming, and no unwinding panic escapes the source.
+        std::fs::write(&path, "{ not valid json").unwrap();
+        let corrupted = load_ci_baseline(Some(&path));
+        assert!(corrupted.repos.is_empty());
+
+        // Cross-repo identity: another repo's baseline never suppresses this
+        // repo's runs.
+        let mut mixed = CIBaseline::default();
+        let other = [run_snapshot(999, "CI", Some("success"), "main")];
+        mixed.record_terminal_runs("/other-repo", &run_map(&other));
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(&other),
+            mixed.repos.get("/repo"),
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "a different repo's baseline must not suppress this repo's runs"
+        );
+    }
+
+    #[test]
+    fn issue_317_in_progress_runs_and_changed_conclusions_still_emit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut ci_baseline = load_ci_baseline(Some(&path));
+
+        // A run observed in-progress is not recorded as terminal...
+        let in_progress = GitHubCISnapshot {
+            status: "in_progress".into(),
+            conclusion: None,
+            run_all_terminal: false,
+            ..run_snapshot(4242424242, "CI", Some("success"), "main")
+        };
+        ci_baseline.record_terminal_runs("/repo", &run_map(std::slice::from_ref(&in_progress)));
+        assert!(ci_baseline.repos["/repo"].terminal_runs.is_empty());
+
+        // ...so its genuinely new started event is emitted even though the
+        // monitor is established.
+        let repo = GitRepoMonitor::default();
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&in_progress)),
+            ci_baseline.repos.get("/repo"),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.ci-started");
+
+        // Once it terminates, the completion transition emits (present in
+        // previous) and is then recorded/suppressed forever after.
+        let completed = run_snapshot(4242424242, "CI", Some("failure"), "main");
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true,
+            &run_map(std::slice::from_ref(&in_progress)),
+            &run_map(std::slice::from_ref(&completed)),
+            ci_baseline.repos.get("/repo"),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.ci-failed");
+
+        ci_baseline.record_terminal_runs("/repo", &run_map(std::slice::from_ref(&completed)));
+        save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
+        let restarted = load_ci_baseline(Some(&path));
+        let events = collect_ci_events(
+            &repo,
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&completed)),
+            restarted.repos.get("/repo"),
+        );
+        assert!(
+            events.is_empty(),
+            "terminal outcome delivered once must never replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_317_restart_and_pagination_cursor_loss_do_not_replay_historical_runs() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Fake GitHub Actions API page: one current run plus three historical
+        // terminal runs (success / failure / cancelled) that predate the
+        // monitor but re-enter the listing when pagination drifts (#317).
+        let workflow_runs_body = |run_ids: &[u64]| {
+            let runs: Vec<String> = run_ids
+                .iter()
+                .map(|id| {
+                    let conclusion = match id % 3 {
+                        0 => "success",
+                        1 => "failure",
+                        _ => "cancelled",
+                    };
+                    format!(
+                        r#"{{"id": {id}, "name": "CI", "status": "completed", "conclusion": "{conclusion}", "head_branch": "main", "head_sha": "sha-{id}", "html_url": "https://github.com/org/repo/actions/runs/{id}", "pull_requests": []}}"#
+                    )
+                })
+                .collect();
+            format!("{{\"workflow_runs\": [{}]}}", runs.join(","))
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Poll sequence the fake server serves:
+        //   1. first poll of process A: current + historical runs (primes
+        //      baseline, no events),
+        //   2. second poll of process A: unchanged (no events),
+        //   3. first poll of restarted process B with the same page
+        //      (pagination/cursor loss re-serving history): no events,
+        //   4. poll after a genuinely new push run: exactly one event.
+        let pages = [
+            workflow_runs_body(&[32205447861, 27620587146, 24244183277, 29691404856]),
+            workflow_runs_body(&[32205447861, 27620587146, 24244183277, 29691404856]),
+            workflow_runs_body(&[32205447861, 27620587146, 24244183277, 29691404856]),
+            workflow_runs_body(&[
+                32205447861,
+                27620587146,
+                24244183277,
+                29691404856,
+                32206000001,
+            ]),
+        ];
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = request_count.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut next_page = 0_usize;
+            while next_page < pages.len() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                requests.push(request.clone());
+                request_count_for_server.fetch_add(1, Ordering::SeqCst);
+
+                // Serve the next workflow-run page only for actions/runs
+                // requests; every other endpoint gets an empty listing so the
+                // CI poll sequence stays deterministic.
+                let body = if request.contains("/actions/runs") {
+                    let page = &pages[next_page];
+                    next_page += 1;
+                    page.clone()
+                } else {
+                    "[]".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let baseline_path = dir.path().join("github-ci-baseline.json");
+
+        let mut config = AppConfig::default();
+        config.monitors.github_api_base = format!("http://{addr}");
+        config.monitors.git.repos = vec![GitRepoMonitor {
+            path: "/tmp/clawhip-replay-repo".into(),
+            name: Some("repo".into()),
+            github_repo: Some("org/repo".into()),
+            emit_pr_status: true,
+            emit_issue_opened: true,
+            emit_commits: false,
+            emit_branch_changes: false,
+            ..GitRepoMonitor::default()
+        }];
+        let client = build_github_client(None).unwrap();
+
+        // ---- Process A, poll 1: primes in-process baseline; nothing emits.
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state_a = HashMap::new();
+        let mut baseline_a = load_ci_baseline(Some(&baseline_path));
+        poll_once_with_baseline(
+            &config,
+            &client,
+            &mut state_a,
+            &mut baseline_a,
+            Some(&baseline_path),
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "first poll must not emit history");
+        assert!(
+            baseline_path.exists(),
+            "terminal identities must be persisted"
+        );
+
+        // ---- Process A, poll 2: unchanged page, still silent.
+        poll_once_with_baseline(
+            &config,
+            &client,
+            &mut state_a,
+            &mut baseline_a,
+            Some(&baseline_path),
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+
+        // ---- Process B (restart): fresh in-process state, baseline reloaded
+        // from disk; the fake server re-serves the same page exactly as a
+        // pagination drift / cursor loss would. Nothing may replay.
+        let mut state_b = HashMap::new();
+        let mut baseline_b = load_ci_baseline(Some(&baseline_path));
+        poll_once_with_baseline(
+            &config,
+            &client,
+            &mut state_b,
+            &mut baseline_b,
+            Some(&baseline_path),
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "restart must not replay historical terminal runs (#317)"
+        );
+
+        // ---- A genuinely new run lands: exactly one event for it.
+        poll_once_with_baseline(
+            &config,
+            &client,
+            &mut state_b,
+            &mut baseline_b,
+            Some(&baseline_path),
+            &tx,
+        )
+        .await
+        .unwrap();
+        let mut delivered = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            delivered.push(event);
+        }
+        assert_eq!(
+            delivered.len(),
+            1,
+            "exactly the new run must be delivered, got {delivered:?}"
+        );
+        assert_eq!(delivered[0].payload["run_id"], json!("32206000001"));
+
+        // Persisted growth is bounded by the number of terminal runs observed
+        // in the window — no history scan, no ledger growth.
+        let persisted: HashMap<String, RepoCIBaseline> =
+            serde_json::from_str(&std::fs::read_to_string(&baseline_path).unwrap()).unwrap();
+        assert!(
+            persisted["/tmp/clawhip-replay-repo"].terminal_runs.len() <= MAX_BASELINE_RUNS_PER_REPO
+        );
+
+        let requests = server.await.unwrap();
+        // Four CI polls; the issues/pulls endpoints add two requests per poll.
+        assert_eq!(requests.len(), 12);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("GET /repos/org/repo/actions/runs?"))
+                .count(),
+            4,
+            "exactly four CI polls must hit the workflow-runs endpoint"
+        );
+    }
+
     #[tokio::test]
     async fn direct_branch_workflow_run_without_open_pr_emits_ci_failed_event() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1103,10 +1712,18 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let prs = HashMap::new();
 
-        let (ci, ci_baseline_established) =
-            poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, &tx)
-                .await
-                .unwrap();
+        let (ci, ci_baseline_established) = poll_ci_statuses(
+            &config,
+            Some(&client),
+            &repo,
+            &snapshot,
+            None,
+            &prs,
+            &tx,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ci.len(), 1);
         assert!(ci_baseline_established);
@@ -1255,7 +1872,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let events = collect_ci_events(&repo, "clawhip", false, &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", false, &previous, &current, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-started");
         assert_eq!(events[0].channel.as_deref(), Some("dev-channel"));
@@ -1285,7 +1902,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-            let events = collect_ci_events(&repo, "clawhip", false, &previous, &current);
+            let events = collect_ci_events(&repo, "clawhip", false, &previous, &current, None);
             assert!(
                 events.is_empty(),
                 "initial completed CI with conclusion {conclusion} should only seed the baseline"
@@ -1311,7 +1928,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-            let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
+            let events = collect_ci_events(&repo, "clawhip", true, &previous, &current, None);
             assert_eq!(
                 events.len(),
                 1,
@@ -1333,7 +1950,7 @@ mod tests {
         let previous = [(ci.dedupe_key(), ci.clone())].into_iter().collect();
         let current = [(ci.dedupe_key(), ci)].into_iter().collect();
 
-        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current, None);
         assert!(events.is_empty());
     }
 
@@ -1352,7 +1969,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-failed");
         assert_eq!(events[0].payload["workflow"], json!("CI / test"));
@@ -1375,7 +1992,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-passed");
     }
@@ -1395,7 +2012,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current);
+        let events = collect_ci_events(&repo, "clawhip", true, &previous, &current, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-cancelled");
     }
@@ -1487,7 +2104,11 @@ mod tests {
             ..GitRepoMonitor::default()
         }];
 
-        let source = GitHubSource::new(Arc::new(config));
+        let baseline_dir = tempfile::tempdir().unwrap();
+        let source = GitHubSource::with_ci_baseline_path(
+            Arc::new(config),
+            baseline_dir.path().join("github-ci-baseline.json"),
+        );
         let (tx, _rx) = mpsc::channel(4);
         let source_task = tokio::spawn(async move { source.run(tx).await });
 
