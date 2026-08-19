@@ -114,6 +114,8 @@ struct PendingCiDelivery {
     url: String,
     branch: Option<String>,
     run_id: Option<String>,
+    #[serde(default = "default_run_attempt")]
+    run_attempt: u32,
     run_job_count: usize,
     run_all_terminal: bool,
     channel: Option<String>,
@@ -153,6 +155,11 @@ impl PendingCiDelivery {
                 .and_then(|object| object.get("run_id"))
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string),
+            run_attempt: payload
+                .and_then(|object| object.get("run_attempt"))
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as u32)
+                .unwrap_or(1),
             run_job_count: payload
                 .and_then(|object| object.get("run_job_count"))
                 .and_then(serde_json::Value::as_u64)
@@ -167,20 +174,21 @@ impl PendingCiDelivery {
     }
 
     fn same_event(&self, other: &Self) -> bool {
-        if !self.identities.is_empty()
-            && self.identities.iter().any(|identity| {
-                other
-                    .identities
-                    .iter()
-                    .any(|candidate| candidate == identity)
-            })
-        {
-            return true;
+        let self_unique = unique_pending_identities(&self.identities);
+        let other_unique = unique_pending_identities(&other.identities);
+        if !self_unique.is_empty() && !other_unique.is_empty() {
+            return self_unique
+                .iter()
+                .any(|identity| other_unique.iter().any(|candidate| candidate == identity));
         }
-        self.run_id.is_some() && self.run_id == other.run_id && self.workflow == other.workflow
-            || self.sha == other.sha
-                && self.workflow == other.workflow
-                && self.pr_number == other.pr_number
+        if self.run_id.is_some() && other.run_id.is_some() {
+            return self.run_id == other.run_id
+                && run_attempt_or_one(self.run_attempt) == run_attempt_or_one(other.run_attempt)
+                && self.workflow == other.workflow;
+        }
+        self.sha == other.sha
+            && self.workflow == other.workflow
+            && self.pr_number == other.pr_number
     }
 
     fn into_event(self) -> IncomingEvent {
@@ -200,6 +208,10 @@ impl PendingCiDelivery {
         if let Some(payload) = event.payload.as_object_mut() {
             if let Some(run_id) = &self.run_id {
                 payload.insert("run_id".to_string(), json!(run_id));
+                payload.insert(
+                    "run_attempt".to_string(),
+                    json!(run_attempt_or_one(self.run_attempt)),
+                );
             }
             payload.insert("run_job_count".to_string(), json!(self.run_job_count));
             payload.insert("run_all_terminal".to_string(), json!(self.run_all_terminal));
@@ -267,6 +279,14 @@ fn ci_baseline_repo_key(snapshot: &GitSnapshot, repo: &GitRepoMonitor) -> String
         .and_then(canonicalize_github_repo)
         .map(|remote| format!("repo:{remote}"))
         .unwrap_or_else(|| format!("path:{}", repo.path))
+}
+
+fn unique_pending_identities(identities: &[String]) -> Vec<String> {
+    identities
+        .iter()
+        .filter(|identity| identity.starts_with("run:") || identity.starts_with("check:"))
+        .cloned()
+        .collect()
 }
 
 fn run_attempt_or_one(attempt: u32) -> u32 {
@@ -719,11 +739,11 @@ fn ack_pending_deliveries(
     path: Option<&Path>,
     delivered: &[PendingCiDelivery],
 ) -> Result<()> {
-    for repo in ci_baseline.repos.values_mut() {
-        repo.pending
-            .retain(|pending| !delivered.iter().any(|item| pending.same_event(item)));
-    }
     let Some(path) = path else {
+        for repo in ci_baseline.repos.values_mut() {
+            repo.pending
+                .retain(|pending| !delivered.iter().any(|item| pending.same_event(item)));
+        }
         return Ok(());
     };
     let _lock = acquire_baseline_lock(path)?;
@@ -1463,6 +1483,7 @@ fn collect_ci_events(
         if let Some(payload) = event.payload.as_object_mut() {
             if let Some(run_id) = &ci.run_id {
                 payload.insert("run_id".to_string(), json!(run_id));
+                payload.insert("run_attempt".to_string(), json!(ci.run_attempt()));
             }
             payload.insert("run_job_count".to_string(), json!(ci.run_job_count));
             payload.insert("run_all_terminal".to_string(), json!(ci.run_all_terminal));
@@ -2694,6 +2715,121 @@ mod tests {
             reloaded.repos.get("/repo"),
             &run
         ));
+    }
+
+    #[test]
+    fn issue_317_ack_save_failure_retains_live_pending_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let run = run_snapshot(77, "CI", Some("success"), "main");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            None,
+        );
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(std::slice::from_ref(&run)));
+        ci_baseline.enqueue_pending(
+            "/repo",
+            "/repo",
+            &events,
+            &run_map(std::slice::from_ref(&run)),
+        );
+        save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
+        let pending = ci_baseline.repos["/repo"].pending.clone();
+        assert_eq!(pending.len(), 1);
+
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"file").unwrap();
+        let bad_path = blocker.join("github-ci-baseline.json");
+        assert!(ack_pending_deliveries(&mut ci_baseline, Some(&bad_path), &pending).is_err());
+        assert_eq!(
+            ci_baseline.repos["/repo"].pending.len(),
+            1,
+            "live pending must survive an ACK persist failure so restart can retry"
+        );
+        assert_eq!(
+            load_ci_baseline(Some(&path)).repos["/repo"].pending.len(),
+            1
+        );
+
+        ack_pending_deliveries(&mut ci_baseline, Some(&path), &pending).unwrap();
+        assert!(ci_baseline.repos["/repo"].pending.is_empty());
+        assert!(
+            load_ci_baseline(Some(&path)).repos["/repo"]
+                .pending
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn issue_317_pending_equivalence_keeps_distinct_run_attempts() {
+        let attempt1 = GitHubCISnapshot {
+            run_attempt: 1,
+            ..run_snapshot(4242, "CI", Some("success"), "main")
+        };
+        let attempt2 = GitHubCISnapshot {
+            run_attempt: 2,
+            conclusion: Some("failure".into()),
+            ..run_snapshot(4242, "CI", Some("failure"), "main")
+        };
+        let events1 = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&attempt1)),
+            None,
+        );
+        let events2 = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&attempt2)),
+            None,
+        );
+        let pending1 = PendingCiDelivery::from_event(&events1[0], attempt1.identities());
+        let pending2 = PendingCiDelivery::from_event(&events2[0], attempt2.identities());
+        assert!(
+            !pending1.same_event(&pending2),
+            "attempt 2 must not coalesce with attempt 1 in outbox equivalence"
+        );
+
+        let mut dest = RepoCIBaseline::default();
+        dest.pending.push(pending1.clone());
+        merge_repo_baseline(
+            &mut dest,
+            RepoCIBaseline {
+                pending: vec![pending2.clone()],
+                ..RepoCIBaseline::default()
+            },
+        );
+        assert_eq!(dest.pending.len(), 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut left = CIBaseline::default();
+        left.enqueue_pending(
+            "/repo",
+            "/repo",
+            &events1,
+            &run_map(std::slice::from_ref(&attempt1)),
+        );
+        commit_ci_baseline(Some(&path), &left).unwrap();
+        let mut right = CIBaseline::default();
+        right.enqueue_pending(
+            "/repo",
+            "/repo",
+            &events2,
+            &run_map(std::slice::from_ref(&attempt2)),
+        );
+        commit_ci_baseline(Some(&path), &right).unwrap();
+        let loaded = load_ci_baseline(Some(&path));
+        assert_eq!(loaded.repos["/repo"].pending.len(), 2);
     }
 
     #[test]
