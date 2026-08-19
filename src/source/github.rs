@@ -1296,11 +1296,15 @@ fn previous_snapshot_for_event<'a>(
     let payload = event.payload.as_object()?;
     let workflow = payload.get("workflow")?.as_str()?;
     let run_id = payload.get("run_id").and_then(|value| value.as_str());
+    let run_attempt = payload
+        .get("run_attempt")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32)
+        .unwrap_or(1);
     previous.values().find(|ci| {
-        if let Some(run_id) = run_id
-            && ci.run_id.as_deref() == Some(run_id)
-        {
-            return true;
+        if let Some(run_id) = run_id {
+            return ci.run_id.as_deref() == Some(run_id)
+                && ci.run_attempt() == run_attempt_or_one(run_attempt);
         }
         ci.workflow == workflow
             && ci.sha
@@ -2830,6 +2834,73 @@ mod tests {
         commit_ci_baseline(Some(&path), &right).unwrap();
         let loaded = load_ci_baseline(Some(&path));
         assert_eq!(loaded.repos["/repo"].pending.len(), 2);
+    }
+
+    #[test]
+    fn issue_317_pending_recovery_does_not_match_across_run_attempts() {
+        let attempt1 = GitHubCISnapshot {
+            run_attempt: 1,
+            ..run_snapshot(4242, "CI", Some("success"), "main")
+        };
+        let attempt2 = GitHubCISnapshot {
+            run_attempt: 2,
+            conclusion: Some("failure".into()),
+            ..run_snapshot(4242, "CI", Some("failure"), "main")
+        };
+        let current = run_map(&[attempt1.clone(), attempt2.clone()]);
+        let events1 = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&attempt1)),
+            None,
+        );
+        let events2 = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&attempt2)),
+            None,
+        );
+        assert_eq!(
+            previous_snapshot_for_event(&current, &events1[0])
+                .unwrap()
+                .run_attempt(),
+            1
+        );
+        assert_eq!(
+            previous_snapshot_for_event(&current, &events2[0])
+                .unwrap()
+                .run_attempt(),
+            2
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut ci_baseline = CIBaseline::default();
+        ci_baseline.enqueue_pending("/repo", "/repo", &events1, &current);
+        ci_baseline.enqueue_pending("/repo", "/repo", &events2, &current);
+        save_ci_baseline(&ci_baseline, Some(&path)).unwrap();
+
+        let restarted = load_ci_baseline(Some(&path));
+        assert_eq!(restarted.repos["/repo"].pending.len(), 2);
+        for pending in &restarted.repos["/repo"].pending {
+            let recovered = previous_snapshot_for_event(&current, &pending.clone().into_event())
+                .expect("pending must recover against its own attempt");
+            assert_eq!(
+                recovered.run_attempt(),
+                run_attempt_or_one(pending.run_attempt)
+            );
+            assert!(
+                recovered
+                    .unique_identities()
+                    .iter()
+                    .any(|identity| pending.identities.contains(identity)),
+                "recovered identities must stay on the same attempt"
+            );
+        }
     }
 
     #[test]
