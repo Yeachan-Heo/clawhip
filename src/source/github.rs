@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -312,8 +311,6 @@ const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
 const MAX_PENDING_SEND_ATTEMPTS: u32 = 3;
 const PENDING_RETRY_BACKOFF_SECS: u64 = 3_600;
-const BASELINE_LOCK_STALE_SECS: u64 = 30;
-const MAX_ACKED_DELIVERIES: usize = 512;
 
 /// Beside the cron state file, matching `tmux-watch-registry.json` and
 /// `discord-watch-state.json`.
@@ -678,9 +675,6 @@ fn record_acked(repo: &mut RepoCIBaseline, delivery: &PendingCiDelivery) {
     if !repo.acked.iter().any(|acked| acked == &key) {
         repo.acked.push_back(key);
     }
-    while repo.acked.len() > MAX_ACKED_DELIVERIES {
-        repo.acked.pop_front();
-    }
 }
 
 fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
@@ -710,9 +704,6 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
         if !dest.acked.iter().any(|acked| acked == &key) {
             dest.acked.push_back(key);
         }
-    }
-    while dest.acked.len() > MAX_ACKED_DELIVERIES {
-        dest.acked.pop_front();
     }
     for delivery in source.pending {
         if pending_is_acked(dest, &delivery) {
@@ -776,89 +767,85 @@ fn merge_ci_baseline(dest: &mut CIBaseline, source: &CIBaseline) {
 }
 
 struct BaselineLock {
-    lock_path: PathBuf,
-    token: String,
+    file: File,
 }
 
 impl Drop for BaselineLock {
     fn drop(&mut self) {
-        let owner = self.lock_path.join("owner");
-        if fs::read_to_string(&owner).ok().as_deref() == Some(self.token.as_str()) {
-            let _ = fs::remove_dir_all(&self.lock_path);
-        }
+        unlock_baseline_file(&self.file);
     }
 }
 
 fn acquire_baseline_lock(path: &Path) -> Result<BaselineLock> {
-    acquire_baseline_lock_inner(path, BASELINE_LOCK_STALE_SECS)
-}
-
-fn acquire_baseline_lock_inner(path: &Path, stale_secs: u64) -> Result<BaselineLock> {
     let lock_path = path.with_extension("json.lock");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let token = format!(
-        "{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    );
+    if lock_path.is_dir() {
+        let _ = fs::remove_dir_all(&lock_path);
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
     for _ in 0..40 {
-        match fs::create_dir(&lock_path) {
-            Ok(()) => {
-                if let Err(error) = fs::write(lock_path.join("owner"), token.as_bytes()) {
-                    let _ = fs::remove_dir_all(&lock_path);
-                    return Err(error.into());
-                }
-                return Ok(BaselineLock { lock_path, token });
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                try_reclaim_stale_lock(&lock_path, stale_secs);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err(error.into()),
+        if try_lock_baseline_file(&file) {
+            return Ok(BaselineLock { file });
         }
+        std::thread::sleep(Duration::from_millis(5));
     }
     Err("timed out waiting for GitHub CI baseline lock".into())
 }
 
-fn try_reclaim_stale_lock(lock_path: &Path, stale_secs: u64) {
-    if !baseline_lock_is_stale(lock_path, stale_secs) {
-        return;
-    }
-    let owner = lock_path.join("owner");
-    let observed = fs::read_to_string(&owner).unwrap_or_default();
-    let current = fs::read_to_string(&owner).unwrap_or_default();
-    if current != observed {
-        return;
-    }
-    let dead = lock_path.with_extension(format!(
-        "json.lock.dead.{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    ));
-    if fs::rename(lock_path, &dead).is_ok() {
-        let _ = fs::remove_dir_all(&dead);
+#[cfg(unix)]
+fn try_lock_baseline_file(file: &File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[cfg(unix)]
+fn unlock_baseline_file(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
     }
 }
 
-fn baseline_lock_is_stale(lock_path: &Path, stale_secs: u64) -> bool {
-    let Ok(metadata) = fs::metadata(lock_path) else {
-        return true;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return true;
-    };
-    modified
-        .elapsed()
-        .map(|elapsed| elapsed.as_secs() >= stale_secs)
-        .unwrap_or(true)
+#[cfg(windows)]
+fn try_lock_baseline_file(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    unsafe { lock_file(file.as_raw_handle(), 0, 0, 1, 0) != 0 }
+}
+
+#[cfg(windows)]
+fn unlock_baseline_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        unlock_file(file.as_raw_handle(), 0, 0, 1, 0);
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    #[link_name = "LockFile"]
+    fn lock_file(
+        handle: *mut core::ffi::c_void,
+        offset_low: u32,
+        offset_high: u32,
+        length_low: u32,
+        length_high: u32,
+    ) -> i32;
+    #[link_name = "UnlockFile"]
+    fn unlock_file(
+        handle: *mut core::ffi::c_void,
+        offset_low: u32,
+        offset_high: u32,
+        length_low: u32,
+        length_high: u32,
+    ) -> i32;
 }
 
 fn unix_now() -> u64 {
@@ -3619,42 +3606,28 @@ mod tests {
         let lock_path = path.with_extension("json.lock");
         fs::create_dir_all(&lock_path).unwrap();
         fs::write(lock_path.join("owner"), b"stale-token").unwrap();
-        std::process::Command::new("touch")
-            .args(["-t", "197001010000"])
-            .arg(&lock_path)
-            .status()
-            .unwrap();
 
         let overlapping = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(AtomicUsize::new(0));
-        let live_deleted = Arc::new(AtomicUsize::new(0));
         let errors = Arc::new(Mutex::new(Vec::new()));
 
         thread::scope(|scope| {
             for _ in 0..2 {
                 let overlapping = overlapping.clone();
                 let current = current.clone();
-                let live_deleted = live_deleted.clone();
                 let errors = errors.clone();
                 let path = path.clone();
-                scope.spawn(move || {
-                    match acquire_baseline_lock_inner(&path, BASELINE_LOCK_STALE_SECS) {
-                        Ok(lock) => {
-                            let owner = lock.lock_path.join("owner");
-                            let token = lock.token.clone();
-                            current.fetch_add(1, Ordering::SeqCst);
-                            thread::sleep(Duration::from_millis(30));
-                            if current.load(Ordering::SeqCst) > 1 {
-                                overlapping.fetch_add(1, Ordering::SeqCst);
-                            }
-                            if fs::read_to_string(&owner).ok().as_deref() != Some(token.as_str()) {
-                                live_deleted.fetch_add(1, Ordering::SeqCst);
-                            }
-                            current.fetch_sub(1, Ordering::SeqCst);
-                            drop(lock);
+                scope.spawn(move || match acquire_baseline_lock(&path) {
+                    Ok(lock) => {
+                        current.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(30));
+                        if current.load(Ordering::SeqCst) > 1 {
+                            overlapping.fetch_add(1, Ordering::SeqCst);
                         }
-                        Err(error) => errors.lock().unwrap().push(error.to_string()),
+                        current.fetch_sub(1, Ordering::SeqCst);
+                        drop(lock);
                     }
+                    Err(error) => errors.lock().unwrap().push(error.to_string()),
                 });
             }
         });
@@ -3667,12 +3640,70 @@ mod tests {
         assert_eq!(
             overlapping.load(Ordering::SeqCst),
             0,
-            "two reclaimers must not enter the critical section together"
+            "advisory lock must serialize critical sections"
         );
-        assert_eq!(
-            live_deleted.load(Ordering::SeqCst),
-            0,
-            "a reclaimer must not delete another owner's live lock"
+    }
+
+    #[test]
+    fn issue_317_acked_tombstones_survive_many_later_acks() {
+        let first = check_job(1, 1, "first", "success");
+        let extra = check_job(1, 2, "extra", "success");
+        let current = run_map(&[first.clone(), extra.clone()]);
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &current,
+            None,
+        );
+        let pending_a = PendingCiDelivery::from_event(
+            events
+                .iter()
+                .find(|event| event.payload["workflow"] == "first")
+                .unwrap(),
+            first.identities(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut durable = CIBaseline::default();
+        durable.enqueue_pending("/repo", "/repo", &events, &current);
+        save_ci_baseline(&durable, Some(&path)).unwrap();
+        let mut proc1 = load_ci_baseline(Some(&path));
+        ack_pending_deliveries(&mut proc1, Some(&path), std::slice::from_ref(&pending_a)).unwrap();
+
+        let mut later = load_ci_baseline(Some(&path));
+        for id in 10..530 {
+            let job = check_job(9, id, "later", "success");
+            let later_events = collect_ci_events(
+                &GitRepoMonitor::default(),
+                "org/repo",
+                true,
+                &HashMap::new(),
+                &run_map(std::slice::from_ref(&job)),
+                None,
+            );
+            later.enqueue_pending(
+                "/repo",
+                "/repo",
+                &later_events,
+                &run_map(std::slice::from_ref(&job)),
+            );
+            let pending = PendingCiDelivery::from_event(&later_events[0], job.identities());
+            ack_pending_deliveries(&mut later, Some(&path), std::slice::from_ref(&pending))
+                .unwrap();
+        }
+
+        let mut stale = CIBaseline::default();
+        stale.enqueue_pending("/repo", "/repo", &events, &current);
+        commit_ci_baseline(Some(&path), &stale).unwrap();
+        let restarted = load_ci_baseline(Some(&path));
+        assert!(
+            !restarted.repos["/repo"]
+                .pending
+                .iter()
+                .any(|pending| pending.same_event(&pending_a)),
+            "tombstone must survive hundreds of later ACKs and a stale merge"
         );
     }
 
