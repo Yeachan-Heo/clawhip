@@ -845,6 +845,7 @@ fn tmux_stderr(stderr: &[u8]) -> String {
 mod tests {
     use super::*;
     use serial_test::serial;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
@@ -1136,6 +1137,7 @@ mod tests {
         assert!(infer_provider_from_hook_setup(&dual).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn deliver_fails_when_prompt_submit_records_but_pane_shows_no_progress() {
@@ -1224,6 +1226,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn deliver_retries_enter_until_prompt_submit_marker_changes() {
