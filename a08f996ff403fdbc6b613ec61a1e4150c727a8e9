@@ -1,0 +1,12 @@
+Gajae review-verdict-evidence receipt reconstruction (redacted, data-only).
+receipt: clawhip-pr318-a08f996-merge-ready
+repo: Yeachan-Heo/clawhip
+pr: 318
+head: a08f996ff403fdbc6b613ec61a1e4150c727a8e9
+base: dev@d7b87436cb1e8aa163e94206ad96f0dcb7ea0b49
+diff_sha256: a7bd1d10abb5a278894d99c159415f480fc9c4c984b1a51eceb95561aebb54ab
+verdict: approve
+ci: 32382365038 / plan 32382365081
+authorized_scope: merge PR 318 into dev; close issue 317
+validated: gajae review-verdict-evidence validate -> valid true
+side_effects: data-only receipt; no credentials, tokens, raw logs, private payloads, or command dumps
