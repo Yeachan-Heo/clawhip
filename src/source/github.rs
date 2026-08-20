@@ -155,6 +155,8 @@ struct AckedDelivery {
     sha: String,
     pr_number: Option<u64>,
     #[serde(default)]
+    repo_name: String,
+    #[serde(default)]
     acked_unix: u64,
 }
 
@@ -169,11 +171,18 @@ impl AckedDelivery {
             workflow: pending.workflow.clone(),
             sha: pending.sha.clone(),
             pr_number: pending.pr_number,
+            repo_name: pending.repo_name.clone(),
             acked_unix: now,
         }
     }
 
     fn matches_pending(&self, pending: &PendingCiDelivery) -> bool {
+        if !self.repo_name.is_empty()
+            && !pending.repo_name.is_empty()
+            && self.repo_name != pending.repo_name
+        {
+            return false;
+        }
         if self.kind != pending.kind || self.conclusion != pending.conclusion {
             return false;
         }
@@ -799,7 +808,9 @@ fn dead_letter_unsent_final_attempts(ci_baseline: &mut CIBaseline, unsent: &[Pen
     for repo in ci_baseline.repos.values_mut() {
         let mut keep = Vec::new();
         for pending in repo.pending.drain(..) {
-            if unsent.iter().any(|item| pending.same_event(item))
+            if unsent
+                .iter()
+                .any(|item| pending.same_event(item) && pending.repo_name == item.repo_name)
                 && pending.send_attempts >= MAX_PENDING_SEND_ATTEMPTS
             {
                 repo.dead_letter.push_back(pending);
@@ -858,7 +869,9 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
                     .any(|identity| pending_check_identities(&acked.identities).contains(identity))
                     || (candidate.run_id.is_some()
                         && candidate.run_id == acked.run_id
-                        && candidate.workflow == acked.workflow))
+                        && candidate.workflow == acked.workflow
+                        && run_attempt_or_one(candidate.run_attempt)
+                            == run_attempt_or_one(acked.run_attempt)))
         }) {
             for identity in acked.identities {
                 if !existing.identities.iter().any(|item| item == &identity) {
@@ -1142,31 +1155,23 @@ async fn send_then_ack_prefix(
     events: Vec<IncomingEvent>,
     delivered: &[PendingCiDelivery],
 ) -> Result<()> {
-    let mut sent = Vec::new();
-    let mut send_error = None;
     for (event, delivery) in events.into_iter().zip(delivered.iter()) {
+        persist_pending_send_attempts(
+            ci_baseline,
+            path,
+            std::slice::from_ref(delivery),
+            unix_now(),
+        )?;
         match send_event(tx, event).await {
-            Ok(()) => sent.push(delivery.clone()),
+            Ok(()) => {
+                ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(delivery))?;
+            }
             Err(error) => {
-                send_error = Some(error);
-                break;
+                dead_letter_unsent_final_attempts(ci_baseline, std::slice::from_ref(delivery));
+                let _ = commit_ci_baseline(path, ci_baseline);
+                return Err(error);
             }
         }
-    }
-    if !sent.is_empty() {
-        ack_pending_deliveries(ci_baseline, path, &sent)?;
-    }
-    let unsent: Vec<PendingCiDelivery> = delivered
-        .iter()
-        .filter(|delivery| !sent.iter().any(|item| item.same_event(delivery)))
-        .cloned()
-        .collect();
-    if !unsent.is_empty() {
-        dead_letter_unsent_final_attempts(ci_baseline, &unsent);
-        let _ = commit_ci_baseline(path, ci_baseline);
-    }
-    if let Some(error) = send_error {
-        return Err(error);
     }
     Ok(())
 }
@@ -1183,32 +1188,23 @@ async fn drain_pending_outbox(
         .flat_map(|repo| repo.pending.iter().cloned())
         .filter(|pending| pending_due_for_send(pending, now))
         .collect();
-    if due.is_empty() {
-        return Ok(());
-    }
-    if let Err(error) = persist_pending_send_attempts(ci_baseline, path, &due, now) {
-        eprintln!("clawhip source github CI baseline outbox attempt persist failed: {error}");
-        return Ok(());
-    }
-    let mut sent = Vec::new();
-    for delivery in &due {
-        if send_event(tx, delivery.clone().into_event()).await.is_err() {
-            break;
+    for delivery in due {
+        if persist_pending_send_attempts(ci_baseline, path, std::slice::from_ref(&delivery), now)
+            .is_err()
+        {
+            eprintln!("clawhip source github CI baseline outbox attempt persist failed");
+            return Ok(());
         }
-        sent.push(delivery.clone());
-    }
-    if !sent.is_empty()
-        && let Err(error) = ack_pending_deliveries(ci_baseline, path, &sent)
-    {
-        eprintln!("clawhip source github CI baseline outbox ack failed: {error}");
-    }
-    let unsent: Vec<PendingCiDelivery> = due
-        .into_iter()
-        .filter(|delivery| !sent.iter().any(|item| item.same_event(delivery)))
-        .collect();
-    if !unsent.is_empty() {
-        dead_letter_unsent_final_attempts(ci_baseline, &unsent);
-        let _ = commit_ci_baseline(path, ci_baseline);
+        if send_event(tx, delivery.clone().into_event()).await.is_err() {
+            dead_letter_unsent_final_attempts(ci_baseline, std::slice::from_ref(&delivery));
+            let _ = commit_ci_baseline(path, ci_baseline);
+            return Ok(());
+        }
+        if let Err(error) =
+            ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(&delivery))
+        {
+            eprintln!("clawhip source github CI baseline outbox ack failed: {error}");
+        }
     }
     Ok(())
 }
@@ -1228,7 +1224,10 @@ fn persist_pending_send_attempts(
 fn bump_pending_send_attempts(ci_baseline: &mut CIBaseline, sent: &[PendingCiDelivery], now: u64) {
     for repo in ci_baseline.repos.values_mut() {
         for pending in &mut repo.pending {
-            if sent.iter().any(|item| pending.same_event(item)) {
+            if sent
+                .iter()
+                .any(|item| pending.same_event(item) && pending.repo_name == item.repo_name)
+            {
                 pending.send_attempts = pending.send_attempts.saturating_add(1);
                 pending.last_sent_unix = Some(now);
             }
@@ -1244,7 +1243,12 @@ fn ack_pending_deliveries(
     let Some(path) = path else {
         for repo in ci_baseline.repos.values_mut() {
             for delivery in delivered {
-                record_acked(repo, delivery);
+                if repo.pending.iter().any(|pending| {
+                    pending.same_event(delivery)
+                        || AckedDelivery::from_pending(delivery, 0).matches_pending(pending)
+                }) {
+                    record_acked(repo, delivery);
+                }
             }
             let acked = repo.acked.clone();
             repo.pending
@@ -1610,24 +1614,6 @@ async fn poll_github(
             })
             .collect();
         if !delivered.is_empty() {
-            if let Err(error) =
-                persist_pending_send_attempts(ci_baseline, ci_baseline_path, &delivered, unix_now())
-            {
-                eprintln!(
-                    "clawhip source github CI baseline outbox attempt persist failed for {}: {error}",
-                    repo.path
-                );
-                state.insert(
-                    repo.path.clone(),
-                    GitHubRepoState {
-                        issues,
-                        prs,
-                        ci,
-                        ci_baseline_established,
-                    },
-                );
-                continue;
-            }
             send_then_ack_prefix(tx, ci_baseline, ci_baseline_path, ci_events, &delivered).await?;
         }
 
