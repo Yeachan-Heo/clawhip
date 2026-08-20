@@ -1329,24 +1329,35 @@ async fn send_then_ack_prefix(
     _events: Vec<IncomingEvent>,
     delivered: &[PendingCiDelivery],
 ) -> Result<()> {
+    let now = unix_now();
     for delivery in delivered {
-        persist_pending_send_attempts(
-            ci_baseline,
-            path,
-            std::slice::from_ref(delivery),
-            unix_now(),
-        )?;
-        let Some(durable) = outbox_entry(ci_baseline, delivery) else {
+        let Some(queued) = outbox_entry(ci_baseline, delivery) else {
+            continue;
+        };
+        if !pending_due_for_send(&queued, now) {
+            continue;
+        }
+        if persist_pending_send_attempts(ci_baseline, path, std::slice::from_ref(&queued), now)
+            .is_err()
+        {
+            eprintln!("clawhip source github CI baseline outbox attempt persist failed");
+            return Ok(());
+        }
+        let Some(durable) = outbox_entry(ci_baseline, &queued) else {
             continue;
         };
         match send_event(tx, durable.clone().into_event()).await {
             Ok(()) => {
-                ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(&durable))?;
+                if let Err(error) =
+                    ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(&durable))
+                {
+                    eprintln!("clawhip source github CI baseline outbox ack failed: {error}");
+                }
             }
-            Err(error) => {
+            Err(_) => {
                 dead_letter_unsent_final_attempts(ci_baseline, std::slice::from_ref(&durable));
                 let _ = commit_ci_baseline(path, ci_baseline);
-                return Err(error);
+                return Ok(());
             }
         }
     }
@@ -2028,6 +2039,19 @@ async fn poll_ci_statuses(
                     &snapshot.repo_name,
                     previous.ci_baseline_established,
                     &previous.ci,
+                    &ci,
+                    repo_ci_baseline,
+                )
+            } else if repo_ci_baseline.is_some_and(|baseline| {
+                !baseline.terminal_runs.is_empty()
+                    || !baseline.pending.is_empty()
+                    || !baseline.acked.is_empty()
+            }) {
+                collect_ci_events(
+                    repo,
+                    &snapshot.repo_name,
+                    true,
+                    &HashMap::new(),
                     &ci,
                     repo_ci_baseline,
                 )
@@ -4385,7 +4409,10 @@ mod tests {
         });
         let mut live = load_ci_baseline(Some(&path));
         let result = send_then_ack_prefix(&tx, &mut live, Some(&path), events, &delivered).await;
-        assert!(result.is_err(), "closed receiver must fail the second send");
+        assert!(
+            result.is_ok(),
+            "closed receiver must not abort later repository polling"
+        );
         let _ = recv.await;
         let restarted = load_ci_baseline(Some(&path));
         let pending = &restarted.repos["/repo"].pending;
@@ -4541,6 +4568,28 @@ mod tests {
             !repo_ci_baseline_is_suppressed(baseline.repos.get("/repo"), &test),
             "run-only historical receipt must not suppress mixed check jobs"
         );
+    }
+
+    #[test]
+    fn issue_317_first_poll_after_restart_emits_unrecorded_terminal() {
+        let historical = run_snapshot(1, "CI", Some("success"), "main");
+        let fresh = run_snapshot(2, "CI", Some("failure"), "main");
+        let mut baseline = CIBaseline::default();
+        baseline.record_terminal_runs(
+            "/repo",
+            "/repo",
+            &run_map(std::slice::from_ref(&historical)),
+        );
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(&[historical.clone(), fresh.clone()]),
+            baseline.repos.get("/repo"),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.ci-failed");
     }
 
     #[test]
