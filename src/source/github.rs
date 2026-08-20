@@ -177,10 +177,7 @@ impl AckedDelivery {
     }
 
     fn matches_pending(&self, pending: &PendingCiDelivery) -> bool {
-        if !self.repo_name.is_empty()
-            && !pending.repo_name.is_empty()
-            && self.repo_name != pending.repo_name
-        {
+        if self.repo_name != pending.repo_name {
             return false;
         }
         if self.kind != pending.kind || self.conclusion != pending.conclusion {
@@ -188,13 +185,22 @@ impl AckedDelivery {
         }
         let self_checks = pending_check_identities(&self.identities);
         let pending_checks = pending_check_identities(&pending.identities);
-        if !self_checks.is_empty() && !pending_checks.is_empty() {
-            return self_checks
-                .iter()
-                .any(|identity| pending_checks.iter().any(|candidate| candidate == identity));
-        }
         let self_has_run = self.run_id.is_some();
         let pending_has_run = pending.run_id.is_some();
+        if !self_checks.is_empty() && !pending_checks.is_empty() {
+            let check_match = self_checks
+                .iter()
+                .any(|identity| pending_checks.iter().any(|candidate| candidate == identity));
+            if !check_match {
+                return false;
+            }
+            if self_has_run && pending_has_run {
+                return self.run_id == pending.run_id
+                    && run_attempt_or_one(self.run_attempt)
+                        == run_attempt_or_one(pending.run_attempt);
+            }
+            return true;
+        }
         if self_has_run && pending_has_run {
             return self.run_id == pending.run_id
                 && run_attempt_or_one(self.run_attempt) == run_attempt_or_one(pending.run_attempt)
@@ -862,16 +868,17 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
     dest.min_writer_epoch = dest.min_writer_epoch.max(source.min_writer_epoch);
     for acked in source.acked {
         if let Some(existing) = dest.acked.iter_mut().find(|candidate| {
-            candidate.kind == acked.kind
+            candidate.repo_name == acked.repo_name
+                && candidate.kind == acked.kind
                 && candidate.conclusion == acked.conclusion
+                && run_attempt_or_one(candidate.run_attempt)
+                    == run_attempt_or_one(acked.run_attempt)
                 && (pending_check_identities(&candidate.identities)
                     .iter()
                     .any(|identity| pending_check_identities(&acked.identities).contains(identity))
                     || (candidate.run_id.is_some()
                         && candidate.run_id == acked.run_id
-                        && candidate.workflow == acked.workflow
-                        && run_attempt_or_one(candidate.run_attempt)
-                            == run_attempt_or_one(acked.run_attempt)))
+                        && candidate.workflow == acked.workflow))
         }) {
             for identity in acked.identities {
                 if !existing.identities.iter().any(|item| item == &identity) {
@@ -1244,8 +1251,9 @@ fn ack_pending_deliveries(
         for repo in ci_baseline.repos.values_mut() {
             for delivery in delivered {
                 if repo.pending.iter().any(|pending| {
-                    pending.same_event(delivery)
-                        || AckedDelivery::from_pending(delivery, 0).matches_pending(pending)
+                    pending.repo_name == delivery.repo_name
+                        && (pending.same_event(delivery)
+                            || AckedDelivery::from_pending(delivery, 0).matches_pending(pending))
                 }) {
                     record_acked(repo, delivery);
                 }
@@ -1263,14 +1271,17 @@ fn ack_pending_deliveries(
         let local_repo = ci_baseline.repos.get(key);
         for delivery in delivered {
             let in_disk = repo.pending.iter().any(|pending| {
-                pending.same_event(delivery)
-                    || AckedDelivery::from_pending(delivery, 0).matches_pending(pending)
+                pending.repo_name == delivery.repo_name
+                    && (pending.same_event(delivery)
+                        || AckedDelivery::from_pending(delivery, 0).matches_pending(pending))
             });
             let in_local = local_repo
                 .map(|local| {
                     local.pending.iter().any(|pending| {
-                        pending.same_event(delivery)
-                            || AckedDelivery::from_pending(delivery, 0).matches_pending(pending)
+                        pending.repo_name == delivery.repo_name
+                            && (pending.same_event(delivery)
+                                || AckedDelivery::from_pending(delivery, 0)
+                                    .matches_pending(pending))
                     })
                 })
                 .unwrap_or(false);
