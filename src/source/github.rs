@@ -464,9 +464,9 @@ where
         .collect())
 }
 
-const MAX_BASELINE_RUNS_PER_REPO: usize = 256;
 const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
+const MAX_BASELINE_RUNS_PER_REPO: usize = CI_PAGE_SIZE * MAX_CI_PAGES;
 const MAX_PENDING_SEND_ATTEMPTS: u32 = 3;
 const PENDING_RETRY_BACKOFF_SECS: u64 = 3_600;
 const ACK_RETENTION_SECS: u64 = 7 * 24 * 3_600;
@@ -2062,9 +2062,7 @@ async fn poll_ci_statuses(
             } else {
                 Vec::new()
             };
-            let established = previous
-                .map(|entry| entry.ci_baseline_established)
-                .unwrap_or(true);
+            let established = true;
             Ok((ci, established, events, window_complete))
         }
         Err(error) => {
