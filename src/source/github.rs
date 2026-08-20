@@ -230,6 +230,9 @@ impl AckedDelivery {
         }
         if self.run_id.is_none() {
             self.run_id = pending.run_id.clone();
+            if pending.run_id.is_some() {
+                self.run_attempt = run_attempt_or_one(pending.run_attempt);
+            }
         }
         if self.sha.is_empty() {
             self.sha = pending.sha.clone();
@@ -307,9 +310,18 @@ impl PendingCiDelivery {
         let self_checks = pending_check_identities(&self.identities);
         let other_checks = pending_check_identities(&other.identities);
         if !self_checks.is_empty() && !other_checks.is_empty() {
-            return self_checks
+            let check_match = self_checks
                 .iter()
                 .any(|identity| other_checks.iter().any(|candidate| candidate == identity));
+            if !check_match {
+                return false;
+            }
+            if self.run_id.is_some() && other.run_id.is_some() {
+                return self.run_id == other.run_id
+                    && run_attempt_or_one(self.run_attempt)
+                        == run_attempt_or_one(other.run_attempt);
+            }
+            return true;
         }
         let self_runs = pending_run_identities(&self.identities);
         let other_runs = pending_run_identities(&other.identities);
@@ -4006,6 +4018,61 @@ mod tests {
         );
         let pending2 = PendingCiDelivery::from_event(&events2[0], attempt2.identities());
         assert!(!pending_is_acked(&repo, &pending2));
+    }
+
+    #[test]
+    fn issue_317_shared_check_id_does_not_collapse_run_attempts() {
+        let attempt1 = check_job(4242, 11, "CI", "success");
+        let events1 = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&attempt1)),
+            None,
+        );
+        let pending1 = PendingCiDelivery::from_event(&events1[0], attempt1.identities());
+        let attempt2 = GitHubCISnapshot {
+            run_attempt: 2,
+            check_run_id: Some("11".into()),
+            ..check_job(4242, 11, "CI", "success")
+        };
+        let events2 = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&attempt2)),
+            None,
+        );
+        let pending2 = PendingCiDelivery::from_event(&events2[0], attempt2.identities());
+        assert!(!pending1.same_event(&pending2));
+        let mut repo = RepoCIBaseline::default();
+        record_acked(&mut repo, &pending1);
+        assert!(!pending_is_acked(&repo, &pending2));
+    }
+
+    #[test]
+    fn issue_317_check_only_ack_adopts_run_attempt_on_alias_merge() {
+        let check = check_job(4242, 11, "CI", "success");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&check)),
+            None,
+        );
+        let mut check_only = PendingCiDelivery::from_event(&events[0], check.identities());
+        check_only.run_id = None;
+        check_only.run_attempt = 1;
+        let mut repo = RepoCIBaseline::default();
+        record_acked(&mut repo, &check_only);
+        let mut attempt2 = PendingCiDelivery::from_event(&events[0], check.identities());
+        attempt2.run_attempt = 2;
+        record_acked(&mut repo, &attempt2);
+        assert_eq!(repo.acked[0].run_attempt, 2);
+        assert!(pending_is_acked(&repo, &attempt2));
     }
 
     #[tokio::test]
