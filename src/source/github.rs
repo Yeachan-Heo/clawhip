@@ -649,27 +649,22 @@ fn snapshot_eviction_key(ci: &GitHubCISnapshot) -> (u8, String, u64, String) {
     TerminalRunRecord::from_snapshot(ci).eviction_key()
 }
 
-fn cap_repo_baseline(repo_baseline: &mut RepoCIBaseline) -> bool {
-    if repo_baseline.terminal_runs.len() <= MAX_BASELINE_RUNS_PER_REPO {
-        return false;
-    }
-    let mut records: Vec<TerminalRunRecord> = repo_baseline.terminal_runs.drain(..).collect();
-    records.sort_by_key(|record| record.eviction_key());
-    let drop_count = records.len() - MAX_BASELINE_RUNS_PER_REPO;
-    records.drain(..drop_count);
-    repo_baseline.terminal_runs = records.into();
-    true
-}
-
 fn cap_repo_baseline_keeping(
     repo_baseline: &mut RepoCIBaseline,
     keep: &[&GitHubCISnapshot],
 ) -> bool {
+    let keep_ids: std::collections::HashSet<String> =
+        keep.iter().flat_map(|ci| ci.unique_identities()).collect();
+    cap_repo_baseline_keeping_ids(repo_baseline, &keep_ids)
+}
+
+fn cap_repo_baseline_keeping_ids(
+    repo_baseline: &mut RepoCIBaseline,
+    keep_ids: &std::collections::HashSet<String>,
+) -> bool {
     if repo_baseline.terminal_runs.len() <= MAX_BASELINE_RUNS_PER_REPO {
         return false;
     }
-    let keep_ids: std::collections::HashSet<String> =
-        keep.iter().flat_map(|ci| ci.unique_identities()).collect();
     let mut records: Vec<TerminalRunRecord> = repo_baseline.terminal_runs.drain(..).collect();
     records.sort_by_key(|record| record.eviction_key());
     let excess = records.len().saturating_sub(MAX_BASELINE_RUNS_PER_REPO);
@@ -942,6 +937,11 @@ fn normalize_repo_outbox(repo: &mut RepoCIBaseline) {
 }
 
 fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
+    let keep_ids: std::collections::HashSet<String> = source
+        .terminal_runs
+        .iter()
+        .flat_map(|record| record.unique_identities().map(str::to_string))
+        .collect();
     for record in source.terminal_runs {
         if let Some(existing) = dest
             .terminal_runs
@@ -963,7 +963,7 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
             dest.terminal_runs.push_back(record);
         }
     }
-    cap_repo_baseline(dest);
+    cap_repo_baseline_keeping_ids(dest, &keep_ids);
     dest.epoch = dest.epoch.max(source.epoch);
     dest.min_writer_epoch = dest.min_writer_epoch.max(source.min_writer_epoch);
     dest.ci_established = dest.ci_established || source.ci_established;
@@ -1055,7 +1055,6 @@ fn load_ci_baseline(path: Option<&Path>) -> CIBaseline {
         Ok(repos) => {
             let mut baseline = CIBaseline { repos };
             for repo_baseline in baseline.repos.values_mut() {
-                cap_repo_baseline(repo_baseline);
                 normalize_repo_outbox(repo_baseline);
             }
             baseline
@@ -3580,6 +3579,37 @@ mod tests {
     }
 
     #[test]
+    fn issue_317_current_window_over_cap_survives_reload() {
+        let mut runs = Vec::new();
+        for id in 0..(MAX_BASELINE_RUNS_PER_REPO + 20) {
+            let mut run = run_snapshot(id as u64, "CI", Some("success"), "main");
+            run.created_at = Some(format!("2026-01-01T00:{:02}:{:02}Z", id / 60, id % 60));
+            runs.push(run);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut baseline = CIBaseline::default();
+        baseline.record_terminal_runs("/repo", "/repo", &run_map(&runs));
+        save_ci_baseline(&baseline, Some(&path)).unwrap();
+        let loaded = load_ci_baseline(Some(&path));
+        let repo = &loaded.repos["/repo"];
+        assert_eq!(repo.terminal_runs.len(), MAX_BASELINE_RUNS_PER_REPO + 20);
+        assert!(repo.contains_identity("run:0"));
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(&runs),
+            loaded.repos.get("/repo"),
+        );
+        assert!(
+            events.is_empty(),
+            "restart against the same oversized window must not replay"
+        );
+    }
+
+    #[test]
     fn issue_317_mixed_legacy_eviction_keeps_timestamped_and_survives_reload() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("github-ci-baseline.json");
@@ -3742,7 +3772,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_317_oversized_loaded_state_is_truncated_oldest_first() {
+    fn issue_317_oversized_loaded_state_is_preserved_across_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("github-ci-baseline.json");
         let mut records = Vec::new();
@@ -3757,8 +3787,12 @@ mod tests {
         std::fs::write(&path, payload).unwrap();
         let loaded = load_ci_baseline(Some(&path));
         let repo = loaded.repos.get("/repo").unwrap();
-        assert_eq!(repo.terminal_runs.len(), MAX_BASELINE_RUNS_PER_REPO);
-        assert!(!repo.contains_identity("run:0"));
+        assert_eq!(
+            repo.terminal_runs.len(),
+            MAX_BASELINE_RUNS_PER_REPO + 12,
+            "load must not evict a stored current window"
+        );
+        assert!(repo.contains_identity("run:0"));
         assert!(repo.contains_identity(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 11)));
     }
 
