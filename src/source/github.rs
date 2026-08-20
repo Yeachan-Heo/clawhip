@@ -151,6 +151,8 @@ struct PendingCiDelivery {
     send_attempts: u32,
     #[serde(default)]
     last_sent_unix: Option<u64>,
+    #[serde(default)]
+    delivery_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -313,6 +315,7 @@ impl PendingCiDelivery {
             template: event.template.clone(),
             send_attempts: 0,
             last_sent_unix: None,
+            delivery_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -357,6 +360,27 @@ impl PendingCiDelivery {
             && self.workflow == other.workflow
             && self.pr_number == other.pr_number
             && run_attempt_or_one(self.run_attempt) == run_attempt_or_one(other.run_attempt)
+    }
+
+    fn same_output(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.conclusion == other.conclusion
+            && self.identities == other.identities
+            && self.repo_name == other.repo_name
+            && self.workflow == other.workflow
+            && self.sha == other.sha
+            && self.pr_number == other.pr_number
+            && self.run_id == other.run_id
+            && run_attempt_or_one(self.run_attempt) == run_attempt_or_one(other.run_attempt)
+            && self.channel == other.channel
+            && self.mention == other.mention
+            && self.format == other.format
+            && self.template == other.template
+            && self.url == other.url
+            && self.status == other.status
+            && self.branch == other.branch
+            && self.run_job_count == other.run_job_count
+            && self.run_all_terminal == other.run_all_terminal
     }
 
     fn into_event(self) -> IncomingEvent {
@@ -1367,15 +1391,8 @@ fn outbox_entry(
 ) -> Option<PendingCiDelivery> {
     for repo in ci_baseline.repos.values() {
         if let Some(pending) = repo.pending.iter().find(|pending| {
-            pending.same_event(delivery)
-                && pending.repo_name == delivery.repo_name
-                && pending.channel == delivery.channel
-                && pending.mention == delivery.mention
-                && pending.format == delivery.format
-                && pending.template == delivery.template
-                && pending.url == delivery.url
-                && pending.status == delivery.status
-                && pending.branch == delivery.branch
+            (!delivery.delivery_id.is_empty() && pending.delivery_id == delivery.delivery_id)
+                || pending.same_output(delivery)
         }) {
             return Some(pending.clone());
         }
@@ -1398,10 +1415,10 @@ fn persist_pending_send_attempts(
 fn bump_pending_send_attempts(ci_baseline: &mut CIBaseline, sent: &[PendingCiDelivery], now: u64) {
     for repo in ci_baseline.repos.values_mut() {
         for pending in &mut repo.pending {
-            if sent
-                .iter()
-                .any(|item| pending.same_event(item) && pending.repo_name == item.repo_name)
-            {
+            if sent.iter().any(|item| {
+                (!item.delivery_id.is_empty() && pending.delivery_id == item.delivery_id)
+                    || (pending.same_event(item) && pending.repo_name == item.repo_name)
+            }) {
                 pending.send_attempts = pending.send_attempts.saturating_add(1);
                 pending.last_sent_unix = Some(now);
             }
