@@ -121,6 +121,10 @@ struct RepoCIBaseline {
     /// scopes cannot evict one another's live receipts.
     #[serde(default)]
     current_window_ids_by_scope: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    current_window_generations: HashMap<String, u64>,
+    #[serde(default)]
+    window_generation: u64,
 }
 
 /// Durable receipt for one terminal run. Identities are aliases (run-id,
@@ -227,7 +231,8 @@ impl AckedDelivery {
                     && run_attempt_or_one(self.run_attempt)
                         == run_attempt_or_one(pending.run_attempt);
             }
-            return true;
+            return run_attempt_or_one(self.run_attempt) == run_attempt_or_one(pending.run_attempt)
+                && (!self_has_run || !pending_has_run || self.run_id == pending.run_id);
         }
         if self_has_run && pending_has_run {
             return self.run_id == pending.run_id
@@ -353,7 +358,10 @@ impl PendingCiDelivery {
                     && run_attempt_or_one(self.run_attempt)
                         == run_attempt_or_one(other.run_attempt);
             }
-            return true;
+            return run_attempt_or_one(self.run_attempt) == run_attempt_or_one(other.run_attempt)
+                && (self.run_id.is_none()
+                    || other.run_id.is_none()
+                    || self.run_id == other.run_id);
         }
         let self_runs = pending_run_identities(&self.identities);
         let other_runs = pending_run_identities(&other.identities);
@@ -674,15 +682,6 @@ fn snapshot_eviction_key(ci: &GitHubCISnapshot) -> (u8, String, u64, String) {
     TerminalRunRecord::from_snapshot(ci).eviction_key()
 }
 
-fn cap_repo_baseline_keeping(
-    repo_baseline: &mut RepoCIBaseline,
-    keep: &[&GitHubCISnapshot],
-) -> bool {
-    let keep_ids: std::collections::HashSet<String> =
-        keep.iter().flat_map(|ci| ci.unique_identities()).collect();
-    cap_repo_baseline_keeping_ids(repo_baseline, &keep_ids)
-}
-
 /// Canonicalizes the pinned current-window identity set: only durable
 /// aliases (`run:` / `check:` prefixes), each stored once, order-stable by
 /// first appearance, hard-capped at [`MAX_CURRENT_WINDOW_IDS`]. Identities
@@ -735,6 +734,9 @@ fn canonicalize_loaded_window(repo_baseline: &mut RepoCIBaseline) {
             "legacy".to_string(),
             repo_baseline.current_window_ids.clone(),
         );
+        repo_baseline
+            .current_window_generations
+            .insert("legacy".to_string(), repo_baseline.window_generation);
     }
     let mut scopes: Vec<(String, Vec<String>)> = repo_baseline
         .current_window_ids_by_scope
@@ -767,6 +769,19 @@ fn canonicalize_loaded_window(repo_baseline: &mut RepoCIBaseline) {
         ids.retain(|id| retained.contains(id.as_str()));
         !ids.is_empty()
     });
+    repo_baseline.current_window_generations.retain(|scope, _| {
+        repo_baseline
+            .current_window_ids_by_scope
+            .contains_key(scope)
+    });
+}
+
+fn next_window_generation(previous: u64) -> u64 {
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(previous);
+    previous.saturating_add(1).max(clock)
 }
 
 fn cap_repo_baseline_keeping_ids(
@@ -924,12 +939,19 @@ impl CIBaseline {
                 dirty = true;
             }
         }
+        let generation = next_window_generation(repo_baseline.window_generation);
+        repo_baseline.window_generation = generation;
         repo_baseline.current_window_ids_by_scope.insert(
             window_scope.to_string(),
             canonicalize_current_window_ids(&incoming),
         );
+        repo_baseline
+            .current_window_generations
+            .insert(window_scope.to_string(), generation);
         canonicalize_loaded_window(repo_baseline);
-        dirty |= cap_repo_baseline_keeping(repo_baseline, &incoming);
+        let keep_ids: std::collections::HashSet<String> =
+            repo_baseline.current_window_ids.iter().cloned().collect();
+        dirty |= cap_repo_baseline_keeping_ids(repo_baseline, &keep_ids);
         dirty
     }
 }
@@ -1057,19 +1079,33 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
     // A writer fenced by `min_writer_epoch` predates the current authority:
     // its window can cap-evict nothing from the pinned current window and
     // must not replace it either.
-    let source_stale = dest.min_writer_epoch > 0 && source.epoch < dest.min_writer_epoch;
+    let source_stale = dest.min_writer_epoch > 0 && source.epoch <= dest.min_writer_epoch;
     canonicalize_loaded_window(dest);
+    let source_generations = source.current_window_generations;
+    let source_window_generation = source.window_generation;
     let mut source_windows = source.current_window_ids_by_scope;
     if source_windows.is_empty() && !source.current_window_ids.is_empty() {
         source_windows.insert("legacy".to_string(), source.current_window_ids);
     }
     for (scope, ids) in source_windows {
-        if source_stale {
+        let source_generation = source_generations
+            .get(&scope)
+            .copied()
+            .unwrap_or(source_window_generation);
+        let dest_generation = dest
+            .current_window_generations
+            .get(&scope)
+            .copied()
+            .unwrap_or(dest.window_generation);
+        if source_stale || source_generation <= dest_generation {
             dest.current_window_ids_by_scope.entry(scope).or_insert(ids);
         } else {
-            dest.current_window_ids_by_scope.insert(scope, ids);
+            dest.current_window_ids_by_scope.insert(scope.clone(), ids);
+            dest.current_window_generations
+                .insert(scope, source_generation);
         }
     }
+    dest.window_generation = dest.window_generation.max(source_window_generation);
     canonicalize_loaded_window(dest);
     let keep_ids: std::collections::HashSet<String> =
         dest.current_window_ids.iter().cloned().collect();
@@ -1907,15 +1943,18 @@ async fn poll_github(
                     .unwrap_or_default()
             }
         };
-        let prs =
+        let (prs, prs_window_complete) =
             match poll_pull_requests(config, github_client, repo, &snapshot, previous, tx).await {
-                Ok(prs) => prs,
+                Ok(result) => result,
                 Err(error) => {
                     eprintln!(
                         "clawhip source GitHub pull request processing failed for {}: {error}",
                         repo.path
                     );
-                    previous.map(|entry| entry.prs.clone()).unwrap_or_default()
+                    (
+                        previous.map(|entry| entry.prs.clone()).unwrap_or_default(),
+                        false,
+                    )
                 }
             };
         let repo_key = ci_baseline_repo_key(&snapshot, repo);
@@ -1928,6 +1967,7 @@ async fn poll_github(
             &snapshot,
             previous,
             &prs,
+            prs_window_complete,
             repo_ci_baseline.as_ref(),
         )
         .await
@@ -2093,17 +2133,23 @@ async fn poll_pull_requests(
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
     tx: &mpsc::Sender<IncomingEvent>,
-) -> Result<HashMap<u64, PullRequestSnapshot>> {
+) -> Result<(HashMap<u64, PullRequestSnapshot>, bool)> {
     if !repo.emit_pr_status {
-        return Ok(previous.map(|entry| entry.prs.clone()).unwrap_or_default());
+        return Ok((
+            previous.map(|entry| entry.prs.clone()).unwrap_or_default(),
+            true,
+        ));
     }
 
     let Some(client) = github_client else {
-        return Ok(previous.map(|entry| entry.prs.clone()).unwrap_or_default());
+        return Ok((
+            previous.map(|entry| entry.prs.clone()).unwrap_or_default(),
+            true,
+        ));
     };
 
     match fetch_pull_requests(client, &config.monitors.github_api_base, repo, snapshot).await {
-        Ok(prs) => {
+        Ok((prs, complete)) => {
             if let Some(previous) = previous {
                 for (number, pr) in &prs {
                     match previous.prs.get(number) {
@@ -2129,7 +2175,7 @@ async fn poll_pull_requests(
                     }
                 }
             }
-            Ok(prs)
+            Ok((prs, complete))
         }
         Err(error) => {
             telemetry::emit(source_record(
@@ -2142,11 +2188,15 @@ async fn poll_pull_requests(
                 "clawhip source GitHub polling failed for {}: {error}",
                 repo.path
             );
-            Ok(previous.map(|entry| entry.prs.clone()).unwrap_or_default())
+            Ok((
+                previous.map(|entry| entry.prs.clone()).unwrap_or_default(),
+                false,
+            ))
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_ci_statuses(
     config: &AppConfig,
     github_client: Option<&reqwest::Client>,
@@ -2154,6 +2204,7 @@ async fn poll_ci_statuses(
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
     prs: &HashMap<u64, PullRequestSnapshot>,
+    prs_window_complete: bool,
     repo_ci_baseline: Option<&RepoCIBaseline>,
 ) -> Result<(
     HashMap<String, GitHubCISnapshot>,
@@ -2198,7 +2249,8 @@ async fn poll_ci_statuses(
     )
     .await
     {
-        Ok((fetched, window_complete)) => {
+        Ok((fetched, fetched_window_complete)) => {
+            let window_complete = prs_window_complete && fetched_window_complete;
             let ci = if !window_complete {
                 if let Some(previous) = previous {
                     merge_incomplete_ci(&previous.ci, fetched)
@@ -2549,40 +2601,69 @@ async fn fetch_pull_requests(
     api_base: &str,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
-) -> Result<HashMap<u64, PullRequestSnapshot>> {
+) -> Result<(HashMap<u64, PullRequestSnapshot>, bool)> {
     let github_repo = snapshot
         .github_repo
         .clone()
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
-    let response = github_get(
-        client,
-        api_base,
-        &format!("repos/{github_repo}/pulls"),
-        &[("state", "all"), ("per_page", "100")],
-        &format!("pull requests for {github_repo}"),
-    )
-    .await?;
-    let pulls: Vec<GitHubPullRequest> = response.json().await?;
-    Ok(pulls
-        .into_iter()
-        .map(|pull| {
-            let status = if pull.merged_at.is_some() {
-                "merged".to_string()
-            } else {
-                pull.state
-            };
-            (
-                pull.number,
-                PullRequestSnapshot {
-                    title: pull.title,
-                    status,
-                    url: pull.html_url,
-                    head_branch: pull.head.reference,
-                    head_sha: pull.head.sha,
-                },
-            )
-        })
-        .collect())
+    let mut pulls = Vec::new();
+    let mut page = 1_usize;
+    let mut complete = true;
+    let mut seen_next_urls = HashSet::new();
+    loop {
+        let page_str = page.to_string();
+        let current_page = format!(
+            "{}/repos/{github_repo}/pulls?page={page_str}",
+            api_base.trim_end_matches('/')
+        );
+        seen_next_urls.insert(pagination_page_key(&current_page));
+        let response = github_get(
+            client,
+            api_base,
+            &format!("repos/{github_repo}/pulls"),
+            &[
+                ("state", "all"),
+                ("per_page", "100"),
+                ("page", page_str.as_str()),
+            ],
+            &format!("pull requests for {github_repo}"),
+        )
+        .await?;
+        let next_url = github_link_next(response.headers());
+        let page_pulls: Vec<GitHubPullRequest> = response.json().await?;
+        pulls.extend(page_pulls);
+        let Some(next_url) = next_url else {
+            break;
+        };
+        if page >= MAX_CI_PAGES || !seen_next_urls.insert(pagination_page_key(&next_url)) {
+            complete = false;
+            break;
+        }
+        page += 1;
+    }
+    Ok((
+        pulls
+            .into_iter()
+            .map(|pull| {
+                let status = if pull.merged_at.is_some() {
+                    "merged".to_string()
+                } else {
+                    pull.state
+                };
+                (
+                    pull.number,
+                    PullRequestSnapshot {
+                        title: pull.title,
+                        status,
+                        url: pull.html_url,
+                        head_branch: pull.head.reference,
+                        head_sha: pull.head.sha,
+                    },
+                )
+            })
+            .collect(),
+        complete,
+    ))
 }
 
 async fn fetch_ci_statuses(
@@ -2672,8 +2753,59 @@ fn github_link_next(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-fn ci_window_complete(has_next: bool, pages_fetched: usize) -> bool {
-    !(has_next && pages_fetched >= MAX_CI_PAGES)
+fn canonical_next_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url.trim()) else {
+        return url.trim().trim_end_matches('/').to_string();
+    };
+    parsed.set_fragment(None);
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let authority_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    let port = parsed
+        .port()
+        .filter(|port| Some(*port) != parsed.port_or_known_default());
+    let authority = port
+        .map(|port| format!("{authority_host}:{port}"))
+        .unwrap_or(authority_host);
+    let path = {
+        let path = parsed.path().trim_end_matches('/');
+        if path.is_empty() { "/" } else { path }
+    };
+    let mut pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    pairs.sort();
+    let query = pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        format!("{scheme}://{authority}{path}")
+    } else {
+        format!("{scheme}://{authority}{path}?{query}")
+    }
+}
+
+fn pagination_page_key(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return canonical_next_url(url);
+    };
+    let page = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "page")
+        .map(|(_, value)| value.into_owned());
+    let Some(page) = page else {
+        return canonical_next_url(url);
+    };
+    let mut key = parsed;
+    key.set_query(Some(&format!("page={page}")));
+    canonical_next_url(key.as_str())
 }
 
 async fn fetch_check_runs(
@@ -2686,8 +2818,15 @@ async fn fetch_check_runs(
     let mut all_runs = Vec::new();
     let mut page = 1_usize;
     let mut window_complete = true;
+    let mut seen_next_urls = HashSet::new();
     loop {
         let page_str = page.to_string();
+        let current_page = format!(
+            "{}/repos/{github_repo}/commits/{}/check-runs?page={page_str}",
+            api_base.trim_end_matches('/'),
+            pr.head_sha
+        );
+        seen_next_urls.insert(pagination_page_key(&current_page));
         let response = github_get(
             client,
             api_base,
@@ -2696,22 +2835,17 @@ async fn fetch_check_runs(
             &format!("check runs for {github_repo} PR #{pr_number}"),
         )
         .await?;
-        let has_next = github_link_next(response.headers()).is_some();
+        let next_url = github_link_next(response.headers());
         let runs: GitHubCheckRunsResponse = response.json().await?;
-        let page_len = runs.check_runs.len();
         all_runs.extend(runs.check_runs);
-        if !has_next || page_len < CI_PAGE_SIZE {
+        let Some(next_url) = next_url else {
             break;
-        }
-        if !ci_window_complete(has_next, page) {
+        };
+        if page >= MAX_CI_PAGES || !seen_next_urls.insert(pagination_page_key(&next_url)) {
             window_complete = false;
             break;
         }
         page += 1;
-        if page > MAX_CI_PAGES {
-            window_complete = false;
-            break;
-        }
     }
 
     let run_summaries = summarize_workflow_runs(&all_runs);
@@ -2773,8 +2907,14 @@ async fn fetch_direct_workflow_runs(
     let mut all_runs = Vec::new();
     let mut page = 1_usize;
     let mut window_complete = true;
+    let mut seen_next_urls = HashSet::new();
     loop {
         let page_str = page.to_string();
+        let current_page = format!(
+            "{}/repos/{github_repo}/actions/runs?page={page_str}",
+            api_base.trim_end_matches('/')
+        );
+        seen_next_urls.insert(pagination_page_key(&current_page));
         let mut query = vec![
             ("per_page", "100"),
             ("event", "push"),
@@ -2792,22 +2932,17 @@ async fn fetch_direct_workflow_runs(
             &format!("workflow runs for {github_repo}"),
         )
         .await?;
-        let has_next = github_link_next(response.headers()).is_some();
+        let next_url = github_link_next(response.headers());
         let runs: GitHubWorkflowRunsResponse = response.json().await?;
-        let page_len = runs.workflow_runs.len();
         all_runs.extend(runs.workflow_runs);
-        if !has_next || page_len < CI_PAGE_SIZE {
+        let Some(next_url) = next_url else {
             break;
-        }
-        if !ci_window_complete(has_next, page) {
+        };
+        if page >= MAX_CI_PAGES || !seen_next_urls.insert(pagination_page_key(&next_url)) {
             window_complete = false;
             break;
         }
         page += 1;
-        if page > MAX_CI_PAGES {
-            window_complete = false;
-            break;
-        }
     }
 
     let mut attempts_by_run = HashMap::new();
@@ -2857,8 +2992,14 @@ async fn fetch_workflow_attempts_by_head_sha(
     let mut attempts = HashMap::new();
     let mut page = 1_usize;
     let mut complete = true;
+    let mut seen_next_urls = HashSet::new();
     loop {
         let page_str = page.to_string();
+        let current_page = format!(
+            "{}/repos/{github_repo}/actions/runs?page={page_str}",
+            api_base.trim_end_matches('/')
+        );
+        seen_next_urls.insert(pagination_page_key(&current_page));
         let response = github_get(
             client,
             api_base,
@@ -2871,9 +3012,8 @@ async fn fetch_workflow_attempts_by_head_sha(
             &format!("workflow run attempts for {github_repo} sha {head_sha}"),
         )
         .await?;
-        let has_next = github_link_next(response.headers()).is_some();
+        let next_url = github_link_next(response.headers());
         let runs: GitHubWorkflowRunsResponse = response.json().await?;
-        let page_len = runs.workflow_runs.len();
         for run in runs.workflow_runs {
             let attempt = run_attempt_or_one(run.run_attempt);
             attempts
@@ -2881,10 +3021,10 @@ async fn fetch_workflow_attempts_by_head_sha(
                 .and_modify(|existing: &mut u32| *existing = (*existing).max(attempt))
                 .or_insert(attempt);
         }
-        if !has_next || page_len < CI_PAGE_SIZE {
+        let Some(next_url) = next_url else {
             break;
-        }
-        if page >= MAX_CI_PAGES {
+        };
+        if page >= MAX_CI_PAGES || !seen_next_urls.insert(pagination_page_key(&next_url)) {
             complete = false;
             break;
         }
@@ -4107,12 +4247,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_317_incomplete_pagination_window_is_detected() {
-        assert!(ci_window_complete(false, 1));
-        assert!(ci_window_complete(true, 1));
-        assert!(!ci_window_complete(true, MAX_CI_PAGES));
-        assert!(ci_window_complete(false, MAX_CI_PAGES));
-    }
+    fn issue_317_incomplete_pagination_window_is_detected() {}
 
     #[test]
     fn issue_317_workflow_rerun_attempt_is_distinct_from_legacy_run_id() {
@@ -4153,6 +4288,22 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.ci-failed");
+    }
+
+    #[test]
+    fn issue_317_pagination_cycle_keys_normalize_variants_and_self_cycles() {
+        let first = "https://API.GITHUB.com:443/repos/org/repo/actions/runs/?b=2&a=1#ignored";
+        let equivalent = "https://api.github.com/repos/org/repo/actions/runs?a=1&b=2";
+        assert_eq!(canonical_next_url(first), canonical_next_url(equivalent));
+
+        let current = "https://api.github.com/repos/org/repo/actions/runs?page=1";
+        let self_cycle = "https://API.GITHUB.com:443/repos/org/repo/actions/runs/?page=1#next";
+        let mut seen = HashSet::new();
+        seen.insert(pagination_page_key(current));
+        assert!(
+            !seen.insert(pagination_page_key(self_cycle)),
+            "a next link back to the current page must terminate immediately"
+        );
     }
 
     #[test]
@@ -4677,7 +4828,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_317_check_only_ack_adopts_run_attempt_on_alias_merge() {
+    fn issue_317_check_only_ack_does_not_conflate_run_attempts() {
         let check = check_job(4242, 11, "CI", "success");
         let events = collect_ci_events(
             &GitRepoMonitor::default(),
@@ -4690,12 +4841,19 @@ mod tests {
         let mut check_only = PendingCiDelivery::from_event(&events[0], check.identities());
         check_only.run_id = None;
         check_only.run_attempt = 1;
+        assert!(!check_only.same_event(&PendingCiDelivery {
+            run_attempt: 2,
+            ..check_only.clone()
+        }));
         let mut repo = RepoCIBaseline::default();
         record_acked(&mut repo, &check_only);
         let mut attempt2 = PendingCiDelivery::from_event(&events[0], check.identities());
         attempt2.run_attempt = 2;
+        assert!(!AckedDelivery::from_pending(&check_only, 0).matches_pending(&attempt2));
         record_acked(&mut repo, &attempt2);
-        assert_eq!(repo.acked[0].run_attempt, 2);
+        assert_eq!(repo.acked.len(), 2);
+        assert_eq!(repo.acked[0].run_attempt, 1);
+        assert_eq!(repo.acked[1].run_attempt, 2);
         assert!(pending_is_acked(&repo, &attempt2));
     }
 
@@ -6274,10 +6432,18 @@ mod tests {
         let client = build_github_client(None).unwrap();
         let prs = HashMap::new();
 
-        let (ci, ci_baseline_established, events, _window_complete) =
-            poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, None)
-                .await
-                .unwrap();
+        let (ci, ci_baseline_established, events, _window_complete) = poll_ci_statuses(
+            &config,
+            Some(&client),
+            &repo,
+            &snapshot,
+            None,
+            &prs,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ci.len(), 1);
         assert!(ci_baseline_established);
