@@ -1261,8 +1261,12 @@ fn write_ci_baseline_atomic(baseline: &CIBaseline, path: &Path) -> Result<()> {
         file.write_all(payload.as_bytes())?;
         sync_file(&file)?;
         drop(file);
+        #[cfg(windows)]
+        {
+            let _ = fs::remove_file(path);
+        }
         fs::rename(&temp_path, path)?;
-        let dest = File::open(path)?;
+        let dest = OpenOptions::new().read(true).write(true).open(path)?;
         sync_file(&dest)?;
         drop(dest);
         if let Some(parent) = path.parent() {
