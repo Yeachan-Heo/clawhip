@@ -111,7 +111,9 @@ struct RepoCIBaseline {
     /// fetched window. Pinned against cap eviction so the live window —
     /// including an oversized fetched window (#317) — always survives merge
     /// and reload. Canonicalized, deduplicated, hard-capped at
-    /// [`MAX_CURRENT_WINDOW_IDS`]; superseded only by an epoch-unfenced
+    /// [`MAX_CURRENT_WINDOW_IDS_PER_SCOPE`] per scope; sibling scopes are
+    /// retained independently and are never evicted by a global union cap.
+    /// Superseded only by an epoch-unfenced
     /// writer whose pinned receipts are at least as recent, and never
     /// dropped by a fenced stale writer.
     #[serde(default)]
@@ -498,8 +500,11 @@ const MAX_BASELINE_RUNS_PER_REPO: usize = CI_PAGE_SIZE * MAX_CI_PAGES;
 // Pull-request inventory is fetched with the GitHub API's 100-item page cap
 // and is not paginated here. The aggregate CI window is therefore bounded by
 // 100 PR windows plus the direct push window, with two durable aliases per
-// snapshot. Keep the protection bound above that actual fetched scope.
-const MAX_CURRENT_WINDOW_IDS: usize = CI_PAGE_SIZE * MAX_CI_PAGES * (CI_PAGE_SIZE + 1) * 2;
+// A complete scope can contain every fetched check run for every paginated
+// pull request plus the direct push window. Bound each scope from that actual
+// fetch shape; never apply this bound to the union of independent scopes.
+const MAX_CURRENT_WINDOW_IDS_PER_SCOPE: usize =
+    (CI_PAGE_SIZE * MAX_CI_PAGES) * (CI_PAGE_SIZE * MAX_CI_PAGES + 1) * 2;
 const MAX_PENDING_SEND_ATTEMPTS: u32 = 3;
 const PENDING_RETRY_BACKOFF_SECS: u64 = 3_600;
 const ACK_RETENTION_SECS: u64 = 7 * 24 * 3_600;
@@ -614,7 +619,9 @@ impl TerminalRunRecord {
             let overlap = rec_checks
                 .iter()
                 .any(|identity| snap_checks.iter().any(|candidate| candidate == identity));
-            return overlap && run_attempt_or_one(self.run_attempt) == ci.run_attempt();
+            return overlap
+                && run_attempt_or_one(self.run_attempt) == ci.run_attempt()
+                && self.conclusion == ci.conclusion;
         }
         if !snap_checks.is_empty() || !rec_checks.is_empty() {
             return false;
@@ -684,7 +691,7 @@ fn snapshot_eviction_key(ci: &GitHubCISnapshot) -> (u8, String, u64, String) {
 
 /// Canonicalizes the pinned current-window identity set: only durable
 /// aliases (`run:` / `check:` prefixes), each stored once, order-stable by
-/// first appearance, hard-capped at [`MAX_CURRENT_WINDOW_IDS`]. Identities
+/// first appearance, hard-capped at [`MAX_CURRENT_WINDOW_IDS_PER_SCOPE`]. Identities
 /// arrive oldest-first (eviction-key order); when the bound trims, the
 /// OLDEST aliases drop so the newest fetched terminal runs — the ones still
 /// inside GitHub's fetch window — always stay protected. Fallback
@@ -698,7 +705,8 @@ fn canonicalize_current_window_ids(incoming: &[&GitHubCISnapshot]) -> Vec<String
 }
 
 /// Same canonical form for an already-pinned identity set (merge/load
-/// paths): deduplicated, order-stable, hard-capped keeping the newest.
+/// paths): deduplicated, order-stable, hard-capped keeping the newest within
+/// this one scope.
 fn canonicalize_current_window_ids_from(ids: &[String]) -> Vec<String> {
     cap_window_ids(canonical_window_identities(ids.iter().cloned()))
 }
@@ -718,7 +726,7 @@ fn canonical_window_identities(identities: impl Iterator<Item = String>) -> Vec<
 /// Applies the explicit window bound. Identities are oldest-first, so
 /// trimming drops from the front and the newest survive.
 fn cap_window_ids(mut ids: Vec<String>) -> Vec<String> {
-    let excess = ids.len().saturating_sub(MAX_CURRENT_WINDOW_IDS);
+    let excess = ids.len().saturating_sub(MAX_CURRENT_WINDOW_IDS_PER_SCOPE);
     ids.drain(..excess);
     ids
 }
@@ -759,16 +767,10 @@ fn canonicalize_loaded_window(repo_baseline: &mut RepoCIBaseline) {
             .into_iter()
             .flat_map(|ids| ids.iter().cloned())
     });
-    repo_baseline.current_window_ids = cap_window_ids(canonical_window_identities(ids));
-    let retained: std::collections::HashSet<&str> = repo_baseline
-        .current_window_ids
-        .iter()
-        .map(String::as_str)
-        .collect();
-    repo_baseline.current_window_ids_by_scope.retain(|_, ids| {
-        ids.retain(|id| retained.contains(id.as_str()));
-        !ids.is_empty()
-    });
+    // This union is an index for retention, not another bounded window. Each
+    // scope was bounded independently above; truncating the union would drop
+    // valid sibling-scope protection.
+    repo_baseline.current_window_ids = canonical_window_identities(ids);
     repo_baseline.current_window_generations.retain(|scope, _| {
         repo_baseline
             .current_window_ids_by_scope
@@ -906,7 +908,14 @@ impl CIBaseline {
         repo_path: &str,
         current: &HashMap<String, GitHubCISnapshot>,
     ) -> bool {
-        self.record_terminal_runs_filtered(repo_key, repo_path, repo_path, current, |_| true)
+        self.record_terminal_runs_filtered(
+            repo_key,
+            repo_path,
+            repo_path,
+            current,
+            (0, true),
+            |_| true,
+        )
     }
 
     fn record_terminal_runs_filtered(
@@ -915,6 +924,7 @@ impl CIBaseline {
         repo_path: &str,
         window_scope: &str,
         current: &HashMap<String, GitHubCISnapshot>,
+        window: (u64, bool),
         include: impl Fn(&GitHubCISnapshot) -> bool,
     ) -> bool {
         let mut incoming: Vec<&GitHubCISnapshot> = current
@@ -939,15 +949,28 @@ impl CIBaseline {
                 dirty = true;
             }
         }
-        let generation = next_window_generation(repo_baseline.window_generation);
-        repo_baseline.window_generation = generation;
-        repo_baseline.current_window_ids_by_scope.insert(
-            window_scope.to_string(),
-            canonicalize_current_window_ids(&incoming),
-        );
-        repo_baseline
-            .current_window_generations
-            .insert(window_scope.to_string(), generation);
+        if window.1 {
+            let generation = if window.0 == 0 {
+                next_window_generation(repo_baseline.window_generation)
+            } else {
+                window.0
+            };
+            let existing_generation = repo_baseline
+                .current_window_generations
+                .get(window_scope)
+                .copied()
+                .unwrap_or(0);
+            if generation >= existing_generation {
+                repo_baseline.window_generation = repo_baseline.window_generation.max(generation);
+                repo_baseline.current_window_ids_by_scope.insert(
+                    window_scope.to_string(),
+                    canonicalize_current_window_ids(&incoming),
+                );
+                repo_baseline
+                    .current_window_generations
+                    .insert(window_scope.to_string(), generation);
+            }
+        }
         canonicalize_loaded_window(repo_baseline);
         let keep_ids: std::collections::HashSet<String> =
             repo_baseline.current_window_ids.iter().cloned().collect();
@@ -963,7 +986,8 @@ fn terminal_records_same_run(left: &TerminalRunRecord, right: &TerminalRunRecord
         return left_checks
             .iter()
             .any(|identity| right_checks.iter().any(|candidate| candidate == identity))
-            && run_attempt_or_one(left.run_attempt) == run_attempt_or_one(right.run_attempt);
+            && run_attempt_or_one(left.run_attempt) == run_attempt_or_one(right.run_attempt)
+            && left.conclusion == right.conclusion;
     }
     let left_unique: Vec<&str> = left.unique_identities().collect();
     let right_unique: Vec<&str> = right.unique_identities().collect();
@@ -971,7 +995,8 @@ fn terminal_records_same_run(left: &TerminalRunRecord, right: &TerminalRunRecord
         return left_unique
             .iter()
             .any(|identity| right_unique.contains(identity))
-            && run_attempt_or_one(left.run_attempt) == run_attempt_or_one(right.run_attempt);
+            && run_attempt_or_one(left.run_attempt) == run_attempt_or_one(right.run_attempt)
+            && left.conclusion == right.conclusion;
     }
     left.identities
         .iter()
@@ -1960,6 +1985,12 @@ async fn poll_github(
         let repo_key = ci_baseline_repo_key(&snapshot, repo);
         let _ = ci_baseline.repo_baseline_mut(&repo_key, &repo.path);
         let repo_ci_baseline = ci_baseline.repos.get(&repo_key).cloned();
+        let fetch_generation = next_window_generation(
+            repo_ci_baseline
+                .as_ref()
+                .map(|baseline| baseline.window_generation)
+                .unwrap_or(0),
+        );
         let (ci, ci_baseline_established, ci_events, window_complete) = match poll_ci_statuses(
             config,
             github_client,
@@ -2000,6 +2031,7 @@ async fn poll_github(
             &repo.path,
             &repo.path,
             &ci,
+            (fetch_generation, window_complete),
             |snapshot| {
                 if previous_ci.is_none() || window_complete {
                     return true;
@@ -3965,16 +3997,16 @@ mod tests {
         let repo = &baseline.repos["/repo"];
         assert_eq!(repo.current_window_ids, vec!["run:77:2", "check:555"]);
 
-        let many = (0..(MAX_CURRENT_WINDOW_IDS as u64 + 60))
+        let many = (0..(MAX_CURRENT_WINDOW_IDS_PER_SCOPE as u64 + 60))
             .map(|id| format!("run:{id}"))
             .collect::<Vec<_>>();
         let bounded = canonicalize_current_window_ids_from(&many);
-        assert_eq!(bounded.len(), MAX_CURRENT_WINDOW_IDS);
+        assert_eq!(bounded.len(), MAX_CURRENT_WINDOW_IDS_PER_SCOPE);
         assert!(
             bounded.iter().all(|id| id.starts_with("run:")),
             "fallback identities must never be pinned"
         );
-        let pinned_newest = format!("run:{}", MAX_CURRENT_WINDOW_IDS as u64 + 59);
+        let pinned_newest = format!("run:{}", MAX_CURRENT_WINDOW_IDS_PER_SCOPE as u64 + 59);
         assert!(
             bounded.contains(&pinned_newest),
             "truncation must keep the newest window identities"
@@ -3985,7 +4017,7 @@ mod tests {
     fn issue_317_loaded_window_ids_are_rebounded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("github-ci-baseline.json");
-        let mut ids: Vec<String> = (0..(MAX_CURRENT_WINDOW_IDS + 25) as u64)
+        let mut ids: Vec<String> = (0..(MAX_CURRENT_WINDOW_IDS_PER_SCOPE + 25) as u64)
             .map(|id| format!("run:{id}"))
             .collect();
         ids.push(ids[0].clone());
@@ -4002,7 +4034,7 @@ mod tests {
         let repo = &loaded.repos["/repo"];
         assert_eq!(
             repo.current_window_ids.len(),
-            MAX_CURRENT_WINDOW_IDS,
+            MAX_CURRENT_WINDOW_IDS_PER_SCOPE,
             "load must re-bound an over-long pinned window"
         );
         let mut unique = std::collections::HashSet::new();
@@ -4014,9 +4046,85 @@ mod tests {
         );
         assert_eq!(
             repo.current_window_ids.last().unwrap(),
-            &format!("run:{}", MAX_CURRENT_WINDOW_IDS as u64 + 24),
+            &format!("run:{}", MAX_CURRENT_WINDOW_IDS_PER_SCOPE as u64 + 24),
             "the load bound must keep the newest pinned identities"
         );
+    }
+
+    #[test]
+    fn issue_317_large_sibling_scopes_keep_their_full_protected_union() {
+        let old_global_cap = CI_PAGE_SIZE * MAX_CI_PAGES * (CI_PAGE_SIZE + 1) * 2;
+        let scope_size = old_global_cap + 1;
+        let mut repo = RepoCIBaseline::default();
+        repo.current_window_ids_by_scope.insert(
+            "branch-a".into(),
+            (0..scope_size).map(|id| format!("run:a-{id}")).collect(),
+        );
+        repo.current_window_ids_by_scope.insert(
+            "branch-b".into(),
+            (0..scope_size).map(|id| format!("run:b-{id}")).collect(),
+        );
+        canonicalize_loaded_window(&mut repo);
+        assert_eq!(repo.current_window_ids.len(), scope_size * 2);
+        assert!(repo.current_window_ids.contains(&"run:a-0".to_string()));
+        assert!(repo.current_window_ids.contains(&"run:b-0".to_string()));
+    }
+
+    #[test]
+    fn issue_317_partial_restart_poll_preserves_authoritative_scope() {
+        let mut baseline = CIBaseline::default();
+        let first = run_snapshot(1, "CI", Some("success"), "main");
+        let second = run_snapshot(2, "CI", Some("failure"), "main");
+        baseline.record_terminal_runs("/repo", "/repo", &run_map(std::slice::from_ref(&first)));
+        let generation = baseline.repos["/repo"].window_generation + 1;
+        baseline.record_terminal_runs_filtered(
+            "/repo",
+            "/repo",
+            "/repo",
+            &run_map(&[second]),
+            (generation, false),
+            |_| true,
+        );
+        let ids = &baseline.repos["/repo"].current_window_ids_by_scope["/repo"];
+        assert!(ids.contains(&"run:1".to_string()));
+        assert!(!ids.contains(&"run:2".to_string()));
+    }
+
+    #[test]
+    fn issue_317_out_of_order_window_response_cannot_overwrite_newer_generation() {
+        let mut baseline = CIBaseline::default();
+        let fresh = run_snapshot(20, "CI", Some("success"), "main");
+        let stale = run_snapshot(10, "CI", Some("success"), "main");
+        baseline.record_terminal_runs_filtered(
+            "/repo",
+            "/repo",
+            "/repo",
+            &run_map(&[fresh]),
+            (20, true),
+            |_| true,
+        );
+        baseline.record_terminal_runs_filtered(
+            "/repo",
+            "/repo",
+            "/repo",
+            &run_map(&[stale]),
+            (10, true),
+            |_| true,
+        );
+        let ids = &baseline.repos["/repo"].current_window_ids_by_scope["/repo"];
+        assert!(ids.contains(&"run:20".to_string()));
+        assert!(!ids.contains(&"run:10".to_string()));
+    }
+
+    #[test]
+    fn issue_317_same_attempt_conclusion_change_is_not_suppressed_after_merge() {
+        let success = check_job(42, 7, "CI", "success");
+        let mut failure = check_job(42, 7, "CI", "failure");
+        failure.run_attempt = success.run_attempt;
+        let success_record = TerminalRunRecord::from_snapshot(&success);
+        let failure_record = TerminalRunRecord::from_snapshot(&failure);
+        assert!(!success_record.matches_snapshot(&failure));
+        assert!(!terminal_records_same_run(&success_record, &failure_record));
     }
 
     #[test]
