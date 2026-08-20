@@ -661,6 +661,34 @@ fn cap_repo_baseline(repo_baseline: &mut RepoCIBaseline) -> bool {
     true
 }
 
+fn cap_repo_baseline_keeping(
+    repo_baseline: &mut RepoCIBaseline,
+    keep: &[&GitHubCISnapshot],
+) -> bool {
+    if repo_baseline.terminal_runs.len() <= MAX_BASELINE_RUNS_PER_REPO {
+        return false;
+    }
+    let keep_ids: std::collections::HashSet<String> =
+        keep.iter().flat_map(|ci| ci.unique_identities()).collect();
+    let mut records: Vec<TerminalRunRecord> = repo_baseline.terminal_runs.drain(..).collect();
+    records.sort_by_key(|record| record.eviction_key());
+    let excess = records.len().saturating_sub(MAX_BASELINE_RUNS_PER_REPO);
+    let mut kept = VecDeque::new();
+    let mut dropped = 0_usize;
+    for record in records {
+        let protected = record
+            .unique_identities()
+            .any(|identity| keep_ids.contains(identity));
+        if !protected && dropped < excess {
+            dropped += 1;
+            continue;
+        }
+        kept.push_back(record);
+    }
+    repo_baseline.terminal_runs = kept;
+    dropped > 0
+}
+
 #[cfg(test)]
 impl RepoCIBaseline {
     fn contains_identity(&self, identity: &str) -> bool {
@@ -775,7 +803,7 @@ impl CIBaseline {
 
         let repo_baseline = self.repo_baseline_mut(repo_key, repo_path);
         let mut dirty = false;
-        for ci in incoming {
+        for ci in &incoming {
             if let Some(existing) = repo_baseline
                 .terminal_runs
                 .iter_mut()
@@ -789,7 +817,7 @@ impl CIBaseline {
                 dirty = true;
             }
         }
-        dirty |= cap_repo_baseline(repo_baseline);
+        dirty |= cap_repo_baseline_keeping(repo_baseline, &incoming);
         dirty
     }
 }
@@ -3527,15 +3555,22 @@ mod tests {
     }
 
     #[test]
-    fn issue_317_single_poll_evicts_oldest_github_runs_first() {
-        let mut runs = Vec::new();
-        for id in 0..(MAX_BASELINE_RUNS_PER_REPO + 20) {
+    fn issue_317_later_poll_evicts_oldest_unprotected_github_runs() {
+        let mut first = Vec::new();
+        for id in 0..MAX_BASELINE_RUNS_PER_REPO {
             let mut run = run_snapshot(id as u64, "CI", Some("success"), "main");
             run.created_at = Some(format!("2026-01-01T00:{:02}:{:02}Z", id / 60, id % 60));
-            runs.push(run);
+            first.push(run);
         }
         let mut ci_baseline = CIBaseline::default();
-        ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&runs));
+        ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&first));
+        let mut later = Vec::new();
+        for id in MAX_BASELINE_RUNS_PER_REPO..(MAX_BASELINE_RUNS_PER_REPO + 20) {
+            let mut run = run_snapshot(id as u64, "CI", Some("success"), "main");
+            run.created_at = Some(format!("2026-01-01T01:{:02}:{:02}Z", id / 60, id % 60));
+            later.push(run);
+        }
+        ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&later));
         let repo = &ci_baseline.repos["/repo"];
         assert_eq!(repo.terminal_runs.len(), MAX_BASELINE_RUNS_PER_REPO);
         assert!(!repo.contains_identity("run:0"));
