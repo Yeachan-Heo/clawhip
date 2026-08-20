@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,6 +18,10 @@ use crate::events::IncomingEvent;
 use crate::source::Source;
 use crate::source::git::{GitSnapshot, repo_display_name, snapshot_git_repo};
 use crate::telemetry;
+
+thread_local! {
+    static SYNC_FILE_CALLS: Cell<u32> = const { Cell::new(0) };
+}
 
 pub struct GitHubSource {
     config: Arc<AppConfig>,
@@ -87,10 +93,18 @@ struct RepoCIBaseline {
     /// crash between the write and the channel send.
     #[serde(default)]
     pending: Vec<PendingCiDelivery>,
-    /// Tombstones for ACKed deliveries so a stale concurrent merge cannot
-    /// restore a receipt that was already durably removed.
+    /// Alias-aware ACK records. Compaction retires stale writers via
+    /// `min_writer_epoch` instead of dropping tombstones while they can
+    /// still be merged back in.
+    #[serde(default, deserialize_with = "deserialize_acked")]
+    acked: VecDeque<AckedDelivery>,
+    /// Exhausted outbox entries that will not be retried.
     #[serde(default)]
-    acked: VecDeque<String>,
+    dead_letter: VecDeque<PendingCiDelivery>,
+    #[serde(default)]
+    epoch: u64,
+    #[serde(default)]
+    min_writer_epoch: u64,
 }
 
 /// Durable receipt for one terminal run. Identities are aliases (run-id,
@@ -127,6 +141,74 @@ struct PendingCiDelivery {
     send_attempts: u32,
     #[serde(default)]
     last_sent_unix: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct AckedDelivery {
+    identities: Vec<String>,
+    kind: String,
+    conclusion: Option<String>,
+    run_id: Option<String>,
+    #[serde(default = "default_run_attempt")]
+    run_attempt: u32,
+    workflow: String,
+    sha: String,
+    pr_number: Option<u64>,
+    #[serde(default)]
+    acked_unix: u64,
+}
+
+impl AckedDelivery {
+    fn from_pending(pending: &PendingCiDelivery, now: u64) -> Self {
+        Self {
+            identities: pending.identities.clone(),
+            kind: pending.kind.clone(),
+            conclusion: pending.conclusion.clone(),
+            run_id: pending.run_id.clone(),
+            run_attempt: run_attempt_or_one(pending.run_attempt),
+            workflow: pending.workflow.clone(),
+            sha: pending.sha.clone(),
+            pr_number: pending.pr_number,
+            acked_unix: now,
+        }
+    }
+
+    fn matches_pending(&self, pending: &PendingCiDelivery) -> bool {
+        if self.kind != pending.kind || self.conclusion != pending.conclusion {
+            return false;
+        }
+        let self_checks = pending_check_identities(&self.identities);
+        let pending_checks = pending_check_identities(&pending.identities);
+        if !self_checks.is_empty() && !pending_checks.is_empty() {
+            return self_checks
+                .iter()
+                .any(|identity| pending_checks.iter().any(|candidate| candidate == identity));
+        }
+        let run_match = self.run_id.is_some()
+            && self.run_id == pending.run_id
+            && run_attempt_or_one(self.run_attempt) == run_attempt_or_one(pending.run_attempt)
+            && self.workflow == pending.workflow;
+        if run_match {
+            return true;
+        }
+        self.sha == pending.sha
+            && self.workflow == pending.workflow
+            && self.pr_number == pending.pr_number
+    }
+
+    fn merge_aliases(&mut self, pending: &PendingCiDelivery) {
+        for identity in &pending.identities {
+            if !self.identities.iter().any(|existing| existing == identity) {
+                self.identities.push(identity.clone());
+            }
+        }
+        if self.run_id.is_none() {
+            self.run_id = pending.run_id.clone();
+        }
+        if self.sha.is_empty() {
+            self.sha = pending.sha.clone();
+        }
+    }
 }
 
 impl PendingCiDelivery {
@@ -225,26 +307,6 @@ impl PendingCiDelivery {
             && self.pr_number == other.pr_number
     }
 
-    fn delivery_key(&self) -> String {
-        let outcome = format!("{}:{}", self.kind, self.conclusion.as_deref().unwrap_or(""));
-        if let Some(check) = pending_check_identities(&self.identities).first() {
-            return format!("{check}:{outcome}");
-        }
-        if let Some(run_id) = &self.run_id {
-            return format!(
-                "run:{run_id}:{}:{}:{outcome}",
-                run_attempt_or_one(self.run_attempt),
-                self.workflow
-            );
-        }
-        format!(
-            "fallback:{}:{}:{}:{outcome}",
-            self.sha,
-            self.workflow,
-            self.pr_number.unwrap_or(0)
-        )
-    }
-
     fn into_event(self) -> IncomingEvent {
         let mut event = IncomingEvent::github_ci(
             &self.kind,
@@ -306,11 +368,29 @@ where
     Ok(raw.into_iter().map(TerminalRunRecord::from).collect())
 }
 
+fn deserialize_acked<'de, D>(
+    deserializer: D,
+) -> std::result::Result<VecDeque<AckedDelivery>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(items) = value.as_array() else {
+        return Ok(VecDeque::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|item| serde_json::from_value::<AckedDelivery>(item.clone()).ok())
+        .collect())
+}
+
 const MAX_BASELINE_RUNS_PER_REPO: usize = 256;
 const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
 const MAX_PENDING_SEND_ATTEMPTS: u32 = 3;
 const PENDING_RETRY_BACKOFF_SECS: u64 = 3_600;
+const ACK_RETENTION_SECS: u64 = 7 * 24 * 3_600;
+const MAX_DEAD_LETTER: usize = 64;
 
 /// Beside the cron state file, matching `tmux-watch-registry.json` and
 /// `discord-watch-state.json`.
@@ -595,6 +675,9 @@ impl CIBaseline {
             .collect();
         let repo_baseline = self.repo_baseline_mut(repo_key, repo_path);
         for delivery in deliveries {
+            if pending_is_acked(repo_baseline, &delivery) {
+                continue;
+            }
             if !repo_baseline
                 .pending
                 .iter()
@@ -666,14 +749,45 @@ fn terminal_records_same_run(left: &TerminalRunRecord, right: &TerminalRunRecord
 }
 
 fn pending_is_acked(repo: &RepoCIBaseline, delivery: &PendingCiDelivery) -> bool {
-    let key = delivery.delivery_key();
-    repo.acked.iter().any(|acked| acked == &key)
+    repo.acked
+        .iter()
+        .any(|acked| acked.matches_pending(delivery))
 }
 
 fn record_acked(repo: &mut RepoCIBaseline, delivery: &PendingCiDelivery) {
-    let key = delivery.delivery_key();
-    if !repo.acked.iter().any(|acked| acked == &key) {
-        repo.acked.push_back(key);
+    if let Some(existing) = repo
+        .acked
+        .iter_mut()
+        .find(|acked| acked.matches_pending(delivery))
+    {
+        existing.merge_aliases(delivery);
+        return;
+    }
+    repo.acked
+        .push_back(AckedDelivery::from_pending(delivery, unix_now()));
+}
+
+fn retire_exhausted_pending(repo: &mut RepoCIBaseline) {
+    let mut still_pending = Vec::new();
+    for pending in repo.pending.drain(..) {
+        if pending.send_attempts >= MAX_PENDING_SEND_ATTEMPTS {
+            repo.dead_letter.push_back(pending);
+        } else {
+            still_pending.push(pending);
+        }
+    }
+    repo.pending = still_pending;
+    while repo.dead_letter.len() > MAX_DEAD_LETTER {
+        repo.dead_letter.pop_front();
+    }
+}
+
+fn compact_acked(repo: &mut RepoCIBaseline, now: u64) {
+    let before = repo.acked.len();
+    repo.acked
+        .retain(|acked| now.saturating_sub(acked.acked_unix) < ACK_RETENTION_SECS);
+    if repo.acked.len() < before {
+        repo.min_writer_epoch = repo.min_writer_epoch.max(repo.epoch);
     }
 }
 
@@ -700,30 +814,61 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
         }
     }
     cap_repo_baseline(dest);
-    for key in source.acked {
-        if !dest.acked.iter().any(|acked| acked == &key) {
-            dest.acked.push_back(key);
+    dest.epoch = dest.epoch.max(source.epoch);
+    dest.min_writer_epoch = dest.min_writer_epoch.max(source.min_writer_epoch);
+    for acked in source.acked {
+        if let Some(existing) = dest.acked.iter_mut().find(|candidate| {
+            candidate.kind == acked.kind
+                && candidate.conclusion == acked.conclusion
+                && (pending_check_identities(&candidate.identities)
+                    .iter()
+                    .any(|identity| pending_check_identities(&acked.identities).contains(identity))
+                    || (candidate.run_id.is_some()
+                        && candidate.run_id == acked.run_id
+                        && candidate.workflow == acked.workflow))
+        }) {
+            for identity in acked.identities {
+                if !existing.identities.iter().any(|item| item == &identity) {
+                    existing.identities.push(identity);
+                }
+            }
+        } else {
+            dest.acked.push_back(acked);
         }
     }
-    for delivery in source.pending {
-        if pending_is_acked(dest, &delivery) {
-            continue;
-        }
-        if let Some(existing) = dest
-            .pending
-            .iter_mut()
-            .find(|existing| existing.same_event(&delivery))
+    for dead in source.dead_letter {
+        if !dest
+            .dead_letter
+            .iter()
+            .any(|existing| existing.same_event(&dead))
         {
-            merge_pending_retry_state(existing, &delivery);
-        } else {
-            dest.pending.push(delivery);
+            dest.dead_letter.push_back(dead);
+        }
+    }
+    while dest.dead_letter.len() > MAX_DEAD_LETTER {
+        dest.dead_letter.pop_front();
+    }
+    let source_retired = source.epoch < dest.min_writer_epoch;
+    if !source_retired {
+        for delivery in source.pending {
+            if pending_is_acked(dest, &delivery) {
+                continue;
+            }
+            if let Some(existing) = dest
+                .pending
+                .iter_mut()
+                .find(|existing| existing.same_event(&delivery))
+            {
+                merge_pending_retry_state(existing, &delivery);
+            } else {
+                dest.pending.push(delivery);
+            }
         }
     }
     let acked = dest.acked.clone();
-    dest.pending.retain(|pending| {
-        let key = pending.delivery_key();
-        !acked.iter().any(|item| item == &key)
-    });
+    dest.pending
+        .retain(|pending| !acked.iter().any(|item| item.matches_pending(pending)));
+    retire_exhausted_pending(dest);
 }
 
 fn load_ci_baseline(path: Option<&Path>) -> CIBaseline {
@@ -777,6 +922,9 @@ impl Drop for BaselineLock {
     }
 }
 
+/// Kernel advisory lock is bound to the opened file descriptor. Replacing
+/// the lock path (symlink/rename) after the FD is held cannot steal the
+/// lock. Leftover directory locks fail closed and are not deleted.
 fn acquire_baseline_lock(path: &Path) -> Result<BaselineLock> {
     let lock_path = path.with_extension("json.lock");
     if let Some(parent) = path.parent() {
@@ -878,6 +1026,27 @@ fn merge_pending_retry_state(dest: &mut PendingCiDelivery, source: &PendingCiDel
     };
 }
 
+fn sync_file(file: &File) -> Result<()> {
+    #[cfg(test)]
+    SYNC_FILE_CALLS.with(|count| count.set(count.get() + 1));
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> Result<()> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_directory(_dir: &Path) -> Result<()> {
+    // NTFS treats replace-on-rename as durable once the destination file
+    // contents have been flushed. Directory metadata is not separately
+    // fsync'd here.
+    Ok(())
+}
+
 fn write_ci_baseline_atomic(baseline: &CIBaseline, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -898,15 +1067,24 @@ fn write_ci_baseline_atomic(baseline: &CIBaseline, path: &Path) -> Result<()> {
         Some(parent) => parent.join(temp_name),
         None => PathBuf::from(temp_name),
     };
-    if let Err(error) = fs::write(&temp_path, payload.as_bytes()) {
+    let write_result = (|| -> Result<()> {
+        let mut file = File::create(&temp_path)?;
+        file.write_all(payload.as_bytes())?;
+        sync_file(&file)?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        let dest = File::open(path)?;
+        sync_file(&dest)?;
+        drop(dest);
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
         let _ = fs::remove_file(&temp_path);
-        return Err(error.into());
     }
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error.into());
-    }
-    Ok(())
+    write_result
 }
 
 fn commit_ci_baseline(path: Option<&Path>, local: &CIBaseline) -> Result<CIBaseline> {
@@ -916,6 +1094,12 @@ fn commit_ci_baseline(path: Option<&Path>, local: &CIBaseline) -> Result<CIBasel
     let _lock = acquire_baseline_lock(path)?;
     let mut disk = load_ci_baseline(Some(path));
     merge_ci_baseline(&mut disk, local);
+    let now = unix_now();
+    for repo in disk.repos.values_mut() {
+        repo.epoch = repo.epoch.saturating_add(1);
+        compact_acked(repo, now);
+        retire_exhausted_pending(repo);
+    }
     write_ci_baseline_atomic(&disk, path)?;
     Ok(disk)
 }
@@ -923,6 +1107,33 @@ fn commit_ci_baseline(path: Option<&Path>, local: &CIBaseline) -> Result<CIBasel
 #[cfg(test)]
 fn save_ci_baseline(baseline: &CIBaseline, path: Option<&Path>) -> Result<()> {
     commit_ci_baseline(path, baseline).map(|_| ())
+}
+
+async fn send_then_ack_prefix(
+    tx: &mpsc::Sender<IncomingEvent>,
+    ci_baseline: &mut CIBaseline,
+    path: Option<&Path>,
+    events: Vec<IncomingEvent>,
+    delivered: &[PendingCiDelivery],
+) -> Result<()> {
+    let mut sent = Vec::new();
+    let mut send_error = None;
+    for (event, delivery) in events.into_iter().zip(delivered.iter()) {
+        match send_event(tx, event).await {
+            Ok(()) => sent.push(delivery.clone()),
+            Err(error) => {
+                send_error = Some(error);
+                break;
+            }
+        }
+    }
+    if !sent.is_empty() {
+        ack_pending_deliveries(ci_baseline, path, &sent)?;
+    }
+    if let Some(error) = send_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn drain_pending_outbox(
@@ -1373,15 +1584,7 @@ async fn poll_github(
                 );
                 continue;
             }
-            for event in ci_events {
-                send_event(tx, event).await?;
-            }
-            if let Err(error) = ack_pending_deliveries(ci_baseline, ci_baseline_path, &delivered) {
-                eprintln!(
-                    "clawhip source github CI baseline outbox ack failed for {}: {error}",
-                    repo.path
-                );
-            }
+            send_then_ack_prefix(tx, ci_baseline, ci_baseline_path, ci_events, &delivered).await?;
         }
 
         state.insert(
@@ -2371,9 +2574,8 @@ fn classify_ci_event_kind(status: &str, conclusion: Option<&str>) -> &'static st
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
-    use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -3575,10 +3777,34 @@ mod tests {
         durable.enqueue_pending("/repo", "/repo", &events, &current);
         save_ci_baseline(&durable, Some(&path)).unwrap();
 
-        let mut proc1 = load_ci_baseline(Some(&path));
-        let mut proc2 = load_ci_baseline(Some(&path));
-        ack_pending_deliveries(&mut proc1, Some(&path), std::slice::from_ref(&pending_a)).unwrap();
-        ack_pending_deliveries(&mut proc2, Some(&path), std::slice::from_ref(&pending_b)).unwrap();
+        let start = Arc::new(Barrier::new(2));
+        thread::scope(|scope| {
+            let path_a = path.clone();
+            let pending_one = pending_a.clone();
+            let start_a = start.clone();
+            scope.spawn(move || {
+                let mut proc1 = load_ci_baseline(Some(&path_a));
+                start_a.wait();
+                ack_pending_deliveries(
+                    &mut proc1,
+                    Some(&path_a),
+                    std::slice::from_ref(&pending_one),
+                )
+                .unwrap();
+            });
+            let path_b = path.clone();
+            let pending_two = pending_b.clone();
+            scope.spawn(move || {
+                let mut proc2 = load_ci_baseline(Some(&path_b));
+                start.wait();
+                ack_pending_deliveries(
+                    &mut proc2,
+                    Some(&path_b),
+                    std::slice::from_ref(&pending_two),
+                )
+                .unwrap();
+            });
+        });
 
         let restarted = load_ci_baseline(Some(&path));
         assert!(
@@ -3625,6 +3851,7 @@ mod tests {
         let overlapping = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(AtomicUsize::new(0));
         let errors = Arc::new(Mutex::new(Vec::new()));
+        let start = Arc::new(Barrier::new(2));
 
         thread::scope(|scope| {
             for _ in 0..2 {
@@ -3632,17 +3859,21 @@ mod tests {
                 let current = current.clone();
                 let errors = errors.clone();
                 let path = path.clone();
-                scope.spawn(move || match acquire_baseline_lock(&path) {
-                    Ok(lock) => {
-                        current.fetch_add(1, Ordering::SeqCst);
-                        thread::sleep(Duration::from_millis(30));
-                        if current.load(Ordering::SeqCst) > 1 {
-                            overlapping.fetch_add(1, Ordering::SeqCst);
+                let start = start.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    match acquire_baseline_lock(&path) {
+                        Ok(lock) => {
+                            current.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(30));
+                            if current.load(Ordering::SeqCst) > 1 {
+                                overlapping.fetch_add(1, Ordering::SeqCst);
+                            }
+                            current.fetch_sub(1, Ordering::SeqCst);
+                            drop(lock);
                         }
-                        current.fetch_sub(1, Ordering::SeqCst);
-                        drop(lock);
+                        Err(error) => errors.lock().unwrap().push(error.to_string()),
                     }
-                    Err(error) => errors.lock().unwrap().push(error.to_string()),
                 });
             }
         });
@@ -3657,6 +3888,177 @@ mod tests {
             0,
             "advisory lock must serialize critical sections"
         );
+    }
+
+    #[test]
+    fn issue_317_ack_covers_check_to_run_and_fallback_drift() {
+        let check = check_job(4242, 11, "CI", "success");
+        let current = run_map(std::slice::from_ref(&check));
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &current,
+            None,
+        );
+        let mut repo = RepoCIBaseline::default();
+        let pending_check = PendingCiDelivery::from_event(&events[0], check.identities());
+        record_acked(&mut repo, &pending_check);
+
+        let mut run_only = pending_check.clone();
+        run_only
+            .identities
+            .retain(|identity| identity.starts_with("run:"));
+        assert!(
+            pending_is_acked(&repo, &run_only),
+            "check-form ACK must cover later run-only representation"
+        );
+
+        let mut fallback_only = pending_check.clone();
+        fallback_only
+            .identities
+            .retain(|identity| !identity.starts_with("run:") && !identity.starts_with("check:"));
+        fallback_only.run_id = None;
+        assert!(
+            pending_is_acked(&repo, &fallback_only),
+            "check-form ACK must cover later fallback representation"
+        );
+
+        let mut dest = CIBaseline::default();
+        dest.repos.insert("/repo".into(), repo);
+        dest.enqueue_pending("/repo", "/repo", &events, &current);
+        assert!(
+            dest.repos["/repo"].pending.is_empty(),
+            "acked check delivery must not re-enqueue as run/fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_317_partial_send_acks_only_successful_prefix() {
+        let lint = check_job(4242, 11, "lint", "success");
+        let test = check_job(4242, 22, "test", "failure");
+        let current = run_map(&[lint.clone(), test.clone()]);
+        let mut events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &current,
+            None,
+        );
+        events.sort_by(|left, right| {
+            left.payload["workflow"]
+                .as_str()
+                .cmp(&right.payload["workflow"].as_str())
+        });
+        let delivered: Vec<_> = events
+            .iter()
+            .map(|event| {
+                let identities = previous_snapshot_for_event(&current, event)
+                    .map(GitHubCISnapshot::identities)
+                    .unwrap_or_default();
+                PendingCiDelivery::from_event(event, identities)
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut baseline = CIBaseline::default();
+        baseline.enqueue_pending("/repo", "/repo", &events, &current);
+        save_ci_baseline(&baseline, Some(&path)).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let recv = tokio::spawn(async move {
+            let first = rx.recv().await;
+            drop(rx);
+            first
+        });
+        let mut live = load_ci_baseline(Some(&path));
+        let result = send_then_ack_prefix(&tx, &mut live, Some(&path), events, &delivered).await;
+        assert!(result.is_err(), "closed receiver must fail the second send");
+        let _ = recv.await;
+        let restarted = load_ci_baseline(Some(&path));
+        let pending = &restarted.repos["/repo"].pending;
+        assert_eq!(pending.len(), 1, "unsent B must remain pending");
+        assert!(pending_is_acked(&restarted.repos["/repo"], &delivered[0]));
+        assert!(!pending_is_acked(&restarted.repos["/repo"], &delivered[1]));
+    }
+
+    #[test]
+    fn issue_317_exhausted_pending_is_dead_lettered_and_bounded() {
+        let mut repo = RepoCIBaseline::default();
+        for id in 0..(MAX_DEAD_LETTER + 8) {
+            let job = check_job(9, id as u64, "later", "failure");
+            let mut pending = PendingCiDelivery::from_event(
+                &collect_ci_events(
+                    &GitRepoMonitor::default(),
+                    "org/repo",
+                    true,
+                    &HashMap::new(),
+                    &run_map(std::slice::from_ref(&job)),
+                    None,
+                )[0],
+                job.identities(),
+            );
+            pending.send_attempts = MAX_PENDING_SEND_ATTEMPTS;
+            repo.pending.push(pending);
+        }
+        retire_exhausted_pending(&mut repo);
+        assert!(repo.pending.is_empty());
+        assert_eq!(repo.dead_letter.len(), MAX_DEAD_LETTER);
+    }
+
+    #[test]
+    fn issue_317_ack_compaction_retires_stale_writers() {
+        let job = check_job(7, 1, "CI", "success");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&job)),
+            None,
+        );
+        let pending = PendingCiDelivery::from_event(&events[0], job.identities());
+        let mut dest = RepoCIBaseline {
+            epoch: 10,
+            ..RepoCIBaseline::default()
+        };
+        record_acked(&mut dest, &pending);
+        dest.acked[0].acked_unix = 0;
+        compact_acked(&mut dest, ACK_RETENTION_SECS + 1);
+        assert!(dest.acked.is_empty());
+        assert_eq!(dest.min_writer_epoch, 10);
+
+        let mut stale = RepoCIBaseline {
+            epoch: 3,
+            ..RepoCIBaseline::default()
+        };
+        stale.pending.push(pending.clone());
+        merge_repo_baseline(&mut dest, stale);
+        assert!(
+            dest.pending.is_empty(),
+            "retired writer must not restore pending after ACK compaction"
+        );
+    }
+
+    #[test]
+    fn issue_317_baseline_write_flushes_file_data() {
+        SYNC_FILE_CALLS.with(|count| count.set(0));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut baseline = CIBaseline::default();
+        baseline
+            .repos
+            .insert("/repo".into(), RepoCIBaseline::default());
+        write_ci_baseline_atomic(&baseline, &path).unwrap();
+        let calls = SYNC_FILE_CALLS.with(|count| count.get());
+        assert!(
+            calls >= 2,
+            "temp file and destination file must be fsync'd, got {calls}"
+        );
+        let loaded = load_ci_baseline(Some(&path));
+        assert!(loaded.repos.contains_key("/repo"));
     }
 
     #[test]
