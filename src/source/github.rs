@@ -230,6 +230,7 @@ impl AckedDelivery {
         self.sha == pending.sha
             && self.workflow == pending.workflow
             && self.pr_number == pending.pr_number
+            && run_attempt_or_one(self.run_attempt) == run_attempt_or_one(pending.run_attempt)
     }
 
     fn merge_aliases(&mut self, pending: &PendingCiDelivery) {
@@ -355,6 +356,7 @@ impl PendingCiDelivery {
         self.sha == other.sha
             && self.workflow == other.workflow
             && self.pr_number == other.pr_number
+            && run_attempt_or_one(self.run_attempt) == run_attempt_or_one(other.run_attempt)
     }
 
     fn into_event(self) -> IncomingEvent {
@@ -504,25 +506,6 @@ fn run_identity(run_id: &str, attempt: u32) -> String {
     }
 }
 
-fn parse_run_identity(identity: &str) -> Option<(String, u32)> {
-    let rest = identity.strip_prefix("run:")?;
-    if rest.is_empty() {
-        return None;
-    }
-    if rest.matches(':').count() == 1
-        && let Some((id, attempt)) = rest.split_once(':')
-        && !id.is_empty()
-        && let Ok(attempt) = attempt.parse::<u32>()
-        && attempt >= 1
-    {
-        return Some((id.to_string(), attempt));
-    }
-    if rest.contains(':') {
-        return None;
-    }
-    Some((rest.to_string(), 1))
-}
-
 impl TerminalRunRecord {
     fn from_snapshot(ci: &GitHubCISnapshot) -> Self {
         Self {
@@ -574,19 +557,16 @@ impl TerminalRunRecord {
                 .any(|identity| snap_checks.iter().any(|candidate| candidate == identity));
             return overlap && run_attempt_or_one(self.run_attempt) == ci.run_attempt();
         }
+        if !snap_checks.is_empty() || !rec_checks.is_empty() {
+            return false;
+        }
         let unique = ci.unique_identities();
         if unique
             .iter()
             .any(|identity| self.contains_identity(identity))
         {
-            return run_attempt_or_one(self.run_attempt) == ci.run_attempt();
-        }
-        for identity in &self.identities {
-            if identity_matches_snapshot(identity, ci)
-                && (unique.is_empty() || self.unique_identities().next().is_none())
-            {
-                return true;
-            }
+            return run_attempt_or_one(self.run_attempt) == ci.run_attempt()
+                && self.conclusion == ci.conclusion;
         }
         false
     }
@@ -624,24 +604,6 @@ impl TerminalRunRecord {
         let ident = self.identities.first().cloned().unwrap_or_default();
         (created_rank, created, run_num, ident)
     }
-}
-
-fn identity_matches_snapshot(identity: &str, ci: &GitHubCISnapshot) -> bool {
-    if ci
-        .identities()
-        .iter()
-        .any(|candidate| candidate == identity)
-    {
-        return true;
-    }
-    let key = ci.dedupe_key();
-    if identity == key {
-        return true;
-    }
-    if let Some((run_id, attempt)) = parse_run_identity(identity) {
-        return ci.run_id.as_deref() == Some(run_id.as_str()) && ci.run_attempt() == attempt;
-    }
-    false
 }
 
 fn repo_ci_baseline_is_suppressed(
@@ -1187,6 +1149,37 @@ unsafe extern "system" {
     ) -> i32;
     #[link_name = "GetLastError"]
     fn get_last_error() -> u32;
+    #[link_name = "MoveFileExW"]
+    fn move_file_ex_w(existing_file_name: *const u16, new_file_name: *const u16, flags: u32)
+    -> i32;
+}
+
+#[cfg(windows)]
+fn replace_file_windows(from: &Path, to: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let from_w: Vec<u16> = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to_w: Vec<u16> = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        if move_file_ex_w(
+            from_w.as_ptr(),
+            to_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
 }
 
 fn unix_now() -> u64 {
@@ -1262,9 +1255,8 @@ fn write_ci_baseline_atomic(baseline: &CIBaseline, path: &Path) -> Result<()> {
         sync_file(&file)?;
         drop(file);
         #[cfg(windows)]
-        {
-            let _ = fs::remove_file(path);
-        }
+        replace_file_windows(&temp_path, path)?;
+        #[cfg(not(windows))]
         fs::rename(&temp_path, path)?;
         let dest = OpenOptions::new().read(true).write(true).open(path)?;
         sync_file(&dest)?;
@@ -1316,6 +1308,9 @@ async fn send_then_ack_prefix(
             std::slice::from_ref(delivery),
             unix_now(),
         )?;
+        if !outbox_contains(ci_baseline, delivery) {
+            continue;
+        }
         match send_event(tx, event).await {
             Ok(()) => {
                 ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(delivery))?;
@@ -1349,6 +1344,9 @@ async fn drain_pending_outbox(
             eprintln!("clawhip source github CI baseline outbox attempt persist failed");
             return Ok(());
         }
+        if !outbox_contains(ci_baseline, &delivery) {
+            continue;
+        }
         if send_event(tx, delivery.clone().into_event()).await.is_err() {
             dead_letter_unsent_final_attempts(ci_baseline, std::slice::from_ref(&delivery));
             let _ = commit_ci_baseline(path, ci_baseline);
@@ -1361,6 +1359,14 @@ async fn drain_pending_outbox(
         }
     }
     Ok(())
+}
+
+fn outbox_contains(ci_baseline: &CIBaseline, delivery: &PendingCiDelivery) -> bool {
+    ci_baseline.repos.values().any(|repo| {
+        repo.pending
+            .iter()
+            .any(|pending| pending.same_event(delivery) && pending.repo_name == delivery.repo_name)
+    })
 }
 
 fn persist_pending_send_attempts(
@@ -1459,14 +1465,25 @@ fn merge_incomplete_ci(
 }
 
 fn snapshots_same_run(left: &GitHubCISnapshot, right: &GitHubCISnapshot) -> bool {
-    let left_unique = left.unique_identities();
-    let right_unique = right.unique_identities();
-    if !left_unique.is_empty()
-        && left_unique
+    let left_ids = left.unique_identities();
+    let right_ids = right.unique_identities();
+    let left_checks = pending_check_identities(&left_ids);
+    let right_checks = pending_check_identities(&right_ids);
+    if !left_checks.is_empty() && !right_checks.is_empty() {
+        return left_checks
             .iter()
-            .any(|identity| right_unique.iter().any(|candidate| candidate == identity))
+            .any(|identity| right_checks.iter().any(|candidate| candidate == identity))
+            && left.run_attempt() == right.run_attempt();
+    }
+    if !left_checks.is_empty() || !right_checks.is_empty() {
+        return false;
+    }
+    if !left_ids.is_empty()
+        && left_ids
+            .iter()
+            .any(|identity| right_ids.iter().any(|candidate| candidate == identity))
     {
-        return true;
+        return left.run_attempt() == right.run_attempt();
     }
     left.dedupe_key() == right.dedupe_key()
 }
@@ -2018,7 +2035,15 @@ fn previous_snapshot_for_event<'a>(
         .unwrap_or(1);
     previous.values().find(|ci| {
         if let Some(check_run_id) = check_run_id {
-            return ci.check_run_id.as_deref() == Some(check_run_id);
+            if ci.check_run_id.as_deref() != Some(check_run_id) {
+                return false;
+            }
+            return match (run_id, ci.run_id.as_deref()) {
+                (Some(event_run), Some(ci_run)) => {
+                    ci_run == event_run && ci.run_attempt() == run_attempt_or_one(run_attempt)
+                }
+                _ => true,
+            };
         }
         if ci.check_run_id.is_some() {
             return false;
@@ -2033,6 +2058,7 @@ fn previous_snapshot_for_event<'a>(
                     .get("sha")
                     .and_then(|value| value.as_str())
                     .unwrap_or_default()
+            && ci.run_attempt() == run_attempt_or_one(run_attempt)
     })
 }
 
@@ -2143,16 +2169,29 @@ fn previous_snapshot<'a>(
     ci: &GitHubCISnapshot,
 ) -> Option<&'a GitHubCISnapshot> {
     if let Some(old) = previous.get(&ci.dedupe_key()) {
-        return Some(old);
+        let same_attempt = old.run_attempt() == ci.run_attempt()
+            && (old.run_id.is_none() || ci.run_id.is_none() || old.run_id == ci.run_id);
+        if same_attempt {
+            return Some(old);
+        }
     }
     let unique = ci.unique_identities();
     if unique.is_empty() {
         return None;
     }
     previous.values().find(|old| {
-        old.unique_identities()
+        let old_ids = old.unique_identities();
+        let old_checks = pending_check_identities(&old_ids);
+        let new_checks = pending_check_identities(&unique);
+        if !old_checks.is_empty() || !new_checks.is_empty() {
+            return old.check_run_id == ci.check_run_id
+                && old.run_id == ci.run_id
+                && old.run_attempt() == ci.run_attempt();
+        }
+        old_ids
             .iter()
             .any(|identity| unique.iter().any(|candidate| candidate == identity))
+            && old.run_attempt() == ci.run_attempt()
     })
 }
 
@@ -3172,8 +3211,8 @@ mod tests {
             ci_baseline.repos.get("/repo"),
         );
         assert!(
-            events.is_empty(),
-            "run-id representation of a fallback-persisted terminal run must stay suppressed"
+            !events.is_empty(),
+            "ambiguous fallback-to-run-id drift must fail open rather than suppress"
         );
 
         assert!(ci_baseline.record_terminal_runs("/repo", "/repo", &run_map(&[with_run_id])));
@@ -4440,6 +4479,46 @@ mod tests {
         assert!(
             !repo_ci_baseline_is_suppressed(baseline.repos.get("/repo"), &test),
             "failed sibling must not be suppressed by a successful sibling in the same run"
+        );
+    }
+
+    #[test]
+    fn issue_317_run_only_receipt_does_not_suppress_check_jobs() {
+        let aggregate = run_snapshot(4242, "CI", Some("success"), "main");
+        let lint = check_job(4242, 11, "lint", "success");
+        let test = check_job(4242, 22, "test", "failure");
+        let mut baseline = CIBaseline::default();
+        baseline.record_terminal_runs("/repo", "/repo", &run_map(std::slice::from_ref(&aggregate)));
+        assert!(!repo_ci_baseline_is_suppressed(
+            baseline.repos.get("/repo"),
+            &lint
+        ));
+        assert!(
+            !repo_ci_baseline_is_suppressed(baseline.repos.get("/repo"), &test),
+            "run-only historical receipt must not suppress mixed check jobs"
+        );
+    }
+
+    #[test]
+    fn issue_317_same_check_id_same_conclusion_rerun_still_emits() {
+        let attempt1 = check_job(4242, 11, "CI", "success");
+        let attempt2 = GitHubCISnapshot {
+            run_attempt: 2,
+            check_run_id: Some("11".into()),
+            ..check_job(4242, 11, "CI", "success")
+        };
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &run_map(std::slice::from_ref(&attempt1)),
+            &run_map(std::slice::from_ref(&attempt2)),
+            None,
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "same check id and conclusion on a new attempt must emit"
         );
     }
 
