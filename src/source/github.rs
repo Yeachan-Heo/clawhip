@@ -1298,25 +1298,25 @@ async fn send_then_ack_prefix(
     tx: &mpsc::Sender<IncomingEvent>,
     ci_baseline: &mut CIBaseline,
     path: Option<&Path>,
-    events: Vec<IncomingEvent>,
+    _events: Vec<IncomingEvent>,
     delivered: &[PendingCiDelivery],
 ) -> Result<()> {
-    for (event, delivery) in events.into_iter().zip(delivered.iter()) {
+    for delivery in delivered {
         persist_pending_send_attempts(
             ci_baseline,
             path,
             std::slice::from_ref(delivery),
             unix_now(),
         )?;
-        if !outbox_contains(ci_baseline, delivery) {
+        let Some(durable) = outbox_entry(ci_baseline, delivery) else {
             continue;
-        }
-        match send_event(tx, event).await {
+        };
+        match send_event(tx, durable.clone().into_event()).await {
             Ok(()) => {
-                ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(delivery))?;
+                ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(&durable))?;
             }
             Err(error) => {
-                dead_letter_unsent_final_attempts(ci_baseline, std::slice::from_ref(delivery));
+                dead_letter_unsent_final_attempts(ci_baseline, std::slice::from_ref(&durable));
                 let _ = commit_ci_baseline(path, ci_baseline);
                 return Err(error);
             }
@@ -1344,16 +1344,16 @@ async fn drain_pending_outbox(
             eprintln!("clawhip source github CI baseline outbox attempt persist failed");
             return Ok(());
         }
-        if !outbox_contains(ci_baseline, &delivery) {
+        let Some(durable) = outbox_entry(ci_baseline, &delivery) else {
             continue;
-        }
-        if send_event(tx, delivery.clone().into_event()).await.is_err() {
-            dead_letter_unsent_final_attempts(ci_baseline, std::slice::from_ref(&delivery));
+        };
+        if send_event(tx, durable.clone().into_event()).await.is_err() {
+            dead_letter_unsent_final_attempts(ci_baseline, std::slice::from_ref(&durable));
             let _ = commit_ci_baseline(path, ci_baseline);
             return Ok(());
         }
         if let Err(error) =
-            ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(&delivery))
+            ack_pending_deliveries(ci_baseline, path, std::slice::from_ref(&durable))
         {
             eprintln!("clawhip source github CI baseline outbox ack failed: {error}");
         }
@@ -1361,12 +1361,26 @@ async fn drain_pending_outbox(
     Ok(())
 }
 
-fn outbox_contains(ci_baseline: &CIBaseline, delivery: &PendingCiDelivery) -> bool {
-    ci_baseline.repos.values().any(|repo| {
-        repo.pending
-            .iter()
-            .any(|pending| pending.same_event(delivery) && pending.repo_name == delivery.repo_name)
-    })
+fn outbox_entry(
+    ci_baseline: &CIBaseline,
+    delivery: &PendingCiDelivery,
+) -> Option<PendingCiDelivery> {
+    for repo in ci_baseline.repos.values() {
+        if let Some(pending) = repo.pending.iter().find(|pending| {
+            pending.same_event(delivery)
+                && pending.repo_name == delivery.repo_name
+                && pending.channel == delivery.channel
+                && pending.mention == delivery.mention
+                && pending.format == delivery.format
+                && pending.template == delivery.template
+                && pending.url == delivery.url
+                && pending.status == delivery.status
+                && pending.branch == delivery.branch
+        }) {
+            return Some(pending.clone());
+        }
+    }
+    None
 }
 
 fn persist_pending_send_attempts(
@@ -1456,6 +1470,9 @@ fn merge_incomplete_ci(
     mut current: HashMap<String, GitHubCISnapshot>,
 ) -> HashMap<String, GitHubCISnapshot> {
     for old in previous.values() {
+        if current.contains_key(&old.dedupe_key()) {
+            continue;
+        }
         if current.values().any(|ci| snapshots_same_run(ci, old)) {
             continue;
         }
@@ -5387,6 +5404,30 @@ mod tests {
             "incomplete check-run pagination must not infer run_all_terminal"
         );
         server.abort();
+    }
+
+    #[test]
+    fn issue_317_incomplete_window_keeps_current_rerun_on_check_key_collision() {
+        let attempt1 = check_job(4242, 11, "CI", "success");
+        let attempt2 = GitHubCISnapshot {
+            run_attempt: 2,
+            check_run_id: Some("11".into()),
+            ..check_job(4242, 11, "CI", "success")
+        };
+        let previous = run_map(std::slice::from_ref(&attempt1));
+        let current = run_map(std::slice::from_ref(&attempt2));
+        let merged = merge_incomplete_ci(&previous, current);
+        let kept = merged.get(&attempt2.dedupe_key()).unwrap();
+        assert_eq!(kept.run_attempt(), 2);
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &previous,
+            &merged,
+            None,
+        );
+        assert_eq!(events.len(), 1);
     }
 
     #[test]
