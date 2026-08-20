@@ -105,6 +105,8 @@ struct RepoCIBaseline {
     epoch: u64,
     #[serde(default)]
     min_writer_epoch: u64,
+    #[serde(default)]
+    ci_established: bool,
 }
 
 /// Durable receipt for one terminal run. Identities are aliases (run-id,
@@ -936,6 +938,7 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
     cap_repo_baseline(dest);
     dest.epoch = dest.epoch.max(source.epoch);
     dest.min_writer_epoch = dest.min_writer_epoch.max(source.min_writer_epoch);
+    dest.ci_established = dest.ci_established || source.ci_established;
     for acked in source.acked {
         if let Some(existing) = dest.acked.iter_mut().find(|candidate| {
             candidate.repo_name == acked.repo_name
@@ -1805,6 +1808,11 @@ async fn poll_github(
             })
         });
         next_baseline.enqueue_pending(&repo_key, &repo.path, &ci_events, &ci);
+        if ci_baseline_established {
+            next_baseline
+                .repo_baseline_mut(&repo_key, &repo.path)
+                .ci_established = true;
+        }
         match commit_ci_baseline(ci_baseline_path, &next_baseline) {
             Ok(committed) => {
                 *ci_baseline = committed;
@@ -2042,7 +2050,7 @@ async fn poll_ci_statuses(
                     &ci,
                     repo_ci_baseline,
                 )
-            } else if repo_ci_baseline.is_some_and(|baseline| baseline.epoch > 0) {
+            } else if repo_ci_baseline.is_some_and(|baseline| baseline.ci_established) {
                 collect_ci_events(
                     repo,
                     &snapshot.repo_name,
@@ -4592,7 +4600,7 @@ mod tests {
     fn issue_317_empty_established_baseline_restart_emits_first_terminal() {
         let fresh = run_snapshot(2, "CI", Some("failure"), "main");
         let mut baseline = CIBaseline::default();
-        baseline.repo_baseline_mut("/repo", "/repo").epoch = 1;
+        baseline.repo_baseline_mut("/repo", "/repo").ci_established = true;
         let events = collect_ci_events(
             &GitRepoMonitor::default(),
             "org/repo",
