@@ -2042,11 +2042,7 @@ async fn poll_ci_statuses(
                     &ci,
                     repo_ci_baseline,
                 )
-            } else if repo_ci_baseline.is_some_and(|baseline| {
-                !baseline.terminal_runs.is_empty()
-                    || !baseline.pending.is_empty()
-                    || !baseline.acked.is_empty()
-            }) {
+            } else if repo_ci_baseline.is_some_and(|baseline| baseline.epoch > 0) {
                 collect_ci_events(
                     repo,
                     &snapshot.repo_name,
@@ -4586,6 +4582,23 @@ mod tests {
             true,
             &HashMap::new(),
             &run_map(&[historical.clone(), fresh.clone()]),
+            baseline.repos.get("/repo"),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.ci-failed");
+    }
+
+    #[test]
+    fn issue_317_empty_established_baseline_restart_emits_first_terminal() {
+        let fresh = run_snapshot(2, "CI", Some("failure"), "main");
+        let mut baseline = CIBaseline::default();
+        baseline.repo_baseline_mut("/repo", "/repo").epoch = 1;
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&fresh)),
             baseline.repos.get("/repo"),
         );
         assert_eq!(events.len(), 1);
