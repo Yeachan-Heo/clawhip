@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK, USER_AGENT};
@@ -22,6 +23,8 @@ use crate::telemetry;
 thread_local! {
     static SYNC_FILE_CALLS: Cell<u32> = const { Cell::new(0) };
 }
+
+static WINDOW_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct GitHubSource {
     config: Arc<AppConfig>,
@@ -750,7 +753,6 @@ fn canonicalize_loaded_window(repo_baseline: &mut RepoCIBaseline) {
         .current_window_ids_by_scope
         .drain()
         .map(|(scope, ids)| (scope, canonicalize_current_window_ids_from(&ids)))
-        .filter(|(_, ids)| !ids.is_empty())
         .collect();
     scopes.sort_by(|left, right| left.0.cmp(&right.0));
     repo_baseline.current_window_ids_by_scope = scopes.into_iter().collect();
@@ -783,7 +785,22 @@ fn next_window_generation(previous: u64) -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
         .unwrap_or(previous);
-    previous.saturating_add(1).max(clock)
+    let floor = previous.saturating_add(1).max(clock);
+    let mut observed = WINDOW_GENERATION_COUNTER.load(Ordering::Relaxed);
+    loop {
+        let next = observed
+            .max(floor)
+            .saturating_add(u64::from(observed >= floor));
+        match WINDOW_GENERATION_COUNTER.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(current) => observed = current,
+        }
+    }
 }
 
 fn cap_repo_baseline_keeping_ids(
@@ -822,6 +839,21 @@ impl RepoCIBaseline {
 }
 
 impl CIBaseline {
+    fn reserve_window_generation(
+        &mut self,
+        repo_key: &str,
+        repo_path: &str,
+        window_scope: &str,
+    ) -> u64 {
+        let repo = self.repo_baseline_mut(repo_key, repo_path);
+        let generation = next_window_generation(repo.window_generation);
+        repo.window_generation = generation;
+        repo.current_window_generations
+            .entry(window_scope.to_string())
+            .or_insert(0);
+        generation
+    }
+
     fn repo_baseline_mut(&mut self, repo_key: &str, repo_path: &str) -> &mut RepoCIBaseline {
         let mut inherited = Vec::new();
         if let Some(legacy) = self.repos.remove(repo_path) {
@@ -972,8 +1004,11 @@ impl CIBaseline {
             }
         }
         canonicalize_loaded_window(repo_baseline);
-        let keep_ids: std::collections::HashSet<String> =
+        let mut keep_ids: std::collections::HashSet<String> =
             repo_baseline.current_window_ids.iter().cloned().collect();
+        if !window.1 {
+            keep_ids.extend(incoming.iter().flat_map(|ci| ci.unique_identities()));
+        }
         dirty |= cap_repo_baseline_keeping_ids(repo_baseline, &keep_ids);
         dirty
     }
@@ -1983,15 +2018,10 @@ async fn poll_github(
                 }
             };
         let repo_key = ci_baseline_repo_key(&snapshot, repo);
-        let _ = ci_baseline.repo_baseline_mut(&repo_key, &repo.path);
+        let fetch_generation =
+            ci_baseline.reserve_window_generation(&repo_key, &repo.path, &repo.path);
         let repo_ci_baseline = ci_baseline.repos.get(&repo_key).cloned();
-        let fetch_generation = next_window_generation(
-            repo_ci_baseline
-                .as_ref()
-                .map(|baseline| baseline.window_generation)
-                .unwrap_or(0),
-        );
-        let (ci, ci_baseline_established, ci_events, window_complete) = match poll_ci_statuses(
+        let (ci, ci_baseline_established, window_complete) = match poll_ci_statuses(
             config,
             github_client,
             repo,
@@ -1999,7 +2029,6 @@ async fn poll_github(
             previous,
             &prs,
             prs_window_complete,
-            repo_ci_baseline.as_ref(),
         )
         .await
         {
@@ -2014,10 +2043,41 @@ async fn poll_github(
                     previous
                         .map(|entry| entry.ci_baseline_established)
                         .unwrap_or(false),
-                    Vec::new(),
                     false,
                 )
             }
+        };
+        let generation_is_current = ci_baseline
+            .repos
+            .get(&repo_key)
+            .is_some_and(|baseline| baseline.window_generation == fetch_generation);
+        let ci_events = if generation_is_current {
+            if let Some(previous) = previous {
+                collect_ci_events(
+                    repo,
+                    &snapshot.repo_name,
+                    previous.ci_baseline_established,
+                    &previous.ci,
+                    &ci,
+                    repo_ci_baseline.as_ref(),
+                )
+            } else if repo_ci_baseline
+                .as_ref()
+                .is_some_and(|baseline| baseline.ci_established)
+            {
+                collect_ci_events(
+                    repo,
+                    &snapshot.repo_name,
+                    true,
+                    &HashMap::new(),
+                    &ci,
+                    repo_ci_baseline.as_ref(),
+                )
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
         };
 
         // Durable outbox: persist pending receipts, then publish, then
@@ -2237,20 +2297,13 @@ async fn poll_ci_statuses(
     previous: Option<&GitHubRepoState>,
     prs: &HashMap<u64, PullRequestSnapshot>,
     prs_window_complete: bool,
-    repo_ci_baseline: Option<&RepoCIBaseline>,
-) -> Result<(
-    HashMap<String, GitHubCISnapshot>,
-    bool,
-    Vec<IncomingEvent>,
-    bool,
-)> {
+) -> Result<(HashMap<String, GitHubCISnapshot>, bool, bool)> {
     if !repo.emit_pr_status {
         return Ok((
             previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
             previous
                 .map(|entry| entry.ci_baseline_established)
                 .unwrap_or(false),
-            Vec::new(),
             true,
         ));
     }
@@ -2261,7 +2314,6 @@ async fn poll_ci_statuses(
             previous
                 .map(|entry| entry.ci_baseline_established)
                 .unwrap_or(false),
-            Vec::new(),
             true,
         ));
     };
@@ -2292,29 +2344,8 @@ async fn poll_ci_statuses(
             } else {
                 fetched
             };
-            let events = if let Some(previous) = previous {
-                collect_ci_events(
-                    repo,
-                    &snapshot.repo_name,
-                    previous.ci_baseline_established,
-                    &previous.ci,
-                    &ci,
-                    repo_ci_baseline,
-                )
-            } else if repo_ci_baseline.is_some_and(|baseline| baseline.ci_established) {
-                collect_ci_events(
-                    repo,
-                    &snapshot.repo_name,
-                    true,
-                    &HashMap::new(),
-                    &ci,
-                    repo_ci_baseline,
-                )
-            } else {
-                Vec::new()
-            };
             let established = true;
-            Ok((ci, established, events, window_complete))
+            Ok((ci, established, window_complete))
         }
         Err(error) => {
             telemetry::emit(source_record(
@@ -2334,7 +2365,6 @@ async fn poll_ci_statuses(
             Ok((
                 previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
                 false,
-                Vec::new(),
                 false,
             ))
         }
@@ -4091,6 +4121,26 @@ mod tests {
     }
 
     #[test]
+    fn issue_317_partial_window_keeps_more_than_history_cap_of_new_terminals() {
+        let mut baseline = CIBaseline::default();
+        let runs: Vec<_> = (0..(MAX_BASELINE_RUNS_PER_REPO + 100) as u64)
+            .map(|id| run_snapshot(id, "CI", Some("failure"), "main"))
+            .collect();
+        let current = run_map(&runs);
+        baseline.record_terminal_runs_filtered(
+            "/repo",
+            "/repo",
+            "/repo",
+            &current,
+            (10, false),
+            |_| true,
+        );
+        let repo = &baseline.repos["/repo"];
+        assert_eq!(repo.terminal_runs.len(), MAX_BASELINE_RUNS_PER_REPO + 100);
+        assert!(repo.contains_identity(&format!("run:{}", MAX_BASELINE_RUNS_PER_REPO + 99)));
+    }
+
+    #[test]
     fn issue_317_out_of_order_window_response_cannot_overwrite_newer_generation() {
         let mut baseline = CIBaseline::default();
         let fresh = run_snapshot(20, "CI", Some("success"), "main");
@@ -4114,6 +4164,48 @@ mod tests {
         let ids = &baseline.repos["/repo"].current_window_ids_by_scope["/repo"];
         assert!(ids.contains(&"run:20".to_string()));
         assert!(!ids.contains(&"run:10".to_string()));
+    }
+
+    #[test]
+    fn issue_317_empty_scope_tombstone_blocks_stale_nonempty_resurrection() {
+        let mut live = RepoCIBaseline::default();
+        live.current_window_ids_by_scope
+            .insert("/repo".into(), vec!["run:old".into()]);
+        live.current_window_generations.insert("/repo".into(), 10);
+        live.window_generation = 10;
+        canonicalize_loaded_window(&mut live);
+
+        let mut empty = RepoCIBaseline::default();
+        empty
+            .current_window_ids_by_scope
+            .insert("/repo".into(), vec![]);
+        empty.current_window_generations.insert("/repo".into(), 20);
+        empty.window_generation = 20;
+        merge_repo_baseline(&mut live, empty);
+        assert!(live.current_window_ids_by_scope["/repo"].is_empty());
+
+        let mut stale = RepoCIBaseline::default();
+        stale
+            .current_window_ids_by_scope
+            .insert("/repo".into(), vec!["run:old".into()]);
+        stale.current_window_generations.insert("/repo".into(), 10);
+        stale.window_generation = 10;
+        merge_repo_baseline(&mut live, stale);
+        assert!(live.current_window_ids_by_scope["/repo"].is_empty());
+    }
+
+    #[test]
+    fn issue_317_generation_reservation_is_unique_under_concurrency() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| next_window_generation(0)))
+            .collect();
+        let mut generations: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        generations.sort_unstable();
+        generations.dedup();
+        assert_eq!(generations.len(), 8);
     }
 
     #[test]
@@ -6540,25 +6632,13 @@ mod tests {
         let client = build_github_client(None).unwrap();
         let prs = HashMap::new();
 
-        let (ci, ci_baseline_established, events, _window_complete) = poll_ci_statuses(
-            &config,
-            Some(&client),
-            &repo,
-            &snapshot,
-            None,
-            &prs,
-            true,
-            None,
-        )
-        .await
-        .unwrap();
+        let (ci, ci_baseline_established, _window_complete) =
+            poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, true)
+                .await
+                .unwrap();
 
         assert_eq!(ci.len(), 1);
         assert!(ci_baseline_established);
-        assert!(
-            events.is_empty(),
-            "first poll after startup should prime CI baseline without emitting historical events"
-        );
 
         let req = server.await.unwrap();
         assert!(req.contains("GET /repos/ultraworkers/claw-code/actions/runs?"));
