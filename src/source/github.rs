@@ -744,10 +744,19 @@ fn canonicalize_loaded_window(repo_baseline: &mut RepoCIBaseline) {
         .collect();
     scopes.sort_by(|left, right| left.0.cmp(&right.0));
     repo_baseline.current_window_ids_by_scope = scopes.into_iter().collect();
-    let ids = repo_baseline
+    let mut scope_names: Vec<&str> = repo_baseline
         .current_window_ids_by_scope
-        .values()
-        .flat_map(|ids| ids.iter().cloned());
+        .keys()
+        .map(String::as_str)
+        .collect();
+    scope_names.sort_unstable();
+    let ids = scope_names.into_iter().flat_map(|scope| {
+        repo_baseline
+            .current_window_ids_by_scope
+            .get(scope)
+            .into_iter()
+            .flat_map(|ids| ids.iter().cloned())
+    });
     repo_baseline.current_window_ids = cap_window_ids(canonical_window_identities(ids));
     let retained: std::collections::HashSet<&str> = repo_baseline
         .current_window_ids
