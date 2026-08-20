@@ -114,6 +114,12 @@ struct TerminalRunRecord {
     identities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
+    #[serde(default = "default_run_attempt")]
+    run_attempt: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    workflow: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conclusion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
 }
@@ -137,6 +143,10 @@ struct PendingCiDelivery {
     run_all_terminal: bool,
     channel: Option<String>,
     mention: Option<String>,
+    #[serde(default)]
+    format: Option<crate::events::MessageFormat>,
+    #[serde(default)]
+    template: Option<String>,
     #[serde(default)]
     send_attempts: u32,
     #[serde(default)]
@@ -298,6 +308,8 @@ impl PendingCiDelivery {
                 .unwrap_or(false),
             channel: event.channel.clone(),
             mention: event.mention.clone(),
+            format: event.format.clone(),
+            template: event.template.clone(),
             send_attempts: 0,
             last_sent_unix: None,
         }
@@ -358,7 +370,9 @@ impl PendingCiDelivery {
             self.branch,
             self.channel,
         )
-        .with_mention(self.mention);
+        .with_mention(self.mention)
+        .with_format(self.format)
+        .with_template(self.template);
         if let Some(payload) = event.payload.as_object_mut() {
             if let Some(run_id) = &self.run_id {
                 payload.insert("run_id".to_string(), json!(run_id));
@@ -427,7 +441,6 @@ const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
 const MAX_PENDING_SEND_ATTEMPTS: u32 = 3;
 const PENDING_RETRY_BACKOFF_SECS: u64 = 3_600;
-#[cfg(test)]
 const ACK_RETENTION_SECS: u64 = 7 * 24 * 3_600;
 const MAX_DEAD_LETTER: usize = 64;
 
@@ -515,6 +528,9 @@ impl TerminalRunRecord {
         Self {
             identities: ci.identities(),
             run_id: ci.run_id.clone(),
+            run_attempt: ci.run_attempt(),
+            workflow: ci.workflow.clone(),
+            conclusion: ci.conclusion.clone(),
             created_at: ci.created_at.clone(),
         }
     }
@@ -527,6 +543,9 @@ impl TerminalRunRecord {
         Self {
             identities: vec![identity],
             run_id,
+            run_attempt: 1,
+            workflow: String::new(),
+            conclusion: None,
             created_at: None,
         }
     }
@@ -546,12 +565,21 @@ impl TerminalRunRecord {
     }
 
     fn matches_snapshot(&self, ci: &GitHubCISnapshot) -> bool {
+        let snap_ids = ci.unique_identities();
+        let rec_checks = pending_check_identities(&self.identities);
+        let snap_checks = pending_check_identities(&snap_ids);
+        if !rec_checks.is_empty() && !snap_checks.is_empty() {
+            let overlap = rec_checks
+                .iter()
+                .any(|identity| snap_checks.iter().any(|candidate| candidate == identity));
+            return overlap && run_attempt_or_one(self.run_attempt) == ci.run_attempt();
+        }
         let unique = ci.unique_identities();
         if unique
             .iter()
             .any(|identity| self.contains_identity(identity))
         {
-            return true;
+            return run_attempt_or_one(self.run_attempt) == ci.run_attempt();
         }
         for identity in &self.identities {
             if identity_matches_snapshot(identity, ci)
@@ -775,12 +803,21 @@ impl CIBaseline {
 }
 
 fn terminal_records_same_run(left: &TerminalRunRecord, right: &TerminalRunRecord) -> bool {
+    let left_checks = pending_check_identities(&left.identities);
+    let right_checks = pending_check_identities(&right.identities);
+    if !left_checks.is_empty() && !right_checks.is_empty() {
+        return left_checks
+            .iter()
+            .any(|identity| right_checks.iter().any(|candidate| candidate == identity))
+            && run_attempt_or_one(left.run_attempt) == run_attempt_or_one(right.run_attempt);
+    }
     let left_unique: Vec<&str> = left.unique_identities().collect();
     let right_unique: Vec<&str> = right.unique_identities().collect();
     if !left_unique.is_empty() && !right_unique.is_empty() {
         return left_unique
             .iter()
-            .any(|identity| right_unique.contains(identity));
+            .any(|identity| right_unique.contains(identity))
+            && run_attempt_or_one(left.run_attempt) == run_attempt_or_one(right.run_attempt);
     }
     left.identities
         .iter()
@@ -825,25 +862,42 @@ fn retire_exhausted_pending(repo: &mut RepoCIBaseline) {
 fn dead_letter_unsent_final_attempts(ci_baseline: &mut CIBaseline, unsent: &[PendingCiDelivery]) {
     for repo in ci_baseline.repos.values_mut() {
         let mut keep = Vec::new();
+        let mut retired = Vec::new();
         for pending in repo.pending.drain(..) {
             if unsent
                 .iter()
                 .any(|item| pending.same_event(item) && pending.repo_name == item.repo_name)
                 && pending.send_attempts >= MAX_PENDING_SEND_ATTEMPTS
             {
-                repo.dead_letter.push_back(pending);
+                eprintln!(
+                    "clawhip source github CI outbox dead-lettered {} {} after {} send attempts",
+                    pending.repo_name, pending.workflow, pending.send_attempts
+                );
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_DEGRADED,
+                    "ci_outbox_dead_lettered",
+                    Some(&pending.repo_name),
+                    Some(format!(
+                        "workflow={} attempts={}",
+                        pending.workflow, pending.send_attempts
+                    )),
+                ));
+                retired.push(pending);
             } else {
                 keep.push(pending);
             }
         }
         repo.pending = keep;
+        for pending in retired {
+            record_acked(repo, &pending);
+            repo.dead_letter.push_back(pending);
+        }
         while repo.dead_letter.len() > MAX_DEAD_LETTER {
             repo.dead_letter.pop_front();
         }
     }
 }
 
-#[cfg(test)]
 fn compact_acked(repo: &mut RepoCIBaseline, now: u64) {
     let before = repo.acked.len();
     repo.acked
@@ -851,6 +905,20 @@ fn compact_acked(repo: &mut RepoCIBaseline, now: u64) {
     if repo.acked.len() < before {
         repo.min_writer_epoch = repo.min_writer_epoch.max(repo.epoch);
     }
+}
+
+fn normalize_repo_outbox(repo: &mut RepoCIBaseline) {
+    while repo.dead_letter.len() > MAX_DEAD_LETTER {
+        repo.dead_letter.pop_front();
+    }
+    let acked = repo.acked.clone();
+    let dead = repo.dead_letter.clone();
+    repo.pending.retain(|pending| {
+        !acked.iter().any(|item| item.matches_pending(pending))
+            && !dead
+                .iter()
+                .any(|item| item.same_event(pending) && item.repo_name == pending.repo_name)
+    });
 }
 
 fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
@@ -913,8 +981,15 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
     while dest.dead_letter.len() > MAX_DEAD_LETTER {
         dest.dead_letter.pop_front();
     }
+    let source_stale = dest.min_writer_epoch > 0 && source.epoch < dest.min_writer_epoch;
     for delivery in source.pending {
-        if pending_is_acked(dest, &delivery) {
+        if source_stale
+            || pending_is_acked(dest, &delivery)
+            || dest
+                .dead_letter
+                .iter()
+                .any(|dead| dead.same_event(&delivery) && dead.repo_name == delivery.repo_name)
+        {
             continue;
         }
         if let Some(existing) = dest
@@ -928,8 +1003,16 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
         }
     }
     let acked = dest.acked.clone();
-    dest.pending
-        .retain(|pending| !acked.iter().any(|item| item.matches_pending(pending)));
+    let dead = dest.dead_letter.clone();
+    dest.pending.retain(|pending| {
+        !acked.iter().any(|item| item.matches_pending(pending))
+            && !dead
+                .iter()
+                .any(|item| item.same_event(pending) && item.repo_name == pending.repo_name)
+    });
+    while dest.dead_letter.len() > MAX_DEAD_LETTER {
+        dest.dead_letter.pop_front();
+    }
 }
 
 fn load_ci_baseline(path: Option<&Path>) -> CIBaseline {
@@ -952,6 +1035,7 @@ fn load_ci_baseline(path: Option<&Path>) -> CIBaseline {
             let mut baseline = CIBaseline { repos };
             for repo_baseline in baseline.repos.values_mut() {
                 cap_repo_baseline(repo_baseline);
+                normalize_repo_outbox(repo_baseline);
             }
             baseline
         }
@@ -1027,38 +1111,82 @@ fn unlock_baseline_file(file: &File) {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct WindowsOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut core::ffi::c_void,
+}
+
+#[cfg(windows)]
 fn try_lock_baseline_file(file: &File) -> bool {
     use std::os::windows::io::AsRawHandle;
-    unsafe { lock_file(file.as_raw_handle(), 0, 0, 1, 0) != 0 }
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+    let mut overlapped = WindowsOverlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        event: std::ptr::null_mut(),
+    };
+    unsafe {
+        let ok = lock_file_ex(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        );
+        if ok != 0 {
+            true
+        } else {
+            let _ = get_last_error();
+            false
+        }
+    }
 }
 
 #[cfg(windows)]
 fn unlock_baseline_file(file: &File) {
     use std::os::windows::io::AsRawHandle;
+    let mut overlapped = WindowsOverlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        event: std::ptr::null_mut(),
+    };
     unsafe {
-        unlock_file(file.as_raw_handle(), 0, 0, 1, 0);
+        let _ = unlock_file_ex(file.as_raw_handle(), 0, 1, 0, &mut overlapped);
     }
 }
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    #[link_name = "LockFile"]
-    fn lock_file(
+    #[link_name = "LockFileEx"]
+    fn lock_file_ex(
         handle: *mut core::ffi::c_void,
-        offset_low: u32,
-        offset_high: u32,
+        flags: u32,
+        reserved: u32,
         length_low: u32,
         length_high: u32,
+        overlapped: *mut WindowsOverlapped,
     ) -> i32;
-    #[link_name = "UnlockFile"]
-    fn unlock_file(
+    #[link_name = "UnlockFileEx"]
+    fn unlock_file_ex(
         handle: *mut core::ffi::c_void,
-        offset_low: u32,
-        offset_high: u32,
+        reserved: u32,
         length_low: u32,
         length_high: u32,
+        overlapped: *mut WindowsOverlapped,
     ) -> i32;
+    #[link_name = "GetLastError"]
+    fn get_last_error() -> u32;
 }
 
 fn unix_now() -> u64 {
@@ -1155,8 +1283,11 @@ fn commit_ci_baseline(path: Option<&Path>, local: &CIBaseline) -> Result<CIBasel
     let _lock = acquire_baseline_lock(path)?;
     let mut disk = load_ci_baseline(Some(path));
     merge_ci_baseline(&mut disk, local);
+    let now = unix_now();
     for repo in disk.repos.values_mut() {
         repo.epoch = repo.epoch.saturating_add(1);
+        compact_acked(repo, now);
+        normalize_repo_outbox(repo);
     }
     write_ci_baseline_atomic(&disk, path)?;
     Ok(disk)
@@ -1548,6 +1679,7 @@ async fn poll_github(
                 }
             };
         let repo_key = ci_baseline_repo_key(&snapshot, repo);
+        let _ = ci_baseline.repo_baseline_mut(&repo_key, &repo.path);
         let repo_ci_baseline = ci_baseline.repos.get(&repo_key).cloned();
         let (ci, ci_baseline_established, ci_events, window_complete) = match poll_ci_statuses(
             config,
@@ -4227,10 +4359,9 @@ mod tests {
         };
         stale.pending.push(pending.clone());
         merge_repo_baseline(&mut dest, stale);
-        assert_eq!(
-            dest.pending.len(),
-            1,
-            "compaction must not drop a concurrent writer's pending set"
+        assert!(
+            dest.pending.is_empty(),
+            "stale writer below compacted epoch floor must not restore pending"
         );
     }
 
@@ -4251,6 +4382,178 @@ mod tests {
         );
         let loaded = load_ci_baseline(Some(&path));
         assert!(loaded.repos.contains_key("/repo"));
+    }
+
+    #[test]
+    fn issue_317_poll_merges_legacy_path_alias_before_suppression_lookup() {
+        let run = run_snapshot(4242, "CI", Some("success"), "main");
+        let mut baseline = CIBaseline::default();
+        baseline.record_terminal_runs(
+            "/old-path",
+            "/old-path",
+            &run_map(std::slice::from_ref(&run)),
+        );
+        let monitor = GitRepoMonitor {
+            path: "/old-path".into(),
+            github_repo: Some("Org/Repo".into()),
+            ..GitRepoMonitor::default()
+        };
+        let snapshot = crate::source::git::GitSnapshot {
+            repo_name: "repo".into(),
+            repo_path: "/old-path".into(),
+            worktree_path: "/old-path".into(),
+            branch: "main".into(),
+            head: "abc".into(),
+            commits: Vec::new(),
+            github_repo: Some("Org/Repo".into()),
+        };
+        let repo_key = ci_baseline_repo_key(&snapshot, &monitor);
+        let _ = baseline.repo_baseline_mut(&repo_key, &monitor.path);
+        let events = collect_ci_events(
+            &monitor,
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            baseline.repos.get(&repo_key),
+        );
+        assert!(
+            events.is_empty(),
+            "legacy path alias must suppress historical terminal runs after re-enrollment"
+        );
+    }
+
+    #[test]
+    fn issue_317_sibling_jobs_do_not_suppress_mixed_outcomes() {
+        let lint = check_job(4242, 11, "lint", "success");
+        let test = check_job(4242, 22, "test", "failure");
+        let mut baseline = CIBaseline::default();
+        baseline.record_terminal_runs("/repo", "/repo", &run_map(std::slice::from_ref(&lint)));
+        assert!(repo_ci_baseline_is_suppressed(
+            baseline.repos.get("/repo"),
+            &lint
+        ));
+        assert!(
+            !repo_ci_baseline_is_suppressed(baseline.repos.get("/repo"), &test),
+            "failed sibling must not be suppressed by a successful sibling in the same run"
+        );
+    }
+
+    #[test]
+    fn issue_317_fallback_kind_change_is_not_suppressed() {
+        let success = check_job(7, 1, "CI", "success");
+        let mut fallback = PendingCiDelivery::from_event(
+            &collect_ci_events(
+                &GitRepoMonitor::default(),
+                "org/repo",
+                true,
+                &HashMap::new(),
+                &run_map(std::slice::from_ref(&success)),
+                None,
+            )[0],
+            success.identities(),
+        );
+        fallback
+            .identities
+            .retain(|identity| !identity.starts_with("run:") && !identity.starts_with("check:"));
+        fallback.run_id = None;
+        let mut failed = fallback.clone();
+        failed.kind = "github.ci-failed".into();
+        failed.conclusion = Some("failure".into());
+        assert!(!fallback.same_event(&failed));
+        let mut repo = RepoCIBaseline::default();
+        record_acked(&mut repo, &fallback);
+        assert!(!pending_is_acked(&repo, &failed));
+    }
+
+    #[test]
+    fn issue_317_restart_preserves_nondefault_format_and_template() {
+        let run = run_snapshot(88, "CI", Some("success"), "main");
+        let mut events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&run)),
+            None,
+        );
+        events[0].format = Some(crate::events::MessageFormat::Alert);
+        events[0].template = Some("ci-alert".into());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut baseline = CIBaseline::default();
+        baseline.enqueue_pending(
+            "/repo",
+            "/repo",
+            &events,
+            &run_map(std::slice::from_ref(&run)),
+        );
+        save_ci_baseline(&baseline, Some(&path)).unwrap();
+        let restarted = load_ci_baseline(Some(&path));
+        let restored = restarted.repos["/repo"].pending[0].clone().into_event();
+        assert_eq!(restored.format, Some(crate::events::MessageFormat::Alert));
+        assert_eq!(restored.template.as_deref(), Some("ci-alert"));
+    }
+
+    #[test]
+    fn issue_317_dead_letter_tombstone_survives_stale_pending_merge() {
+        let job = check_job(3, 9, "CI", "failure");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&job)),
+            None,
+        );
+        let mut pending = PendingCiDelivery::from_event(&events[0], job.identities());
+        pending.send_attempts = MAX_PENDING_SEND_ATTEMPTS;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let mut live = CIBaseline::default();
+        live.repos.insert("/repo".into(), RepoCIBaseline::default());
+        live.repos
+            .get_mut("/repo")
+            .unwrap()
+            .pending
+            .push(pending.clone());
+        save_ci_baseline(&live, Some(&path)).unwrap();
+        dead_letter_unsent_final_attempts(&mut live, std::slice::from_ref(&pending));
+        let _ = commit_ci_baseline(Some(&path), &live).unwrap();
+        let restarted = load_ci_baseline(Some(&path));
+        assert!(restarted.repos["/repo"].pending.is_empty());
+        assert_eq!(restarted.repos["/repo"].dead_letter.len(), 1);
+    }
+
+    #[test]
+    fn issue_317_stale_writer_below_epoch_floor_cannot_restore_pending() {
+        let start = std::sync::Arc::new(std::sync::Barrier::new(1));
+        let job = check_job(4, 1, "CI", "success");
+        let events = collect_ci_events(
+            &GitRepoMonitor::default(),
+            "org/repo",
+            true,
+            &HashMap::new(),
+            &run_map(std::slice::from_ref(&job)),
+            None,
+        );
+        let pending = PendingCiDelivery::from_event(&events[0], job.identities());
+        let mut dest = RepoCIBaseline {
+            epoch: 10,
+            min_writer_epoch: 10,
+            ..RepoCIBaseline::default()
+        };
+        let mut stale = RepoCIBaseline {
+            epoch: 3,
+            ..RepoCIBaseline::default()
+        };
+        stale.pending.push(pending);
+        start.wait();
+        merge_repo_baseline(&mut dest, stale);
+        assert!(
+            dest.pending.is_empty(),
+            "stale writer below epoch floor must not restore pending"
+        );
     }
 
     #[test]
