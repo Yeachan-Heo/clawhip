@@ -315,7 +315,7 @@ impl PendingCiDelivery {
             template: event.template.clone(),
             send_attempts: 0,
             last_sent_unix: None,
-            delivery_id: uuid::Uuid::new_v4().to_string(),
+            delivery_id: String::new(),
         }
     }
 
@@ -736,6 +736,10 @@ impl CIBaseline {
                 .iter()
                 .any(|existing| existing.same_event(&delivery))
             {
+                let mut delivery = delivery;
+                if delivery.delivery_id.is_empty() {
+                    delivery.delivery_id = uuid::Uuid::new_v4().to_string();
+                }
                 repo_baseline.pending.push(delivery);
             }
         }
@@ -1391,8 +1395,11 @@ fn outbox_entry(
 ) -> Option<PendingCiDelivery> {
     for repo in ci_baseline.repos.values() {
         if let Some(pending) = repo.pending.iter().find(|pending| {
-            (!delivery.delivery_id.is_empty() && pending.delivery_id == delivery.delivery_id)
-                || pending.same_output(delivery)
+            if !delivery.delivery_id.is_empty() {
+                pending.delivery_id == delivery.delivery_id
+            } else {
+                pending.same_output(delivery)
+            }
         }) {
             return Some(pending.clone());
         }
@@ -1416,8 +1423,11 @@ fn bump_pending_send_attempts(ci_baseline: &mut CIBaseline, sent: &[PendingCiDel
     for repo in ci_baseline.repos.values_mut() {
         for pending in &mut repo.pending {
             if sent.iter().any(|item| {
-                (!item.delivery_id.is_empty() && pending.delivery_id == item.delivery_id)
-                    || (pending.same_event(item) && pending.repo_name == item.repo_name)
+                if !item.delivery_id.is_empty() {
+                    pending.delivery_id == item.delivery_id
+                } else {
+                    pending.same_output(item)
+                }
             }) {
                 pending.send_attempts = pending.send_attempts.saturating_add(1);
                 pending.last_sent_unix = Some(now);
