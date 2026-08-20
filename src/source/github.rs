@@ -116,6 +116,11 @@ struct RepoCIBaseline {
     /// dropped by a fenced stale writer.
     #[serde(default)]
     current_window_ids: Vec<String>,
+    /// Independently fetched windows keyed by monitor scope. Windows are
+    /// merged rather than selected by receipt recency so branch/checkout
+    /// scopes cannot evict one another's live receipts.
+    #[serde(default)]
+    current_window_ids_by_scope: HashMap<String, Vec<String>>,
 }
 
 /// Durable receipt for one terminal run. Identities are aliases (run-id,
@@ -482,7 +487,11 @@ const MAX_BASELINE_RUNS_PER_REPO: usize = CI_PAGE_SIZE * MAX_CI_PAGES;
 /// check-run ids) and an oversized fetch can exceed the receipt cap;
 /// protection stops here so alias multiplication cannot grow the pinned
 /// window unboundedly.
-const MAX_CURRENT_WINDOW_IDS: usize = MAX_BASELINE_RUNS_PER_REPO * 4;
+// Pull-request inventory is fetched with the GitHub API's 100-item page cap
+// and is not paginated here. The aggregate CI window is therefore bounded by
+// 100 PR windows plus the direct push window, with two durable aliases per
+// snapshot. Keep the protection bound above that actual fetched scope.
+const MAX_CURRENT_WINDOW_IDS: usize = CI_PAGE_SIZE * MAX_CI_PAGES * (CI_PAGE_SIZE + 1) * 2;
 const MAX_PENDING_SEND_ATTEMPTS: u32 = 3;
 const PENDING_RETRY_BACKOFF_SECS: u64 = 3_600;
 const ACK_RETENTION_SECS: u64 = 7 * 24 * 3_600;
@@ -700,16 +709,6 @@ fn canonicalize_current_window_ids_from(ids: &[String]) -> Vec<String> {
 /// pinned receipts are the newest reflects the latest GitHub fetch state
 /// and stays protected; a writer whose window pins only older receipts
 /// (restart with a stale view, fenced writer) must not evict or replace it.
-fn window_recency_key(repo: &RepoCIBaseline) -> Option<(u8, String, u64, String)> {
-    let pinned: std::collections::HashSet<&str> =
-        repo.current_window_ids.iter().map(String::as_str).collect();
-    repo.terminal_runs
-        .iter()
-        .filter(|record| record.unique_identities().any(|id| pinned.contains(id)))
-        .map(TerminalRunRecord::eviction_key)
-        .max()
-}
-
 fn canonical_window_identities(identities: impl Iterator<Item = String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     identities
@@ -729,8 +728,36 @@ fn cap_window_ids(mut ids: Vec<String>) -> Vec<String> {
 /// store a canonicalized set; this only guards files written by older or
 /// differently-shaped writers.
 fn canonicalize_loaded_window(repo_baseline: &mut RepoCIBaseline) {
-    repo_baseline.current_window_ids =
-        canonicalize_current_window_ids_from(&repo_baseline.current_window_ids);
+    if repo_baseline.current_window_ids_by_scope.is_empty()
+        && !repo_baseline.current_window_ids.is_empty()
+    {
+        repo_baseline.current_window_ids_by_scope.insert(
+            "legacy".to_string(),
+            repo_baseline.current_window_ids.clone(),
+        );
+    }
+    let mut scopes: Vec<(String, Vec<String>)> = repo_baseline
+        .current_window_ids_by_scope
+        .drain()
+        .map(|(scope, ids)| (scope, canonicalize_current_window_ids_from(&ids)))
+        .filter(|(_, ids)| !ids.is_empty())
+        .collect();
+    scopes.sort_by(|left, right| left.0.cmp(&right.0));
+    repo_baseline.current_window_ids_by_scope = scopes.into_iter().collect();
+    let ids = repo_baseline
+        .current_window_ids_by_scope
+        .values()
+        .flat_map(|ids| ids.iter().cloned());
+    repo_baseline.current_window_ids = cap_window_ids(canonical_window_identities(ids));
+    let retained: std::collections::HashSet<&str> = repo_baseline
+        .current_window_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    repo_baseline.current_window_ids_by_scope.retain(|_, ids| {
+        ids.retain(|id| retained.contains(id.as_str()));
+        !ids.is_empty()
+    });
 }
 
 fn cap_repo_baseline_keeping_ids(
@@ -855,13 +882,14 @@ impl CIBaseline {
         repo_path: &str,
         current: &HashMap<String, GitHubCISnapshot>,
     ) -> bool {
-        self.record_terminal_runs_filtered(repo_key, repo_path, current, |_| true)
+        self.record_terminal_runs_filtered(repo_key, repo_path, repo_path, current, |_| true)
     }
 
     fn record_terminal_runs_filtered(
         &mut self,
         repo_key: &str,
         repo_path: &str,
+        window_scope: &str,
         current: &HashMap<String, GitHubCISnapshot>,
         include: impl Fn(&GitHubCISnapshot) -> bool,
     ) -> bool {
@@ -887,7 +915,11 @@ impl CIBaseline {
                 dirty = true;
             }
         }
-        repo_baseline.current_window_ids = canonicalize_current_window_ids(&incoming);
+        repo_baseline.current_window_ids_by_scope.insert(
+            window_scope.to_string(),
+            canonicalize_current_window_ids(&incoming),
+        );
+        canonicalize_loaded_window(repo_baseline);
         dirty |= cap_repo_baseline_keeping(repo_baseline, &incoming);
         dirty
     }
@@ -1017,24 +1049,21 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
     // its window can cap-evict nothing from the pinned current window and
     // must not replace it either.
     let source_stale = dest.min_writer_epoch > 0 && source.epoch < dest.min_writer_epoch;
-    // Window authority is epoch-fenced recency: the window whose pinned
-    // receipts are newest reflects the latest GitHub fetch. A writer whose
-    // window pins only older receipts (restart with a stale view, fenced
-    // writer) must not evict or replace the live window, while a writer
-    // carrying genuinely newer receipts does supersede it.
-    let source_authoritative = !source_stale
-        && match (window_recency_key(dest), window_recency_key(&source)) {
-            (Some(dest_key), Some(source_key)) => source_key >= dest_key,
-            (None, _) => true,
-            _ => false,
-        };
-    // Eviction protection pins only the authoritative window: pinning both
-    // would pin two windows and defeat the bounded cap.
-    let keep_ids: std::collections::HashSet<String> = if source_authoritative {
-        source.current_window_ids.iter().cloned().collect()
-    } else {
-        dest.current_window_ids.iter().cloned().collect()
-    };
+    canonicalize_loaded_window(dest);
+    let mut source_windows = source.current_window_ids_by_scope;
+    if source_windows.is_empty() && !source.current_window_ids.is_empty() {
+        source_windows.insert("legacy".to_string(), source.current_window_ids);
+    }
+    for (scope, ids) in source_windows {
+        if source_stale {
+            dest.current_window_ids_by_scope.entry(scope).or_insert(ids);
+        } else {
+            dest.current_window_ids_by_scope.insert(scope, ids);
+        }
+    }
+    canonicalize_loaded_window(dest);
+    let keep_ids: std::collections::HashSet<String> =
+        dest.current_window_ids.iter().cloned().collect();
     for record in source.terminal_runs {
         if let Some(existing) = dest
             .terminal_runs
@@ -1057,9 +1086,6 @@ fn merge_repo_baseline(dest: &mut RepoCIBaseline, source: RepoCIBaseline) {
         }
     }
     cap_repo_baseline_keeping_ids(dest, &keep_ids);
-    if source_authoritative {
-        dest.current_window_ids = canonicalize_current_window_ids_from(&source.current_window_ids);
-    }
     dest.epoch = dest.epoch.max(source.epoch);
     dest.min_writer_epoch = dest.min_writer_epoch.max(source.min_writer_epoch);
     dest.ci_established = dest.ci_established || source.ci_established;
@@ -1920,19 +1946,25 @@ async fn poll_github(
         // from the outbox on the next poll.
         let mut next_baseline = ci_baseline.clone();
         let previous_ci = previous.map(|entry| &entry.ci);
-        next_baseline.record_terminal_runs_filtered(&repo_key, &repo.path, &ci, |snapshot| {
-            if previous_ci.is_none() || window_complete {
-                return true;
-            }
-            previous_ci.is_some_and(|old_map| {
-                old_map
-                    .values()
-                    .any(|old| snapshots_same_run(old, snapshot) && old.is_terminal())
-            }) || ci_events.iter().any(|event| {
-                previous_snapshot_for_event(&ci, event)
-                    .is_some_and(|matched| snapshots_same_run(matched, snapshot))
-            })
-        });
+        next_baseline.record_terminal_runs_filtered(
+            &repo_key,
+            &repo.path,
+            &repo.path,
+            &ci,
+            |snapshot| {
+                if previous_ci.is_none() || window_complete {
+                    return true;
+                }
+                previous_ci.is_some_and(|old_map| {
+                    old_map
+                        .values()
+                        .any(|old| snapshots_same_run(old, snapshot) && old.is_terminal())
+                }) || ci_events.iter().any(|event| {
+                    previous_snapshot_for_event(&ci, event)
+                        .is_some_and(|matched| snapshots_same_run(matched, snapshot))
+                })
+            },
+        );
         next_baseline.enqueue_pending(&repo_key, &repo.path, &ci_events, &ci);
         if ci_baseline_established {
             next_baseline
@@ -2573,9 +2605,10 @@ async fn fetch_ci_statuses(
 
     let mut attempts_by_run = HashMap::new();
     for (_, pr) in open_prs {
-        let pr_attempts =
+        let (pr_attempts, attempts_complete) =
             fetch_workflow_attempts_by_head_sha(client, api_base, &github_repo, &pr.head_sha)
                 .await?;
+        window_complete &= attempts_complete;
         for (run_id, attempt) in pr_attempts {
             attempts_by_run
                 .entry(run_id)
@@ -2811,9 +2844,10 @@ async fn fetch_workflow_attempts_by_head_sha(
     api_base: &str,
     github_repo: &str,
     head_sha: &str,
-) -> Result<HashMap<String, u32>> {
+) -> Result<(HashMap<String, u32>, bool)> {
     let mut attempts = HashMap::new();
     let mut page = 1_usize;
+    let mut complete = true;
     loop {
         let page_str = page.to_string();
         let response = github_get(
@@ -2838,12 +2872,16 @@ async fn fetch_workflow_attempts_by_head_sha(
                 .and_modify(|existing: &mut u32| *existing = (*existing).max(attempt))
                 .or_insert(attempt);
         }
-        if !has_next || page_len < CI_PAGE_SIZE || page >= MAX_CI_PAGES {
+        if !has_next || page_len < CI_PAGE_SIZE {
+            break;
+        }
+        if page >= MAX_CI_PAGES {
+            complete = false;
             break;
         }
         page += 1;
     }
-    Ok(attempts)
+    Ok((attempts, complete))
 }
 
 fn workflow_run_id(url: &str) -> Option<String> {
@@ -3720,6 +3758,7 @@ mod tests {
         let path = dir.path().join("github-ci-baseline.json");
         let mut live = CIBaseline::default();
         live.record_terminal_runs("/repo", "/repo", &run_map(&current));
+        live.repos.get_mut("/repo").unwrap().min_writer_epoch = 1;
         save_ci_baseline(&live, Some(&path)).unwrap();
         let committed_epoch = load_ci_baseline(Some(&path)).repos["/repo"].epoch;
 
@@ -3777,25 +3816,18 @@ mod tests {
         let repo = &baseline.repos["/repo"];
         assert_eq!(repo.current_window_ids, vec!["run:77:2", "check:555"]);
 
-        let mut many = Vec::new();
-        for id in 0..(MAX_CURRENT_WINDOW_IDS as u64 + 60) {
-            let mut run = run_snapshot(id, "CI", Some("success"), "main");
-            run.created_at = Some(format!("2026-01-01T00:{:02}:{:02}Z", id / 60, id % 60));
-            many.push(run);
-        }
-        let mut oversized = CIBaseline::default();
-        oversized.record_terminal_runs("/repo", "/repo", &run_map(&many));
-        let repo = &oversized.repos["/repo"];
-        assert_eq!(repo.current_window_ids.len(), MAX_CURRENT_WINDOW_IDS);
+        let many = (0..(MAX_CURRENT_WINDOW_IDS as u64 + 60))
+            .map(|id| format!("run:{id}"))
+            .collect::<Vec<_>>();
+        let bounded = canonicalize_current_window_ids_from(&many);
+        assert_eq!(bounded.len(), MAX_CURRENT_WINDOW_IDS);
         assert!(
-            repo.current_window_ids
-                .iter()
-                .all(|id| id.starts_with("run:")),
+            bounded.iter().all(|id| id.starts_with("run:")),
             "fallback identities must never be pinned"
         );
         let pinned_newest = format!("run:{}", MAX_CURRENT_WINDOW_IDS as u64 + 59);
         assert!(
-            repo.current_window_ids.contains(&pinned_newest),
+            bounded.contains(&pinned_newest),
             "truncation must keep the newest window identities"
         );
     }
