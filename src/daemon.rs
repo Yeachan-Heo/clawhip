@@ -2878,6 +2878,38 @@ mod tests {
         assert!(payload["native_hooks"]["totals"]["received"].is_number());
         assert_eq!(payload["token_precedence_warning"], Value::Null);
         assert_eq!(payload["http_routes_configured"], Value::Bool(false));
+        assert_eq!(payload["expected_discord_bot_id"], Value::Null);
+    }
+
+    #[test]
+    fn health_payload_surfaces_expected_discord_bot_id_when_configured() {
+        let mut config = AppConfig::default();
+        config.providers.discord.bot_token = Some("config-token".into());
+        config.providers.discord.expected_bot_id = Some("900000000000000101".into());
+
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
+            &[],
+            GitMonitorLifecycleCounts::default(),
+        );
+
+        // The health payload exposes only the public-safe expected bot ID —
+        // never the token. `ok` semantics stay unchanged: identity
+        // verification itself is the fail-closed CLI preflight's job.
+        assert_eq!(
+            payload["expected_discord_bot_id"],
+            Value::String("900000000000000101".to_string())
+        );
+        let rendered = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !rendered.contains("config-token"),
+            "token leaked: {rendered}"
+        );
+        assert_eq!(payload["ok"], Value::Bool(true));
     }
 
     #[test]

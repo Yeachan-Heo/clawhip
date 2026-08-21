@@ -231,23 +231,23 @@ mod tests {
             expected_bot_id: "1471139513983307916".into(),
             observed_bot_id: "1465264645320474637".into(),
         };
-        for verdict in [
+        // Independent enumeration of the healthy set: only Verified may be
+        // healthy; every other verdict must fail closed. Written per-variant
+        // so a new variant added without an explicit assertion stands out.
+        assert!(
             SenderIdentityVerdict::Verified {
-                bot_id: "1471139513983307916".into(),
-            },
-            mismatch.clone(),
-            SenderIdentityVerdict::NotConfigured,
-            SenderIdentityVerdict::NoToken,
-            SenderIdentityVerdict::InvalidCredential,
-            SenderIdentityVerdict::Forbidden,
-            SenderIdentityVerdict::RateLimited,
-            SenderIdentityVerdict::MalformedResponse,
-            SenderIdentityVerdict::TransportFailure,
-        ] {
-            let verified = verdict.is_verified();
-            let expected = matches!(&verdict, SenderIdentityVerdict::Verified { .. });
-            assert_eq!(verified, expected, "verdict {verdict:?}");
-        }
+                bot_id: "1471139513983307916".into()
+            }
+            .is_verified()
+        );
+        assert!(!mismatch.clone().is_verified());
+        assert!(!SenderIdentityVerdict::NotConfigured.is_verified());
+        assert!(!SenderIdentityVerdict::NoToken.is_verified());
+        assert!(!SenderIdentityVerdict::InvalidCredential.is_verified());
+        assert!(!SenderIdentityVerdict::Forbidden.is_verified());
+        assert!(!SenderIdentityVerdict::RateLimited.is_verified());
+        assert!(!SenderIdentityVerdict::MalformedResponse.is_verified());
+        assert!(!SenderIdentityVerdict::TransportFailure.is_verified());
         // Wrong-but-valid token: the exact regression this contract closes.
         assert!(!mismatch.is_verified());
     }

@@ -65,8 +65,8 @@ fn run_verify(config_path: &std::path::Path, api_base: &str, temp: &TempDir, jso
         .current_dir(temp.path())
         .env("HOME", temp.path())
         .env("CLAWHIP_DISCORD_API_BASE", api_base)
-        .env_remove("CLAWHIP_BOT_TOKEN")
-        .env_remove("DISCORD_BOT_TOKEN")
+        .env_remove("DISCORD_TOKEN")
+        .env_remove("CLAWHIP_DISCORD_BOT_TOKEN")
         .arg("--config")
         .arg(config_path)
         .arg("config")
@@ -202,10 +202,10 @@ bot_token = "test-token-319"
         text.contains("sender_identity_not_configured"),
         "stdout: {text}"
     );
-    assert!(
-        text.contains("null"),
-        "expected_bot_id should be null: {text}"
-    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&text).expect("absent-expectation JSON must parse");
+    assert_eq!(payload["expected_bot_id"], serde_json::Value::Null);
+    assert_eq!(payload["verified"], serde_json::Value::Bool(false));
 }
 
 #[test]
@@ -421,6 +421,154 @@ expected_bot_id = "clawhip-bot"
         text.contains("expected_bot_id must be a numeric Discord snowflake ID"),
         "diagnostic missing: {text}"
     );
+}
+
+#[test]
+fn forbidden_403_fails_closed() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config(
+        &temp,
+        &format!(
+            r#"
+[providers.discord]
+bot_token = "test-token-319"
+expected_bot_id = "{EXPECTED_BOT_ID}"
+"#
+        ),
+    );
+    let (api_base, request_rx) =
+        spawn_discord_api_mock("403 Forbidden", r#"{"message": "403: Forbidden"}"#);
+
+    let output = run_verify(&config_path, &api_base, &temp, true);
+
+    assert!(
+        !output.status.success(),
+        "403 must fail closed\nstdout:\n{}",
+        stdout(&output)
+    );
+    assert_identity_request(&request_rx.recv().expect("mock saw request"));
+    let text = stdout(&output);
+    assert!(text.contains("sender_identity_forbidden"), "stdout: {text}");
+    assert!(!text.contains("403: Forbidden"), "body leaked: {text}");
+}
+
+#[test]
+fn rate_limited_429_fails_closed() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config(
+        &temp,
+        &format!(
+            r#"
+[providers.discord]
+bot_token = "test-token-319"
+expected_bot_id = "{EXPECTED_BOT_ID}"
+"#
+        ),
+    );
+    let (api_base, request_rx) = spawn_discord_api_mock(
+        "429 Too Many Requests",
+        r#"{"message": "You are being rate limited.", "retry_after": 1.0}"#,
+    );
+
+    let output = run_verify(&config_path, &api_base, &temp, true);
+
+    assert!(
+        !output.status.success(),
+        "429 must fail closed\nstdout:\n{}",
+        stdout(&output)
+    );
+    assert_identity_request(&request_rx.recv().expect("mock saw request"));
+    let text = stdout(&output);
+    assert!(
+        text.contains("sender_identity_rate_limited"),
+        "stdout: {text}"
+    );
+    assert!(
+        !text.contains("You are being rate limited"),
+        "body leaked: {text}"
+    );
+}
+
+#[test]
+fn match_reports_verified_json_output() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config(
+        &temp,
+        &format!(
+            r#"
+[providers.discord]
+bot_token = "test-token-319"
+expected_bot_id = "{EXPECTED_BOT_ID}"
+"#
+        ),
+    );
+    let (api_base, request_rx) = spawn_discord_api_mock(
+        "200 OK",
+        &format!(r#"{{"id": "{EXPECTED_BOT_ID}", "username": "clawhip"}}"#),
+    );
+
+    let output = run_verify(&config_path, &api_base, &temp, true);
+
+    assert!(
+        output.status.success(),
+        "verified identity must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_identity_request(&request_rx.recv().expect("mock saw request"));
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("verified JSON output must parse");
+    assert_eq!(payload["verified"], serde_json::Value::Bool(true));
+    assert_eq!(
+        payload["reason_code"],
+        serde_json::Value::String("sender_identity_verified".into())
+    );
+    assert_eq!(
+        payload["expected_bot_id"],
+        serde_json::Value::String(EXPECTED_BOT_ID.into())
+    );
+    assert_eq!(
+        payload["observed_bot_id"],
+        serde_json::Value::String(EXPECTED_BOT_ID.into())
+    );
+    assert!(
+        payload["token_source"].is_string(),
+        "token_source must be a public-safe label: {payload}"
+    );
+    assert!(
+        !stdout(&output).contains("test-token-319"),
+        "token leaked: {}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn text_mode_failure_report_shows_fail_header() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = write_config(
+        &temp,
+        r#"
+[providers.discord]
+bot_token = "test-token-319"
+"#,
+    );
+    let (api_base, _request_rx) = spawn_discord_api_mock("200 OK", r#"{"id": "1"}"#);
+
+    let output = run_verify(&config_path, &api_base, &temp, false);
+
+    assert!(
+        !output.status.success(),
+        "absent expectation must fail closed in text mode\nstdout:\n{}",
+        stdout(&output)
+    );
+    let text = stdout(&output);
+    assert!(text.contains("[FAIL]"), "text FAIL header missing: {text}");
+    assert!(
+        text.contains("token source: config (credential value never printed)"),
+        "public-safe token-source line missing: {text}"
+    );
+    assert!(!text.contains("test-token-319"), "token leaked: {text}");
 }
 
 #[test]

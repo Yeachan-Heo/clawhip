@@ -4350,11 +4350,10 @@ expected_bot_id = "900000000000000101"
 
         let serialized = config.to_pretty_toml().unwrap();
         assert!(serialized.contains("expected_bot_id"));
-        assert!(
-            !serialized.contains("bot_token = \"bot-token\"")
-                || serialized.contains("expected_bot_id"),
-            "expected_bot_id must survive serialization"
-        );
+        // Serialization preserves the expectation. The token is also
+        // serialized by design (operator-local config file); credential
+        // redaction is enforced on verify/report outputs, not here.
+        assert!(serialized.contains("expected_bot_id = \"900000000000000101\""));
 
         // Round-trip: the serialized form parses back to the same expectation.
         let round_path = dir.path().join("round.toml");
