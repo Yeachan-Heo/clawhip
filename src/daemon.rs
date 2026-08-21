@@ -519,6 +519,7 @@ fn health_payload(
         "version": VERSION,
         "token_source": config.discord_token_source(),
         "token_precedence_warning": config.discord_token_env_shadow().map(discord_token_shadow_warning),
+        "expected_discord_bot_id": config.expected_discord_bot_id(),
         "webhook_routes_configured": config.has_webhook_routes(),
         "http_routes_configured": config.has_http_routes(),
         "port": port,

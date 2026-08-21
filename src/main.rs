@@ -26,6 +26,7 @@ mod provenance;
 mod release_preflight;
 mod render;
 mod router;
+mod sender_identity;
 mod sink;
 mod slack;
 mod source;
@@ -46,6 +47,7 @@ use crate::cli::{
     GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, LedgerCommands,
     MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands,
     TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    VerifySenderIdentityArgs,
 };
 
 use crate::client::DaemonClient;
@@ -455,6 +457,9 @@ async fn real_main(cli: Cli) -> Result<()> {
             ConfigCommand::VerifyBindings(args) => run_verify_bindings(config, args).await,
             ConfigCommand::VerifyGatewayAllowlist(args) => {
                 run_verify_gateway_allowlist(config, args)
+            }
+            ConfigCommand::VerifySenderIdentity(args) => {
+                run_verify_sender_identity(config, args).await
             }
         },
         Commands::Plugin { command } => match command {
@@ -996,6 +1001,68 @@ async fn run_verify_bindings(config: Arc<AppConfig>, args: VerifyBindingsArgs) -
         std::process::exit(1);
     }
     Ok(())
+}
+
+async fn run_verify_sender_identity(
+    config: Arc<AppConfig>,
+    args: VerifySenderIdentityArgs,
+) -> Result<()> {
+    use crate::sender_identity::{sender_identity_expectation, verify_sender_identity};
+    config.validate()?;
+
+    let token_source = config.discord_token_source();
+    let expectation = sender_identity_expectation(config.expected_discord_bot_id().as_deref());
+    let client = DiscordClient::from_config(config.clone())?;
+    let verdict = verify_sender_identity(&client, &expectation).await;
+
+    if args.json {
+        let payload = sender_identity_json(&verdict, &expectation, token_source);
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_sender_identity_report(&verdict, token_source);
+    }
+
+    // Fail closed: every non-verified outcome — mismatch, absent expectation,
+    // invalid credential, rate limit, malformed response, transport failure —
+    // exits non-zero. Transport success alone never passes this preflight.
+    if !verdict.is_verified() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn sender_identity_json(
+    verdict: &crate::sender_identity::SenderIdentityVerdict,
+    expectation: &crate::sender_identity::SenderIdentityExpectation,
+    token_source: &str,
+) -> serde_json::Value {
+    use crate::sender_identity::SenderIdentityExpectation;
+    use serde_json::json;
+    let expected_bot_id = match expectation {
+        SenderIdentityExpectation::Expected { bot_id } => json!(bot_id),
+        SenderIdentityExpectation::Absent => serde_json::Value::Null,
+    };
+    let observed_bot_id = verdict
+        .observed_bot_id()
+        .map(|id| json!(id))
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "verified": verdict.is_verified(),
+        "reason_code": verdict.reason_code(),
+        "expected_bot_id": expected_bot_id,
+        "observed_bot_id": observed_bot_id,
+        "verdict": verdict.to_string(),
+        "token_source": token_source,
+    })
+}
+
+fn print_sender_identity_report(
+    verdict: &crate::sender_identity::SenderIdentityVerdict,
+    token_source: &str,
+) {
+    let status = if verdict.is_verified() { "ok" } else { "FAIL" };
+    println!("[{status:>4}] {verdict}");
+    println!("       token source: {token_source} (credential value never printed)");
 }
 
 fn run_verify_gateway_allowlist(

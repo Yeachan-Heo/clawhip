@@ -301,6 +301,13 @@ pub struct VerifyGatewayAllowlistArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Default, Args)]
+pub struct VerifySenderIdentityArgs {
+    /// Emit machine-readable JSON instead of the human-readable text report.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 impl EmitArgs {
     pub fn into_event(self) -> crate::Result<crate::events::IncomingEvent> {
         let mut channel = None;
@@ -1088,6 +1095,17 @@ pub enum ConfigCommand {
     /// channel IDs plus clawhip source labels; never dumps gateway tokens,
     /// webhooks, payloads, or unrelated config fields.
     VerifyGatewayAllowlist(VerifyGatewayAllowlistArgs),
+    /// Verify the effective Discord bot token resolves to the expected bot
+    /// identity via the Discord /users/@me endpoint.
+    ///
+    /// Fail-closed sender-identity preflight: requires
+    /// providers.discord.expected_bot_id, queries Discord with the effective
+    /// token (non-mutating, bounded), compares the observed stable bot ID to
+    /// the expected one, and reports a public-safe verdict that never
+    /// contains the token. Exits non-zero on any non-verified outcome so a
+    /// wrong-but-valid token cannot pass a smoke test merely because
+    /// transport works.
+    VerifySenderIdentity(VerifySenderIdentityArgs),
 }
 
 #[cfg(test)]
@@ -1447,6 +1465,31 @@ mod tests {
             Some(std::path::Path::new("/tmp/clawdbot.json"))
         );
         assert!(args.json);
+    }
+    #[test]
+    fn parses_config_verify_sender_identity_json() {
+        let cli = Cli::parse_from(["clawhip", "config", "verify-sender-identity", "--json"]);
+
+        let Some(Commands::Config {
+            command: Some(ConfigCommand::VerifySenderIdentity(args)),
+        }) = cli.command
+        else {
+            panic!("expected verify-sender-identity");
+        };
+        assert!(args.json);
+    }
+
+    #[test]
+    fn parses_config_verify_sender_identity_text_default() {
+        let cli = Cli::parse_from(["clawhip", "config", "verify-sender-identity"]);
+
+        let Some(Commands::Config {
+            command: Some(ConfigCommand::VerifySenderIdentity(args)),
+        }) = cli.command
+        else {
+            panic!("expected verify-sender-identity");
+        };
+        assert!(!args.json);
     }
 
     #[test]
