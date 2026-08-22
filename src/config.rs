@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use time::{Date, Duration as TimeDuration, OffsetDateTime, PrimitiveDateTime, format_description};
 
 use crate::Result;
+use crate::discord::is_discord_snowflake;
 use crate::events::MessageFormat;
 use crate::source::workspace::{default_workspace_debounce_ms, default_workspace_watch_dirs};
 
@@ -327,6 +328,11 @@ pub struct DiscordConfig {
     pub bot_token: Option<String>,
     #[serde(alias = "default_channel")]
     pub legacy_default_channel: Option<String>,
+    /// Operator-configured stable Discord bot ID that the effective bot token
+    /// must resolve to via `GET /users/@me`. Presence enables fail-closed
+    /// sender-identity verification; absence leaves transport-only behavior.
+    #[serde(default, alias = "bot_id", skip_serializing_if = "Option::is_none")]
+    pub expected_bot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -352,7 +358,9 @@ pub struct DaemonConfig {
 
 impl DiscordConfig {
     fn is_empty(&self) -> bool {
-        self.bot_token.is_none() && self.legacy_default_channel.is_none()
+        self.bot_token.is_none()
+            && self.legacy_default_channel.is_none()
+            && self.expected_bot_id.is_none()
     }
 }
 
@@ -1156,6 +1164,11 @@ impl AppConfig {
                 self.discord.legacy_default_channel.clone(),
                 &mut self.providers.discord.legacy_default_channel,
             )?;
+            merge_legacy_discord_field(
+                "bot_id",
+                self.discord.expected_bot_id.clone(),
+                &mut self.providers.discord.expected_bot_id,
+            )?;
         }
 
         self.discord = DiscordConfig::default();
@@ -1389,6 +1402,12 @@ impl AppConfig {
             .or_else(|| normalize_secret(self.providers.discord.bot_token.clone()))
             .or_else(|| normalize_secret(self.discord.bot_token.clone()))
     }
+    /// Operator-configured expected Discord bot ID after legacy [discord]
+    /// migration, normalized. `Some(id)` enables fail-closed sender-identity
+    /// verification; `None` keeps the transport-only behavior.
+    pub fn expected_discord_bot_id(&self) -> Option<String> {
+        normalize_text(self.providers.discord.expected_bot_id.clone())
+    }
 
     pub fn discord_token_source(&self) -> &'static str {
         self.discord_token_source_with(|name| env::var(name).ok())
@@ -1589,6 +1608,13 @@ impl AppConfig {
         }
         if self.cron.poll_interval_secs == 0 {
             return Err("cron.poll_interval_secs must be at least 1".into());
+        }
+        if let Some(expected_bot_id) = self.expected_discord_bot_id()
+            && !is_discord_snowflake(&expected_bot_id)
+        {
+            return Err(
+                "providers.discord.expected_bot_id must be a numeric Discord snowflake ID".into(),
+            );
         }
         if self.discord_watch.enabled {
             if self.discord_watch.gaebal_gajae_user_id.trim().is_empty() {
@@ -2401,6 +2427,9 @@ impl AppConfig {
             normalize_secret(self.providers.discord.bot_token.clone());
         self.providers.discord.legacy_default_channel =
             normalize_text(self.providers.discord.legacy_default_channel.clone());
+        self.providers.discord.expected_bot_id =
+            normalize_text(self.providers.discord.expected_bot_id.clone());
+        self.discord.expected_bot_id = normalize_text(self.discord.expected_bot_id.clone());
         self.providers.http.endpoint = normalize_text(self.providers.http.endpoint.clone());
         self.providers.http.hmac_secret_env =
             normalize_text(self.providers.http.hmac_secret_env.clone());
@@ -4297,6 +4326,100 @@ mod tests {
         assert!(config.discord.is_empty());
         assert_eq!(config.defaults.channel.as_deref(), Some("123"));
     }
+    #[test]
+    fn expected_bot_id_parses_serializes_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[providers.discord]
+token = "bot-token"
+expected_bot_id = "900000000000000101"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(
+            config.expected_discord_bot_id().as_deref(),
+            Some("900000000000000101")
+        );
+        assert!(config.validate().is_ok());
+
+        let serialized = config.to_pretty_toml().unwrap();
+        assert!(serialized.contains("expected_bot_id"));
+        // Serialization preserves the expectation. The token is also
+        // serialized by design (operator-local config file); credential
+        // redaction is enforced on verify/report outputs, not here.
+        assert!(serialized.contains("expected_bot_id = \"900000000000000101\""));
+
+        // Round-trip: the serialized form parses back to the same expectation.
+        let round_path = dir.path().join("round.toml");
+        fs::write(&round_path, &serialized).unwrap();
+        let round = AppConfig::load_or_default(&round_path).unwrap();
+        assert_eq!(
+            round.expected_discord_bot_id().as_deref(),
+            Some("900000000000000101")
+        );
+    }
+
+    #[test]
+    fn legacy_discord_bot_id_migrates_to_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[discord]\ntoken = \"legacy-token\"\nbot_id = \"900000000000000101\"\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(
+            config.expected_discord_bot_id().as_deref(),
+            Some("900000000000000101")
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn expected_bot_id_rejects_non_snowflake_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[providers.discord]
+token = "bot-token"
+expected_bot_id = "clawhip-bot"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("must be a numeric Discord snowflake ID"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_without_expected_bot_id_still_validates() {
+        // Backward compatibility: existing configs parse and validate with no
+        // expectation configured; identity verification stays opt-in.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[providers.discord]\ntoken = \"bot-token\"\n").unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.expected_discord_bot_id(), None);
+        assert!(config.validate().is_ok());
+        assert!(!config.to_pretty_toml().unwrap().contains("expected_bot_id"));
+    }
 
     #[test]
     fn config_without_http_provider_remains_backward_compatible() {
@@ -4765,6 +4888,7 @@ sink = "http"
                 discord: DiscordConfig {
                     bot_token: Some("token".into()),
                     legacy_default_channel: None,
+                    expected_bot_id: None,
                 },
                 slack: SlackConfig::default(),
                 http: HttpConfig::default(),
@@ -4841,6 +4965,7 @@ sink = "http"
                 discord: DiscordConfig {
                     bot_token: Some("old-token".into()),
                     legacy_default_channel: None,
+                    expected_bot_id: None,
                 },
                 slack: SlackConfig::default(),
                 http: HttpConfig::default(),
@@ -5200,6 +5325,7 @@ message = " ping "
                 discord: DiscordConfig {
                     bot_token: Some("token".into()),
                     legacy_default_channel: None,
+                    expected_bot_id: None,
                 },
                 slack: SlackConfig::default(),
                 http: HttpConfig::default(),

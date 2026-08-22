@@ -157,6 +157,12 @@ pub enum DiscordThreadMessageList {
 }
 
 #[derive(Debug, Deserialize)]
+struct DiscordSelfBody {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DiscordMessageBody {
     #[serde(default)]
     id: Option<String>,
@@ -583,6 +589,64 @@ impl DiscordClient {
             }
         }
     }
+}
+
+/// Public-safe result of resolving the effective bot token's own Discord
+/// identity via `GET /users/@me`. Variants carry no response bodies and no
+/// token material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfLookup {
+    /// Token resolved to a stable bot ID.
+    Bot { id: String },
+    /// No bot token is configured.
+    NoToken,
+    /// Discord rejected the credential (401).
+    Unauthorized,
+    /// Credential valid but the endpoint is forbidden (403).
+    Forbidden,
+    /// Rate limited (429); retry later, identity unverified.
+    RateLimited,
+    /// Success response could not be parsed into a stable bot ID.
+    MalformedSuccess,
+    /// Network/transport or unexpected HTTP failure; identity unverified.
+    Transport,
+}
+
+impl DiscordClient {
+    /// Resolve the bot's own Discord identity via `GET /users/@me`.
+    ///
+    /// A read-only, bounded identity probe used by sender-identity
+    /// verification. It never touches the delivery circuit, limiter,
+    /// telemetry, or DLQ, and the returned value never contains Discord
+    /// response bodies or token material — only the stable bot ID and,
+    /// on failure, a public-safe failure mode.
+    pub async fn lookup_self(&self) -> SelfLookup {
+        let Some(client) = self.bot_client.as_ref() else {
+            return SelfLookup::NoToken;
+        };
+
+        let Some(url) = discord_lane_url(&self.api_base, &["users", "@me"]) else {
+            return SelfLookup::Transport;
+        };
+
+        match client.get(url).timeout(LANE_REQUEST_TIMEOUT).send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<DiscordSelfBody>()
+                .await
+                .ok()
+                .and_then(|body| body.id)
+                .filter(|id| is_discord_snowflake(id))
+                .map(|id| SelfLookup::Bot { id })
+                .unwrap_or(SelfLookup::MalformedSuccess),
+            Ok(response) => match lane_http_error(response.status(), None).category {
+                DiscordLaneErrorCategory::Unauthorized => SelfLookup::Unauthorized,
+                DiscordLaneErrorCategory::Forbidden => SelfLookup::Forbidden,
+                DiscordLaneErrorCategory::RateLimited => SelfLookup::RateLimited,
+                _ => SelfLookup::Transport,
+            },
+            Err(_) => SelfLookup::Transport,
+        }
+    }
 
     async fn send_message(
         &self,
@@ -880,7 +944,7 @@ fn request_error_category(error: &reqwest::Error) -> DiscordLaneErrorCategory {
     }
 }
 
-fn is_discord_snowflake(value: &str) -> bool {
+pub(crate) fn is_discord_snowflake(value: &str) -> bool {
     (1..=20).contains(&value.len()) && value.as_bytes().iter().all(u8::is_ascii_digit)
 }
 
