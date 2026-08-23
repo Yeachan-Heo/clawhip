@@ -1085,7 +1085,11 @@ async fn feed_gjc_bridge_from_query(
         worktree_path: record.worktree.clone(),
         ..GjcSnapshotIdentity::default()
     };
-    let snapshot = snapshot_from_session_query(sdk_session_id, record.revision, query, &identity);
+    // sdk_revision (the SDK's own monotonic counter) keeps the query feed in
+    // the same revision space as push-ingress payloads so interleaved seams
+    // cannot suppress each other's transitions.
+    let snapshot =
+        snapshot_from_session_query(sdk_session_id, record.sdk_revision, query, &identity);
     let outcome = {
         let Ok(mut bridge) = gjc_bridge_slot().lock() else {
             return;
@@ -1096,7 +1100,9 @@ async fn feed_gjc_bridge_from_query(
         return;
     };
     for event in outcome.events {
-        let _ = state.tx.try_send(normalize_event(event));
+        // Awaited send like every other ingress: bridge dedupe state has
+        // already advanced, so a silently dropped event would never re-emit.
+        let _ = enqueue_event(&state.tx, normalize_event(event)).await;
     }
 }
 
