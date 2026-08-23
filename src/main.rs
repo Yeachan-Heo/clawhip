@@ -16,6 +16,7 @@ mod gateway_allowlist;
 mod gjc;
 mod gjc_lane;
 mod gjc_sdk;
+mod gjc_sdk_events;
 mod hooks;
 mod keyword_window;
 mod lane;
