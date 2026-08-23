@@ -25,6 +25,11 @@ use crate::native_observability::{
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 
+use crate::gjc_lane::{
+    GjcLaneRegistrationRequest, GjcLaneStore, GjcReconciler, SharedGjcLaneStore,
+    SharedGjcReconciler,
+};
+use crate::gjc_lane::{default_gjc_lane_state_path, health_json as gjc_health_json};
 use crate::sink::{DiscordSink, HttpSink, LocalFileSink, Sink, SlackSink};
 use crate::source::tmux::{
     AbsentRegistrationCandidate, prune_absent_dynamic_registrations, session_exists,
@@ -105,6 +110,8 @@ struct AppState {
     discord_watch_lock: Arc<Mutex<()>>,
     subscriptions: SharedSubscriptionRegistry,
     git_monitor_diagnostics: SharedGitMonitorDiagnostics,
+    gjc_store: Option<SharedGjcLaneStore>,
+    gjc_reconciler: Option<SharedGjcReconciler>,
 }
 
 type SharedSubscriptionRegistry = Arc<RwLock<BTreeMap<String, SubscriptionEntry>>>;
@@ -236,6 +243,8 @@ pub async fn run(
             update::run_checker(config, tx, pending).await;
         });
     }
+    let (gjc_store, gjc_reconciler) =
+        spawn_gjc_lane_reconciler(config.clone(), cron_state_path.clone(), tx.clone()).await?;
 
     let app = AxumRouter::new()
         .route("/health", get(health))
@@ -263,6 +272,17 @@ pub async fn run(
         )
         .route("/api/lane/delivery", post(record_lane_delivery_handler))
         .route("/api/lane/retire", post(retire_lane_handler))
+        .route("/api/gjc/health", get(gjc_health_handler))
+        .route(
+            "/api/gjc/lanes",
+            get(list_gjc_lanes_handler).post(register_gjc_lane_handler),
+        )
+        .route("/api/gjc/lanes/{lane}", get(gjc_lane_detail_handler))
+        .route(
+            "/api/gjc/lanes/{lane}/retire",
+            post(retire_gjc_lane_handler),
+        )
+        .route("/api/gjc/lane/reconcile", post(reconcile_gjc_lanes_handler))
         .route("/api/subscriptions", get(list_subscriptions))
         .route("/api/subscriptions/{name}", get(subscription_detail))
         .route("/api/ledger/status", get(ledger_status))
@@ -282,6 +302,8 @@ pub async fn run(
         discord_watch_lock: Arc::new(Mutex::new(())),
         subscriptions: subscriptions.clone(),
         git_monitor_diagnostics,
+        gjc_store,
+        gjc_reconciler,
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -369,6 +391,193 @@ async fn ledger_query(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":"ledger_unavailable"})),
         ),
+    }
+}
+
+/// Open the durable GJC lane store and start the reconciler when enabled.
+///
+/// The reconciler runs only once a control plane registers through the
+/// [`crate::gjc_lane::register_gjc_control_plane`] seam; until then durable
+/// ownership, status surfaces, and PR reconciliation stay live while polling
+/// stays idle instead of fabricating SDK evidence (transport contract under
+/// repair by its own track).
+async fn spawn_gjc_lane_reconciler(
+    config: Arc<AppConfig>,
+    cron_state_path: PathBuf,
+    tx: mpsc::Sender<IncomingEvent>,
+) -> Result<(Option<SharedGjcLaneStore>, Option<SharedGjcReconciler>)> {
+    if !config.gjc_lanes.enabled {
+        return Ok((None, None));
+    }
+    let path = config
+        .gjc_lanes
+        .state_path
+        .clone()
+        .unwrap_or_else(|| default_gjc_lane_state_path(&cron_state_path));
+    let store = Arc::new(GjcLaneStore::open(&path)?);
+    store.note_restart()?;
+    println!(
+        "clawhip gjc lane reconciliation enabled ({})",
+        path.display()
+    );
+    let Some(plane) = crate::gjc_lane::take_registered_control_plane() else {
+        eprintln!("clawhip gjc lanes: control plane not registered yet; reconciliation idle");
+        return Ok((Some(store), None));
+    };
+    let pr_resolver: Option<std::sync::Arc<dyn crate::gjc_lane::GjcLanePrResolver>> =
+        crate::gjc_lane::GithubApiPrResolver::from_config(&config.gjc_lanes.pr)?
+            .map(|resolver| resolver as _);
+    let reconciler = Arc::new(GjcReconciler::new(
+        plane,
+        pr_resolver,
+        store.clone(),
+        tx,
+        config.gjc_lanes.polling_policy(),
+    ));
+    {
+        let runner = reconciler.clone();
+        tokio::spawn(async move {
+            runner.run().await;
+        });
+    }
+    Ok((Some(store), Some(reconciler)))
+}
+
+fn gjc_lanes_disabled() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"ok": false, "error": "gjc lanes are not enabled"})),
+    )
+}
+
+fn gjc_lane_error(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    let message = error.to_string();
+    let status = if message.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("conflict") || message.contains("revision") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(json!({"ok": false, "error": "gjc lane request rejected"})),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GjcLaneListParams {
+    removed: Option<bool>,
+}
+
+async fn gjc_health_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    Json(gjc_health_json(store, state.gjc_reconciler.is_some())).into_response()
+}
+
+async fn list_gjc_lanes_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Query(params): Query<GjcLaneListParams>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    let include_removed = params.removed.unwrap_or(false);
+    Json(json!({
+        "schema": crate::gjc_lane::GJC_LANE_STATE_SCHEMA,
+        "lanes": store.snapshot_watches(include_removed),
+    }))
+    .into_response()
+}
+
+async fn gjc_lane_detail_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(lane_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    match store.record(&lane_id) {
+        Some(record) => Json(record).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": "gjc lane not found"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn register_gjc_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<GjcLaneRegistrationRequest>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    match store.register_lane(&request, &crate::gjc_lane::now_rfc3339()) {
+        Ok(record) => Json(record).into_response(),
+        Err(error) => gjc_lane_error(error).into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GjcLaneRetireRequest {
+    reason: Option<String>,
+}
+
+async fn retire_gjc_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(lane_id): axum::extract::Path<String>,
+    Json(request): Json<GjcLaneRetireRequest>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    let Some(record) = store.record(&lane_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": "gjc lane not found"})),
+        )
+            .into_response();
+    };
+    match store.retire_lane(
+        &lane_id,
+        record.revision,
+        request.reason.as_deref().unwrap_or("manual retirement"),
+        &crate::gjc_lane::now_rfc3339(),
+    ) {
+        Ok(updated) => Json(updated).into_response(),
+        Err(error) => gjc_lane_error(error).into_response(),
+    }
+}
+
+async fn reconcile_gjc_lanes_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let Some(reconciler) = &state.gjc_reconciler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "gjc reconciler is idle; control plane not registered"})),
+        )
+            .into_response();
+    };
+    match reconciler.poll_once(OffsetDateTime::now_utc()).await {
+        Ok(outcome) => Json(json!({"ok": true, "outcome": outcome})).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": "gjc reconcile pass failed"})),
+        )
+            .into_response(),
     }
 }
 
@@ -2200,6 +2409,8 @@ mod tests {
                 discord_watch_lock: Arc::new(Mutex::new(())),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
                 git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+                gjc_store: None,
+                gjc_reconciler: None,
             },
             rx,
         )
@@ -2345,6 +2556,8 @@ mod tests {
                 discord_watch_lock: Arc::new(Mutex::new(())),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
                 git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+                gjc_store: None,
+                gjc_reconciler: None,
             },
             rx,
         )
@@ -2695,6 +2908,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -2813,6 +3028,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -3312,6 +3529,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -3353,6 +3572,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -3387,6 +3608,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let event = IncomingEvent::agent_started(
             "worker-1".into(),
@@ -3433,6 +3656,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -3490,6 +3715,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -3552,6 +3779,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -3612,6 +3841,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let event = |id: &str| IncomingEvent {
@@ -3670,6 +3901,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -3700,6 +3933,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let payload = json!({"provider": "codex", "event_name": "Bogus"});
 
@@ -3729,6 +3964,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -3772,6 +4009,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -3814,6 +4053,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let payload = json!({
             "provider": "codex",
@@ -3885,6 +4126,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let payload = json!({
             "provider": "claude-code",
@@ -4053,6 +4296,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -4143,6 +4388,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = list_tmux(State(state)).await.into_response();
@@ -4191,6 +4438,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -4224,6 +4473,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -4250,6 +4501,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = approve_update(State(state)).await.into_response();
@@ -4288,6 +4541,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = dismiss_update(State(state)).await.into_response();
@@ -4314,6 +4569,8 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = dismiss_update(State(state)).await.into_response();

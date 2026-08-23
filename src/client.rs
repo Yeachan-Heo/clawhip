@@ -162,6 +162,35 @@ impl DaemonClient {
             Err(format!("daemon request failed with {status}: {body}").into())
         }
     }
+    pub async fn gjc_health(&self) -> Result<Value> {
+        self.private_get_json("/api/gjc/health").await
+    }
+
+    pub async fn gjc_lanes(&self, include_removed: bool) -> Result<Value> {
+        let suffix = if include_removed { "?removed=true" } else { "" };
+        self.private_get_json(&format!("/api/gjc/lanes{suffix}"))
+            .await
+    }
+
+    pub async fn gjc_register(
+        &self,
+        request: &crate::gjc_lane::GjcLaneRegistrationRequest,
+    ) -> Result<Value> {
+        self.private_post_json("/api/gjc/lanes", request).await
+    }
+
+    pub async fn gjc_reconcile(&self) -> Result<Value> {
+        self.private_post_json("/api/gjc/lane/reconcile", &serde_json::json!({}))
+            .await
+    }
+
+    pub async fn gjc_retire(&self, lane: &str, reason: Option<&str>) -> Result<Value> {
+        self.private_post_json(
+            &format!("/api/gjc/lanes/{lane}/retire"),
+            &serde_json::json!({ "reason": reason.unwrap_or("manual retirement") }),
+        )
+        .await
+    }
 
     pub async fn list_lanes(&self) -> Result<Vec<LaneSnapshot>> {
         self.private_get_json("/api/lane").await
@@ -199,6 +228,10 @@ impl DaemonClient {
     ) -> Result<T> {
         self.ensure_loopback_daemon()?;
         self.post_typed(path, payload).await
+    }
+    async fn private_post_json<P: Serialize>(&self, path: &str, payload: &P) -> Result<Value> {
+        self.ensure_loopback_daemon()?;
+        self.post_json(path, payload).await
     }
     fn ensure_loopback_daemon(&self) -> Result<()> {
         let url = reqwest::Url::parse(&self.base_url)?;

@@ -49,6 +49,11 @@ pub struct AppConfig {
     pub subscriptions: Vec<SubscriptionConfig>,
     #[serde(default, skip_serializing_if = "LedgerConfig::is_empty")]
     pub ledger: LedgerConfig,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::gjc_lane::GjcLanesConfig::is_empty"
+    )]
+    pub gjc_lanes: crate::gjc_lane::GjcLanesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1606,6 +1611,7 @@ impl AppConfig {
                 return Err("invalid_subscription_config".into());
             }
         }
+        self.gjc_lanes.validate()?;
         if self.cron.poll_interval_secs == 0 {
             return Err("cron.poll_interval_secs must be at least 1".into());
         }
