@@ -362,6 +362,62 @@ impl Renderer for DefaultRenderer {
             ),
             ("tmux.stale", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
+            ("workflow.question", MessageFormat::Compact) => format!(
+                "❓ GJC question {} · turn {} · rev {}: {}",
+                optional_string_field(payload, "question_id")
+                    .unwrap_or_else(|| "unknown".to_string()),
+                optional_string_field(payload, "turn_id").unwrap_or_else(|| "unknown".to_string()),
+                payload
+                    .get("gate_revision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                optional_string_field(payload, "summary")
+                    .unwrap_or_else(|| "operator input requested".to_string())
+            ),
+            ("workflow.question", MessageFormat::Alert) => format!(
+                "🚨 ❓ GJC question {} needs an answer · turn {} · rev {}: {}",
+                optional_string_field(payload, "question_id")
+                    .unwrap_or_else(|| "unknown".to_string()),
+                optional_string_field(payload, "turn_id").unwrap_or_else(|| "unknown".to_string()),
+                payload
+                    .get("gate_revision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                optional_string_field(payload, "summary")
+                    .unwrap_or_else(|| "operator input requested".to_string())
+            ),
+            ("workflow.question", MessageFormat::Inline) => format!(
+                "[gjc question:{}] {}",
+                optional_string_field(payload, "question_id")
+                    .unwrap_or_else(|| "unknown".to_string()),
+                optional_string_field(payload, "summary")
+                    .unwrap_or_else(|| "operator input requested".to_string())
+            ),
+            ("workflow.gate", MessageFormat::Compact | MessageFormat::Inline) => format!(
+                "🚧 GJC gate {} blocked · turn {} · rev {}: {}",
+                optional_string_field(payload, "question_id")
+                    .unwrap_or_else(|| "unknown".to_string()),
+                optional_string_field(payload, "turn_id").unwrap_or_else(|| "unknown".to_string()),
+                payload
+                    .get("gate_revision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                optional_string_field(payload, "summary")
+                    .unwrap_or_else(|| "workflow gate requires approval".to_string())
+            ),
+            ("workflow.gate", MessageFormat::Alert) => format!(
+                "🚨 🚧 GJC gate {} blocked · turn {} · rev {}: {}",
+                optional_string_field(payload, "question_id")
+                    .unwrap_or_else(|| "unknown".to_string()),
+                optional_string_field(payload, "turn_id").unwrap_or_else(|| "unknown".to_string()),
+                payload
+                    .get("gate_revision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                optional_string_field(payload, "summary")
+                    .unwrap_or_else(|| "workflow gate requires approval".to_string())
+            ),
+
             (_, MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
             (_, _) => serde_json::to_string(payload)?,
         };

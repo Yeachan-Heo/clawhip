@@ -997,6 +997,10 @@ fn should_bypass_routine_batch(event: &IncomingEvent) -> bool {
         || kind.ends_with(".blocked")
         || kind == "tmux.stale"
         || kind.starts_with("github.ci-")
+        // GJC SDK question/gate notifications (#324) are operator-facing
+        // alerts and must never sit in the routine delivery batch window.
+        || kind == "workflow.question"
+        || kind == "workflow.gate"
 }
 
 /// One chunk of a split Discord routine batch.

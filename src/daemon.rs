@@ -13,6 +13,10 @@ use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::gajae::{HandlerAction, HandlerLimits, HandlerOutcome};
+use crate::gjc_sdk_events::{
+    GjcEventBridge, GjcSnapshotIdentity, snapshot_from_response_payload,
+    snapshot_from_session_query,
+};
 use crate::ledger::{EventLedger, LedgerQuery, SharedEventLedger};
 use crate::native_hooks::{
     NATIVE_NON_GIT_OUTCOME, NATIVE_NORMALIZATION_OUTCOME_FIELD,
@@ -78,6 +82,15 @@ fn shared_event_ledger() -> Option<SharedEventLedger> {
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
+}
+
+/// Process-wide GJC SDK event bridge (#324): authoritative snapshots pushed by
+/// sibling tracks reduce here into lifecycle/question/notification events that
+/// flow through the normal accept pipeline (ledger -> router -> sinks).
+static GJC_SDK_BRIDGE: OnceLock<std::sync::Mutex<GjcEventBridge>> = OnceLock::new();
+
+fn gjc_bridge_slot() -> &'static std::sync::Mutex<GjcEventBridge> {
+    GJC_SDK_BRIDGE.get_or_init(|| std::sync::Mutex::new(GjcEventBridge::new()))
 }
 
 const STALE_NATIVE_REPLAY_GRACE: Duration = Duration::from_secs(5 * 60);
@@ -305,7 +318,8 @@ pub async fn run(
         )
         .route("/api/gjc/ask-answer", post(gjc_ask_answer))
         .route("/api/gjc/model-selection", post(gjc_model_selection))
-        .route("/api/gjc/command/{key}", get(gjc_command_receipt));
+        .route("/api/gjc/command/{key}", get(gjc_command_receipt))
+        .route("/api/gjc/bridge", post(post_gjc_bridge));
     let port = port_override.unwrap_or(config.daemon.port);
 
     let app = app.with_state(AppState {
@@ -1016,6 +1030,28 @@ async fn gjc_session_query(
     axum::extract::Path(session): axum::extract::Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
+    // Full-section reads feed the #324 event bridge from the same authoritative
+    // evidence they return; partial `sections` reads skip the bridge because a
+    // reducer fed partial state could derive wrong transitions.
+    if !params.contains_key("sections") {
+        match state
+            .gjc
+            .query_session(
+                &match crate::gjc::model::SessionId::new(&session) {
+                    Ok(session) => session,
+                    Err(error) => return gjc_error_response(&error),
+                },
+                crate::gjc::api::SESSION_SECTIONS,
+            )
+            .await
+        {
+            Ok(query) => {
+                feed_gjc_bridge_from_query(&state, &session, &query).await;
+                return Json(crate::gjc::api::session_query_body(&query)).into_response();
+            }
+            Err(error) => return gjc_error_response(&error),
+        }
+    }
     match crate::gjc::api::run_session_query(
         &state.gjc,
         &session,
@@ -1025,6 +1061,48 @@ async fn gjc_session_query(
     {
         Ok(body) => Json(body).into_response(),
         Err(error) => gjc_error_response(&error),
+    }
+}
+
+/// Reduce one authoritative #323 session query through the #324 event bridge.
+/// Only registered lanes feed the bridge: routing identity and the monotonic
+/// dedupe revision come from the durable lane store (#325). Emitted events are
+/// enqueued through the normal dispatch pipeline (ledger -> router -> sinks).
+async fn feed_gjc_bridge_from_query(
+    state: &AppState,
+    sdk_session_id: &str,
+    query: &crate::gjc::model::SessionQuery,
+) {
+    let Some(store) = state.gjc_store.as_ref() else {
+        return;
+    };
+    let lane_id = crate::gjc_lane::gjc_lane_id(sdk_session_id);
+    let Some(record) = store.record(&lane_id) else {
+        return;
+    };
+    let identity = GjcSnapshotIdentity {
+        repo_name: record.pr.as_ref().map(|pr| pr.repo.clone()),
+        worktree_path: record.worktree.clone(),
+        ..GjcSnapshotIdentity::default()
+    };
+    // sdk_revision (the SDK's own monotonic counter) keeps the query feed in
+    // the same revision space as push-ingress payloads so interleaved seams
+    // cannot suppress each other's transitions.
+    let snapshot =
+        snapshot_from_session_query(sdk_session_id, record.sdk_revision, query, &identity);
+    let outcome = {
+        let Ok(mut bridge) = gjc_bridge_slot().lock() else {
+            return;
+        };
+        bridge.observe(&snapshot)
+    };
+    let Ok(outcome) = outcome else {
+        return;
+    };
+    for event in outcome.events {
+        // Awaited send like every other ingress: bridge dedupe state has
+        // already advanced, so a silently dropped event would never re-emit.
+        let _ = enqueue_event(&state.tx, normalize_event(event)).await;
     }
 }
 
@@ -1316,6 +1394,109 @@ async fn post_native_hook(
     }
 
     accept_event(&state, event).await
+}
+
+/// Ingress for authoritative GJC SDK state snapshots (#324).
+///
+/// Push-only: sibling transport/control/reconcile tracks deliver one typed
+/// snapshot per observation; the process-wide bridge reduces transitions and
+/// the emitted events flow through `accept_event` (ledger, router, sinks).
+/// No polling loop or durable lane ownership lives here.
+async fn post_gjc_bridge(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let snapshot = match snapshot_from_response_payload(&payload) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error})),
+            )
+                .into_response();
+        }
+    };
+    let session_id = snapshot.session_id.trim().to_string();
+    let revision = snapshot.revision;
+    let outcome = {
+        let Ok(mut bridge) = gjc_bridge_slot().lock() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc_bridge_unavailable"})),
+            )
+                .into_response();
+        };
+        bridge.observe(&snapshot)
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut emitted = Vec::new();
+    let mut rejected = Vec::new();
+    for event in outcome.events {
+        let kind = event.kind.clone();
+        let event_id = event
+            .payload
+            .get("event_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let response = accept_event(&state, normalize_event(event)).await;
+        if response.status().is_success() {
+            emitted.push(json!({"type": kind, "event_id": event_id}));
+        } else {
+            rejected.push(json!({"type": kind, "event_id": event_id}));
+        }
+    }
+    let totals = gjc_bridge_slot()
+        .lock()
+        .map(|bridge| bridge.stats())
+        .unwrap_or_default();
+
+    let mut record = telemetry::record(
+        "gjc_bridge_snapshot",
+        if rejected.is_empty() {
+            "gjc_bridge_accepted"
+        } else {
+            "gjc_bridge_partial"
+        },
+        format!("gjc-{session_id}"),
+    );
+    record.insert(
+        "details".to_string(),
+        json!({
+            "session_id": session_id,
+            "revision": revision,
+            "emitted": emitted.len(),
+            "rejected": rejected.len(),
+            "duplicate": outcome.duplicate,
+            "stale": outcome.stale,
+        }),
+    );
+    telemetry::emit(record);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "session_id": session_id,
+            "revision": revision,
+            "duplicate": outcome.duplicate,
+            "stale": outcome.stale,
+            "emitted": emitted,
+            "rejected": rejected,
+            "totals": totals,
+        })),
+    )
+        .into_response()
 }
 
 fn native_payload_is_non_git(payload: &Value) -> bool {

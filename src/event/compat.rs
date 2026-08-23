@@ -420,6 +420,7 @@ fn priority_for(kind: &str, payload: &Value) -> EventPriority {
         | "github.release-prereleased"
         | "gajae.release.hold"
         | "gajae.merge.hold" => EventPriority::High,
+        "workflow.question" | "workflow.gate" | "session.endpoint-failed" => EventPriority::High,
         "github.pr-status-changed"
             if optional_string_field(payload, "new_status")
                 .map(|status| status == "merged" || status == "closed")
