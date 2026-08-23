@@ -85,7 +85,6 @@ impl GjcControlPlane {
         }
     }
 
-
     /// Resolve a usable transport, enforcing session binding for
     /// discovery-sourced endpoints. `wanted` is the session about to be
     /// addressed; a live endpoint bound to another session fails closed.
@@ -464,7 +463,11 @@ impl GjcControlPlane {
         // closed; the recorded receipt stays non-terminal so a replay does
         // not fabricate an outcome.
         let mut reply = self
-            .round_trip(&transport, &format!("control.{}", kind.as_str()), request_params)
+            .round_trip(
+                &transport,
+                &format!("control.{}", kind.as_str()),
+                request_params,
+            )
             .await?;
 
         let acked = reply
@@ -679,8 +682,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_accepts_and_records_acked_receipt() {
         let key = IdempotencyKey::new("idem-key-0100").unwrap();
-        let (plane, _transport) =
-            implemented_plane_with(vec![ack_reply("turn-100")]).await;
+        let (plane, _transport) = implemented_plane_with(vec![ack_reply("turn-100")]).await;
         let receipt = plane
             .prompt(PromptRequest {
                 envelope: envelope("idem-key-0100"),
@@ -699,8 +701,7 @@ mod tests {
     #[tokio::test]
     async fn idempotent_replay_returns_recorded_terminal_receipt() {
         let (plane, transport) =
-            implemented_plane_with(vec![terminal_ack_reply("turn-101", "succeeded", "done")])
-                .await;
+            implemented_plane_with(vec![terminal_ack_reply("turn-101", "succeeded", "done")]).await;
         let first = plane
             .prompt(PromptRequest {
                 envelope: envelope("idem-key-0101"),

@@ -6,9 +6,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use super::model::{
-    GjcError, GjcRequest, GjcResponse, GjcResult, GjcTransport,
-};
+use super::model::{GjcError, GjcRequest, GjcResponse, GjcResult, GjcTransport};
 use crate::gjc_sdk::{
     self, Discovery, EndpointMetadata, SdkClient, SdkRequest, SdkTransportError, StateRoot,
 };
@@ -48,14 +46,16 @@ fn map_transport_error(method: &str, error: &crate::DynError) -> GjcError {
         SdkTransportError::EndpointUnauthorized => GjcError::StaleEndpoint {
             capability: "endpoint".into(),
         },
-        SdkTransportError::FrameRejected => GjcError::InvalidPeerReply {
-            method: method.into(),
-            reason: "frame rejected by transport bounds".into(),
-        },
         SdkTransportError::EndpointMalformed => GjcError::InvalidPeerReply {
             method: method.into(),
             reason: "endpoint metadata malformed".into(),
         },
+        SdkTransportError::FrameRejected | SdkTransportError::InvalidHello => {
+            GjcError::InvalidPeerReply {
+                method: method.into(),
+                reason: "frame rejected by transport bounds".into(),
+            }
+        }
         SdkTransportError::EndpointUnavailable
         | SdkTransportError::ConnectionClosed
         | SdkTransportError::RetryExhausted => GjcError::TransportUnavailable,
@@ -64,11 +64,16 @@ fn map_transport_error(method: &str, error: &crate::DynError) -> GjcError {
 
 #[async_trait]
 impl GjcTransport for SdkEndpointTransport {
-    async fn round_trip(
-        &self,
-        request: GjcRequest,
-    ) -> std::result::Result<GjcResponse, GjcError> {
-        let sdk_request = SdkRequest::new(request.method.clone(), request.params.clone());
+    async fn round_trip(&self, request: GjcRequest) -> std::result::Result<GjcResponse, GjcError> {
+        // v3 wire mapping: `control.*` methods become control_request
+        // frames; every other method is a query_request. The correlation ID
+        // is minted inside the typed frame and echoed by the peer.
+        let sdk_request = if let Some(operation) = request.method.strip_prefix("control.") {
+            SdkRequest::control(operation, request.params.clone())
+        } else {
+            SdkRequest::query(request.method.clone(), request.params.clone())
+        };
+        let correlation_id = sdk_request.correlation_id().to_string();
         let mut client = SdkClient::new(self.metadata.clone());
         let reply = client
             .request(&sdk_request)
@@ -77,7 +82,7 @@ impl GjcTransport for SdkEndpointTransport {
 
         // Defense in depth: the transport already enforces correlation;
         // re-check before trusting the payload.
-        if reply.id.as_deref() != Some(request.correlation_id.as_str()) {
+        if reply.id.as_deref() != Some(correlation_id.as_str()) {
             return Err(GjcError::AmbiguousAck {
                 method: request.method.clone(),
             });
@@ -93,8 +98,8 @@ impl GjcTransport for SdkEndpointTransport {
             });
         }
         Ok(GjcResponse {
-            correlation_id: request.correlation_id,
-            result: reply.payload,
+            correlation_id,
+            result: reply.result,
         })
     }
 }
@@ -103,10 +108,8 @@ impl GjcTransport for SdkEndpointTransport {
 /// unrelated root. Outcomes map directly onto control-plane failures so the
 /// daemon never guesses.
 pub fn discover_endpoint(worktree: &Path) -> GjcResult<SdkEndpointTransport> {
-    let discovery =
-        gjc_sdk::discover(&StateRoot::for_worktree(worktree)).map_err(|error| {
-            map_transport_error("endpoint.discover", &error)
-        })?;
+    let discovery = gjc_sdk::discover(&StateRoot::for_worktree(worktree))
+        .map_err(|error| map_transport_error("endpoint.discover", &error))?;
     match discovery {
         Discovery::Live(metadata) => Ok(SdkEndpointTransport::new(metadata)),
         Discovery::Stale { .. } => Err(GjcError::StaleEndpoint {
@@ -121,14 +124,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn write_metadata(worktree: &Path, url: &str, token: &str) -> std::path::PathBuf {
+    fn write_metadata(
+        worktree: &Path,
+        session_id: &str,
+        url: &str,
+        token: &str,
+    ) -> std::path::PathBuf {
         let sdk_dir = worktree.join(".gjc").join("state").join("sdk");
         std::fs::create_dir_all(&sdk_dir).unwrap();
-        let path = sdk_dir.join("01a02ccd-cb43-7570-8ce2-98b3b67ed2ef.json");
+        // v3 contract: the file stem must equal the recorded session id.
+        let path = sdk_dir.join(format!("{session_id}.json"));
         std::fs::write(
             &path,
             json!({
-                "sessionId": "sess-lane-1",
+                "version": 1,
+                "sessionId": session_id,
                 "url": url,
                 "token": token,
             })
@@ -151,55 +161,36 @@ mod tests {
         let error = discover_endpoint(temp.path()).unwrap_err();
         assert_eq!(error.error_code(), "transport_unavailable");
 
-        // Malformed layout (file instead of directory) -> transport_unavailable.
+        // Malformed layout (file instead of directory) -> the discovery
+        // surface degrades this to a non-live outcome, mapped fail-closed.
         std::fs::create_dir_all(temp.path().join(".gjc")).unwrap();
         std::fs::write(temp.path().join(".gjc").join("state"), "not-a-dir").unwrap();
         let error = discover_endpoint(temp.path()).unwrap_err();
         assert_eq!(error.error_code(), "transport_unavailable");
 
-        // Live metadata binds to its recorded session.
+        // Live metadata binds to its recorded session. The v3 contract
+        // requires the metadata file stem to equal the session id.
         std::fs::remove_file(temp.path().join(".gjc").join("state")).unwrap();
         std::fs::create_dir_all(temp.path().join(".gjc").join("state")).unwrap();
-        write_metadata(temp.path(), "ws://127.0.0.1:1/", "tok-1");
+        write_metadata(temp.path(), "sess-lane-1", "ws://127.0.0.1:1/", "tok-1");
         let transport = discover_endpoint(temp.path()).unwrap();
         assert_eq!(transport.session_id(), "sess-lane-1");
 
-        // Dead pid recorded -> stale endpoint.
+        // Dead pid recorded -> stale endpoint. Remove the live record so
+        // the only remaining candidate is the dead-owner one.
         let sdk_dir = temp.path().join(".gjc").join("state").join("sdk");
-        let stale_path = sdk_dir.join("ffffffff-ffff-ffff-ffff-ffffffffffff.json");
-        std::fs::write(
-            &stale_path,
-            json!({
-                "sessionId": "sess-dead",
-                "url": "ws://127.0.0.1:1/",
-                "token": "tok-1",
-                "pid": 0xFFFF_FFF1u32,
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let _ = std::fs::remove_file(sdk_dir.join("sess-lane-1.json"));
+        write_metadata(temp.path(), "sess-dead", "ws://127.0.0.1:1/", "tok-1");
+        let dead_path = sdk_dir.join("sess-dead.json");
+        let contents = std::fs::read_to_string(&dead_path).unwrap().replace(
+            "\"token\":\"tok-1\"",
+            &format!("\"token\":\"tok-1\",\"pid\":{}", 0xFFFF_FFF1u32),
+        );
+        std::fs::write(&dead_path, contents).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stale_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let newer = sdk_dir.join("01a02ccd-cb43-7570-8ce2-98b3b67ed2ef.json");
-        let _ = std::fs::remove_file(&newer);
-        std::fs::write(
-            &newer,
-            json!({
-                "sessionId": "sess-dead",
-                "url": "ws://127.0.0.1:1/",
-                "token": "tok-1",
-                "pid": 0xFFFF_FFF1u32,
-            })
-            .to_string(),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&dead_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let error = discover_endpoint(temp.path()).unwrap_err();
         assert_eq!(error.error_code(), "stale_endpoint");
@@ -209,7 +200,7 @@ mod tests {
     async fn unreachable_endpoint_maps_to_transport_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".gjc").join("state").join("sdk")).unwrap();
-        write_metadata(temp.path(), "ws://127.0.0.1:1/", "tok-1");
+        write_metadata(temp.path(), "sess-lane-1", "ws://127.0.0.1:1/", "tok-1");
         let transport = discover_endpoint(temp.path()).unwrap();
         let error = transport
             .round_trip(GjcRequest::new("corr-1", "session.get", json!({})))

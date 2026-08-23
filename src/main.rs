@@ -14,6 +14,7 @@ mod events;
 mod gajae;
 mod gateway_allowlist;
 mod gjc;
+mod gjc_lane;
 mod gjc_sdk;
 mod hooks;
 mod keyword_window;
@@ -46,10 +47,10 @@ use tokio::runtime::Builder;
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs,
     GajaeCheckpointCommands, GajaeCommands, GajaeMutationPlanCommands, GajaeProfileCommands,
-    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands,
-    LedgerCommands, MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs,
-    SubscribeCommands, TmuxCommands, UpdateCommands, VerifyBindingsArgs,
-    VerifyGatewayAllowlistArgs, VerifySenderIdentityArgs,
+    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, LedgerCommands,
+    MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands,
+    TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    VerifySenderIdentityArgs,
 };
 
 use crate::client::DaemonClient;
@@ -600,10 +601,10 @@ async fn real_main(cli: Cli) -> Result<()> {
                 }
             },
         },
-        Commands::Gjc { command } => Ok(crate::gjc::cli::run(config.clone(), command).await?),
         Commands::Release { command } => match command {
             ReleaseCommands::Preflight { version, repo } => release_preflight::run(repo, version),
         },
+        Commands::Gjc { command } => crate::gjc::cli::run(config.clone(), command).await,
     }
 }
 

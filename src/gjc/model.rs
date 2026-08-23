@@ -798,5 +798,4 @@ mod tests {
         assert!(!Completed.can_transition_to(Acked));
         assert!(!Failed.can_transition_to(Acked));
     }
-
 }
