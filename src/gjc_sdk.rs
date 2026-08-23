@@ -903,8 +903,11 @@ async fn exchange(
     frame: &str,
     limits: &SdkTransportLimits,
 ) -> Result<SdkResponse> {
+    // One absolute deadline for the whole exchange: id-less frames consume
+    // the bounded tolerance but can never extend the caller's wait window.
+    let deadline = tokio::time::Instant::now() + limits.request_timeout;
     let send = stream.send(Message::Text(frame.into()));
-    tokio::time::timeout(limits.request_timeout, send)
+    tokio::time::timeout_at(deadline, send)
         .await
         .map_err(|_| SdkTransportError::Timeout)?
         .map_err(|_| SdkTransportError::ConnectionClosed)?;
@@ -912,7 +915,7 @@ async fn exchange(
     // cannot be correlated to this request.
     let mut uncorrelated = 0u8;
     loop {
-        let next = tokio::time::timeout(limits.request_timeout, stream.next()).await;
+        let next = tokio::time::timeout_at(deadline, stream.next()).await;
         let message = match next {
             Ok(Some(message)) => message.map_err(|_| SdkTransportError::ConnectionClosed)?,
             Ok(None) => return Err(SdkTransportError::ConnectionClosed.into()),
@@ -2030,6 +2033,19 @@ mod tests {
                             .await;
                     }
                 }
+                if mode == "slow-drip" {
+                    // Drip id-less frames just inside any per-read window: the
+                    // absolute exchange deadline must still terminate on time.
+                    for _ in 0..30 {
+                        let _ = writer
+                            .send(Message::Text(Utf8Bytes::from(
+                                r#"{"type":"hello","connectionId":"drip"}"#,
+                            )))
+                            .await;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    return;
+                }
                 let response_type = match value.get("type").and_then(Value::as_str) {
                     Some("control_request") => "control_response",
                     Some("broker_request") => "broker_response",
@@ -2059,6 +2075,13 @@ mod tests {
                         .as_object_mut()
                         .expect("response object")
                         .remove("ok");
+                }
+                if mode == "bad-error" {
+                    // Malformed envelope: failure without structured error data.
+                    let object = response.as_object_mut().expect("response object");
+                    object.insert("ok".to_string(), Value::Bool(false));
+                    object.remove("error");
+                    object.remove("result");
                 }
                 if mode == "paged" && response_type == "query_response" {
                     response["page"] = json!({"items": [{"n": 1}], "complete": true});
@@ -2206,6 +2229,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_fails_closed_on_malformed_error_envelope() {
+        let fixture = loopback::spawn("bad-error").await;
+        let mut client =
+            SdkClient::new(fixture.metadata).with_limits(loopback::probe_limits_short());
+        client.connect().await.unwrap();
+        let error = client
+            .request(&SdkRequest::query("session.metadata", Value::Null))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SdkTransportError>().unwrap().reason(),
+            "frame_rejected",
+            "an ok:false response without structured error data must be a protocol violation"
+        );
+    }
+
+    #[tokio::test]
     async fn client_terminates_under_hello_frame_flood() {
         let fixture = loopback::spawn("hello-flood").await;
         let mut client =
@@ -2223,5 +2263,34 @@ mod tests {
             "correlation_mismatch"
         );
         assert!(started.elapsed() < loopback::probe_limits_short().request_timeout * 2);
+    }
+
+    #[tokio::test]
+    async fn client_times_out_under_slow_dripping_id_less_frames() {
+        let fixture = loopback::spawn("slow-drip").await;
+        let limits = loopback::probe_limits_short();
+        let mut client = SdkClient::new(fixture.metadata).with_limits(limits);
+        client.connect().await.unwrap();
+        // Drips every 250ms previously reset a per-read timeout indefinitely
+        // (30 frames ≈ many request windows). The absolute exchange deadline
+        // must terminate at ~one window with Timeout instead.
+        let started = std::time::Instant::now();
+        let error = client
+            .request(&SdkRequest::query("session.metadata", Value::Null))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SdkTransportError>().unwrap().reason(),
+            "timeout"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= limits.request_timeout,
+            "terminated early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < limits.request_timeout * 2,
+            "deadline extended beyond one exchange window: {elapsed:?}"
+        );
     }
 }
