@@ -319,10 +319,18 @@ pub async fn run(
         discord_watch_lock: Arc::new(Mutex::new(())),
         subscriptions: subscriptions.clone(),
         git_monitor_diagnostics,
-        gjc: crate::gjc::control::GjcControlPlane::for_worktree(
-            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            crate::gjc::control::new_shared_command_registry(),
-        ),
+        gjc: match std::env::current_dir() {
+            Ok(cwd) => crate::gjc::control::GjcControlPlane::for_worktree(
+                &cwd,
+                crate::gjc::control::new_shared_command_registry(),
+            ),
+            // Without a resolvable worktree anchor the plane stays
+            // explicitly unavailable instead of silently re-scoping the
+            // trust boundary to ".".
+            Err(_) => crate::gjc::control::GjcControlPlane::unavailable(
+                crate::gjc::control::new_shared_command_registry(),
+            ),
+        },
         gjc_store,
         gjc_reconciler,
     });

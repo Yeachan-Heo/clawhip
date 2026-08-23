@@ -8,8 +8,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::Result;
-
 /// Public contract schema version. Bumped only on breaking envelope change.
 pub const GJC_CONTROL_SCHEMA: &str = "gjc-control/1";
 
@@ -123,6 +121,12 @@ impl CommandId {
                 reason: "must be 1..=128 bytes".into(),
             });
         }
+        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(GjcError::InvalidRequest {
+                field: "command_id",
+                reason: "control characters and whitespace are not allowed".into(),
+            });
+        }
         Ok(Self(value))
     }
 
@@ -162,6 +166,12 @@ impl TurnId {
             return Err(GjcError::InvalidRequest {
                 field: "turn_id",
                 reason: "must be 1..=128 bytes".into(),
+            });
+        }
+        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(GjcError::InvalidRequest {
+                field: "turn_id",
+                reason: "control characters and whitespace are not allowed".into(),
             });
         }
         Ok(Self(value))
@@ -206,14 +216,23 @@ pub struct GjcRequest {
     pub method: String,
     /// Method parameters (public-safe; no tokens ever cross this boundary).
     pub params: Value,
+    /// Bounded exchange budget in milliseconds; the transport must clamp
+    /// its request timeout to at most this value.
+    pub timeout_ms: u64,
 }
 
 impl GjcRequest {
-    pub fn new(correlation_id: impl Into<String>, method: &str, params: Value) -> Self {
+    pub fn new(
+        correlation_id: impl Into<String>,
+        method: &str,
+        params: Value,
+        timeout_ms: u64,
+    ) -> Self {
         Self {
             correlation_id: correlation_id.into(),
             method: method.into(),
             params,
+            timeout_ms,
         }
     }
 }
@@ -363,6 +382,9 @@ pub const CAP_SESSION_CONTROL: &str = "session.control";
 pub const CAP_MODEL_SELECTION: &str = "session.model_selection";
 pub const CAP_WORKFLOW_GATES: &str = "workflow.gates";
 pub const CAP_ASK_ANSWERS: &str = "ask.answers";
+/// Pseudo-capability used by `stale_endpoint` when endpoint metadata
+/// itself is no longer trustworthy.
+pub const CAP_ENDPOINT: &str = "endpoint";
 
 /// Capabilities this control plane can exercise given a transport.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,10 +743,6 @@ pub struct CommandReceipt {
 // ---------------------------------------------------------------------------
 
 pub type GjcResult<T> = std::result::Result<T, GjcError>;
-
-// Keep the crate-wide alias referenced so the module compiles standalone.
-#[allow(dead_code)]
-fn _assert_result_alias_compatible(_: Result<()>) {}
 
 #[cfg(test)]
 mod tests {

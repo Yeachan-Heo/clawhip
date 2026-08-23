@@ -162,7 +162,14 @@ impl GjcControlPlane {
             "session_id": session.as_str(),
             "sections": sections,
         });
-        let reply = self.round_trip(&transport, "session.get", params).await?;
+        let reply = self
+            .round_trip(
+                &transport,
+                "session.get",
+                params,
+                ControlRequestEnvelope::DEFAULT_TIMEOUT_MS,
+            )
+            .await?;
         let result = reply.result;
         let mut query = SessionQuery::default();
         if let Some(value) = result.get("metadata") {
@@ -235,7 +242,14 @@ impl GjcControlPlane {
             "session_id": session.as_str(),
             "turn_id": turn_id,
         });
-        let reply = self.round_trip(&transport, "turn.outcome", params).await?;
+        let reply = self
+            .round_trip(
+                &transport,
+                "turn.outcome",
+                params,
+                ControlRequestEnvelope::DEFAULT_TIMEOUT_MS,
+            )
+            .await?;
         let outcome =
             reply
                 .result
@@ -374,9 +388,10 @@ impl GjcControlPlane {
         transport: &BoundTransport,
         method: &str,
         params: Value,
+        timeout_ms: u64,
     ) -> GjcResult<GjcResponse> {
         let correlation_id = Uuid::new_v4().to_string();
-        let request = GjcRequest::new(&correlation_id, method, params);
+        let request = GjcRequest::new(&correlation_id, method, params, timeout_ms);
         let reply = transport.transport.round_trip(request).await?;
         if reply.correlation_id != correlation_id {
             return Err(GjcError::AmbiguousAck {
@@ -462,11 +477,12 @@ impl GjcControlPlane {
         // transport implementation (#322). Ambiguous or malformed acks fail
         // closed; the recorded receipt stays non-terminal so a replay does
         // not fabricate an outcome.
-        let mut reply = self
+        let reply = self
             .round_trip(
                 &transport,
                 &format!("control.{}", kind.as_str()),
                 request_params,
+                envelope.timeout_ms,
             )
             .await?;
 
@@ -519,28 +535,38 @@ impl GjcControlPlane {
         let mut updated = entry.clone();
         drop(write);
 
-        // Terminal receipt: peer outcome present means terminal now.
+        // Terminal receipt: a peer outcome is only trusted when it carries
+        // a parseable TERMINAL prompt status. Anything else (missing,
+        // non-terminal, or unparsable status) fails closed as an invalid
+        // peer reply; the record stays Acked so a replay cannot fabricate
+        // terminality from malformed input.
         if let Some(outcome) = outcome {
             let outcome_status = outcome
                 .get("status")
                 .and_then(Value::as_str)
                 .and_then(parse_prompt_status);
-            let mut write = self.registry.write().await;
-            if let Some(entry) = write.get_mut(envelope.idempotency_key.as_str()) {
-                let terminal = match outcome_status {
-                    Some(status) if status.is_terminal() => GjcCommandStatus::Completed,
-                    Some(_) => GjcCommandStatus::Failed,
-                    None => GjcCommandStatus::Failed,
-                };
-                if entry.status.can_transition_to(terminal) {
-                    entry.status = terminal;
-                    entry.outcome = Some(outcome);
-                    updated = entry.clone();
+            let terminal = match outcome_status {
+                Some(status) if status.is_terminal() => match status {
+                    GjcPromptStatus::Succeeded => GjcCommandStatus::Completed,
+                    _ => GjcCommandStatus::Failed,
+                },
+                _ => {
+                    return Err(GjcError::InvalidPeerReply {
+                        method: kind.as_str().into(),
+                        reason: "peer ack carried no terminal outcome status".into(),
+                    });
                 }
+            };
+            let mut write = self.registry.write().await;
+            if let Some(entry) = write.get_mut(envelope.idempotency_key.as_str())
+                && entry.status.can_transition_to(terminal)
+            {
+                entry.status = terminal;
+                entry.outcome = Some(outcome);
+                updated = entry.clone();
             }
         }
 
-        let _ = &mut reply;
         Ok(updated)
     }
 
@@ -585,6 +611,7 @@ mod tests {
     struct MockTransport {
         replies: Mutex<Vec<GjcResult<GjcResponse>>>,
         seen: Mutex<Vec<String>>,
+        timeouts: Mutex<Vec<u64>>,
     }
 
     impl MockTransport {
@@ -592,6 +619,7 @@ mod tests {
             Self {
                 replies: Mutex::new(replies),
                 seen: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -603,6 +631,7 @@ mod tests {
             request: GjcRequest,
         ) -> std::result::Result<GjcResponse, GjcError> {
             self.seen.lock().unwrap().push(request.method.clone());
+            self.timeouts.lock().unwrap().push(request.timeout_ms);
             let mut replies = self.replies.lock().unwrap();
             if replies.is_empty() {
                 return Err(GjcError::Timeout {
@@ -946,5 +975,48 @@ mod tests {
             .unwrap_err();
         // Unknown keys surface as not-found rather than leaking registry size.
         assert_eq!(error.error_code(), "session_not_found");
+    }
+    #[tokio::test]
+    async fn correlation_mismatch_fails_closed_as_ambiguous_ack() {
+        // A transport that echoes a DIFFERENT correlation id must trip the
+        // plane's defense-in-depth branch, which the scripted transport
+        // normally never exercises because it echoes verbatim.
+        struct WrongEcho;
+        #[async_trait::async_trait]
+        impl GjcTransport for WrongEcho {
+            async fn round_trip(
+                &self,
+                _request: GjcRequest,
+            ) -> std::result::Result<GjcResponse, GjcError> {
+                Ok(GjcResponse {
+                    correlation_id: "not-the-id".into(),
+                    result: json!({"accepted": true}),
+                })
+            }
+        }
+        let plane = GjcControlPlane::new(Arc::new(WrongEcho), new_shared_command_registry());
+        let error = plane
+            .prompt(PromptRequest {
+                envelope: envelope("idem-key-0108"),
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.error_code(), "ambiguous_ack");
+    }
+
+    #[tokio::test]
+    async fn mutation_timeout_budget_is_forwarded_to_the_transport() {
+        let (plane, transport) = implemented_plane_with(vec![ack_reply("turn-109")]).await;
+        let mut env = envelope("idem-key-0109");
+        env.timeout_ms = 4_321;
+        plane
+            .prompt(PromptRequest {
+                envelope: env,
+                prompt: "bounded".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(transport.timeouts.lock().unwrap()[0], 4_321);
     }
 }

@@ -8,7 +8,8 @@ use async_trait::async_trait;
 
 use super::model::{GjcError, GjcRequest, GjcResponse, GjcResult, GjcTransport};
 use crate::gjc_sdk::{
-    self, Discovery, EndpointMetadata, SdkClient, SdkRequest, SdkTransportError, StateRoot,
+    self, Discovery, EndpointMetadata, SdkClient, SdkRequest, SdkTransportError,
+    SdkTransportLimits, StateRoot,
 };
 
 /// Control-plane transport backed by the landed SDK websocket client.
@@ -44,7 +45,7 @@ fn map_transport_error(method: &str, error: &crate::DynError) -> GjcError {
             method: method.into(),
         },
         SdkTransportError::EndpointUnauthorized => GjcError::StaleEndpoint {
-            capability: "endpoint".into(),
+            capability: crate::gjc::model::CAP_ENDPOINT.into(),
         },
         SdkTransportError::EndpointMalformed => GjcError::InvalidPeerReply {
             method: method.into(),
@@ -74,7 +75,14 @@ impl GjcTransport for SdkEndpointTransport {
             SdkRequest::query(request.method.clone(), request.params.clone())
         };
         let correlation_id = sdk_request.correlation_id().to_string();
-        let mut client = SdkClient::new(self.metadata.clone());
+        // The caller's bounded budget is clamped into the transport limits
+        // so `timeout_ms` is authoritative for this exchange (sanitized()
+        // bounds it to [100ms, MAX_TRANSPORT_TIMEOUT]).
+        let limits = SdkTransportLimits {
+            request_timeout: std::time::Duration::from_millis(request.timeout_ms),
+            ..SdkTransportLimits::default()
+        };
+        let mut client = SdkClient::new(self.metadata.clone()).with_limits(limits);
         let reply = client
             .request(&sdk_request)
             .await
@@ -113,7 +121,7 @@ pub fn discover_endpoint(worktree: &Path) -> GjcResult<SdkEndpointTransport> {
     match discovery {
         Discovery::Live(metadata) => Ok(SdkEndpointTransport::new(metadata)),
         Discovery::Stale { .. } => Err(GjcError::StaleEndpoint {
-            capability: "endpoint".into(),
+            capability: super::model::CAP_ENDPOINT.into(),
         }),
         Discovery::Malformed | Discovery::NoMetadata => Err(GjcError::TransportUnavailable),
     }
@@ -203,7 +211,7 @@ mod tests {
         write_metadata(temp.path(), "sess-lane-1", "ws://127.0.0.1:1/", "tok-1");
         let transport = discover_endpoint(temp.path()).unwrap();
         let error = transport
-            .round_trip(GjcRequest::new("corr-1", "session.get", json!({})))
+            .round_trip(GjcRequest::new("corr-1", "session.get", json!({}), 10_000))
             .await
             .unwrap_err();
         assert_eq!(error.error_code(), "transport_unavailable");
