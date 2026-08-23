@@ -13,6 +13,7 @@ mod event;
 mod events;
 mod gajae;
 mod gateway_allowlist;
+mod gjc_lane;
 mod gjc_sdk;
 mod hooks;
 mod keyword_window;
@@ -610,6 +611,74 @@ async fn real_main(cli: Cli) -> Result<()> {
                     json_output: args.json,
                 })
                 .await
+            }
+            GjcCommands::Status { json } => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let health = client.gjc_health().await?;
+                let lanes = client.gjc_lanes(false).await?;
+                gjc_lane::render_status(&health, &lanes, json);
+                Ok(())
+            }
+            GjcCommands::Register(args) => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let request = crate::gjc_lane::GjcLaneRegistrationRequest {
+                    sdk_session_id: args.session,
+                    worktree: args.worktree,
+                    endpoint_generation: None,
+                    owner_id: args.owner,
+                    pr: match (args.pr_repo, args.pr_number, args.pr_head_sha, args.pr_base) {
+                        (Some(repo), Some(number), Some(head_sha), Some(base)) => {
+                            Some(crate::gjc_lane::GjcPrBindingInput {
+                                repo,
+                                number,
+                                head_sha,
+                                base_branch: base,
+                            })
+                        }
+                        (None, None, None, None) => None,
+                        _ => {
+                            return Err(
+                                "gjc lane register requires all of --pr-repo/--pr-number/--pr-head-sha/--pr-base"
+                                    .into(),
+                            );
+                        }
+                    },
+                };
+                let record = client.gjc_register(&request).await?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&record)?);
+                } else {
+                    println!(
+                        "registered lane {} for session {}",
+                        record["lane_id"].as_str().unwrap_or("?"),
+                        record["sdk_session_id"].as_str().unwrap_or("?"),
+                    );
+                }
+                Ok(())
+            }
+            GjcCommands::Reconcile { json } => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let response = client.gjc_reconcile().await?;
+                let outcome: crate::gjc_lane::GjcReconcileOutcome =
+                    serde_json::from_value(response["outcome"].clone())?;
+                gjc_lane::render_reconcile(&outcome, json);
+                Ok(())
+            }
+            GjcCommands::Retire { lane, reason, json } => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let record = client.gjc_retire(&lane, reason.as_deref()).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&record)?);
+                } else {
+                    println!(
+                        "retired lane {} (terminal: {})",
+                        record["lane_id"].as_str().unwrap_or("?"),
+                        record["terminal_disposition"]["kind"]
+                            .as_str()
+                            .unwrap_or("-"),
+                    );
+                }
+                Ok(())
             }
         },
     }

@@ -730,6 +730,63 @@ pub enum GjcCommands {
     /// Discovery only: reports the validated session endpoint for the target
     /// worktree without exposing tokens or URLs.
     Inspect(GjcInspectArgs),
+    /// Show durable GJC SDK lane health and retained watch summary.
+    ///
+    /// Reads daemon-owned durable lane state only; never scrapes panes or
+    /// exposes endpoint tokens/URLs.
+    Status {
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Register an SDK-backed lane for durable ownership tracking.
+    Register(GjcLaneRegisterArgs),
+    /// Trigger one immediate reconciliation pass in the daemon.
+    Reconcile {
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Manually retire a retained lane watch (terminal disposition).
+    Retire {
+        /// Retained lane id (gjc-<fingerprint>) from `clawhip gjc status`.
+        #[arg(long)]
+        lane: String,
+        /// Bounded audit reason for the retirement.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct GjcLaneRegisterArgs {
+    /// Authoritative GJC SDK session identity to retain.
+    #[arg(long)]
+    pub session: String,
+    /// Worktree root the session runs in (trust boundary for discovery).
+    #[arg(long)]
+    pub worktree: Option<String>,
+    /// Claim ownership on behalf of this owner id.
+    #[arg(long)]
+    pub owner: Option<String>,
+    /// Repository (`owner/repo`) whose PR head/base invalidates stale evidence.
+    #[arg(long)]
+    pub pr_repo: Option<String>,
+    /// PR number bound to the lane.
+    #[arg(long)]
+    pub pr_number: Option<u64>,
+    /// PR head sha at binding time (7-64 hex chars).
+    #[arg(long)]
+    pub pr_head_sha: Option<String>,
+    /// PR base branch at binding time.
+    #[arg(long)]
+    pub pr_base: Option<String>,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Args)]
