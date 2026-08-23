@@ -13,6 +13,7 @@ mod event;
 mod events;
 mod gajae;
 mod gateway_allowlist;
+mod gjc_sdk;
 mod hooks;
 mod keyword_window;
 mod lane;
@@ -44,10 +45,10 @@ use tokio::runtime::Builder;
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs,
     GajaeCheckpointCommands, GajaeCommands, GajaeMutationPlanCommands, GajaeProfileCommands,
-    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, LedgerCommands,
-    MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands,
-    TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
-    VerifySenderIdentityArgs,
+    GajaeReceiptCommands, GitCommands, GithubCommands, GjcCommands, HooksCommands, LaneCommands,
+    LedgerCommands, MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs,
+    SubscribeCommands, TmuxCommands, UpdateCommands, VerifyBindingsArgs,
+    VerifyGatewayAllowlistArgs, VerifySenderIdentityArgs,
 };
 
 use crate::client::DaemonClient;
@@ -600,6 +601,16 @@ async fn real_main(cli: Cli) -> Result<()> {
         },
         Commands::Release { command } => match command {
             ReleaseCommands::Preflight { version, repo } => release_preflight::run(repo, version),
+        },
+        Commands::Gjc { command } => match command {
+            GjcCommands::Inspect(args) => {
+                gjc_sdk::run_inspect(gjc_sdk::InspectOptions {
+                    worktree: args.worktree,
+                    probe: args.probe,
+                    json_output: args.json,
+                })
+                .await
+            }
         },
     }
 }
