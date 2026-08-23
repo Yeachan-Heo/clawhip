@@ -179,6 +179,17 @@ pub enum Commands {
         #[command(subcommand)]
         command: GajaeCommands,
     },
+    /// Query and control GJC SDK sessions through the local daemon.
+    ///
+    /// Authoritative session queries (metadata, stats, model/profile, turn,
+    /// queue, workflow gates, goal/todo, capabilities) and mutation verbs
+    /// (prompt, steer, abort-and-prompt, workflow gate answer, ask answer,
+    /// model selection). All commands talk to the local daemon and fail
+    /// closed with typed error codes.
+    Gjc {
+        #[command(subcommand)]
+        command: GjcCommands,
+    },
     /// Release consistency checks.
     Release {
         #[command(subcommand)]
@@ -739,6 +750,136 @@ pub enum CronCommands {
     Run {
         /// Cron job id from [[cron.jobs]].id.
         id: String,
+    },
+}
+
+/// Shared mutation flags for GJC control verbs.
+#[derive(Debug, Clone, Args)]
+pub struct GjcMutationArgs {
+    /// Client idempotency key (8..=128 bytes). Replays with the same key
+    /// return the recorded receipt instead of issuing a second command.
+    #[arg(long)]
+    pub idempotency_key: String,
+    /// Expected authoritative session id; the command fails closed on
+    /// mismatch when provided.
+    #[arg(long)]
+    pub expected_session: Option<String>,
+    /// Bounded peer exchange timeout in milliseconds (1..=60000).
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum GjcCommands {
+    /// Show capabilities advertised by the local daemon's control plane.
+    Capabilities {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Query authoritative session surfaces (metadata, stats, model, turn, queue, gates, goal/todo).
+    Session {
+        /// GJC session id.
+        session: String,
+        /// Comma-separated sections to fetch. Defaults to all.
+        #[arg(long)]
+        sections: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch the terminal outcome receipt for one turn.
+    TurnOutcome {
+        /// GJC session id.
+        session: String,
+        /// Turn id whose terminal outcome is requested.
+        turn_id: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a prompt into a session.
+    Prompt {
+        /// GJC session id.
+        session: String,
+        /// Prompt text to submit.
+        #[arg(long)]
+        prompt: String,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Steer an in-flight turn without aborting it.
+    Steer {
+        /// GJC session id.
+        session: String,
+        /// Steering message for the active turn.
+        #[arg(long)]
+        message: String,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Abort in-flight turns and immediately submit a replacement prompt.
+    AbortAndPrompt {
+        /// GJC session id.
+        session: String,
+        /// Replacement prompt submitted after the abort.
+        #[arg(long)]
+        prompt: String,
+        /// Restrict the abort to these turn ids (repeatable).
+        #[arg(long = "turn")]
+        turn_ids: Vec<String>,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Answer a raised workflow gate.
+    GateAnswer {
+        /// GJC session id.
+        session: String,
+        /// Workflow gate id being answered.
+        #[arg(long)]
+        gate_id: String,
+        /// Chosen option for the gate.
+        #[arg(long)]
+        option: String,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Answer an ask/question prompt.
+    AskAnswer {
+        /// GJC session id.
+        session: String,
+        /// Ask/question id being answered.
+        #[arg(long)]
+        ask_id: String,
+        /// Chosen option(s); repeatable for multi-select asks.
+        #[arg(long = "choice")]
+        choices: Vec<String>,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Select the model or profile for a session (exactly one of --model/--profile).
+    Select {
+        /// GJC session id.
+        session: String,
+        /// Model id to select.
+        #[arg(long)]
+        model: Option<String>,
+        /// Profile name to select.
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Replay the receipt of an accepted command by idempotency key.
+    Receipt {
+        /// Idempotency key used when the command was accepted.
+        idempotency_key: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 

@@ -13,6 +13,7 @@ mod event;
 mod events;
 mod gajae;
 mod gateway_allowlist;
+mod gjc;
 mod hooks;
 mod keyword_window;
 mod lane;
@@ -598,6 +599,7 @@ async fn real_main(cli: Cli) -> Result<()> {
                 }
             },
         },
+        Commands::Gjc { command } => Ok(crate::gjc::cli::run(config.clone(), command).await?),
         Commands::Release { command } => match command {
             ReleaseCommands::Preflight { version, repo } => release_preflight::run(repo, version),
         },
