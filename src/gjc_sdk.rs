@@ -48,6 +48,13 @@ const MAX_URL_CHARS: usize = 512;
 const MAX_SESSION_ID_CHARS: usize = 64;
 /// Ceiling applied to every inbound frame regardless of configuration.
 const ABSOLUTE_MAX_FRAME_BYTES: usize = 262_144;
+/// Upper bound applied to every transport timeout during sanitization.
+///
+/// Callers may pass arbitrary durations through the public
+/// [`SdkTransportLimits`] API; clamping here keeps every derived deadline far
+/// below the platform `Instant` representable range so deadline arithmetic can
+/// never overflow and panic before a request is sent (issue #332).
+const MAX_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(3600);
 /// Endpoint record schema version supported by this transport.
 ///
 /// The installed GJC host publishes `{"version":1, ...}` endpoint records;
@@ -491,9 +498,11 @@ pub fn discover(root: &StateRoot) -> Result<Discovery> {
 /// Bounded transport configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SdkTransportLimits {
-    /// Connect + hello handshake timeout.
+    /// Connect + hello handshake timeout (sanitized into
+    /// `[100ms, MAX_TRANSPORT_TIMEOUT]`).
     pub connect_timeout: Duration,
-    /// Per-request response timeout.
+    /// Per-request response timeout (sanitized into
+    /// `[100ms, MAX_TRANSPORT_TIMEOUT]`).
     pub request_timeout: Duration,
     /// Maximum accepted inbound text frame size.
     pub max_frame_bytes: usize,
@@ -516,10 +525,19 @@ impl Default for SdkTransportLimits {
 }
 
 impl SdkTransportLimits {
+    /// Explicitly bounds every caller-supplied value: timeouts are clamped
+    /// into `[100ms, MAX_TRANSPORT_TIMEOUT]` so every downstream deadline is
+    /// representable and bounded on every platform, frame/payload caps are
+    /// clamped into `[1KiB, ABSOLUTE_MAX_FRAME_BYTES]`, and reconnect attempts
+    /// into `[0, 5]`.
     fn sanitized(self) -> Self {
         Self {
-            connect_timeout: self.connect_timeout.max(Duration::from_millis(100)),
-            request_timeout: self.request_timeout.max(Duration::from_millis(100)),
+            connect_timeout: self
+                .connect_timeout
+                .clamp(Duration::from_millis(100), MAX_TRANSPORT_TIMEOUT),
+            request_timeout: self
+                .request_timeout
+                .clamp(Duration::from_millis(100), MAX_TRANSPORT_TIMEOUT),
             max_frame_bytes: self.max_frame_bytes.clamp(1024, ABSOLUTE_MAX_FRAME_BYTES),
             max_payload_bytes: self.max_payload_bytes.clamp(1024, ABSOLUTE_MAX_FRAME_BYTES),
             max_reconnect_attempts: self.max_reconnect_attempts.min(5),
@@ -905,7 +923,12 @@ async fn exchange(
 ) -> Result<SdkResponse> {
     // One absolute deadline for the whole exchange: id-less frames consume
     // the bounded tolerance but can never extend the caller's wait window.
-    let deadline = tokio::time::Instant::now() + limits.request_timeout;
+    // Sanitization caps `request_timeout`; the checked addition additionally
+    // guarantees deadline construction cannot panic on any residual value.
+    let now = tokio::time::Instant::now();
+    let deadline = now
+        .checked_add(limits.request_timeout)
+        .unwrap_or_else(|| now + MAX_TRANSPORT_TIMEOUT);
     let send = stream.send(Message::Text(frame.into()));
     tokio::time::timeout_at(deadline, send)
         .await
@@ -1869,6 +1892,34 @@ mod tests {
         assert_eq!(sanitized.max_reconnect_attempts, 5);
     }
 
+    #[test]
+    fn limits_sanitization_caps_extreme_timeouts() {
+        // Issue #332: every representable caller-supplied duration must land
+        // in [100ms, MAX_TRANSPORT_TIMEOUT] so deadline construction stays
+        // representable and bounded on every platform.
+        for extreme in [
+            Duration::MAX,
+            Duration::from_secs(u64::MAX),
+            Duration::from_millis(u64::MAX),
+            Duration::from_secs(3601), // one step past the cap boundary
+        ] {
+            let sanitized = SdkTransportLimits {
+                connect_timeout: extreme,
+                request_timeout: extreme,
+                ..SdkTransportLimits::default()
+            }
+            .sanitized();
+            assert_eq!(
+                sanitized.connect_timeout, MAX_TRANSPORT_TIMEOUT,
+                "{extreme:?}"
+            );
+            assert_eq!(
+                sanitized.request_timeout, MAX_TRANSPORT_TIMEOUT,
+                "{extreme:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn authenticated_url_appends_token_query_once() {
         let metadata =
@@ -2291,6 +2342,68 @@ mod tests {
         assert!(
             elapsed < limits.request_timeout * 2,
             "deadline extended beyond one exchange window: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_round_trips_with_duration_max_request_timeout() {
+        // Issue #332: a caller-supplied `Duration::MAX` request timeout used to
+        // panic inside the exchange deadline addition before any frame left.
+        let fixture = loopback::spawn("standard").await;
+        let mut client = SdkClient::new(fixture.metadata).with_limits(SdkTransportLimits {
+            request_timeout: Duration::MAX,
+            ..loopback::probe_limits_short()
+        });
+        client.connect().await.unwrap();
+        let request = SdkRequest::query("session.metadata", Value::Null);
+        let correlation_id = request.correlation_id().to_string();
+        let response = client.request(&request).await.unwrap();
+        assert_eq!(response.id.as_deref(), Some(correlation_id.as_str()));
+        assert_eq!(response.ok, Some(true));
+    }
+
+    #[tokio::test]
+    async fn client_with_duration_max_connect_timeout_round_trips() {
+        // Issue #332 adjacency: the connect/hello timeout takes the same
+        // sanitization path and must stay panic-free and bounded.
+        let fixture = loopback::spawn("standard").await;
+        let mut client = SdkClient::new(fixture.metadata).with_limits(SdkTransportLimits {
+            connect_timeout: Duration::MAX,
+            ..loopback::probe_limits_short()
+        });
+        assert_eq!(client.limits.connect_timeout, MAX_TRANSPORT_TIMEOUT);
+        client.connect().await.unwrap();
+        let response = client
+            .request(&SdkRequest::query("session.metadata", Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(response.ok, Some(true));
+    }
+
+    #[tokio::test]
+    async fn client_bounded_tolerance_survives_duration_max_request_timeout() {
+        // Extreme limits must not disable the bounded uncorrelated-frame
+        // tolerance: a hello flood still terminates quickly even when the
+        // caller asked for a `Duration::MAX` request window.
+        let fixture = loopback::spawn("hello-flood").await;
+        let mut client = SdkClient::new(fixture.metadata).with_limits(SdkTransportLimits {
+            request_timeout: Duration::MAX,
+            ..loopback::probe_limits_short()
+        });
+        client.connect().await.unwrap();
+        let started = std::time::Instant::now();
+        let error = client
+            .request(&SdkRequest::query("session.metadata", Value::Null))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SdkTransportError>().unwrap().reason(),
+            "correlation_mismatch"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "flood tolerance terminated late: {:?}",
+            started.elapsed()
         );
     }
 }
