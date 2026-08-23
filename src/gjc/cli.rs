@@ -52,6 +52,14 @@ fn print_text(value: &Value, keys: &[&str]) {
 pub async fn run(config: Arc<AppConfig>, command: GjcCommands) -> Result<()> {
     let client = DaemonClient::from_config(config.as_ref());
     match command {
+        GjcCommands::Inspect(args) => {
+            crate::gjc_sdk::run_inspect(crate::gjc_sdk::InspectOptions {
+                worktree: args.worktree,
+                probe: args.probe,
+                json_output: args.json,
+            })
+            .await
+        }
         GjcCommands::Capabilities { json } => {
             let body = client.gjc_capabilities().await?;
             render(

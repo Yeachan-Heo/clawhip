@@ -429,6 +429,27 @@ fn subscription_path_name(name: &str) -> String {
         .collect()
 }
 
+fn urlencoding_lite(value: &str) -> String {
+    // Session/turn/key ids are validated to exclude whitespace and control
+    // characters, so only path-hostile separators need escaping here.
+    value
+        .replace('/', "%2F")
+        .replace('?', "%3F")
+        .replace('#', "%23")
+}
+
+fn gjc_error_message(status: reqwest::StatusCode, body: &Value) -> String {
+    let code = body
+        .get("error_code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    let message = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("gjc request failed");
+    format!("daemon gjc request failed with {status} [{code}]: {message}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,25 +565,4 @@ mod tests {
         assert_eq!(response.reason, "started");
         server.await.unwrap();
     }
-}
-
-fn urlencoding_lite(value: &str) -> String {
-    // Session/turn/key ids are validated to exclude whitespace and control
-    // characters, so only path-hostile separators need escaping here.
-    value
-        .replace('/', "%2F")
-        .replace('?', "%3F")
-        .replace('#', "%23")
-}
-
-fn gjc_error_message(status: reqwest::StatusCode, body: &Value) -> String {
-    let code = body
-        .get("error_code")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown_error");
-    let message = body
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or("gjc request failed");
-    format!("daemon gjc request failed with {status} [{code}]: {message}")
 }

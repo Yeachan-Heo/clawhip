@@ -730,50 +730,12 @@ pub struct GajaeZeroBacklogCheckpointArgs {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-pub enum ReleaseCommands {
-    /// Verify version/Cargo.lock/CHANGELOG consistency before tagging a release.
-    ///
-    /// If <VERSION> is omitted the current Cargo.toml version is used.
-    /// Exits non-zero when any check fails.
-    Preflight {
-        /// Expected release version (e.g. 0.6.5, v0.6.5, refs/tags/v0.6.5).
-        version: Option<String>,
-        /// Path to the repository root. Defaults to the current directory.
-        #[arg(long)]
-        repo: Option<std::path::PathBuf>,
-    },
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum CronCommands {
-    /// Run one configured cron job immediately, which is useful for native system-cron entrypoints.
-    Run {
-        /// Cron job id from [[cron.jobs]].id.
-        id: String,
-    },
-}
-
-/// Shared mutation flags for GJC control verbs.
-#[derive(Debug, Clone, Args)]
-pub struct GjcMutationArgs {
-    /// Client idempotency key (8..=128 bytes). Replays with the same key
-    /// return the recorded receipt instead of issuing a second command.
-    #[arg(long)]
-    pub idempotency_key: String,
-    /// Expected authoritative session id; the command fails closed on
-    /// mismatch when provided.
-    #[arg(long)]
-    pub expected_session: Option<String>,
-    /// Bounded peer exchange timeout in milliseconds (1..=60000).
-    #[arg(long)]
-    pub timeout_ms: Option<u64>,
-    /// Emit machine-readable JSON instead of text.
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Clone, Subcommand)]
 pub enum GjcCommands {
+    /// Inspect worktree-local GJC SDK endpoint metadata and transport readiness.
+    ///
+    /// Discovery only: reports the validated session endpoint for the target
+    /// worktree without exposing tokens or URLs.
+    Inspect(GjcInspectArgs),
     /// Show capabilities advertised by the local daemon's control plane.
     Capabilities {
         /// Emit machine-readable JSON.
@@ -882,6 +844,63 @@ pub enum GjcCommands {
         json: bool,
     },
 }
+
+#[derive(Debug, Clone, Args)]
+pub struct GjcInspectArgs {
+    /// Worktree root to inspect. Defaults to the current directory.
+    #[arg(long)]
+    pub worktree: Option<PathBuf>,
+    /// Open the discovered endpoint and issue one typed probe request.
+    #[arg(long, default_value_t = false)]
+    pub probe: bool,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ReleaseCommands {
+    /// Verify version/Cargo.lock/CHANGELOG consistency before tagging a release.
+    ///
+    /// If <VERSION> is omitted the current Cargo.toml version is used.
+    /// Exits non-zero when any check fails.
+    Preflight {
+        /// Expected release version (e.g. 0.6.5, v0.6.5, refs/tags/v0.6.5).
+        version: Option<String>,
+        /// Path to the repository root. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CronCommands {
+    /// Run one configured cron job immediately, which is useful for native system-cron entrypoints.
+    Run {
+        /// Cron job id from [[cron.jobs]].id.
+        id: String,
+    },
+}
+
+/// Shared mutation flags for GJC control verbs.
+#[derive(Debug, Clone, Args)]
+pub struct GjcMutationArgs {
+    /// Client idempotency key (8..=128 bytes). Replays with the same key
+    /// return the recorded receipt instead of issuing a second command.
+    #[arg(long)]
+    pub idempotency_key: String,
+    /// Expected authoritative session id; the command fails closed on
+    /// mismatch when provided.
+    #[arg(long)]
+    pub expected_session: Option<String>,
+    /// Bounded peer exchange timeout in milliseconds (1..=60000).
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum UpdateCommands {

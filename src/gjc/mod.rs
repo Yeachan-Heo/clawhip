@@ -11,3 +11,4 @@ pub mod api;
 pub mod cli;
 pub mod control;
 pub mod model;
+pub mod transport;

@@ -426,21 +426,23 @@ mod tests {
 
     #[test]
     fn session_query_body_filters_non_scalar_provider_metadata() {
-        let mut query = SessionQuery::default();
-        query.metadata = Some(super::super::model::SessionMetadata {
-            session_id: "sess-1".into(),
-            title: Some("t".into()),
-            project: None,
-            created_at: None,
-            last_active_at: None,
-            lane: None,
-            provider_metadata: [
-                ("safe".to_string(), Value::String("v".into())),
-                ("nested".to_string(), json!({"secret": true})),
-            ]
-            .into_iter()
-            .collect(),
-        });
+        let query = SessionQuery {
+            metadata: Some(super::super::model::SessionMetadata {
+                session_id: "sess-1".into(),
+                title: Some("t".into()),
+                project: None,
+                created_at: None,
+                last_active_at: None,
+                lane: None,
+                provider_metadata: [
+                    ("safe".to_string(), Value::String("v".into())),
+                    ("nested".to_string(), json!({"secret": true})),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            ..SessionQuery::default()
+        };
         let body = session_query_body(&query);
         assert_eq!(body["metadata"]["provider_metadata"]["safe"], "v");
         assert!(

@@ -25,32 +25,124 @@ fn now_rfc3339() -> String {
     crate::source::tmux::current_timestamp_rfc3339()
 }
 
+/// Where the control plane obtains its peer transport.
+#[derive(Clone)]
+enum TransportSource {
+    /// Injected transport (tests, or an explicit endpoint binding).
+    #[allow(dead_code)] // exercised by in-crate tests only
+    Static(Arc<dyn GjcTransport>),
+    /// No transport is available on this daemon; everything fails closed.
+    Unavailable,
+    /// Discover the lane endpoint under this worktree root on demand
+    /// (production wiring over the #322 transport).
+    Discovery(std::path::PathBuf),
+}
+
+/// A live transport binding: the resolved endpoint and the session it serves.
+#[derive(Clone)]
+struct BoundTransport {
+    session_id: Option<String>,
+    transport: Arc<dyn GjcTransport>,
+}
+
 /// The authoritative control plane. One instance per daemon; CLI paths go
 /// through the daemon HTTP surface rather than constructing this directly.
 #[derive(Clone)]
 pub struct GjcControlPlane {
-    transport: Arc<dyn GjcTransport>,
+    source: TransportSource,
+    bound: Arc<RwLock<Option<BoundTransport>>>,
     registry: SharedGjcCommandRegistry,
-    transport_implemented: bool,
 }
 
 impl GjcControlPlane {
-    pub fn new(
-        transport: Arc<dyn GjcTransport>,
-        registry: SharedGjcCommandRegistry,
-        transport_implemented: bool,
-    ) -> Self {
+    /// Static-transport constructor (tests and explicit bindings).
+    #[cfg_attr(not(test), allow(dead_code))] // test injection seam
+    pub fn new(transport: Arc<dyn GjcTransport>, registry: SharedGjcCommandRegistry) -> Self {
         Self {
-            transport,
+            source: TransportSource::Static(transport),
+            bound: Arc::new(RwLock::new(None)),
             registry,
-            transport_implemented,
         }
     }
 
-    pub fn transport_implemented(&self) -> bool {
-        self.transport_implemented
+    /// Fail-closed plane with no transport at all.
+    #[cfg_attr(not(test), allow(dead_code))] // daemon tests only
+    pub fn unavailable(registry: SharedGjcCommandRegistry) -> Self {
+        Self {
+            source: TransportSource::Unavailable,
+            bound: Arc::new(RwLock::new(None)),
+            registry,
+        }
     }
 
+    /// Production constructor: resolve the lane endpoint under `worktree`
+    /// through the #322 discovery surface on demand.
+    pub fn for_worktree(worktree: &std::path::Path, registry: SharedGjcCommandRegistry) -> Self {
+        Self {
+            source: TransportSource::Discovery(worktree.to_path_buf()),
+            bound: Arc::new(RwLock::new(None)),
+            registry,
+        }
+    }
+
+
+    /// Resolve a usable transport, enforcing session binding for
+    /// discovery-sourced endpoints. `wanted` is the session about to be
+    /// addressed; a live endpoint bound to another session fails closed.
+    async fn resolve_transport(
+        &self,
+        wanted: Option<&SessionId>,
+    ) -> GjcResult<Option<BoundTransport>> {
+        match &self.source {
+            TransportSource::Static(transport) => Ok(Some(BoundTransport {
+                session_id: None,
+                transport: transport.clone(),
+            })),
+            TransportSource::Unavailable => Ok(None),
+            TransportSource::Discovery(root) => {
+                let cached = self.bound.read().await.clone();
+                if let Some(bound) = cached {
+                    let matches = match (bound.session_id.as_deref(), wanted) {
+                        (_, None) => true,
+                        (None, _) => true,
+                        (Some(bound_session), Some(wanted)) => bound_session == wanted.as_str(),
+                    };
+                    if matches {
+                        return Ok(Some(bound));
+                    }
+                }
+                match super::transport::discover_endpoint(root) {
+                    Ok(endpoint) => {
+                        if let Some(wanted) = wanted {
+                            let endpoint_session = endpoint.session_id().to_string();
+                            if endpoint_session != wanted.as_str() {
+                                return Err(GjcError::SessionMismatch {
+                                    expected: wanted.as_str().to_string(),
+                                });
+                            }
+                        }
+                        let bound = BoundTransport {
+                            session_id: Some(endpoint.session_id().to_string()),
+                            transport: Arc::new(endpoint),
+                        };
+                        *self.bound.write().await = Some(bound.clone());
+                        Ok(Some(bound))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Capability snapshot for the public capabilities surface. Never
+    /// errors: unavailability is reported as `transport_implemented=false`.
+    pub async fn capabilities(&self) -> super::model::Capabilities {
+        let implemented = matches!(
+            self.resolve_transport(None).await,
+            Ok(Some(_)) | Err(GjcError::SessionMismatch { .. })
+        );
+        super::model::Capabilities::for_transport(implemented)
+    }
     // -----------------------------------------------------------------
     // Queries
     // -----------------------------------------------------------------
@@ -62,15 +154,16 @@ impl GjcControlPlane {
         session: &SessionId,
         sections: &[&str],
     ) -> GjcResult<SessionQuery> {
-        self.require_transport()?;
-        let capabilities = super::model::Capabilities::for_transport(self.transport_implemented);
-        capabilities.require(super::model::CAP_SESSION_QUERY)?;
+        let transport = self
+            .resolve_transport(Some(session))
+            .await?
+            .ok_or(GjcError::TransportUnavailable)?;
 
         let params = json!({
             "session_id": session.as_str(),
             "sections": sections,
         });
-        let reply = self.round_trip("session.get", params).await?;
+        let reply = self.round_trip(&transport, "session.get", params).await?;
         let result = reply.result;
         let mut query = SessionQuery::default();
         if let Some(value) = result.get("metadata") {
@@ -135,12 +228,15 @@ impl GjcControlPlane {
 
     /// Terminal outcome receipt for one turn.
     pub async fn turn_outcome(&self, session: &SessionId, turn_id: &str) -> GjcResult<Value> {
-        self.require_transport()?;
+        let transport = self
+            .resolve_transport(Some(session))
+            .await?
+            .ok_or(GjcError::TransportUnavailable)?;
         let params = json!({
             "session_id": session.as_str(),
             "turn_id": turn_id,
         });
-        let reply = self.round_trip("turn.outcome", params).await?;
+        let reply = self.round_trip(&transport, "turn.outcome", params).await?;
         let outcome =
             reply
                 .result
@@ -274,18 +370,15 @@ impl GjcControlPlane {
     // Internals
     // -----------------------------------------------------------------
 
-    fn require_transport(&self) -> GjcResult<()> {
-        if self.transport_implemented {
-            Ok(())
-        } else {
-            Err(GjcError::TransportUnavailable)
-        }
-    }
-
-    async fn round_trip(&self, method: &str, params: Value) -> GjcResult<GjcResponse> {
+    async fn round_trip(
+        &self,
+        transport: &BoundTransport,
+        method: &str,
+        params: Value,
+    ) -> GjcResult<GjcResponse> {
         let correlation_id = Uuid::new_v4().to_string();
         let request = GjcRequest::new(&correlation_id, method, params);
-        let reply = self.transport.round_trip(request).await?;
+        let reply = transport.transport.round_trip(request).await?;
         if reply.correlation_id != correlation_id {
             return Err(GjcError::AmbiguousAck {
                 method: method.into(),
@@ -304,9 +397,15 @@ impl GjcControlPlane {
         params: Value,
     ) -> GjcResult<CommandReceipt> {
         envelope.validate()?;
-        self.require_transport()?;
-        let capabilities = super::model::Capabilities::for_transport(self.transport_implemented);
-        capabilities.require(kind.required_capability())?;
+        // Capability gate: mutations fail closed on missing capability
+        // before any session or transport work happens.
+        self.capabilities()
+            .await
+            .require(kind.required_capability())?;
+        let transport = self
+            .resolve_transport(Some(&envelope.session))
+            .await?
+            .ok_or(GjcError::TransportUnavailable)?;
 
         // Idempotent replay: the identical key returns the recorded receipt.
         if let Some(existing) = self
@@ -365,7 +464,7 @@ impl GjcControlPlane {
         // closed; the recorded receipt stays non-terminal so a replay does
         // not fabricate an outcome.
         let mut reply = self
-            .round_trip(&format!("control.{}", kind.as_str()), request_params)
+            .round_trip(&transport, &format!("control.{}", kind.as_str()), request_params)
             .await?;
 
         let acked = reply
@@ -472,8 +571,7 @@ fn parse_prompt_status(raw: &str) -> Option<GjcPromptStatus> {
 mod tests {
     use super::*;
     use crate::gjc::model::{
-        AbortAndPromptRequest, Capabilities, ControlRequestEnvelope, IdempotencyKey,
-        ModelSelectionRequest, SessionId, TransportUnavailable,
+        Capabilities, ControlRequestEnvelope, IdempotencyKey, ModelSelectionRequest, SessionId,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -541,11 +639,7 @@ mod tests {
         replies: Vec<GjcResult<GjcResponse>>,
     ) -> (GjcControlPlane, Arc<MockTransport>) {
         let transport = Arc::new(MockTransport::new(replies));
-        let plane = GjcControlPlane::new(
-            transport.clone(),
-            new_shared_command_registry(),
-            true,
-        );
+        let plane = GjcControlPlane::new(transport.clone(), new_shared_command_registry());
         (plane, transport)
     }
 
@@ -751,11 +845,7 @@ mod tests {
     }
 
     fn plane() -> GjcControlPlane {
-        GjcControlPlane::new(
-            Arc::new(TransportUnavailable),
-            new_shared_command_registry(),
-            false,
-        )
+        GjcControlPlane::unavailable(new_shared_command_registry())
     }
 
     #[tokio::test]
@@ -773,7 +863,9 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert_eq!(error.error_code(), "transport_unavailable");
+        // Mutations gate on capabilities first: with no transport nothing is
+        // exercisable, so the typed failure is capability_missing.
+        assert_eq!(error.error_code(), "missing_capability");
     }
 
     #[tokio::test]

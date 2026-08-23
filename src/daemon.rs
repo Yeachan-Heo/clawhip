@@ -299,10 +299,9 @@ pub async fn run(
         discord_watch_lock: Arc::new(Mutex::new(())),
         subscriptions: subscriptions.clone(),
         git_monitor_diagnostics,
-        gjc: crate::gjc::control::GjcControlPlane::new(
-            std::sync::Arc::new(crate::gjc::model::TransportUnavailable),
+        gjc: crate::gjc::control::GjcControlPlane::for_worktree(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             crate::gjc::control::new_shared_command_registry(),
-            false,
         ),
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
@@ -790,7 +789,7 @@ async fn gjc_capabilities(
     _control: SubscriptionControlRequest,
     State(state): State<AppState>,
 ) -> axum::response::Response {
-    let caps = crate::gjc::model::Capabilities::for_transport(state.gjc.transport_implemented());
+    let caps = state.gjc.capabilities().await;
     Json(crate::gjc::api::capabilities_body(&caps)).into_response()
 }
 
@@ -2351,10 +2350,8 @@ async fn enqueue_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -
 mod tests {
     use super::*;
     fn test_gjc_plane() -> crate::gjc::control::GjcControlPlane {
-        crate::gjc::control::GjcControlPlane::new(
-            std::sync::Arc::new(crate::gjc::model::TransportUnavailable),
+        crate::gjc::control::GjcControlPlane::unavailable(
             crate::gjc::control::new_shared_command_registry(),
-            false,
         )
     }
     use crate::config::AppConfig;
@@ -4600,7 +4597,9 @@ mod tests {
             gjc_prompt(SubscriptionControlRequest, State(state.clone()), Json(valid))
                 .await
                 .into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Capability gate fires before the transport check: with no
+        // transport nothing is exercisable, so mutations are 501.
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
         // Unknown receipts are 404; malformed keys are 400.
         let response = gjc_command_receipt(

@@ -14,6 +14,7 @@ mod events;
 mod gajae;
 mod gateway_allowlist;
 mod gjc;
+mod gjc_sdk;
 mod hooks;
 mod keyword_window;
 mod lane;
@@ -45,10 +46,10 @@ use tokio::runtime::Builder;
 use crate::cli::{
     AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs,
     GajaeCheckpointCommands, GajaeCommands, GajaeMutationPlanCommands, GajaeProfileCommands,
-    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, LedgerCommands,
-    MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands,
-    TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
-    VerifySenderIdentityArgs,
+    GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands,
+    LedgerCommands, MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs,
+    SubscribeCommands, TmuxCommands, UpdateCommands, VerifyBindingsArgs,
+    VerifyGatewayAllowlistArgs, VerifySenderIdentityArgs,
 };
 
 use crate::client::DaemonClient;

@@ -237,17 +237,6 @@ pub trait GjcTransport: Send + Sync {
     async fn round_trip(&self, request: GjcRequest) -> std::result::Result<GjcResponse, GjcError>;
 }
 
-/// Placeholder transport used until #322 lands. Every call fails closed.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TransportUnavailable;
-
-#[async_trait]
-impl GjcTransport for TransportUnavailable {
-    async fn round_trip(&self, _request: GjcRequest) -> std::result::Result<GjcResponse, GjcError> {
-        Err(GjcError::TransportUnavailable)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Error taxonomy
 // ---------------------------------------------------------------------------
@@ -810,13 +799,4 @@ mod tests {
         assert!(!Failed.can_transition_to(Acked));
     }
 
-    #[tokio::test]
-    async fn unimplemented_transport_fails_closed() {
-        let transport = TransportUnavailable;
-        let error = transport
-            .round_trip(GjcRequest::new("c1", "session.get", Value::Null))
-            .await
-            .unwrap_err();
-        assert_eq!(error, GjcError::TransportUnavailable);
-    }
 }
