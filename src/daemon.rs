@@ -110,6 +110,7 @@ struct AppState {
     discord_watch_lock: Arc<Mutex<()>>,
     subscriptions: SharedSubscriptionRegistry,
     git_monitor_diagnostics: SharedGitMonitorDiagnostics,
+    gjc: crate::gjc::control::GjcControlPlane,
     gjc_store: Option<SharedGjcLaneStore>,
     gjc_reconciler: Option<SharedGjcReconciler>,
 }
@@ -288,7 +289,23 @@ pub async fn run(
         .route("/api/ledger/status", get(ledger_status))
         .route("/api/ledger/query", get(ledger_query))
         .route("/api/subscriptions/{name}/start", post(start_subscription))
-        .route("/api/subscriptions/{name}/stop", post(stop_subscription));
+        .route("/api/subscriptions/{name}/stop", post(stop_subscription))
+        .route("/api/gjc/capabilities", get(gjc_capabilities))
+        .route("/api/gjc/session/{session}", get(gjc_session_query))
+        .route(
+            "/api/gjc/session/{session}/turn/{turn}",
+            get(gjc_turn_outcome),
+        )
+        .route("/api/gjc/prompt", post(gjc_prompt))
+        .route("/api/gjc/steer", post(gjc_steer))
+        .route("/api/gjc/abort-and-prompt", post(gjc_abort_and_prompt))
+        .route(
+            "/api/gjc/workflow-gate-answer",
+            post(gjc_workflow_gate_answer),
+        )
+        .route("/api/gjc/ask-answer", post(gjc_ask_answer))
+        .route("/api/gjc/model-selection", post(gjc_model_selection))
+        .route("/api/gjc/command/{key}", get(gjc_command_receipt));
     let port = port_override.unwrap_or(config.daemon.port);
 
     let app = app.with_state(AppState {
@@ -302,6 +319,18 @@ pub async fn run(
         discord_watch_lock: Arc::new(Mutex::new(())),
         subscriptions: subscriptions.clone(),
         git_monitor_diagnostics,
+        gjc: match std::env::current_dir() {
+            Ok(cwd) => crate::gjc::control::GjcControlPlane::for_worktree(
+                &cwd,
+                crate::gjc::control::new_shared_command_registry(),
+            ),
+            // Without a resolvable worktree anchor the plane stays
+            // explicitly unavailable instead of silently re-scoping the
+            // trust boundary to ".".
+            Err(_) => crate::gjc::control::GjcControlPlane::unavailable(
+                crate::gjc::control::new_shared_command_registry(),
+            ),
+        },
         gjc_store,
         gjc_reconciler,
     });
@@ -960,6 +989,162 @@ async fn stop_subscription(
     match stop_subscription_entry(&state.subscription_registry(), &name).await {
         Ok(reason) => Json(json!({"ok": true, "name": name, "reason": reason})).into_response(),
         Err((status, reason)) => subscription_error(status, reason),
+    }
+}
+// --- GJC SDK control plane (#323): public-safe, loopback-guarded surface ---
+
+fn gjc_error_response(error: &crate::gjc::model::GjcError) -> axum::response::Response {
+    let (status, body) = crate::gjc::api::error_response(error);
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+        Json(body),
+    )
+        .into_response()
+}
+
+async fn gjc_capabilities(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    let caps = state.gjc.capabilities().await;
+    Json(crate::gjc::api::capabilities_body(&caps)).into_response()
+}
+
+async fn gjc_session_query(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    axum::extract::Path(session): axum::extract::Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    match crate::gjc::api::run_session_query(
+        &state.gjc,
+        &session,
+        params.get("sections").map(String::as_str),
+    )
+    .await
+    {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_turn_outcome(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    axum::extract::Path((session, turn)): axum::extract::Path<(String, String)>,
+) -> axum::response::Response {
+    let session = match crate::gjc::model::SessionId::new(session) {
+        Ok(session) => session,
+        Err(error) => return gjc_error_response(&error),
+    };
+    if turn.is_empty() || turn.len() > 128 {
+        return gjc_error_response(&crate::gjc::model::GjcError::InvalidRequest {
+            field: "turn_id",
+            reason: "must be 1..=128 bytes".into(),
+        });
+    }
+    match state.gjc.turn_outcome(&session, &turn).await {
+        Ok(outcome) => Json(crate::gjc::api::outcome_body(&outcome)).into_response(),
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_prompt(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::PromptDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => match state.gjc.prompt(request).await {
+            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
+            Err(error) => gjc_error_response(&error),
+        },
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_steer(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::SteerDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => match state.gjc.steer(request).await {
+            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
+            Err(error) => gjc_error_response(&error),
+        },
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_abort_and_prompt(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::AbortAndPromptDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => match state.gjc.abort_and_prompt(request).await {
+            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
+            Err(error) => gjc_error_response(&error),
+        },
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_workflow_gate_answer(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::WorkflowGateAnswerDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => match state.gjc.answer_workflow_gate(request).await {
+            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
+            Err(error) => gjc_error_response(&error),
+        },
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_ask_answer(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::AskAnswerDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => match state.gjc.answer_ask(request).await {
+            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
+            Err(error) => gjc_error_response(&error),
+        },
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_model_selection(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::ModelSelectionDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => match state.gjc.select_model(request).await {
+            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
+            Err(error) => gjc_error_response(&error),
+        },
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_command_receipt(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let key = match crate::gjc::model::IdempotencyKey::new(key) {
+        Ok(key) => key,
+        Err(error) => return gjc_error_response(&error),
+    };
+    match state.gjc.command_receipt(&key).await {
+        Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
+        Err(error) => gjc_error_response(&error),
     }
 }
 
@@ -2381,6 +2566,11 @@ async fn enqueue_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_gjc_plane() -> crate::gjc::control::GjcControlPlane {
+        crate::gjc::control::GjcControlPlane::unavailable(
+            crate::gjc::control::new_shared_command_registry(),
+        )
+    }
     use crate::config::AppConfig;
     use crate::config::{CronJob, CronJobKind};
     use crate::events::{MessageFormat, RoutingMetadata};
@@ -2409,6 +2599,7 @@ mod tests {
                 discord_watch_lock: Arc::new(Mutex::new(())),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
                 git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+                gjc: test_gjc_plane(),
                 gjc_store: None,
                 gjc_reconciler: None,
             },
@@ -2556,6 +2747,7 @@ mod tests {
                 discord_watch_lock: Arc::new(Mutex::new(())),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
                 git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+                gjc: test_gjc_plane(),
                 gjc_store: None,
                 gjc_reconciler: None,
             },
@@ -2908,6 +3100,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3028,6 +3221,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3529,6 +3723,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3572,6 +3767,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3608,6 +3804,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3656,6 +3853,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3715,6 +3913,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3779,6 +3978,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3841,6 +4041,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3901,6 +4102,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3933,6 +4135,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -3964,6 +4167,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4009,6 +4213,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4053,6 +4258,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4126,6 +4332,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4296,6 +4503,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4388,6 +4596,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4438,6 +4647,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4473,6 +4683,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4501,6 +4712,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4541,6 +4753,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4569,6 +4782,7 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
             gjc_store: None,
             gjc_reconciler: None,
         };
@@ -4579,5 +4793,98 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn gjc_handlers_fail_closed_and_validate_before_transport() {
+        let (state, _rx) = native_hook_test_state();
+
+        // Capabilities surface is honest about the missing transport.
+        let response = gjc_capabilities(SubscriptionControlRequest, State(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["transport_implemented"], Value::Bool(false));
+        assert_eq!(body["capabilities"], json!([]));
+
+        // Session queries require a transport and fail closed with 503.
+        let response = gjc_session_query(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            axum::extract::Path("sess-1".into()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_code"], "transport_unavailable");
+
+        // Local validation runs before the transport check.
+        let invalid = crate::gjc::api::PromptDto {
+            base: crate::gjc::api::MutationDto {
+                session: "sess-1".into(),
+                idempotency_key: "short".into(),
+                expected_session: None,
+                timeout_ms: None,
+            },
+            prompt: "hello".into(),
+        };
+        let response = gjc_prompt(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            Json(invalid),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_code"], "invalid_request");
+
+        // Well-formed mutations still fail closed without a transport.
+        let valid = crate::gjc::api::PromptDto {
+            base: crate::gjc::api::MutationDto {
+                session: "sess-1".into(),
+                idempotency_key: "idem-key-e2e1".into(),
+                expected_session: Some("sess-1".into()),
+                timeout_ms: None,
+            },
+            prompt: "hello".into(),
+        };
+        let response = gjc_prompt(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            Json(valid),
+        )
+        .await
+        .into_response();
+        // Capability gate fires before the transport check: with no
+        // transport nothing is exercisable, so mutations are 501.
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Unknown receipts are 404; malformed keys are 400.
+        let response = gjc_command_receipt(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            axum::extract::Path("idem-key-missing".into()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = gjc_command_receipt(
+            SubscriptionControlRequest,
+            State(state),
+            axum::extract::Path("bad key!".into()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

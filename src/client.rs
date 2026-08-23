@@ -302,7 +302,79 @@ impl DaemonClient {
         )
         .await
     }
+    // --- GJC SDK control plane (#323) ---
 
+    pub async fn gjc_capabilities(&self) -> Result<Value> {
+        self.gjc_private_request(reqwest::Method::GET, "/api/gjc/capabilities", None)
+            .await
+    }
+
+    pub async fn gjc_session_query(&self, session: &str, sections: Option<&str>) -> Result<Value> {
+        let mut path = format!("/api/gjc/session/{}", urlencoding_lite(session));
+        if let Some(sections) = sections {
+            path.push_str("?sections=");
+            path.push_str(sections);
+        }
+        self.gjc_private_request(reqwest::Method::GET, &path, None)
+            .await
+    }
+
+    pub async fn gjc_turn_outcome(&self, session: &str, turn: &str) -> Result<Value> {
+        self.gjc_private_request(
+            reqwest::Method::GET,
+            &format!(
+                "/api/gjc/session/{}/turn/{}",
+                urlencoding_lite(session),
+                urlencoding_lite(turn)
+            ),
+            None,
+        )
+        .await
+    }
+
+    pub async fn gjc_command_receipt(&self, key: &str) -> Result<Value> {
+        self.gjc_private_request(
+            reqwest::Method::GET,
+            &format!("/api/gjc/command/{}", urlencoding_lite(key)),
+            None,
+        )
+        .await
+    }
+
+    pub async fn gjc_mutation(&self, verb: &str, payload: Value) -> Result<Value> {
+        self.gjc_private_request(
+            reqwest::Method::POST,
+            &format!("/api/gjc/{verb}"),
+            Some(payload),
+        )
+        .await
+    }
+
+    /// GJC endpoints are private control surfaces: loopback daemon URLs
+    /// only, local-control header always set, typed error bodies surfaced.
+    async fn gjc_private_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<Value>,
+    ) -> Result<Value> {
+        self.ensure_loopback_daemon()?;
+        let mut request = self
+            .http
+            .request(method, format!("{}{}", self.base_url, path))
+            .header(LOCAL_CONTROL_HEADER, "1");
+        if let Some(payload) = payload.as_ref() {
+            request = request.json(payload);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.json::<Value>().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(std::io::Error::other(gjc_error_message(status, &body)).into())
+        }
+    }
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let response = self
             .http
@@ -388,6 +460,27 @@ fn subscription_path_name(name: &str) -> String {
             _ => format!("%{byte:02X}").chars().collect(),
         })
         .collect()
+}
+
+fn urlencoding_lite(value: &str) -> String {
+    // Session/turn/key ids are validated to exclude whitespace and control
+    // characters, so only path-hostile separators need escaping here.
+    value
+        .replace('/', "%2F")
+        .replace('?', "%3F")
+        .replace('#', "%23")
+}
+
+fn gjc_error_message(status: reqwest::StatusCode, body: &Value) -> String {
+    let code = body
+        .get("error_code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    let message = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("gjc request failed");
+    format!("daemon gjc request failed with {status} [{code}]: {message}")
 }
 
 #[cfg(test)]
