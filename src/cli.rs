@@ -184,6 +184,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ReleaseCommands,
     },
+    /// Inspect the worktree-local GJC SDK transport surface (diagnostics only).
+    Gjc {
+        #[command(subcommand)]
+        command: GjcCommands,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -716,6 +721,28 @@ pub struct GajaeZeroBacklogCheckpointArgs {
     /// Mark a release hold as present, which forces follow-up emission.
     #[arg(long, default_value_t = false)]
     pub release_hold: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum GjcCommands {
+    /// Inspect worktree-local GJC SDK endpoint metadata and transport readiness.
+    ///
+    /// Discovery only: reports the validated session endpoint for the target
+    /// worktree without exposing tokens or URLs.
+    Inspect(GjcInspectArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct GjcInspectArgs {
+    /// Worktree root to inspect. Defaults to the current directory.
+    #[arg(long)]
+    pub worktree: Option<PathBuf>,
+    /// Open the discovered endpoint and issue one typed probe request.
+    #[arg(long, default_value_t = false)]
+    pub probe: bool,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
