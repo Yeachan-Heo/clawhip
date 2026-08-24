@@ -54,6 +54,8 @@ pub struct AppConfig {
         skip_serializing_if = "crate::gjc_lane::GjcLanesConfig::is_empty"
     )]
     pub gjc_lanes: crate::gjc_lane::GjcLanesConfig,
+    #[serde(default, skip_serializing_if = "GjcConfig::is_empty")]
+    pub gjc: GjcConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +154,25 @@ pub struct SubscriptionRoutingConfig {
 
 pub const GJC_QUESTION_SUBSCRIPTION_NAME: &str = "gjc-question";
 pub const GJC_QUESTION_ENDPOINT_ENV: &str = "GJC_QUESTION_WS";
+/// GJC SDK integration surface (issue #326).
+///
+/// Reconciled with the landed #322 transport: SDK endpoint discovery is
+/// worktree-file-based (`<worktree>/.gjc/state/sdk/*.json`, owner-only
+/// permissions enforced by the transport), so this section carries only the
+/// opt-in switch. The auth token lives exclusively inside the 0600 metadata
+/// file and is never configured or logged here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GjcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl GjcConfig {
+    fn is_empty(&self) -> bool {
+        !self.enabled
+    }
+}
 
 fn default_subscription_max_frame_bytes() -> usize {
     65_536
@@ -1583,7 +1604,6 @@ impl AppConfig {
 
         Ok(())
     }
-
     pub fn validate(&self) -> Result<()> {
         if self.dispatch.ci_batch_window_secs == 0 {
             return Err("dispatch.ci_batch_window_secs must be at least 1".into());
@@ -2033,6 +2053,14 @@ impl AppConfig {
             _ => unreachable!(),
         }
         Ok(())
+    }
+    /// Enable the GJC SDK integration surface (issue #326).
+    ///
+    /// Idempotent. Endpoint discovery itself stays worktree-file-based per
+    /// the landed #322 transport; enabling here only flips the opt-in switch,
+    /// so no endpoint or secret is ever written into the config file.
+    pub fn apply_gjc_sdk_setup(&mut self) {
+        self.gjc.enabled = true;
     }
 
     pub fn scaffold_webhook_quickstart(&mut self, webhook: String) -> Result<()> {
@@ -7387,6 +7415,68 @@ format = "compact"
         .unwrap();
 
         config.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod gjc_config_tests {
+    use super::AppConfig;
+
+    #[test]
+    fn legacy_config_without_gjc_section_parses_and_stays_absent() {
+        let config: AppConfig =
+            toml::from_str("[providers.discord]\ntoken = \"fixture-token\"\n").unwrap();
+        assert!(!config.gjc.enabled);
+        config.validate().unwrap();
+        // Backward compatibility: the section must not materialize on
+        // round-trip, so old configs stay byte-stable.
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("[gjc]"));
+    }
+
+    #[test]
+    fn explicit_gjc_section_parses_and_rejects_unknown_fields() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[gjc]
+enabled = true
+
+[[routes]]
+event = "*"
+sink = "localfile"
+local_path = "/tmp/clawhip-gjc-fixture.jsonl"
+"#,
+        )
+        .unwrap();
+        assert!(config.gjc.enabled);
+        config.validate().unwrap();
+
+        // The reconciled #322-aligned surface carries only the opt-in flag;
+        // endpoint/token fields must never reappear in config.
+        let unknown: Result<AppConfig, _> = toml::from_str(
+            r#"
+[gjc]
+enabled = true
+discovery_roots = ["http://127.0.0.1"]
+"#,
+        );
+        assert!(
+            unknown.is_err(),
+            "invented discovery fields must be rejected"
+        );
+    }
+
+    #[test]
+    fn gjc_setup_is_idempotent_flag_flip_without_secrets() {
+        let mut config: AppConfig =
+            toml::from_str("[providers.discord]\ntoken = \"fixture-token\"\n").unwrap();
+        config.apply_gjc_sdk_setup();
+        config.apply_gjc_sdk_setup();
+        assert!(config.gjc.enabled);
+        config.validate().unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        let gjc_section = serialized.split("[gjc]").nth(1).unwrap_or_default();
+        assert_eq!(gjc_section.trim(), "enabled = true");
     }
 }
 

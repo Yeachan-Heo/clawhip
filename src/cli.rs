@@ -291,6 +291,13 @@ pub struct SetupArgs {
     /// Use the configured default channel when no --question-channel is supplied.
     #[arg(long = "question-fallback", default_value_t = false)]
     pub question_fallback: bool,
+    /// Enable the loopback-safe GJC SDK integration with safe defaults.
+    ///
+    /// Marks [gjc] enabled and trusts only the loopback discovery root.
+    /// The SDK endpoint and auth token stay environment-driven; no secret is
+    /// ever written into the config file.
+    #[arg(long = "gjc-sdk", default_value_t = false)]
+    pub gjc_sdk: bool,
 }
 
 #[derive(Debug, Clone, Default, Args)]

@@ -785,6 +785,12 @@ fn health_payload(
         "tmux": tmux,
         "native_hooks": native_hooks,
         "subscriptions": {"configured": subscriptions.len(), "degraded": subscription_degraded},
+        "gjc": {
+            "enabled": config.gjc.enabled,
+            "question_subscription": config.subscriptions.iter().any(|subscription| {
+                subscription.name == crate::config::GJC_QUESTION_SUBSCRIPTION_NAME
+            }),
+        },
     })
 }
 
@@ -3502,6 +3508,33 @@ mod tests {
             "token leaked: {rendered}"
         );
         assert_eq!(payload["ok"], Value::Bool(true));
+    }
+
+    #[test]
+    fn health_payload_surfaces_gjc_state_without_endpoints_or_tokens() {
+        let mut config = AppConfig::default();
+        config.gjc.enabled = true;
+
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
+            &[],
+            GitMonitorLifecycleCounts::default(),
+        );
+
+        assert_eq!(payload["gjc"]["enabled"], Value::Bool(true));
+        assert_eq!(payload["gjc"]["question_subscription"], Value::Bool(false));
+
+        // Redaction assertions: the health surface carries flags only — the
+        // SDK endpoint URL and token live in the 0600 worktree metadata file
+        // (landed #322 transport) and must never reach health output.
+        assert_eq!(
+            payload["gjc"],
+            json!({"enabled": true, "question_subscription": false})
+        );
     }
 
     #[test]

@@ -69,11 +69,16 @@ impl GjcTransport for SdkEndpointTransport {
         // v3 wire mapping: `control.*` methods become control_request
         // frames; every other method is a query_request. The correlation ID
         // is minted inside the typed frame and echoed by the peer.
-        let sdk_request = if let Some(operation) = request.method.strip_prefix("control.") {
+        let mut sdk_request = if let Some(operation) = request.method.strip_prefix("control.") {
             SdkRequest::control(operation, request.params.clone())
         } else {
             SdkRequest::query(request.method.clone(), request.params.clone())
         };
+        // The caller owns correlation identity: `GjcControlPlane::round_trip`
+        // validates `reply.correlation_id == request.correlation_id`, so the
+        // wire frame must carry the caller's id verbatim instead of the
+        // transport-minted default.
+        sdk_request.id = request.correlation_id.clone();
         let correlation_id = sdk_request.correlation_id().to_string();
         // The caller's bounded budget is clamped into the transport limits
         // so `timeout_ms` is authoritative for this exchange (sanitized()
@@ -202,6 +207,61 @@ mod tests {
         }
         let error = discover_endpoint(temp.path()).unwrap_err();
         assert_eq!(error.error_code(), "stale_endpoint");
+    }
+
+    #[tokio::test]
+    async fn round_trip_echoes_caller_correlation_id_verbatim() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+
+        // Loopback fixture: server hello, then echo the request id back on
+        // the matching response family with an accepted verdict.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio_tungstenite::tungstenite::Message;
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut stream) = ws.split();
+            sink.send(Message::text(
+                r#"{"type":"hello","connectionId":"corr-fixture"}"#,
+            ))
+            .await
+            .unwrap();
+            if let Some(Ok(Message::Text(text))) = stream.next().await {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let reply = serde_json::json!({
+                    "type": "control_response",
+                    "id": value["id"],
+                    "ok": true,
+                    "result": {"accepted": true},
+                });
+                sink.send(Message::text(reply.to_string())).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".gjc").join("state").join("sdk")).unwrap();
+        write_metadata(
+            temp.path(),
+            "sess-lane-1",
+            &format!("ws://{addr}/"),
+            "tok-1",
+        );
+        let transport = discover_endpoint(temp.path()).unwrap();
+
+        let reply = transport
+            .round_trip(GjcRequest::new(
+                "caller-corr-326",
+                "control.prompt",
+                json!({"session_id": "sess-lane-1"}),
+                10_000,
+            ))
+            .await
+            .expect("caller correlation id must be echoed verbatim");
+        assert_eq!(reply.correlation_id, "caller-corr-326");
+        assert_eq!(reply.result["accepted"], true);
+        server.await.unwrap();
     }
 
     #[tokio::test]
