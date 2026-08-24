@@ -1051,6 +1051,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn eof_reading_adapters_terminate_when_stdin_closes() {
         use std::os::unix::fs::PermissionsExt;
