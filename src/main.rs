@@ -848,6 +848,7 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
         && binds.is_empty()
         && !args.verify_bindings
         && !question_setup_requested
+        && !args.gjc_sdk
     {
         return Err("setup requires at least one non-empty setup flag".into());
     }
@@ -867,6 +868,9 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
             repo,
             adapter_program,
         )?;
+    }
+    if args.gjc_sdk {
+        editable.apply_gjc_sdk_setup();
     }
 
     // Process --bind entries: resolve each channel against Discord and write a

@@ -286,40 +286,46 @@ pub async fn run(
         )
         .route("/api/lane/delivery", post(record_lane_delivery_handler))
         .route("/api/lane/retire", post(retire_lane_handler))
-        .route("/api/gjc/health", get(gjc_health_handler))
-        .route(
-            "/api/gjc/lanes",
-            get(list_gjc_lanes_handler).post(register_gjc_lane_handler),
-        )
-        .route("/api/gjc/lanes/{lane}", get(gjc_lane_detail_handler))
-        .route(
-            "/api/gjc/lanes/{lane}/retire",
-            post(retire_gjc_lane_handler),
-        )
-        .route("/api/gjc/lane/reconcile", post(reconcile_gjc_lanes_handler))
         .route("/api/subscriptions", get(list_subscriptions))
         .route("/api/subscriptions/{name}", get(subscription_detail))
         .route("/api/ledger/status", get(ledger_status))
         .route("/api/ledger/query", get(ledger_query))
         .route("/api/subscriptions/{name}/start", post(start_subscription))
-        .route("/api/subscriptions/{name}/stop", post(stop_subscription))
-        .route("/api/gjc/capabilities", get(gjc_capabilities))
-        .route("/api/gjc/session/{session}", get(gjc_session_query))
-        .route(
-            "/api/gjc/session/{session}/turn/{turn}",
-            get(gjc_turn_outcome),
-        )
-        .route("/api/gjc/prompt", post(gjc_prompt))
-        .route("/api/gjc/steer", post(gjc_steer))
-        .route("/api/gjc/abort-and-prompt", post(gjc_abort_and_prompt))
-        .route(
-            "/api/gjc/workflow-gate-answer",
-            post(gjc_workflow_gate_answer),
-        )
-        .route("/api/gjc/ask-answer", post(gjc_ask_answer))
-        .route("/api/gjc/model-selection", post(gjc_model_selection))
-        .route("/api/gjc/command/{key}", get(gjc_command_receipt))
-        .route("/api/gjc/bridge", post(post_gjc_bridge));
+        .route("/api/subscriptions/{name}/stop", post(stop_subscription));
+    // The GJC surface is strictly opt-in: with `[gjc] enabled = false` no
+    // /api/gjc route is registered at all, not merely reported disabled.
+    let app = if config.gjc.enabled {
+        app.route("/api/gjc/health", get(gjc_health_handler))
+            .route(
+                "/api/gjc/lanes",
+                get(list_gjc_lanes_handler).post(register_gjc_lane_handler),
+            )
+            .route("/api/gjc/lanes/{lane}", get(gjc_lane_detail_handler))
+            .route(
+                "/api/gjc/lanes/{lane}/retire",
+                post(retire_gjc_lane_handler),
+            )
+            .route("/api/gjc/lane/reconcile", post(reconcile_gjc_lanes_handler))
+            .route("/api/gjc/capabilities", get(gjc_capabilities))
+            .route("/api/gjc/session/{session}", get(gjc_session_query))
+            .route(
+                "/api/gjc/session/{session}/turn/{turn}",
+                get(gjc_turn_outcome),
+            )
+            .route("/api/gjc/prompt", post(gjc_prompt))
+            .route("/api/gjc/steer", post(gjc_steer))
+            .route("/api/gjc/abort-and-prompt", post(gjc_abort_and_prompt))
+            .route(
+                "/api/gjc/workflow-gate-answer",
+                post(gjc_workflow_gate_answer),
+            )
+            .route("/api/gjc/ask-answer", post(gjc_ask_answer))
+            .route("/api/gjc/model-selection", post(gjc_model_selection))
+            .route("/api/gjc/command/{key}", get(gjc_command_receipt))
+            .route("/api/gjc/bridge", post(post_gjc_bridge))
+    } else {
+        app
+    };
     let port = port_override.unwrap_or(config.daemon.port);
 
     let app = app.with_state(AppState {
@@ -785,6 +791,12 @@ fn health_payload(
         "tmux": tmux,
         "native_hooks": native_hooks,
         "subscriptions": {"configured": subscriptions.len(), "degraded": subscription_degraded},
+        "gjc": {
+            "enabled": config.gjc.enabled,
+            "question_subscription": config.subscriptions.iter().any(|subscription| {
+                subscription.name == crate::config::GJC_QUESTION_SUBSCRIPTION_NAME
+            }),
+        },
     })
 }
 
@@ -3502,6 +3514,33 @@ mod tests {
             "token leaked: {rendered}"
         );
         assert_eq!(payload["ok"], Value::Bool(true));
+    }
+
+    #[test]
+    fn health_payload_surfaces_gjc_state_without_endpoints_or_tokens() {
+        let mut config = AppConfig::default();
+        config.gjc.enabled = true;
+
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
+            &[],
+            GitMonitorLifecycleCounts::default(),
+        );
+
+        assert_eq!(payload["gjc"]["enabled"], Value::Bool(true));
+        assert_eq!(payload["gjc"]["question_subscription"], Value::Bool(false));
+
+        // Redaction assertions: the health surface carries flags only — the
+        // SDK endpoint URL and token live in the 0600 worktree metadata file
+        // (landed #322 transport) and must never reach health output.
+        assert_eq!(
+            payload["gjc"],
+            json!({"enabled": true, "question_subscription": false})
+        );
     }
 
     #[test]

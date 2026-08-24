@@ -413,7 +413,7 @@ async fn run_adapter(
         let _ = child.wait().await;
         return Err(subscription_error("adapter_timeout"));
     }
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| subscription_error("adapter_stdin_failed"))?;
@@ -445,8 +445,21 @@ async fn run_adapter(
     });
     let result = tokio::select! {
         result = async {
-            stdin.write_all(input).await.map_err(|_| subscription_error("adapter_stdin_failed"))?;
-            stdin.shutdown().await.map_err(|_| subscription_error("adapter_stdin_failed"))?;
+            {
+                let mut stdin = stdin;
+                stdin
+                    .write_all(input)
+                    .await
+                    .map_err(|_| subscription_error("adapter_stdin_failed"))?;
+                stdin
+                    .flush()
+                    .await
+                    .map_err(|_| subscription_error("adapter_stdin_failed"))?;
+                // Dropping the write half closes the child's stdin so adapters
+                // that read to EOF observe end-of-input before we wait for
+                // exit; shutdown() alone leaves the descriptor open and would
+                // deadlock against wait().
+            }
             let status = child.wait().await.map_err(|_| subscription_error("adapter_invalid_output"))?;
             let output = (&mut stdout_task)
                 .await
@@ -986,6 +999,42 @@ mod tests {
     }
 
     #[test]
+    fn gjc_sdk_frames_project_without_secret_material() {
+        let mut config = config();
+        // Mirror the setup-owned gjc-question subscription: discriminator
+        // /type == "question", projection limited to question_id/summary.
+        config.filter = SubscriptionFilterConfig {
+            discriminator_pointer: "/type".into(),
+            discriminator_equals: "question".into(),
+            predicates: Vec::new(),
+        };
+        config.projection = BTreeMap::from([
+            (String::from("question_id"), String::from("/question/id")),
+            (String::from("summary"), String::from("/question/summary")),
+        ]);
+        // Any SDK auth material riding alongside is dropped by the
+        // projection and never reaches the event stream.
+        let frame = r#"{"type":"question","question":{"id":"q1","summary":"s"},"sdk_token":"secret","endpoint":"ws://127.0.0.1:9/v1","nested":{"authorization":"Bearer x"}}"#;
+        let input = project_frame(&config, frame).unwrap().unwrap();
+        assert_eq!(config.filter.discriminator_equals, "question");
+        let serialized = serde_json::to_string(&input).unwrap();
+        for secret_marker in ["secret", "sdk_token", "endpoint", "authorization", "Bearer"] {
+            assert!(
+                !serialized.contains(secret_marker),
+                "{secret_marker} leaked through projection: {serialized}"
+            );
+        }
+        // Defense in depth: even if an adapter echoed such keys back, the
+        // reserved-field check rejects them.
+        for key in ["sdk_token", "endpoint", "authorization"] {
+            let echo = format!(
+                r#"{{"type":"workflow.question","payload":{{"question_id":"q1","{key}":"x"}}}}"#
+            );
+            assert!(adapter_event(echo.as_bytes(), &config).is_err(), "{key}");
+        }
+    }
+
+    #[test]
     fn rejects_decorated_sensitive_keys_at_every_payload_depth() {
         let config = config();
         for key in [
@@ -1000,6 +1049,43 @@ mod tests {
             );
             assert!(adapter_event(output.as_bytes(), &config).is_err(), "{key}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eof_reading_adapters_terminate_when_stdin_closes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A `cat`-style adapter reads stdin to EOF before producing output;
+        // the write half must actually close (shutdown alone keeps the
+        // descriptor open and would deadlock against wait()).
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("eof-reading-adapter");
+        // `cat` blocks until stdin reaches EOF, then the script emits a
+        // valid restricted event — proving both EOF delivery and output.
+        let output =
+            r#"{"type":"workflow.gate","payload":{"workflow_id":"wf-1","gate_state":"ready"}}"#;
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat > /dev/null\necho '{output}'\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let mut config = config();
+        config.adapter.program = script.to_string_lossy().into_owned();
+        config.adapter.timeout_ms = 5_000;
+        let (_sender, mut cancel) = watch::channel(false);
+        let event = run_adapter(
+            &config,
+            br#"{"workflow_id":"wf-1","gate_state":"ready"}"#,
+            &mut cancel,
+        )
+        .await
+        .expect("adapter must observe EOF and exit promptly");
+        assert_eq!(event.kind, "workflow.gate");
     }
 
     #[cfg(unix)]

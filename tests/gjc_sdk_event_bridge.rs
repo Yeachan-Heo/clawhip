@@ -126,6 +126,9 @@ bind_host = "127.0.0.1"
 port = {port}
 base_url = "http://127.0.0.1:{port}"
 
+[gjc]
+enabled = true
+
 [ledger]
 enabled = true
 path = "{}"
