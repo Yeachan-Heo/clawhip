@@ -193,10 +193,17 @@ impl FakeGjcServer {
                  axum::extract::Query(params): axum::extract::Query<
                     std::collections::BTreeMap<String, String>,
                 >,
+                 headers: axum::http::HeaderMap,
                  axum::extract::State(state): axum::extract::State<RouterState>| async move {
-                    if params.get("token").map(String::as_str) != Some(FIXTURE_TOKEN)
-                        || state.0.lock().await.should_reject_auth()
-                    {
+                    // Documented contract: the credential travels as the
+                    // `?token=` query parameter plus an Authorization Bearer
+                    // header; either matching credential authenticates.
+                    let query_ok = params.get("token").map(String::as_str) == Some(FIXTURE_TOKEN);
+                    let bearer_ok = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value == format!("Bearer {FIXTURE_TOKEN}"));
+                    if !(query_ok || bearer_ok) || state.0.lock().await.should_reject_auth() {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
                     ws.on_upgrade(move |socket| session_socket(socket, state.0, state.1, state.2))

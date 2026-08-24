@@ -286,40 +286,46 @@ pub async fn run(
         )
         .route("/api/lane/delivery", post(record_lane_delivery_handler))
         .route("/api/lane/retire", post(retire_lane_handler))
-        .route("/api/gjc/health", get(gjc_health_handler))
-        .route(
-            "/api/gjc/lanes",
-            get(list_gjc_lanes_handler).post(register_gjc_lane_handler),
-        )
-        .route("/api/gjc/lanes/{lane}", get(gjc_lane_detail_handler))
-        .route(
-            "/api/gjc/lanes/{lane}/retire",
-            post(retire_gjc_lane_handler),
-        )
-        .route("/api/gjc/lane/reconcile", post(reconcile_gjc_lanes_handler))
         .route("/api/subscriptions", get(list_subscriptions))
         .route("/api/subscriptions/{name}", get(subscription_detail))
         .route("/api/ledger/status", get(ledger_status))
         .route("/api/ledger/query", get(ledger_query))
         .route("/api/subscriptions/{name}/start", post(start_subscription))
-        .route("/api/subscriptions/{name}/stop", post(stop_subscription))
-        .route("/api/gjc/capabilities", get(gjc_capabilities))
-        .route("/api/gjc/session/{session}", get(gjc_session_query))
-        .route(
-            "/api/gjc/session/{session}/turn/{turn}",
-            get(gjc_turn_outcome),
-        )
-        .route("/api/gjc/prompt", post(gjc_prompt))
-        .route("/api/gjc/steer", post(gjc_steer))
-        .route("/api/gjc/abort-and-prompt", post(gjc_abort_and_prompt))
-        .route(
-            "/api/gjc/workflow-gate-answer",
-            post(gjc_workflow_gate_answer),
-        )
-        .route("/api/gjc/ask-answer", post(gjc_ask_answer))
-        .route("/api/gjc/model-selection", post(gjc_model_selection))
-        .route("/api/gjc/command/{key}", get(gjc_command_receipt))
-        .route("/api/gjc/bridge", post(post_gjc_bridge));
+        .route("/api/subscriptions/{name}/stop", post(stop_subscription));
+    // The GJC surface is strictly opt-in: with `[gjc] enabled = false` no
+    // /api/gjc route is registered at all, not merely reported disabled.
+    let app = if config.gjc.enabled {
+        app.route("/api/gjc/health", get(gjc_health_handler))
+            .route(
+                "/api/gjc/lanes",
+                get(list_gjc_lanes_handler).post(register_gjc_lane_handler),
+            )
+            .route("/api/gjc/lanes/{lane}", get(gjc_lane_detail_handler))
+            .route(
+                "/api/gjc/lanes/{lane}/retire",
+                post(retire_gjc_lane_handler),
+            )
+            .route("/api/gjc/lane/reconcile", post(reconcile_gjc_lanes_handler))
+            .route("/api/gjc/capabilities", get(gjc_capabilities))
+            .route("/api/gjc/session/{session}", get(gjc_session_query))
+            .route(
+                "/api/gjc/session/{session}/turn/{turn}",
+                get(gjc_turn_outcome),
+            )
+            .route("/api/gjc/prompt", post(gjc_prompt))
+            .route("/api/gjc/steer", post(gjc_steer))
+            .route("/api/gjc/abort-and-prompt", post(gjc_abort_and_prompt))
+            .route(
+                "/api/gjc/workflow-gate-answer",
+                post(gjc_workflow_gate_answer),
+            )
+            .route("/api/gjc/ask-answer", post(gjc_ask_answer))
+            .route("/api/gjc/model-selection", post(gjc_model_selection))
+            .route("/api/gjc/command/{key}", get(gjc_command_receipt))
+            .route("/api/gjc/bridge", post(post_gjc_bridge))
+    } else {
+        app
+    };
     let port = port_override.unwrap_or(config.daemon.port);
 
     let app = app.with_state(AppState {
