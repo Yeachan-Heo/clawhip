@@ -30,11 +30,36 @@ fn unused_port() -> u16 {
 }
 
 fn request(port: u16, method: &str, path: &str, body: Option<&[u8]>) -> (u16, Vec<u8>) {
+    request_with(
+        port,
+        method,
+        path,
+        body,
+        &format!("127.0.0.1:{port}"),
+        &[("x-clawhip-local-control", "1")],
+    )
+}
+
+fn request_with(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    host: &str,
+    extra_headers: &[(&str, &str)],
+) -> (u16, Vec<u8>) {
     let body = body.unwrap_or_default();
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut extra = String::new();
+    for (name, value) in extra_headers {
+        extra.push_str(name);
+        extra.push_str(": ");
+        extra.push_str(value);
+        extra.push_str("\r\n");
+    }
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
     )
     .unwrap();
@@ -115,19 +140,41 @@ fn wait_for_ledger_and_delivery(
 }
 
 fn write_config(temp: &TempDir, port: u16) -> std::path::PathBuf {
-    let config = temp.path().join("clawhip.toml");
-    let ledger = temp.path().join("ledger");
-    let delivery = temp.path().join("delivery.jsonl");
+    write_config_with(temp, port, "127.0.0.1", true, None)
+}
+
+fn write_config_with(
+    temp: &TempDir,
+    port: u16,
+    bind_host: &str,
+    gjc_enabled: bool,
+    tag: Option<&str>,
+) -> std::path::PathBuf {
+    let (config_name, ledger_name, delivery_name) = match tag {
+        Some(tag) => (
+            format!("clawhip-{tag}.toml"),
+            format!("ledger-{tag}"),
+            format!("delivery-{tag}.jsonl"),
+        ),
+        None => (
+            "clawhip.toml".into(),
+            "ledger".into(),
+            "delivery.jsonl".into(),
+        ),
+    };
+    let config = temp.path().join(config_name);
+    let ledger = temp.path().join(ledger_name);
+    let delivery = temp.path().join(delivery_name);
     std::fs::write(
         &config,
         format!(
             r#"[daemon]
-bind_host = "127.0.0.1"
+bind_host = "{bind_host}"
 port = {port}
 base_url = "http://127.0.0.1:{port}"
 
 [gjc]
-enabled = true
+enabled = {gjc_enabled}
 
 [ledger]
 enabled = true
@@ -379,4 +426,114 @@ fn gjc_bridge_ingest_dedupes_replay_stale_and_restart_boundaries() {
     assert!(totals["snapshots"].as_u64().unwrap() >= 6, "{totals}");
     assert!(totals["duplicates"].as_u64().unwrap() >= 2, "{totals}");
     assert!(totals["stale"].as_u64().unwrap() >= 1, "{totals}");
+}
+
+#[test]
+fn gjc_bridge_requires_local_control_and_is_absent_when_disabled() {
+    let temp = TempDir::new().unwrap();
+    let payload = serde_json::to_vec(&snapshot(1)).unwrap();
+
+    let disabled_port = unused_port();
+    let disabled_config =
+        write_config_with(&temp, disabled_port, "127.0.0.1", false, Some("disabled"));
+    let _disabled = spawn_daemon(&disabled_config, &temp, disabled_port, "disabled");
+    wait_for_health(disabled_port);
+    let (status, body) = request(
+        disabled_port,
+        "POST",
+        "/api/gjc/bridge",
+        Some(payload.as_slice()),
+    );
+    assert_eq!(
+        status,
+        404,
+        "disabled [gjc] must hide /api/gjc/bridge: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let port = unused_port();
+    let config = write_config_with(&temp, port, "0.0.0.0", true, Some("open"));
+    let _daemon = spawn_daemon(&config, &temp, port, "open");
+    wait_for_health(port);
+    let loopback_host = format!("127.0.0.1:{port}");
+
+    let (status, body) = request_with(
+        port,
+        "POST",
+        "/api/gjc/bridge",
+        Some(payload.as_slice()),
+        &loopback_host,
+        &[],
+    );
+    assert_local_control_rejected(status, &body);
+
+    let (status, body) = request_with(
+        port,
+        "POST",
+        "/api/gjc/bridge",
+        Some(payload.as_slice()),
+        &loopback_host,
+        &[("x-clawhip-local-control", "0")],
+    );
+    assert_local_control_rejected(status, &body);
+
+    let (status, body) = request_with(
+        port,
+        "POST",
+        "/api/gjc/bridge",
+        Some(payload.as_slice()),
+        &format!("8.8.8.8:{port}"),
+        &[("x-clawhip-local-control", "1")],
+    );
+    assert_local_control_rejected(status, &body);
+
+    let (status, body) = request_with(
+        port,
+        "POST",
+        "/api/gjc/bridge",
+        Some(payload.as_slice()),
+        &loopback_host,
+        &[
+            ("x-clawhip-local-control", "1"),
+            ("Origin", "http://evil.example"),
+        ],
+    );
+    assert_local_control_rejected(status, &body);
+
+    let (status, body) = request(
+        port,
+        "GET",
+        "/api/ledger/query?session_id=sess-324&limit=50",
+        None,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let query: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        query["records"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "rejected snapshots must not reach the ledger: {query}"
+    );
+
+    let response = post_snapshot(port, &snapshot(1));
+    let emitted: Vec<String> = response["emitted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["type"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        emitted.contains(&"session.started".to_string()),
+        "{response}"
+    );
+    assert!(
+        emitted.contains(&"session.prompt-submitted".to_string()),
+        "{response}"
+    );
+}
+
+fn assert_local_control_rejected(status: u16, body: &[u8]) {
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(body));
+    let value: Value = serde_json::from_slice(body).expect("local-control JSON body");
+    assert_eq!(value["ok"], json!(false), "{value}");
+    assert_eq!(value["reason"], json!("local_control_rejected"), "{value}");
 }

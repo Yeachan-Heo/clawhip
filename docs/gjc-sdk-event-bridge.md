@@ -15,9 +15,18 @@ scraping, key injection, or credentials**:
 ```
 POST /api/gjc/bridge
 Content-Type: application/json
+x-clawhip-local-control: 1
+Host: 127.0.0.1:<port>
 
 { ...one authoritative state snapshot... }
 ```
+
+The route is registered only when `[gjc] enabled = true`. Live ingress uses
+the same local-control contract as other GJC control handlers: loopback peer,
+loopback `Host`, loopback `Origin` when present, and `x-clawhip-local-control:
+1`. Missing or invalid credentials, and non-loopback Host/Origin, are rejected
+with `403` (`local_control_rejected`). Unauthenticated remote snapshot
+forgery is not accepted even when the daemon binds `0.0.0.0`.
 
 The body is one SDK response payload (the `payload` value of the #322 typed
 websocket response envelope). It is mapped through
