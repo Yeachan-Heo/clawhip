@@ -3,7 +3,7 @@
 //!
 //! Proves the deterministic fake endpoint behaves as the production
 //! transport and control plane demand: token-authenticated loopback
-//! websocket, hello-after-auth, `session.get` typed sections, correlated
+//! websocket (query token and/or Bearer), hello-after-auth, `session.get` typed sections, correlated
 //! `control.*` verbs with accepted verdicts, uncorrelated notification
 //! streaming, disconnect/reconnect survival, and terminal retirement with no
 //! ghost frames.
@@ -29,6 +29,38 @@ async fn connect_authenticated(server: &FakeGjcServer) -> WsStream {
     let request = server.authenticated_url().into_client_request().unwrap();
     let (stream, _) = connect_async(request).await.expect("connect authenticated");
     stream
+}
+
+async fn connect_with(
+    url: &str,
+    bearer: Option<&str>,
+) -> Result<WsStream, tokio_tungstenite::tungstenite::Error> {
+    let mut request = url.into_client_request().unwrap();
+    if let Some(token) = bearer {
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    }
+    connect_async(request).await.map(|(stream, _)| stream)
+}
+
+fn assert_unauthorized(result: Result<WsStream, tokio_tungstenite::tungstenite::Error>) {
+    assert!(
+        matches!(
+            &result,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status().as_u16() == 401
+        ),
+        "expected 401 unauthorized handshake, got {result:?}"
+    );
+}
+
+async fn assert_hello(stream: &mut WsStream) {
+    let mut frames = Frames::default();
+    match frames.next(stream).await {
+        InboundFrame::Hello(hello) => assert_eq!(hello.connection_id, "fixture-connection"),
+        other => panic!("hello must follow authenticated handshake, got {other:?}"),
+    }
 }
 
 /// Persistent decoded-frame queue over one websocket connection.
@@ -160,6 +192,45 @@ async fn handshake_requires_token_and_hello_precedes_everything() {
         InboundFrame::Hello(hello) => assert_eq!(hello.connection_id, "fixture-connection"),
         other => panic!("hello must precede everything else, got {other:?}"),
     }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn handshake_accepts_query_and_bearer_credential_combinations() {
+    let server = FakeGjcServer::start().await;
+    let query = server.authenticated_url();
+    let bare = server.metadata_url();
+    let wrong_query = format!("{bare}?token=nope");
+
+    let mut query_only = connect_with(&query, None)
+        .await
+        .expect("query-only credential must authenticate");
+    assert_hello(&mut query_only).await;
+
+    let mut bearer_only = connect_with(&bare, Some(FIXTURE_TOKEN))
+        .await
+        .expect("bearer-only credential must authenticate");
+    assert_hello(&mut bearer_only).await;
+
+    let mut query_and_bearer = connect_with(&query, Some(FIXTURE_TOKEN))
+        .await
+        .expect("matching query plus bearer must authenticate");
+    assert_hello(&mut query_and_bearer).await;
+
+    let mut query_wins = connect_with(&query, Some("nope"))
+        .await
+        .expect("matching query must authenticate even with a wrong bearer");
+    assert_hello(&mut query_wins).await;
+
+    let mut bearer_wins = connect_with(&wrong_query, Some(FIXTURE_TOKEN))
+        .await
+        .expect("matching bearer must authenticate even with a wrong query token");
+    assert_hello(&mut bearer_wins).await;
+
+    assert_unauthorized(connect_with(&bare, Some("nope")).await);
+    assert_unauthorized(connect_with(&wrong_query, Some("nope")).await);
+    assert_unauthorized(connect_with(&bare, None).await);
+
     server.stop().await;
 }
 

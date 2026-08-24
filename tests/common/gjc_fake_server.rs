@@ -3,7 +3,8 @@
 //!
 //! Speaks the production wire contract:
 //! - loopback websocket at the metadata-advertised path;
-//! - `?token=` query credential required (401 handshake rejection otherwise);
+//! - `?token=` query or matching `Authorization: Bearer` authenticates
+//!   (401 when neither credential matches);
 //! - `{"type":"hello","connectionId":...}` immediately after authentication;
 //! - `session.get` answered from the scripted phase with typed sections whose
 //!   serde names match `gjc::model` exactly;

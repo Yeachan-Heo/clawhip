@@ -1414,7 +1414,14 @@ async fn post_native_hook(
 /// snapshot per observation; the process-wide bridge reduces transitions and
 /// the emitted events flow through `accept_event` (ledger, router, sinks).
 /// No polling loop or durable lane ownership lives here.
+///
+/// Fail-closed like the rest of the GJC control plane: the route is absent
+/// when `[gjc] enabled = false`, and live ingress requires the local-control
+/// header plus a loopback peer/Host/Origin (`SubscriptionControlRequest` and
+/// `LoopbackLanePeer`). Unauthenticated or remote snapshot forgery is rejected.
 async fn post_gjc_bridge(
+    _control: SubscriptionControlRequest,
+    _peer: LoopbackLanePeer,
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> axum::response::Response {
