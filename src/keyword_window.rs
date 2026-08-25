@@ -374,6 +374,12 @@ struct MonitorArgvState {
     complete: bool,
     pending_value: bool,
     pending_flag: Option<&'static str>,
+    /// Flag whose value the current row's leading token just supplied (set
+    /// only while advancing that row). `pending_flag` describes the parser
+    /// state for *later* rows; this describes the *current* row, so a
+    /// remainder that discovers a newer pending flag never has to overwrite
+    /// the origin to keep the current row classifiable (issue #345).
+    consumed_flag: Option<&'static str>,
     remaining: u8,
     kind: EchoKind,
     cli_new: bool,
@@ -390,6 +396,7 @@ impl Default for MonitorArgvState {
             complete: false,
             pending_value: false,
             pending_flag: None,
+            consumed_flag: None,
             remaining: 0,
             kind: EchoKind::Monitor,
             cli_new: false,
@@ -622,9 +629,17 @@ fn advance_monitor_argv(mut state: MonitorArgvState, line: &str) -> MonitorArgvS
         let mut next = state;
         let origin_flag = state.pending_flag;
         next.pending_value = false;
+        next.consumed_flag = origin_flag;
         if let Some((_, rest)) = command.split_once(char::is_whitespace) {
+            // The leading token supplies the value of `origin_flag`; the
+            // remainder may discover a newer pending state (a wrapped
+            // `--keywords` at end of row, or a quoted option spanning rows).
+            // One flag cannot serve both masters: the current row classifies
+            // against the consumed origin, later rows parse against the
+            // scanner's newer state, and neither overwrites the other
+            // (issue #345).
             let mut scanned = scan_monitor_argv(next, rest.trim_start());
-            scanned.pending_flag = origin_flag;
+            scanned.consumed_flag = origin_flag;
             scanned.remaining = scanned.remaining.saturating_sub(1);
             return scanned;
         }
@@ -706,12 +721,14 @@ fn scan_monitor_argv(mut state: MonitorArgvState, line: &str) -> MonitorArgvStat
             index += 1;
         }
         state.pending_value = false;
+        state.consumed_flag = None;
         if state.quote.is_none() {
             state.pending_flag = None;
         }
         index += 1;
     }
     state.pending_value = false;
+    state.consumed_flag = None;
     let complete = match state.kind {
         EchoKind::Monitor => state.seen_session && state.seen_keyword,
         EchoKind::Keyword => state.seen_session && state.seen_keyword && state.seen_line,
@@ -783,15 +800,19 @@ fn is_keyword_self_match_occurrence(
         {
             return true;
         }
+        // Row classification flag: the origin consumed by this row's leading
+        // token, else the scanner's newer pending state. Preferring the
+        // consumed origin keeps a row that supplies a keyword value and then
+        // opens a quoted option classifiable as the keywords row (issue #345).
+        let row_flag = monitor_argv.consumed_flag.or(monitor_argv.pending_flag);
         if (monitor_argv.quote.is_some() || monitor_argv.complete)
             && keyword_echo_matches
             && (matches!(monitor_argv.kind, EchoKind::Keyword)
                 || (matches!(monitor_argv.kind, EchoKind::Monitor)
-                    && monitor_argv.pending_flag == Some("--keywords")))
+                    && row_flag == Some("--keywords")))
         {
             let dechromed = strip_shell_prompt(strip_pane_frame_chrome(line));
-            if matches!(monitor_argv.kind, EchoKind::Monitor)
-                && monitor_argv.pending_flag == Some("--quoted-value")
+            if matches!(monitor_argv.kind, EchoKind::Monitor) && row_flag == Some("--quoted-value")
             {
                 return true;
             }
@@ -922,20 +943,32 @@ fn monitor_continuation_is_valid(line: &str, occurrence: &str, state: MonitorArg
     let Some(tokens) = tokenize_monitor_argv(command) else {
         return false;
     };
+    // The current row is classified against whichever flag its leading
+    // token supplied: the scanner's newer pending state (this row ends
+    // pending on a new flag) or the consumed origin carried from the
+    // previous row (issue #345).
+    let row_flag = state.pending_flag.or(state.consumed_flag);
     tokens
         .first()
         .is_some_and(|token| token.eq_ignore_ascii_case(occurrence))
-        && (tokens.len() > 1 && monitor_argv_tokens_valid(&tokens[1..]) || tokens.len() == 1)
+        && (tokens.len() > 1
+            && (monitor_argv_tokens_valid(&tokens[1..])
+                // A row ending pending on a value-taking flag (its value is on
+                // the next row) is a legitimate mid-argv continuation, not a
+                // forged tail (issue #345 variant A).
+                || (state.pending_value
+                    && (tokens.len() == 2
+                        || monitor_argv_tokens_valid(&tokens[1..tokens.len() - 1]))
+                    && monitor_flag(&tokens[tokens.len() - 1]).is_some_and(|(_, takes)| takes)))
+            || tokens.len() == 1)
         && match state.kind {
             EchoKind::Monitor => {
-                state.seen_session
-                    && state.seen_keyword
-                    && matches!(state.pending_flag, Some("--keywords"))
+                state.seen_session && state.seen_keyword && matches!(row_flag, Some("--keywords"))
             }
             EchoKind::Keyword => {
                 state.seen_session
                     && state.seen_keyword
-                    && matches!(state.pending_flag, Some("--keyword" | "--line"))
+                    && matches!(row_flag, Some("--keyword" | "--line"))
             }
         }
 }
@@ -1408,6 +1441,120 @@ owner-endpoint-unreachable: runtime owner failed";
         );
     }
 
+    /// Issue #345: a wrapped argv row that ends with a value-taking flag
+    /// (`--session`) enters the pending-value branch on the next row; that
+    /// row's remainder can itself discover a *newer* pending flag
+    /// (`--keywords`). The old origin flag must not overwrite the newer
+    /// discovery, or the row after it (the wrapped keyword value) loses its
+    /// verified-continuation suppression and alerts on self-echo.
+    #[test]
+    fn collect_keyword_hits_preserves_newly_pending_flag_across_wrapped_argv_rows() {
+        let keyword = "panic";
+
+        // Exact three-row wrapped argv: head row ends with the value-taking
+        // `--session`, the second row both supplies that value and discovers
+        // `--keywords`, the third row is the wrapped keyword value. All three
+        // rows are the monitor's own command echo: zero hits.
+        let wrapped_three_rows = "boot
+clawhip tmux watch --session
+worker --keywords
+panic";
+        assert!(
+            collect_keyword_hits("boot", wrapped_three_rows, &[keyword.into()]).is_empty(),
+            "wrapped argv rows must not self-alert"
+        );
+
+        // The same three rows followed by a genuine application panic after
+        // the completed command: exactly one hit, on the application line.
+        let with_genuine_panic = "boot
+clawhip tmux watch --session
+worker --keywords
+panic
+panic: application failure";
+        let hits = collect_keyword_hits("boot", with_genuine_panic, &[keyword.into()]);
+        assert_eq!(hits.len(), 1, "genuine panic must be kept: {hits:?}");
+        assert_eq!(hits[0].line, "panic: application failure");
+        assert_eq!(hits[0].keyword, "panic");
+
+        // Pinning the second arm of the same fix (external review NIT): the
+        // remainder scan itself can end pending on a *new* value-taking flag
+        // (`--keywords` at end of row). The consumed origin (`--format`, not
+        // keyword-bearing) must not overwrite that newer pending state either.
+        let wrapped_pending_tail = "boot
+clawhip tmux watch --session s --format
+compact --keywords
+panic";
+        assert!(
+            collect_keyword_hits("boot", wrapped_pending_tail, &[keyword.into()]).is_empty(),
+            "scan-discovered pending value must survive the origin flag"
+        );
+
+        let tail_with_genuine_panic = "boot
+clawhip tmux watch --session s --format
+compact --keywords
+panic
+panic: application failure";
+        let tail_hits = collect_keyword_hits("boot", tail_with_genuine_panic, &[keyword.into()]);
+        assert_eq!(
+            tail_hits.len(),
+            1,
+            "genuine panic must be kept: {tail_hits:?}"
+        );
+        assert_eq!(tail_hits[0].line, "panic: application failure");
+
+        // Automated review P2 (variant A): the consumed keyword value shares
+        // its row with a newer value-taking flag whose value wraps. The row
+        // must classify against the consumed `--keywords` origin while the
+        // parser stays pending on `--channel` for the row after — one flag
+        // cannot serve both masters.
+        let variant_a = "boot
+clawhip tmux watch --session worker --keywords
+panic --channel
+123";
+        assert!(
+            collect_keyword_hits("boot", variant_a, &[keyword.into()]).is_empty(),
+            "consumed keyword origin must classify the current row"
+        );
+
+        let variant_a_genuine = "boot
+clawhip tmux watch --session worker --keywords
+panic --channel
+123
+panic: application failure";
+        let variant_a_hits = collect_keyword_hits("boot", variant_a_genuine, &[keyword.into()]);
+        assert_eq!(
+            variant_a_hits.len(),
+            1,
+            "genuine panic must be kept: {variant_a_hits:?}"
+        );
+        assert_eq!(variant_a_hits[0].line, "panic: application failure");
+
+        // Automated review P2 (variant B): the consumed keyword value shares
+        // its row with a newer quoted option spanning rows. The newer
+        // `--quoted-value` state must drive later rows, but this row's
+        // `panic` stays a `--keywords` value, not a channel value.
+        let variant_b = "boot
+clawhip tmux watch --session worker --keywords
+panic --channel \"123
+456\"";
+        assert!(
+            collect_keyword_hits("boot", variant_b, &[keyword.into()]).is_empty(),
+            "quoted-option row must not misclassify the consumed keyword value"
+        );
+
+        let variant_b_genuine = "boot
+clawhip tmux watch --session worker --keywords
+panic --channel \"123
+456\"
+panic: application failure";
+        let variant_b_hits = collect_keyword_hits("boot", variant_b_genuine, &[keyword.into()]);
+        assert_eq!(
+            variant_b_hits.len(),
+            1,
+            "genuine panic after quoted option must be kept: {variant_b_hits:?}"
+        );
+        assert_eq!(variant_b_hits[0].line, "panic: application failure");
+    }
     #[test]
     fn collect_keyword_hits_keeps_mid_line_application_occurrence_without_narration() {
         // A genuine application line mentioning the keyword mid-line with no
