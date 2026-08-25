@@ -299,7 +299,7 @@ case "$1" in
   attach-session) expected="$(cat "$S/session")"; if test -f "$S/prefix_collision" && test "$3" != "=$expected"; then echo 'fixture-prefix-collision' >&2; exit 1; fi; if test -f "$S/require_attach_tty"; then test -t 0 && test -t 1 && test -t 2 || {{ echo 'fixture-attach-not-a-tty' >&2; exit 1; }}; printf '0 1 2\n' >> "$S/attach_ttys"; fi; echo 'fixture-attach-stdio' >&2; printf '%s\n' "$3" >> "$S/attach_targets"; if test -f "$S/fail_attach_session"; then echo 'fixture-attach-failed' >&2; exit 1; fi ;;
   display-message) printf 'lane\t%%1\t1\tcodex\t/tmp\n' ;;
   kill-session) rm -f "$S/live" ;;
-  list-sessions) test -f "$S/live" && test -f "$S/session" && cat "$S/session" ;;
+  list-sessions) if test -f "$S/sessions_list"; then test -f "$S/live" && cat "$S/sessions_list"; else test -f "$S/live" && test -f "$S/session" && cat "$S/session"; fi ;;
   *) : ;;
 esac
 "#
@@ -542,6 +542,33 @@ fn http_json_value(port: u16, method: &str, path: &str, body: Value) -> Value {
         .expect("HTTP response body")
         .1;
     serde_json::from_str(payload).expect("daemon JSON response")
+}
+
+/// POST a runtime tmux registration the way the wrapper client does (with the
+/// local-control header) and return the parsed JSON response.
+fn register_runtime_watch(port: u16, body: Value) -> Value {
+    let payload = serde_json::to_string(&body).expect("request json");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect daemon");
+    let request = format!(
+        "POST /api/tmux/register HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nx-clawhip-local-control: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write daemon request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read daemon response");
+    assert!(
+        response.starts_with("HTTP/1.1 202"),
+        "daemon rejected registration fixture: {response}"
+    );
+    let body = response
+        .split_once("\r\n\r\n")
+        .expect("HTTP response body")
+        .1;
+    serde_json::from_str(body).expect("daemon JSON response")
 }
 
 fn calls_after(state: &Path, baseline: &str) -> String {
@@ -1129,6 +1156,170 @@ fn restart_reconciles_stale_terminal_watch_registry_without_duplicate_live_watch
     let public_again = String::from_utf8_lossy(&listed_again.stdout);
     assert!(public_again.contains("live-watch"));
     assert!(!public_again.contains("stale-watch"));
+}
+
+/// #341: wrapper-owned registrations whose tmux session no longer exists are
+/// ghost watches. Daemon restart must reconcile them out of the active
+/// registry (status/list stay truthful), keep live wrapper watches, and
+/// retain bounded tombstone evidence in the audit file beside the registry.
+#[test]
+#[serial]
+fn restart_reconciles_persisted_wrapper_owned_ghost_watches() {
+    let temp = TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let config_path = temp.path().join("config.toml");
+    let state = temp.path().join("tmux");
+    let tmux = temp.path().join("tmux.sh");
+    fs::create_dir_all(&home).expect("home");
+    fake_tmux(&tmux, &state);
+    // Live inventory: exactly one live session plus an active config monitor
+    // projection target is not needed here; two ghosts come from the durable
+    // registry (both wrapper-owned like real `create.sh`-launched watches).
+    write_file(&state.join("live"), "1");
+    write_file(&state.join("session"), "live-watch");
+    write_file(&state.join("sessions_list"), "live-watch\n");
+    write_file(&state.join("strict_has_session"), "1");
+    config(&config_path, free_port());
+
+    let ghost = |session: &str, generation: u64| {
+        json!({
+            "session": session,
+            "channel": "alerts",
+            "mention": null,
+            "keywords": ["owner-endpoint-unreachable"],
+            "keyword_window_secs": 30,
+            "stale_minutes": 60,
+            "format": "compact",
+            "registered_at": "2026-08-01T00:00:00Z",
+            "registration_source": "cli-watch",
+            "parent_process": {"pid": 905215, "name": "create.sh"},
+            "registration_generation": generation,
+            "active_wrapper_monitor": true
+        })
+    };
+    write_file(
+        &registry_path(&config_path),
+        &json!({
+            "clawhip-issue-339-gjc-bridge-auth": ghost("clawhip-issue-339-gjc-bridge-auth", 7),
+            "gajae-code-issue-4844-unlazy-evaluation": ghost(
+                "gajae-code-issue-4844-unlazy-evaluation",
+                8
+            ),
+            "live-watch": {
+                "session": "live-watch",
+                "channel": "alerts",
+                "mention": null,
+                "keywords": ["owner-endpoint-unreachable"],
+                "keyword_window_secs": 30,
+                "stale_minutes": 60,
+                "format": "compact",
+                "registered_at": "2026-08-01T00:00:01Z",
+                "registration_source": "cli-watch",
+                "parent_process": {"pid": 252806, "name": "clawhip"},
+                "registration_generation": 9,
+                "active_wrapper_monitor": true
+            }
+        })
+        .to_string(),
+    );
+
+    let discord = MockDiscord::start("success");
+    let port = free_port();
+    config(&config_path, port);
+    let mut config_contents = fs::read_to_string(&config_path).expect("read config");
+    config_contents.push_str("\n[monitors]\npoll_interval_secs = 1\n");
+    write_file(&config_path, &config_contents);
+
+    let _daemon = start(&config_path, &home, &tmux, &discord, port);
+
+    // Restart reconcile happens during daemon startup: ghosts must already be
+    // gone from the durable registry once the daemon is healthy.
+    let reconciled = registry(&config_path);
+    assert!(
+        reconciled
+            .get("clawhip-issue-339-gjc-bridge-auth")
+            .is_none()
+    );
+    assert!(
+        reconciled
+            .get("gajae-code-issue-4844-unlazy-evaluation")
+            .is_none()
+    );
+    assert!(reconciled.get("live-watch").is_some());
+
+    // Status and list report active ownership truthfully.
+    let health = http_json_value(port, "GET", "/health", json!({}));
+    assert_eq!(health["registered_tmux_sessions"], 1);
+    assert_eq!(health["tmux"]["registry_registration_count"], 1);
+    assert_eq!(health["tmux"]["registered_count"], 1);
+    assert_eq!(health["tmux"]["durable_runtime_count"], 1);
+    assert_eq!(health["tmux"]["live_probe"]["count"], 1);
+
+    let listed = lane_command(&config_path, &home, &tmux, &discord, &["tmux", "list"]);
+    successful(&listed);
+    let public = String::from_utf8_lossy(&listed.stdout);
+    assert!(public.contains("live-watch"));
+    assert!(!public.contains("clawhip-issue-339-gjc-bridge-auth"));
+    assert!(!public.contains("gajae-code-issue-4844-unlazy-evaluation"));
+
+    // Bounded tombstone evidence is retained beside the registry state.
+    let audit_path = registry_path(&config_path).with_file_name("tmux-watch-registry.audit.json");
+    let audit: Value =
+        serde_json::from_slice(&fs::read(&audit_path).expect("audit file")).expect("audit json");
+    assert_eq!(audit["schema"], "clawhip.tmux-watch-audit.v1");
+    let sessions: Vec<&str> = audit["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| entry["session"].as_str().expect("session"))
+        .collect();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.contains(&"clawhip-issue-339-gjc-bridge-auth"));
+    assert!(sessions.contains(&"gajae-code-issue-4844-unlazy-evaluation"));
+    for entry in audit["entries"].as_array().expect("entries") {
+        assert_eq!(entry["wrapper_owned"], json!(true));
+        assert_eq!(entry["parent_pid"], json!(905215));
+        assert_eq!(
+            entry["reason"],
+            json!("tmux session absent at daemon restart reconcile")
+        );
+    }
+    // A wrapper may legitimately re-register the same session name right
+    // after the ghost was reconciled away (session recreated, then
+    // re-watched): the registry must accept it as a fresh live registration
+    // and `tmux list` must keep it because the session is live again.
+    write_file(
+        &state.join("sessions_list"),
+        "live-watch\nclawhip-issue-339-gjc-bridge-auth\n",
+    );
+    let reregister = register_runtime_watch(
+        port,
+        json!({
+            "session": "clawhip-issue-339-gjc-bridge-auth",
+            "channel": "alerts",
+            "keywords": ["owner-endpoint-unreachable"],
+            "keyword_window_secs": 30,
+            "stale_minutes": 60,
+            "format": "compact",
+            "registered_at": "2026-08-25T00:00:00Z",
+            "registration_source": "cli-watch",
+            "parent_process": {"pid": 424242, "name": "clawhip"},
+            "registration_generation": 0,
+            "active_wrapper_monitor": true
+        }),
+    );
+    assert_eq!(reregister["ok"], json!(true));
+    assert!(
+        registry(&config_path)
+            .get("clawhip-issue-339-gjc-bridge-auth")
+            .is_some()
+    );
+    let listed_again = lane_command(&config_path, &home, &tmux, &discord, &["tmux", "list"]);
+    successful(&listed_again);
+    let public_again = String::from_utf8_lossy(&listed_again.stdout);
+    assert!(public_again.contains("live-watch"));
+    assert!(public_again.contains("clawhip-issue-339-gjc-bridge-auth"));
+    assert!(!public_again.contains("gajae-code-issue-4844-unlazy-evaluation"));
 }
 
 #[test]

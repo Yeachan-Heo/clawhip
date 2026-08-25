@@ -7,3 +7,4 @@ target/
 .clawhip/state/
 .gjc/
 tmux-watch-registry.json
+tmux-watch-registry.audit.json

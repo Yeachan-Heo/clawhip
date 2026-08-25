@@ -20,7 +20,8 @@ pub use subscription::{SubscriptionSnapshot, SubscriptionState, SubscriptionWork
 pub use tmux::{
     RegisteredTmuxSession, SharedTmuxRegistry, TmuxSource, default_registry_state_path,
     inspect_tmux_registry_state, list_active_tmux_registrations, load_tmux_registry_state,
-    register_runtime_tmux_registration, tmux_registry_diagnostics,
+    reconcile_restored_tmux_registry, register_runtime_tmux_registration,
+    tmux_registry_diagnostics,
 };
 pub use workspace::WorkspaceSource;
 
