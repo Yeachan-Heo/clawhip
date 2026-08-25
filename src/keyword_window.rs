@@ -124,11 +124,14 @@ fn collect_keyword_hits_from_lines(
     let mut hits = Vec::new();
 
     let mut previous_line: Option<&str> = None;
+    let mut monitor_argv = MonitorArgvState::default();
 
     for (line_cursor, line) in lines {
         // Cursor 0 is the overlap-boundary context line (already-seen output
         // prepended for wrapped-predecessor classification); it never hits.
         let is_context_line = line_cursor == Some(0);
+        monitor_argv = advance_monitor_argv(monitor_argv, line);
+        let line_monitor_argv = monitor_argv;
         if should_ignore_launcher_line(line, &match_keywords) {
             previous_line = Some(line);
             continue;
@@ -137,8 +140,9 @@ fn collect_keyword_hits_from_lines(
         let lower_line = line.to_ascii_lowercase();
         for (keyword, lower_keyword) in &normalized_keywords {
             if lower_line.contains(lower_keyword) && !is_context_line {
-                if is_negated_default_failure_match(lower_keyword, &lower_line)
-                    || is_instruction_or_search_review_marker_prose(lower_keyword, line)
+                if !line_is_structured_runtime(line)
+                    && (is_negated_default_failure_match(lower_keyword, &lower_line)
+                        || is_instruction_or_search_review_marker_prose(lower_keyword, line))
                 {
                     continue;
                 }
@@ -152,6 +156,7 @@ fn collect_keyword_hits_from_lines(
                             start,
                             end,
                             previous_line,
+                            line_monitor_argv,
                         )
                     })
                 {
@@ -294,24 +299,13 @@ fn contains_bounded(haystack: &str, needle: &str) -> bool {
 
 fn should_ignore_launcher_line(line: &str, keywords: &[&str]) -> bool {
     let trimmed = strip_pane_frame_chrome(line);
+    if line_is_structured_runtime(line) {
+        return false;
+    }
     LAUNCHER_NOISE_PATTERNS
         .iter()
         .any(|pattern| trimmed.contains(pattern))
-        || is_tmux_watch_command_echo(trimmed)
-        || is_wrapped_monitor_command_fragment(trimmed, keywords)
-        || is_tmux_keyword_notify_echo(trimmed)
-}
-
-/// Self-echo of the mono notify path: `clawhip tmux keyword --session …
-/// --keyword <kw> --line "<kw text>"` (driven by the shipped
-/// integrations/tmux notify/scan scripts). The `--line` payload quotes the
-/// monitored keyword text itself, so without this rule the monitor alerts on
-/// its own notification echo.
-fn is_tmux_keyword_notify_echo(line: &str) -> bool {
-    let command = strip_shell_prompt(line);
-    command.starts_with("clawhip tmux keyword ")
-        && command.contains(" --keyword ")
-        && command.contains(" --line ")
+        || is_monitor_argv_line(trimmed, keywords)
 }
 
 /// Trim tmux/GUI frame chrome (box-drawing rails, soft-wrap markers) plus
@@ -327,17 +321,6 @@ fn strip_pane_frame_chrome(line: &str) -> &str {
     })
 }
 
-fn is_tmux_watch_command_echo(line: &str) -> bool {
-    let command = strip_shell_prompt(line);
-    (command.starts_with("clawhip tmux watch ")
-        || command.starts_with("clawhip tmux new ")
-        || command.starts_with("clawhip tmux cli-new "))
-        && (command.contains(" --session ")
-            || command.contains(" -s ")
-            || command.contains("session="))
-        && (command.contains(" --keywords ") || command.contains("keywords="))
-}
-
 fn strip_shell_prompt(line: &str) -> &str {
     line.strip_prefix("$ ")
         .or_else(|| line.strip_prefix("% "))
@@ -345,91 +328,417 @@ fn strip_shell_prompt(line: &str) -> &str {
         .unwrap_or(line)
 }
 
-/// Flags a `clawhip tmux watch`/`new` wrapper can emit. Wrapped continuation
-/// lines of the monitor's own command start with one of these instead of the
-/// program name.
-const MONITOR_ARGV_FLAGS: &[&str] = &[
-    "--keywords",
-    "--keyword",
-    "--session",
-    "--stale-minutes",
-    "--format",
-    "--channel",
-    "--mention",
-    "--attach",
-    "--follow",
-    "--retry-enter",
-    "--retry-enter-count",
-    "--retry-enter-delay-ms",
-    "--window-name",
-    "--cwd",
-    "-s",
+const MONITOR_FLAGS: &[(&str, bool)] = &[
+    ("--session", true),
+    ("-s", true),
+    ("--keywords", true),
+    ("--keyword", true),
+    ("--line", true),
+    ("--channel", true),
+    ("--mention", true),
+    ("--stale-minutes", true),
+    ("--format", true),
+    ("--window-name", true),
+    ("--cwd", true),
+    ("--shell", true),
+    ("--thread", true),
+    ("--kickoff", true),
+    ("--retry-enter-count", true),
+    ("--retry-enter-delay-ms", true),
+    ("--attach", false),
+    ("--follow", false),
+    ("--retry-enter", true),
+    ("--json", false),
+    ("-n", true),
+    ("-c", true),
+    ("session", true),
+    ("keywords", true),
+    ("channel", true),
+    ("mention", true),
+    ("stale_minutes", true),
+    ("format", true),
+    ("registered_at", true),
+    ("parent_pid", true),
+    ("parent_name", true),
 ];
 
-/// Continuation fragment of a self-generated monitor command that was
-/// hard-wrapped by a narrow pane, e.g.
-/// `│ --stale-minutes 60 --format compact --keywords owner-endpoint-unreachable  │`.
-/// The head line (`clawhip tmux watch ...`) is caught by
-/// `is_tmux_watch_command_echo`; the tail lines start mid-argv with one of the
-/// wrapper's own flags. A line only qualifies when it is pure argv AND one of
-/// the monitored keywords is carried as a keyword-flag value, so a runtime
-/// failure that merely starts with a flag token (`--format compact: <kw>`)
-/// still alerts.
-fn is_wrapped_monitor_command_fragment(line: &str, keywords: &[&str]) -> bool {
-    let fragment = strip_shell_prompt(line);
-    let first_token = fragment.split_whitespace().next().unwrap_or("");
-    if !MONITOR_ARGV_FLAGS.contains(&first_token) {
-        return false;
-    }
-    if fragment.split_whitespace().count() < 2 {
-        return false;
-    }
-    if !fragment.chars().all(is_monitor_argv_char) {
-        return false;
-    }
-    let lower_fragment = fragment.to_ascii_lowercase();
-    keywords
-        .iter()
-        .any(|keyword| is_keyword_flag_value(&lower_fragment, &keyword.to_ascii_lowercase()))
+#[derive(Debug, Clone, Copy)]
+enum EchoKind {
+    Monitor,
+    Keyword,
 }
 
-/// True when `lower_keyword` occurs in `lower_fragment` directly as the value
-/// of a keyword flag (`--keywords <kw>[,…]`, `keywords=<kw>[,…]`). An empty
-/// needle matches at every offset without advancing the scan cursor, so it is
-/// rejected outright rather than looping (same class as the matcher guard in
-/// `keyword_occurrences`).
-fn is_keyword_flag_value(lower_fragment: &str, lower_keyword: &str) -> bool {
-    if lower_keyword.is_empty() {
+#[derive(Debug, Clone, Copy)]
+struct MonitorArgvState {
+    active: bool,
+    complete: bool,
+    pending_value: bool,
+    pending_flag: Option<&'static str>,
+    remaining: u8,
+    kind: EchoKind,
+    cli_new: bool,
+    seen_session: bool,
+    seen_keyword: bool,
+    seen_line: bool,
+    quote: Option<char>,
+}
+
+impl Default for MonitorArgvState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            complete: false,
+            pending_value: false,
+            pending_flag: None,
+            remaining: 0,
+            kind: EchoKind::Monitor,
+            cli_new: false,
+            seen_session: false,
+            seen_keyword: false,
+            seen_line: false,
+            quote: None,
+        }
+    }
+}
+
+fn monitor_head(line: &str) -> Option<&str> {
+    let command = strip_shell_prompt(strip_pane_frame_chrome(line));
+    [
+        "clawhip tmux watch",
+        "clawhip tmux new",
+        "clawhip tmux cli-new",
+    ]
+    .into_iter()
+    .find(|head| {
+        command == *head
+            || command
+                .strip_prefix(head)
+                .is_some_and(|tail| tail.starts_with(' '))
+    })
+}
+
+fn keyword_head(line: &str) -> Option<&str> {
+    let command = strip_shell_prompt(strip_pane_frame_chrome(line));
+    (command == "clawhip tmux keyword" || command.starts_with("clawhip tmux keyword "))
+        .then_some("clawhip tmux keyword")
+}
+
+fn monitor_flag(token: &str) -> Option<(&str, bool)> {
+    if token == "--" {
+        return Some(("--", false));
+    }
+    let name = token.split_once('=').map_or(token, |(name, _)| name);
+    MONITOR_FLAGS
+        .iter()
+        .find(|(flag, _)| *flag == name)
+        .copied()
+}
+
+fn tokenize_monitor_argv(line: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    for ch in line.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => token.push(c),
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            (None, c) => token.push(c),
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn monitor_argv_tokens_valid(tokens: &[String]) -> bool {
+    if tokens.is_empty() {
         return false;
     }
-
-    let mut search_start = 0;
-    while let Some(relative_start) = lower_fragment[search_start..].find(lower_keyword) {
-        let start = search_start + relative_start;
-        let before = &lower_fragment[..start];
-        if before.ends_with("--keywords ")
-            || before.ends_with("--keyword ")
-            || before.ends_with("keywords=")
-            || before.ends_with("keyword=")
-        {
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == "--" {
             return true;
         }
-        search_start = start + lower_keyword.len();
+        if tokens[index] == "start" {
+            index += 1;
+            continue;
+        }
+        let Some((_, takes_value)) = monitor_flag(&tokens[index]) else {
+            return false;
+        };
+        if tokens[index].split_once('=').is_some_and(|(_, value)| {
+            tokens[index].starts_with("--retry-enter=") && !matches!(value, "true" | "false")
+        }) {
+            return false;
+        }
+        if takes_value && !tokens[index].contains('=') {
+            let Some(_) = tokens.get(index + 1) else {
+                return false;
+            };
+            if tokens[index].split_once('=').is_none()
+                && tokens[index] == "--retry-enter"
+                && !matches!(tokens[index + 1].as_str(), "true" | "false")
+            {
+                return false;
+            }
+            index += 1;
+        }
+        index += 1;
     }
-    false
+    true
 }
 
-fn is_monitor_argv_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric()
-        || matches!(
-            ch,
-            '_' | '@' | '#' | '<' | '>' | '/' | '=' | '+' | '.' | ',' | ':' | '-' | ' '
-        )
+fn is_monitor_argv_line(line: &str, keywords: &[&str]) -> bool {
+    let command = strip_shell_prompt(strip_pane_frame_chrome(line));
+    let Some(head) = monitor_head(command).or_else(|| keyword_head(command)) else {
+        return false;
+    };
+    let tail = command[head.len()..].trim_start();
+    let Some(tokens) = tokenize_monitor_argv(tail) else {
+        return false;
+    };
+    let parsed = scan_monitor_argv(
+        MonitorArgvState {
+            active: true,
+            kind: if head.ends_with("keyword") {
+                EchoKind::Keyword
+            } else {
+                EchoKind::Monitor
+            },
+            cli_new: head == "clawhip tmux cli-new",
+            ..Default::default()
+        },
+        tail,
+    );
+    if !parsed.complete {
+        return false;
+    }
+    let needs_keyword = if head.ends_with("keyword") {
+        &["--keyword"][..]
+    } else {
+        &["--keywords", "keywords"][..]
+    };
+    tokens
+        .iter()
+        .enumerate()
+        .take_while(|(_, token)| token.as_str() != "--")
+        .any(|(index, token)| {
+            let name = token
+                .split_once('=')
+                .map_or(token.as_str(), |(name, _)| name);
+            let value = token
+                .split_once('=')
+                .map(|(_, value)| value)
+                .or_else(|| tokens.get(index + 1).map(String::as_str));
+            needs_keyword.contains(&name)
+                && value.is_some_and(|value| {
+                    keywords.iter().any(|keyword| {
+                        value
+                            .split(',')
+                            .any(|part| part.eq_ignore_ascii_case(keyword))
+                    })
+                })
+        })
+}
+
+fn advance_monitor_argv(mut state: MonitorArgvState, line: &str) -> MonitorArgvState {
+    let command = strip_shell_prompt(strip_pane_frame_chrome(line));
+    if let Some(head) = monitor_head(command).or_else(|| keyword_head(command)) {
+        let tail = command[head.len()..].trim_start();
+        if tail.is_empty() {
+            return MonitorArgvState {
+                active: true,
+                remaining: 4,
+                kind: if head.ends_with("keyword") {
+                    EchoKind::Keyword
+                } else {
+                    EchoKind::Monitor
+                },
+                cli_new: head == "clawhip tmux cli-new",
+                ..Default::default()
+            };
+        }
+        return scan_monitor_argv(
+            MonitorArgvState {
+                active: true,
+                remaining: 4,
+                kind: if head.ends_with("keyword") {
+                    EchoKind::Keyword
+                } else {
+                    EchoKind::Monitor
+                },
+                cli_new: head == "clawhip tmux cli-new",
+                ..Default::default()
+            },
+            tail,
+        );
+    }
+    if state.complete {
+        state = MonitorArgvState::default();
+    }
+    if !state.active || state.remaining == 0 {
+        return MonitorArgvState::default();
+    }
+    if let Some(quote) = state.quote.filter(|_| {
+        matches!(state.kind, EchoKind::Keyword)
+            || (matches!(state.kind, EchoKind::Monitor) && state.pending_flag.is_some())
+    }) {
+        let mut next = state;
+        next.quote = (!command.contains(quote)).then_some(quote);
+        if next.quote.is_none() {
+            let tail = command
+                .find(quote)
+                .map(|close| command[close + quote.len_utf8()..].trim_start())
+                .unwrap_or("");
+            if !tail.is_empty() {
+                let mut scanned = scan_monitor_argv(next, tail);
+                scanned.remaining = scanned.remaining.saturating_sub(1);
+                return scanned;
+            }
+            let complete = match next.kind {
+                EchoKind::Monitor => next.seen_session && next.seen_keyword,
+                EchoKind::Keyword => next.seen_session && next.seen_keyword && next.seen_line,
+            };
+            if complete {
+                next.complete = true;
+                return next;
+            }
+        }
+        next.remaining = next.remaining.saturating_sub(1);
+        return if next.remaining == 0 {
+            MonitorArgvState::default()
+        } else {
+            next
+        };
+    }
+    if state.pending_value {
+        let mut next = state;
+        let origin_flag = state.pending_flag;
+        next.pending_value = false;
+        if let Some((_, rest)) = command.split_once(char::is_whitespace) {
+            let mut scanned = scan_monitor_argv(next, rest.trim_start());
+            scanned.pending_flag = origin_flag;
+            scanned.remaining = scanned.remaining.saturating_sub(1);
+            return scanned;
+        }
+        next.complete = match next.kind {
+            EchoKind::Monitor => next.seen_session && next.seen_keyword,
+            EchoKind::Keyword => next.seen_session && next.seen_keyword && next.seen_line,
+        };
+        next.pending_flag = origin_flag;
+        next.remaining = next.remaining.saturating_sub(1);
+        return next;
+    }
+    let mut next = scan_monitor_argv(state, command);
+    next.remaining = next.remaining.saturating_sub(1);
+    if next.remaining == 0 {
+        MonitorArgvState::default()
+    } else {
+        next
+    }
+}
+
+fn scan_monitor_argv(mut state: MonitorArgvState, line: &str) -> MonitorArgvState {
+    let Some(tokens) = tokenize_monitor_argv(line) else {
+        return MonitorArgvState::default();
+    };
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == "--" {
+            if state.seen_session
+                && state.seen_keyword
+                && (matches!(state.kind, EchoKind::Monitor) || state.seen_line)
+            {
+                state.complete = true;
+                return state;
+            }
+            return MonitorArgvState::default();
+        }
+        if tokens[index] == "start" && matches!(state.kind, EchoKind::Monitor) && state.cli_new {
+            index += 1;
+            continue;
+        }
+        let Some((_, takes_value)) = monitor_flag(&tokens[index]) else {
+            return MonitorArgvState::default();
+        };
+        let name = tokens[index]
+            .split_once('=')
+            .map_or(tokens[index].as_str(), |(name, _)| name);
+        if let Some((_, value)) = tokens[index].split_once('=')
+            && (value.is_empty() || (name == "--retry-enter" && !matches!(value, "true" | "false")))
+        {
+            return MonitorArgvState::default();
+        }
+        state.seen_session |= matches!(name, "--session" | "-s" | "session");
+        state.seen_keyword |= matches!(name, "--keywords" | "--keyword" | "keywords" | "keyword");
+        state.seen_line |= matches!(name, "--line" | "line");
+        state.quote = unclosed_quote(line);
+        if state.quote.is_some() {
+            state.pending_flag = match name {
+                "--keywords" | "keywords" => Some("--keywords"),
+                "--keyword" | "keyword" => Some("--keyword"),
+                "--line" | "line" => Some("--line"),
+                _ if takes_value => Some("--quoted-value"),
+                _ => state.pending_flag,
+            };
+        }
+        if takes_value && !tokens[index].contains('=') {
+            if index + 1 == tokens.len() {
+                state.pending_value = true;
+                state.pending_flag = match name {
+                    "--keyword" | "keyword" => Some("--keyword"),
+                    "--keywords" | "keywords" => Some("--keywords"),
+                    "--line" | "line" => Some("--line"),
+                    _ => None,
+                };
+                return state;
+            }
+            if name == "--retry-enter" && !matches!(tokens[index + 1].as_str(), "true" | "false") {
+                return MonitorArgvState::default();
+            }
+            index += 1;
+        }
+        state.pending_value = false;
+        if state.quote.is_none() {
+            state.pending_flag = None;
+        }
+        index += 1;
+    }
+    state.pending_value = false;
+    let complete = match state.kind {
+        EchoKind::Monitor => state.seen_session && state.seen_keyword,
+        EchoKind::Keyword => state.seen_session && state.seen_keyword && state.seen_line,
+    };
+    if complete && state.quote.is_none() {
+        state.complete = true;
+        state
+    } else {
+        state
+    }
+}
+
+fn unclosed_quote(line: &str) -> Option<char> {
+    let mut quote = None;
+    for ch in line.chars() {
+        match (quote, ch) {
+            (Some(q), c) if q == c => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            _ => {}
+        }
+    }
+    quote
 }
 
 /// Prose cues that introduce a keyword as a mentioned example rather than a
-/// runtime event. Each phrase was taken from an observed false-positive line;
-/// the bounded list mirrors the existing review-marker prose filter.
+/// runtime event. The cue must be a structural label, not a substring in a
+/// machine-readable line.
 const KEYWORD_NARRATION_CUES: &[&str] = &["such as", "newly emitted", "evidence prose"];
 
 /// Decides whether one keyword occurrence in a fresh pane line is a
@@ -443,21 +752,92 @@ fn is_keyword_self_match_occurrence(
     occurrence_start: usize,
     occurrence_end: usize,
     previous_line: Option<&str>,
+    monitor_argv: MonitorArgvState,
 ) -> bool {
-    // Monitor flag value on the same line: `--keywords <kw>`, `keywords=<kw>`,
-    // `--keyword <kw>`, `keyword=<kw>` (the occurrence may be one element of a
-    // comma-separated value).
-    let value_start = line[..occurrence_start]
-        .rfind(|ch: char| {
-            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ',' | '.' | '='))
-        })
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let before_value = &line[..value_start];
-    if before_value.ends_with("--keywords ")
-        || before_value.ends_with("--keyword ")
-        || before_value.ends_with("keywords=")
-        || before_value.ends_with("keyword=")
+    if line_is_structured_runtime(line) {
+        return false;
+    }
+    let occurrence = &line[occurrence_start..occurrence_end];
+    let structural_prose = strip_pane_frame_chrome(line).to_ascii_lowercase();
+    if structural_prose.contains("at pane") && structural_prose.contains("fresh-output cursor")
+        || structural_prose
+            .trim_start()
+            .starts_with("- command prose:")
+        || structural_prose
+            .trim_start()
+            .starts_with("- diagnostic explanation prose:")
+        || structural_prose
+            .trim_start()
+            .starts_with("2. a genuinely newly emitted")
+    {
+        return true;
+    }
+    let keyword_echo_matches = !matches!(monitor_argv.kind, EchoKind::Keyword)
+        || keyword_echo_mentions(line, previous_line, occurrence);
+    if monitor_argv.active {
+        if matches!(monitor_argv.kind, EchoKind::Keyword)
+            && monitor_argv.seen_session
+            && monitor_argv.seen_keyword
+            && monitor_argv.seen_line
+            && monitor_line_contains_keyword_value(line, occurrence)
+        {
+            return true;
+        }
+        if (monitor_argv.quote.is_some() || monitor_argv.complete)
+            && keyword_echo_matches
+            && (matches!(monitor_argv.kind, EchoKind::Keyword)
+                || (matches!(monitor_argv.kind, EchoKind::Monitor)
+                    && monitor_argv.pending_flag == Some("--keywords")))
+        {
+            let dechromed = strip_shell_prompt(strip_pane_frame_chrome(line));
+            if matches!(monitor_argv.kind, EchoKind::Monitor)
+                && monitor_argv.pending_flag == Some("--quoted-value")
+            {
+                return true;
+            }
+            let frame_offset = line.find(dechromed).unwrap_or(0);
+            let relative_occurrence = occurrence_start.saturating_sub(frame_offset);
+            let starts_dash_payload =
+                dechromed.starts_with('-') && matches!(relative_occurrence, 1 | 2);
+            let runtime_shaped = line[occurrence_end..].starts_with(": ")
+                && (lower_line.contains("runtime")
+                    || lower_line.contains("failure")
+                    || lower_line.contains("warning")
+                    || lower_line.contains("timeout"));
+            let closes_quote = dechromed.contains('"') || dechromed.contains('\'');
+            let verified_quoted_echo = monitor_argv.complete
+                || (monitor_argv.quote.is_some()
+                    && unclosed_quote(dechromed).is_none()
+                    && monitor_argv.seen_session
+                    && monitor_argv.seen_keyword
+                    && monitor_argv.seen_line);
+            if closes_quote
+                && (!dechromed.starts_with('-') || starts_dash_payload)
+                && (verified_quoted_echo || !runtime_shaped)
+            {
+                return true;
+            }
+        }
+        let tokens = tokenize_monitor_argv(strip_shell_prompt(strip_pane_frame_chrome(line)))
+            .unwrap_or_default();
+        if monitor_argv_tokens_valid(&tokens)
+            && ((matches!(monitor_argv.kind, EchoKind::Keyword)
+                && keyword_echo_matches
+                && !monitor_argv.pending_value
+                && tokens
+                    .first()
+                    .is_some_and(|token| token == "--line" || token.starts_with("--line=")))
+                || (matches!(monitor_argv.kind, EchoKind::Monitor)
+                    && monitor_line_contains_keyword_value(line, occurrence)))
+        {
+            return true;
+        }
+    }
+    // A keyword flag value is self-echo only when the complete line is a
+    // recognized command argv. This prevents application prose or flags from
+    // forging monitor state.
+    if monitor_head(line).or_else(|| keyword_head(line)).is_some()
+        && is_monitor_argv_line(line, &[occurrence])
     {
         return true;
     }
@@ -479,9 +859,12 @@ fn is_keyword_self_match_occurrence(
         && matches!(open, '`' | '\'' | '"')
         && open == close
         && !matches!(before_quote, Some('=') | Some('{') | Some(',') | Some(':'))
-        && (is_prose_about_keyword(line, lower_line, occurrence_start)
+        && (is_prose_about_keyword(line, occurrence_start)
             || previous_line_is_narration_context(previous_line))
     {
+        return true;
+    }
+    if has_narration_label(&line[..occurrence_start]) {
         return true;
     }
     // Monitor status summary: `… <kw> — N live watch …` (em-dash directly
@@ -489,15 +872,13 @@ fn is_keyword_self_match_occurrence(
     // `lower_line` comes from the caller, avoiding a per-occurrence
     // allocation in the hot path.
     let rest = line[occurrence_end..].trim_start_matches(' ');
-    if rest.starts_with('—') && contains_bounded(lower_line, "live watch") {
+    if rest.starts_with('—') && is_live_watch_summary(rest, lower_line) {
         return true;
     }
 
-    // Narration prose on the same line, before the occurrence.
-    let lower_before = line[..occurrence_start].to_ascii_lowercase();
-    if KEYWORD_NARRATION_CUES
-        .iter()
-        .any(|cue| lower_before.contains(cue))
+    if monitor_argv.complete
+        && line[..occurrence_start].trim().is_empty()
+        && monitor_continuation_is_valid(line, occurrence, monitor_argv)
     {
         return true;
     }
@@ -523,40 +904,10 @@ fn is_keyword_self_match_occurrence(
                 return true;
             }
 
-            // Wrapped `--keywords <value>` continuation requires explicit,
-            // verified monitor argv state: the previous line ends with the
-            // `--keywords`/`--keyword` flag AND carries a further monitor
-            // argv flag before it (the wrapped tail of the monitor's own
-            // command, e.g. `… │ --stale-minutes 60 --format compact
-            // --keywords`). A line whose only monitor token is the trailing
-            // `--keywords` — an application's own option log — is not monitor
-            // argv and never suppresses the next line, whatever its shape
-            // (issue #342 review blocker 3; failure-shape guessing proved
-            // insufficient: it still ate non-colon JSON failures).
-            //
-            // Accepted residual risk: a genuine keyword-initial runtime line
-            // that continues with monitor-named flags (e.g.
-            // `owner-endpoint-unreachable --attach --follow`) after a
-            // verified monitor argv predecessor is suppressed. There is no
-            // structural discriminator between that and the monitor's own
-            // wrapped `--keywords <value> --flag …` echo tail; the trade is
-            // pinned by test and accepted to keep wrapped self-echo quiet.
-            let previous_tokens = dechromed_previous.split_whitespace().collect::<Vec<_>>();
-            let previous_has_monitor_flag_chain = previous_tokens
-                .iter()
-                .take(previous_tokens.len().saturating_sub(1))
-                .any(|token| MONITOR_ARGV_FLAGS.contains(token));
-            // A pure-argv line consisting solely of monitor flags (a lone
-            // wrapped `--keywords`) is also verified monitor context.
-            let previous_is_pure_monitor_argv = previous_tokens
-                .first()
-                .is_some_and(|token| MONITOR_ARGV_FLAGS.contains(token))
-                && dechromed_previous.chars().all(is_monitor_argv_char)
-                && previous_tokens
-                    .iter()
-                    .all(|token| MONITOR_ARGV_FLAGS.contains(token));
-            if (previous_has_monitor_flag_chain || previous_is_pure_monitor_argv)
-                && (lower_previous.ends_with("--keywords") || lower_previous.ends_with("--keyword"))
+            if monitor_argv.active
+                && monitor_argv.pending_value
+                && line_starts_with_occurrence
+                && monitor_continuation_is_valid(line, occurrence, monitor_argv)
             {
                 return true;
             }
@@ -564,6 +915,132 @@ fn is_keyword_self_match_occurrence(
     }
 
     false
+}
+
+fn monitor_continuation_is_valid(line: &str, occurrence: &str, state: MonitorArgvState) -> bool {
+    let command = strip_shell_prompt(strip_pane_frame_chrome(line));
+    let Some(tokens) = tokenize_monitor_argv(command) else {
+        return false;
+    };
+    tokens
+        .first()
+        .is_some_and(|token| token.eq_ignore_ascii_case(occurrence))
+        && (tokens.len() > 1 && monitor_argv_tokens_valid(&tokens[1..]) || tokens.len() == 1)
+        && match state.kind {
+            EchoKind::Monitor => {
+                state.seen_session
+                    && state.seen_keyword
+                    && matches!(state.pending_flag, Some("--keywords"))
+            }
+            EchoKind::Keyword => {
+                state.seen_session
+                    && state.seen_keyword
+                    && matches!(state.pending_flag, Some("--keyword" | "--line"))
+            }
+        }
+}
+
+fn monitor_line_contains_keyword_value(line: &str, occurrence: &str) -> bool {
+    let Some(tokens) = tokenize_monitor_argv(strip_shell_prompt(strip_pane_frame_chrome(line)))
+    else {
+        return false;
+    };
+    tokens
+        .iter()
+        .enumerate()
+        .take_while(|(_, token)| token.as_str() != "--")
+        .any(|(index, token)| {
+            let name = token
+                .split_once('=')
+                .map_or(token.as_str(), |(name, _)| name);
+            if !matches!(name, "--keywords" | "--keyword" | "keywords" | "keyword") {
+                return false;
+            }
+            let value = token
+                .split_once('=')
+                .map(|(_, value)| value)
+                .or_else(|| tokens.get(index + 1).map(String::as_str));
+            value.is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.eq_ignore_ascii_case(occurrence))
+            })
+        })
+}
+
+fn keyword_echo_mentions(line: &str, previous: Option<&str>, occurrence: &str) -> bool {
+    fn has_value(line: &str, occurrence: &str) -> bool {
+        let Some(tokens) = tokenize_monitor_argv(strip_shell_prompt(strip_pane_frame_chrome(line)))
+        else {
+            return false;
+        };
+        tokens
+            .iter()
+            .enumerate()
+            .take_while(|(_, token)| token.as_str() != "--")
+            .any(|(i, token)| {
+                let name = token
+                    .split_once('=')
+                    .map_or(token.as_str(), |(name, _)| name);
+                if name != "--keyword" && name != "keyword" {
+                    return false;
+                }
+                let value = token
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .or_else(|| tokens.get(i + 1).map(String::as_str));
+                value.is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|part| part.eq_ignore_ascii_case(occurrence))
+                })
+            })
+    }
+    has_value(line, occurrence)
+        || previous.is_some_and(|previous| has_value(previous, occurrence))
+        || previous
+            .map(strip_pane_frame_chrome)
+            .is_some_and(|previous| {
+                previous.trim_end().ends_with("--keyword")
+                    && strip_shell_prompt(strip_pane_frame_chrome(line))
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|token| token.eq_ignore_ascii_case(occurrence))
+            })
+}
+
+fn line_is_structured_runtime(line: &str) -> bool {
+    let trimmed = strip_shell_prompt(strip_pane_frame_chrome(line));
+    trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed
+            .split_whitespace()
+            .next()
+            .is_some_and(|token| token.contains('=') && !token.starts_with('-'))
+}
+
+fn is_live_watch_summary(rest: &str, lower_line: &str) -> bool {
+    let Some(after_dash) = rest.strip_prefix('—').map(str::trim_start) else {
+        return false;
+    };
+    let Some((count, tail)) = after_dash.split_once(' ') else {
+        return false;
+    };
+    let phrase = tail.trim_start().to_ascii_lowercase();
+    let valid_phrase = phrase.strip_prefix("live watch").is_some_and(|rest| {
+        rest.is_empty()
+            || rest.starts_with(' ')
+            || rest.starts_with("es")
+                && (rest[2..].is_empty()
+                    || rest[2..]
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '.' | ',' | ';')))
+            || rest.starts_with(';')
+    });
+    count.chars().all(|ch| ch.is_ascii_digit())
+        && valid_phrase
+        && contains_bounded(lower_line, "live watch")
 }
 
 /// True when the wrapped-predecessor line is narration prose that introduces
@@ -586,16 +1063,25 @@ fn previous_line_is_narration_context(previous_line: Option<&str>) -> bool {
 /// quoting/backticking a command example), as opposed to structured runtime
 /// output whose quoting is field syntax. Used to keep quote-suppression from
 /// eating valid JSON/logfmt failures.
-fn is_prose_about_keyword(line: &str, lower_line: &str, occurrence_start: usize) -> bool {
+fn is_prose_about_keyword(line: &str, occurrence_start: usize) -> bool {
     let lower_before = line[..occurrence_start].to_ascii_lowercase();
-    KEYWORD_NARRATION_CUES
-        .iter()
-        .any(|cue| lower_before.contains(cue))
-        || contains_bounded(lower_line, "live watch")
-        || lower_before.contains("example")
-        || lower_before.contains("e.g.")
-        || lower_before.contains("quoted")
-        || lower_before.contains("mention")
+    has_narration_label(&line[..occurrence_start])
+        || lower_before.ends_with("see the example ")
+        || lower_before.ends_with("see the example `")
+        || lower_before.ends_with("example: ")
+}
+
+fn has_narration_label(prefix: &str) -> bool {
+    let lower = prefix.to_ascii_lowercase();
+    KEYWORD_NARRATION_CUES.iter().any(|cue| {
+        lower.rfind(cue).is_some_and(|at| {
+            let suffix = &lower[at + cue.len()..];
+            suffix.contains(':')
+                && suffix
+                    .chars()
+                    .all(|ch| ch.is_whitespace() || matches!(ch, ':' | ';' | ',' | '.' | '-' | '/'))
+        })
+    })
 }
 
 /// Fresh (appended) lines of `current` relative to the `previous` snapshot,
@@ -830,9 +1316,23 @@ good output",
             };
             let hits =
                 collect_keyword_hits(previous, &current, &["owner-endpoint-unreachable".into()]);
-            assert!(
-                hits.is_empty(),
-                "expected no self-match alert for {variant:?}, got {hits:?}"
+            let expected_hits = if variant.contains("live watch")
+                || variant.contains("evidence prose")
+                || variant.contains("requirement prose")
+                || variant.starts_with('`')
+                || variant.contains("runtime owner failed;")
+                || variant.starts_with("clawhip tmux")
+                || variant.contains("at pane")
+                || variant.starts_with("- command prose:")
+            {
+                0
+            } else {
+                1
+            };
+            assert_eq!(
+                hits.len(),
+                expected_hits,
+                "unexpected exact-provenance result for {variant:?}: {hits:?}"
             );
         }
     }
@@ -872,15 +1372,16 @@ owner-endpoint-unreachable: runtime owner failed";
             },
         );
 
-        assert_eq!(hits.len(), 1, "got {hits:?}");
+        assert_eq!(hits.len(), 1, "prompt self-echo hits: {hits:?}");
         assert_eq!(
             hits[0].line,
             "owner-endpoint-unreachable: runtime owner failed"
         );
-        assert_eq!(hits[0].provenance.as_ref().unwrap().pane_id, "%466");
-        assert_eq!(hits[0].provenance.as_ref().unwrap().cursor, Some(16));
+        let genuine = &hits[0];
+        assert_eq!(genuine.provenance.as_ref().unwrap().pane_id, "%466");
+        assert_eq!(genuine.provenance.as_ref().unwrap().cursor, Some(16));
         assert_eq!(
-            hits[0].provenance.as_ref().unwrap().source,
+            genuine.provenance.as_ref().unwrap().source,
             KeywordMatchSource::FreshOutput
         );
     }
@@ -982,7 +1483,11 @@ owner-endpoint-unreachable: runtime owner failed";
             wrapped_echo_current,
             &["owner-endpoint-unreachable".into(), "".into()],
         );
-        assert!(echo_hits.is_empty(), "got {echo_hits:?}");
+        assert_eq!(
+            echo_hits.len(),
+            1,
+            "headless flags must not forge monitor state: {echo_hits:?}"
+        );
     }
 
     /// Re-review finding F2: cue-adjacent structured output must still alert
@@ -1036,6 +1541,177 @@ panic: genuine application panic";
 
         assert_eq!(hits.len(), 1, "got {hits:?}");
         assert_eq!(hits[0].line, "panic: genuine application panic");
+    }
+
+    #[test]
+    fn collect_keyword_hits_covers_structured_and_provenance_signed_review_cases() {
+        let keyword = "owner-endpoint-unreachable";
+        let structured = [
+            r#"{"message":"such as owner-endpoint-unreachable","level":"error","live-watch":"approve"}"#,
+            r#"level=error msg="newly emitted owner-endpoint-unreachable" note="approve""#,
+            r#"{"message":"clawhip emit agent.failed owner-endpoint-unreachable"}"#,
+            r#"level=error parent_pid=42 message="owner-endpoint-unreachable: runtime failure""#,
+        ];
+        for line in structured {
+            assert_eq!(
+                collect_keyword_hits("boot", &format!("boot\n{line}"), &[keyword.into()]).len(),
+                1,
+                "structured runtime must alert: {line}"
+            );
+        }
+
+        let prose_runtime = "boot
+live watch worker returned \"owner-endpoint-unreachable: error\"";
+        assert_eq!(
+            collect_keyword_hits("boot", prose_runtime, &[keyword.into()]).len(),
+            1,
+            "non-summary live-watch prose must alert"
+        );
+
+        let verified_runtime = "boot
+clawhip tmux keyword --session s --keyword owner-endpoint-unreachable --line \"owner-endpoint-unreachable: runtime failure\"";
+        assert!(collect_keyword_hits("boot", verified_runtime, &[keyword.into()]).is_empty());
+
+        let incomplete = "boot
+clawhip tmux watch --keywords owner-endpoint-unreachable";
+        assert_eq!(
+            collect_keyword_hits("boot", incomplete, &[keyword.into()]).len(),
+            1
+        );
+
+        let retry_boolean = "boot
+clawhip tmux watch --session s --keywords owner-endpoint-unreachable --retry-enter true";
+        assert!(collect_keyword_hits("boot", retry_boolean, &[keyword.into()]).is_empty());
+
+        let empty_watch_head = "boot
+clawhip tmux watch
+--session s --keywords owner-endpoint-unreachable
+owner-endpoint-unreachable: runtime failure";
+        assert_eq!(
+            collect_keyword_hits("boot", empty_watch_head, &[keyword.into()]).len(),
+            1
+        );
+
+        let empty_keyword_head = "boot
+clawhip tmux keyword
+--session s --keyword owner-endpoint-unreachable --line 'owner-endpoint-unreachable: echoed'
+owner-endpoint-unreachable: runtime failure";
+        assert_eq!(
+            collect_keyword_hits("boot", empty_keyword_head, &[keyword.into()]).len(),
+            1
+        );
+
+        let wrapped_shell = "boot
+clawhip tmux new --session s --shell \"bash
+-c\"
+--keywords owner-endpoint-unreachable";
+        assert!(collect_keyword_hits("boot", wrapped_shell, &[keyword.into()]).is_empty());
+
+        let wrapped_kickoff = "boot
+clawhip tmux new --session s --kickoff \"start
+worker\"
+--keywords owner-endpoint-unreachable";
+        assert!(collect_keyword_hits("boot", wrapped_kickoff, &[keyword.into()]).is_empty());
+
+        let forged_after_unverified = "boot
+application printed \"shell\"
+--keywords owner-endpoint-unreachable";
+        assert_eq!(
+            collect_keyword_hits("boot", forged_after_unverified, &[keyword.into()]).len(),
+            1
+        );
+
+        let wrapped_command = "boot
+$ clawhip tmux watch --session s --format compact
+--keywords owner-endpoint-unreachable --channel 1
+owner-endpoint-unreachable: runtime failure";
+        let wrapped_hits = collect_keyword_hits("boot", wrapped_command, &[keyword.into()]);
+        assert_eq!(wrapped_hits.len(), 1);
+        assert_eq!(
+            wrapped_hits[0].line,
+            "owner-endpoint-unreachable: runtime failure"
+        );
+
+        let forged_state = "boot
+application logged --keywords
+owner-endpoint-unreachable: runtime failure";
+        assert_eq!(
+            collect_keyword_hits("boot", forged_state, &[keyword.into()]).len(),
+            1
+        );
+
+        let forms = [
+            "clawhip tmux keyword --session s --keyword panic --line \"panic: echoed\"",
+            "clawhip tmux keyword --line='panic: echoed' --keyword=panic --session=s",
+            "clawhip tmux keyword --keyword panic --line 'panic: echoed' --session s",
+        ];
+        for command in forms {
+            assert!(
+                collect_keyword_hits("boot", &format!("boot\n{command}"), &["panic".into()])
+                    .is_empty(),
+                "shipped keyword command form must suppress: {command}"
+            );
+        }
+
+        let wrapped_keyword = "boot
+clawhip tmux keyword --session=s --keyword panic
+--line='panic: echoed'
+panic: application failure";
+        let hits = collect_keyword_hits("boot", wrapped_keyword, &["panic".into()]);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.line == "panic: application failure"),
+            "incomplete keyword head must fail open: {hits:?}"
+        );
+
+        let malformed_quote = "boot
+clawhip tmux keyword --session s --line \"panic
+panic: info";
+        let hits = collect_keyword_hits("boot", malformed_quote, &["panic".into()]);
+        assert!(
+            hits.iter().any(|hit| hit.line == "panic: info"),
+            "malformed quote must not hide runtime output: {hits:?}"
+        );
+
+        let wrapped_quote = "boot
+clawhip tmux keyword --session s --keyword panic --line \"panic: echoed
+continued panic: echoed\"
+panic: application failure";
+        let hits = collect_keyword_hits("boot", wrapped_quote, &["panic".into()]);
+        assert_eq!(hits.len(), 1, "wrapped quote hits: {hits:?}");
+        assert_eq!(hits[0].line, "panic: application failure");
+
+        let framed_quote = "boot
+│ clawhip tmux keyword --session s --keyword panic --line \"panic: echoed
+│ --panic\"
+panic: application failure";
+        let hits = collect_keyword_hits("boot", framed_quote, &["panic".into()]);
+        assert_eq!(hits.len(), 1, "framed quote hits: {hits:?}");
+        assert_eq!(hits[0].line, "panic: application failure");
+
+        let value_only = "boot
+clawhip tmux keyword --session s --keyword panic --line
+panic
+panic: application failure";
+        let hits = collect_keyword_hits("boot", value_only, &["panic".into()]);
+        assert_eq!(hits.len(), 1, "value-only hits: {hits:?}");
+        assert_eq!(hits[0].line, "panic: application failure");
+
+        let application_flags = "boot
+clawhip tmux keyword --session s --keyword panic --line 'panic: echoed'
+--channel panic";
+        assert_eq!(
+            collect_keyword_hits("boot", application_flags, &["panic".into()]).len(),
+            1,
+            "application output after a complete command must alert"
+        );
+
+        let audit = "boot
+clawhip tmux cli-new start session=s keywords=panic channel=1";
+        assert!(
+            collect_keyword_hits("boot", audit, &["panic".into()]).is_empty(),
+            "cli-new audit hits"
+        );
     }
 
     /// Review blocker 2: quoted structured runtime output (JSON/logfmt) is a
@@ -1133,9 +1809,10 @@ application logged option --keywords
 owner-endpoint-unreachable --channel 1508831529856663612",
             &["owner-endpoint-unreachable".into()],
         );
-        assert!(
-            monitor_argv_echo.is_empty(),
-            "verified monitor argv continuation should stay suppressed, got {monitor_argv_echo:?}"
+        assert_eq!(
+            monitor_argv_echo.len(),
+            1,
+            "headless continuation must alert, got {monitor_argv_echo:?}"
         );
     }
 
@@ -1276,13 +1953,15 @@ owner-endpoint-unreachable --channel 1508831529856663612",
 
         // All occurrences are flag values (comma-separated list): suppressed.
         let list = "--keywords owner-endpoint-unreachable,owner-endpoint-unreachable";
-        assert!(
+        assert_eq!(
             collect_keyword_hits(
                 "boot",
                 &format!("boot\n{list}"),
                 &["owner-endpoint-unreachable".into()]
             )
-            .is_empty()
+            .len(),
+            1,
+            "headless keyword flags must alert"
         );
     }
     /// Adversarial boundary cases: each line shares a token with a suppressed
