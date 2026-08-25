@@ -110,8 +110,11 @@ fn collect_keyword_hits_from_lines(
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
 
+    let mut previous_line: Option<&str> = None;
+
     for (line_cursor, line) in lines {
-        if should_ignore_launcher_line(line) {
+        if should_ignore_launcher_line(line, keywords) {
+            previous_line = Some(line);
             continue;
         }
 
@@ -120,6 +123,21 @@ fn collect_keyword_hits_from_lines(
             if lower_line.contains(lower_keyword) {
                 if is_negated_default_failure_match(lower_keyword, &lower_line)
                     || is_instruction_or_search_review_marker_prose(lower_keyword, line)
+                {
+                    continue;
+                }
+
+                if keyword_occurrences(&lower_line, lower_keyword)
+                    .iter()
+                    .all(|&(start, end)| {
+                        is_keyword_self_match_occurrence(
+                            line,
+                            &lower_line,
+                            start,
+                            end,
+                            previous_line,
+                        )
+                    })
                 {
                     continue;
                 }
@@ -139,9 +157,26 @@ fn collect_keyword_hits_from_lines(
                 }
             }
         }
+
+        previous_line = Some(line);
     }
 
     hits
+}
+
+/// Byte offsets of every occurrence of `lower_keyword` in `lower_line` (the
+/// caller's already-lowercased line). ASCII-only lowering keeps byte
+/// positions identical to the original line, so offsets slice both safely.
+fn keyword_occurrences(lower_line: &str, lower_keyword: &str) -> Vec<(usize, usize)> {
+    let mut occurrences = Vec::new();
+    let mut search_start = 0;
+    while let Some(relative_start) = lower_line[search_start..].find(lower_keyword) {
+        let start = search_start + relative_start;
+        let end = start + lower_keyword.len();
+        occurrences.push((start, end));
+        search_start = end;
+    }
+    occurrences
 }
 
 fn is_negated_default_failure_match(lower_keyword: &str, lower_line: &str) -> bool {
@@ -235,23 +270,216 @@ fn contains_bounded(haystack: &str, needle: &str) -> bool {
     false
 }
 
-fn should_ignore_launcher_line(line: &str) -> bool {
-    let trimmed = line.trim();
+fn should_ignore_launcher_line(line: &str, keywords: &[String]) -> bool {
+    let trimmed = strip_pane_frame_chrome(line);
     LAUNCHER_NOISE_PATTERNS
         .iter()
         .any(|pattern| trimmed.contains(pattern))
         || is_tmux_watch_command_echo(trimmed)
+        || is_wrapped_monitor_command_fragment(trimmed, keywords)
+}
+
+/// Trim tmux/GUI frame chrome (box-drawing rails, soft-wrap markers) plus
+/// surrounding whitespace so a wrapped pane line can be inspected as the bare
+/// text it carries.
+fn strip_pane_frame_chrome(line: &str) -> &str {
+    line.trim_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '│' | '┃' | '║' | '|' | '╎' | '▏' | '▕' | '┆' | '┊' | '·' | '┄' | '┈'
+            )
+    })
 }
 
 fn is_tmux_watch_command_echo(line: &str) -> bool {
-    let command = line
-        .strip_prefix("$ ")
+    let command = strip_shell_prompt(line);
+    (command.starts_with("clawhip tmux watch ")
+        || command.starts_with("clawhip tmux new ")
+        || command.starts_with("clawhip tmux cli-new "))
+        && (command.contains(" --session ")
+            || command.contains(" -s ")
+            || command.contains("session="))
+        && (command.contains(" --keywords ") || command.contains("keywords="))
+}
+
+fn strip_shell_prompt(line: &str) -> &str {
+    line.strip_prefix("$ ")
         .or_else(|| line.strip_prefix("% "))
         .or_else(|| line.strip_prefix("> "))
-        .unwrap_or(line);
-    command.starts_with("clawhip tmux watch ")
-        && (command.contains(" --session ") || command.contains(" -s "))
-        && command.contains(" --keywords ")
+        .unwrap_or(line)
+}
+
+/// Flags a `clawhip tmux watch`/`new` wrapper can emit. Wrapped continuation
+/// lines of the monitor's own command start with one of these instead of the
+/// program name.
+const MONITOR_ARGV_FLAGS: &[&str] = &[
+    "--keywords",
+    "--keyword",
+    "--session",
+    "--stale-minutes",
+    "--format",
+    "--channel",
+    "--mention",
+    "--attach",
+    "--follow",
+    "--retry-enter",
+    "--retry-enter-count",
+    "--retry-enter-delay-ms",
+    "--window-name",
+    "--cwd",
+    "-s",
+];
+
+/// Continuation fragment of a self-generated monitor command that was
+/// hard-wrapped by a narrow pane, e.g.
+/// `│ --stale-minutes 60 --format compact --keywords owner-endpoint-unreachable  │`.
+/// The head line (`clawhip tmux watch ...`) is caught by
+/// `is_tmux_watch_command_echo`; the tail lines start mid-argv with one of the
+/// wrapper's own flags. A line only qualifies when it is pure argv AND one of
+/// the monitored keywords is carried as a keyword-flag value, so a runtime
+/// failure that merely starts with a flag token (`--format compact: <kw>`)
+/// still alerts.
+fn is_wrapped_monitor_command_fragment(line: &str, keywords: &[String]) -> bool {
+    let fragment = strip_shell_prompt(line);
+    let first_token = fragment.split_whitespace().next().unwrap_or("");
+    if !MONITOR_ARGV_FLAGS.contains(&first_token) {
+        return false;
+    }
+    if fragment.split_whitespace().count() < 2 {
+        return false;
+    }
+    if !fragment.chars().all(is_monitor_argv_char) {
+        return false;
+    }
+    let lower_fragment = fragment.to_ascii_lowercase();
+    keywords
+        .iter()
+        .any(|keyword| is_keyword_flag_value(&lower_fragment, &keyword.to_ascii_lowercase()))
+}
+
+/// True when `lower_keyword` occurs in `lower_fragment` directly as the value
+/// of a keyword flag (`--keywords <kw>[,…]`, `keywords=<kw>[,…]`).
+fn is_keyword_flag_value(lower_fragment: &str, lower_keyword: &str) -> bool {
+    let mut search_start = 0;
+    while let Some(relative_start) = lower_fragment[search_start..].find(lower_keyword) {
+        let start = search_start + relative_start;
+        let before = &lower_fragment[..start];
+        if before.ends_with("--keywords ")
+            || before.ends_with("--keyword ")
+            || before.ends_with("keywords=")
+            || before.ends_with("keyword=")
+        {
+            return true;
+        }
+        search_start = start + lower_keyword.len();
+    }
+    false
+}
+
+fn is_monitor_argv_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '_' | '@' | '#' | '<' | '>' | '/' | '=' | '+' | '.' | ',' | ':' | '-' | ' '
+        )
+}
+
+/// Prose cues that introduce a keyword as a mentioned example rather than a
+/// runtime event. Each phrase was taken from an observed false-positive line;
+/// the bounded list mirrors the existing review-marker prose filter.
+const KEYWORD_NARRATION_CUES: &[&str] = &["such as", "newly emitted", "evidence prose"];
+
+/// Decides whether one keyword occurrence in a fresh pane line is a
+/// self-match: text about the monitor or about the keyword itself, not a
+/// runtime event. All rules are structural (flag positions, quote spans,
+/// summary dashes, narration cues); none suppress a bare `keyword: message`
+/// runtime line.
+fn is_keyword_self_match_occurrence(
+    line: &str,
+    lower_line: &str,
+    occurrence_start: usize,
+    occurrence_end: usize,
+    previous_line: Option<&str>,
+) -> bool {
+    // Monitor flag value on the same line: `--keywords <kw>`, `keywords=<kw>`,
+    // `--keyword <kw>`, `keyword=<kw>` (the occurrence may be one element of a
+    // comma-separated value).
+    let value_start = line[..occurrence_start]
+        .rfind(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ',' | '.' | '='))
+        })
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let before_value = &line[..value_start];
+    if before_value.ends_with("--keywords ")
+        || before_value.ends_with("--keyword ")
+        || before_value.ends_with("keywords=")
+        || before_value.ends_with("keyword=")
+    {
+        return true;
+    }
+
+    // Quoted mention: the occurrence is wrapped in backticks or matched
+    // quotes (`<kw>`, '<kw>', "<kw>") — a mention, not an event.
+    let before = line[..occurrence_start].chars().next_back();
+    let after = line[occurrence_end..].chars().next();
+    if let (Some(open), Some(close)) = (before, after)
+        && matches!(open, '`' | '\'' | '"')
+        && open == close
+    {
+        return true;
+    }
+
+    // Monitor status summary: `… <kw> — N live watch …` (em-dash directly
+    // after the keyword plus the live-watch vocabulary on the same line).
+    // `lower_line` comes from the caller, avoiding a per-occurrence
+    // allocation in the hot path.
+    let rest = line[occurrence_end..].trim_start_matches(' ');
+    if rest.starts_with('—') && contains_bounded(lower_line, "live watch") {
+        return true;
+    }
+
+    // Narration prose on the same line, before the occurrence.
+    let lower_before = line[..occurrence_start].to_ascii_lowercase();
+    if KEYWORD_NARRATION_CUES
+        .iter()
+        .any(|cue| lower_before.contains(cue))
+    {
+        return true;
+    }
+
+    // Wrapped prose continuation: the occurrence starts the line and the
+    // previous pane line ends with a narration cue, so this line is the
+    // quoted example that cue introduced (`… preserve real lines such as`
+    // / `owner-endpoint-unreachable: runtime owner failed;`).
+    if let Some(previous) = previous_line {
+        let line_starts_with_occurrence = line[..occurrence_start]
+            .chars()
+            .all(|ch| ch.is_whitespace() || matches!(ch, '│' | '┃' | '║' | ' '));
+        if line_starts_with_occurrence {
+            let dechromed_previous = strip_pane_frame_chrome(previous);
+            let lower_previous = dechromed_previous.to_ascii_lowercase();
+            let lower_previous = lower_previous.trim_end_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '.' | ',' | ';' | ':')
+            });
+            if KEYWORD_NARRATION_CUES
+                .iter()
+                .any(|cue| lower_previous.ends_with(cue))
+            {
+                return true;
+            }
+
+            // Wrapped monitor argv continuation: the previous line ends with
+            // the `--keywords`/`--keyword` flag itself, so this line begins
+            // with the flag's value.
+            if lower_previous.ends_with("--keywords") || lower_previous.ends_with("--keyword") {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn appended_lines_with_cursors<'a>(previous: &'a str, current: &'a str) -> Vec<(usize, &'a str)> {
@@ -406,6 +634,258 @@ good output",
         assert_eq!(
             hits[0].provenance.as_ref().and_then(|value| value.cursor),
             Some(3)
+        );
+    }
+    /// Issue #342: exact observed false-positive variants from live pane
+    /// captures (%460 fresh-output cursors 205/179 and %466's 8 self-matches)
+    /// must produce zero alerts, while a genuinely new runtime failure line
+    /// after baseline still alerts with full provenance.
+    #[test]
+    fn collect_keyword_hits_suppresses_observed_wrapped_monitor_self_matches() {
+        // Exact observed wrapped continuation fragment at pane width 80
+        // (cursor 205 / 179 class), including the trailing frame rail.
+        let observed_variants = [
+            // (a) wrapped continuation of the monitor's own command, framed
+            "│ --stale-minutes 60 --format compact --keywords owner-endpoint-unreachable  │",
+            // (b) same fragment as the second wrap segment
+            "owner-endpoint-unreachable │ at pane %460/0.0, fresh-output cursor 205 and",
+            // (c) full command wrapped across lines (all three segments)
+            "clawhip tmux watch --session project-pr-4935-auth-gateway-scope",
+            "--keywords owner-endpoint-unreachable --channel 1508831529856663612",
+            // (d) summary/echo prose (cursor 105 class)
+            "watch --session ... --keywords owner-endpoint-unreachable — 4 live watch",
+            "owner-endpoint-unreachable — 4 live watch at cursor 105.",
+            // (e) bare quoted/mentioned keyword in evidence prose
+            "- bare quoted/mentioned keyword in evidence prose: owner-endpoint-unreachable;",
+            "`owner-endpoint-unreachable`",
+            // (f) command prose
+            "- command prose: watch ... --keywords owner-endpoint-unreachable, but wrapped;",
+            // (g) requirement bullet quoting the expected real line
+            "owner-endpoint-unreachable: runtime owner failed;",
+            // (h) diagnostic narration quoting the flag
+            "--keywords owner-endpoint-unreachable │ bypass filtering.",
+            "- diagnostic explanation prose: --keywords owner-endpoint-unreachable │ bypass",
+        ];
+
+        for variant in observed_variants {
+            // `boot` anchors both the cue and the variant inside one fresh
+            // window; without it the overlap logic treats the cue line as
+            // already-seen scrollback and drops the pairing context.
+            let cue = match variant {
+                // (b) is the second wrap segment of the framed fragment (a)
+                "owner-endpoint-unreachable │ at pane %460/0.0, fresh-output cursor 205 and" => {
+                    Some("│ --stale-minutes 60 --format compact --keywords")
+                }
+                // (g) is the wrapped continuation of the requirement bullet
+                // that names it an example
+                "owner-endpoint-unreachable: runtime owner failed;" => {
+                    Some("- requirement prose/bullet: preserve real lines such as")
+                }
+                // (e) bare quoted continuation lands alone after the cue
+                "`owner-endpoint-unreachable`" => {
+                    Some("- bare quoted/mentioned keyword in evidence prose:")
+                }
+                // (h) second line is the wrapped continuation of the
+                // diagnostic narration line above it; already covered by the
+                // full line variant.
+                "- diagnostic explanation prose: --keywords owner-endpoint-unreachable │ bypass" =>
+                {
+                    continue;
+                }
+                _ => None,
+            };
+            let previous = "boot";
+            let current = match cue {
+                Some(cue) => format!("{previous}\n{cue}\n{variant}"),
+                None => format!("{previous}\n{variant}"),
+            };
+            let hits =
+                collect_keyword_hits(previous, &current, &["owner-endpoint-unreachable".into()]);
+            assert!(
+                hits.is_empty(),
+                "expected no self-match alert for {variant:?}, got {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_keyword_hits_suppresses_full_observed_prompt_window_but_keeps_new_failure() {
+        // The exact observed fresh window that produced the 8 self-matches
+        // (pane %466, user prompt text), followed by a genuine runtime
+        // failure emitted after the prompt.
+        let baseline = "prior work";
+        let current = "prior work
+ 1. False alert line: │ --stale-minutes 60 --format compact --keywords
+ owner-endpoint-unreachable │ at pane %460/0.0, fresh-output cursor 205 and
+ again cursor 179.
+ 2. Additional false summary/echo line: watch --session ... --keywords
+ owner-endpoint-unreachable — 4 live watch at cursor 105.
+ - bare quoted/mentioned keyword in evidence prose: owner-endpoint-unreachable;
+ - summary/echo: owner-endpoint-unreachable — 4 live watch;
+ - command prose: watch ... --keywords owner-endpoint-unreachable, but wrapped;
+ - requirement prose/bullet: preserve real lines such as
+ owner-endpoint-unreachable: runtime owner failed;
+ - diagnostic explanation prose: --keywords owner-endpoint-unreachable │ bypass
+ filtering.
+ 2. a genuinely newly emitted owner-endpoint-unreachable: runtime owner failed
+ after baseline still produces one alert with correct provenance.
+owner-endpoint-unreachable: runtime owner failed";
+
+        let hits = collect_keyword_hits_with_provenance(
+            baseline,
+            current,
+            &["owner-endpoint-unreachable".into()],
+            KeywordMatchProvenance {
+                pane_id: "%466".into(),
+                pane_name: "0.0".into(),
+                cursor: None,
+                source: KeywordMatchSource::FreshOutput,
+            },
+        );
+
+        assert_eq!(hits.len(), 1, "got {hits:?}");
+        assert_eq!(
+            hits[0].line,
+            "owner-endpoint-unreachable: runtime owner failed"
+        );
+        assert_eq!(hits[0].provenance.as_ref().unwrap().pane_id, "%466");
+        assert_eq!(hits[0].provenance.as_ref().unwrap().cursor, Some(16));
+        assert_eq!(
+            hits[0].provenance.as_ref().unwrap().source,
+            KeywordMatchSource::FreshOutput
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_suppresses_wrapped_command_keyword_value_on_own_line() {
+        // Narrow pane wraps the flag and its value onto separate lines.
+        let previous = "boot";
+        let current = "boot
+$ clawhip tmux watch --session x --stale-minutes 60 --format compact
+ --keywords
+ owner-endpoint-unreachable --channel 1508831529856663612 --mention <@1>
+owner-endpoint-unreachable: runtime owner failed";
+
+        let hits = collect_keyword_hits(previous, current, &["owner-endpoint-unreachable".into()]);
+
+        assert_eq!(
+            hits,
+            vec![KeywordHit {
+                keyword: "owner-endpoint-unreachable".into(),
+                line: "owner-endpoint-unreachable: runtime owner failed".into(),
+                provenance: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_keeps_mid_line_application_occurrence_without_narration() {
+        // A genuine application line mentioning the keyword mid-line with no
+        // monitor/narration context must still alert.
+        let hits = collect_keyword_hits(
+            "boot",
+            "boot\nretrying after owner-endpoint-unreachable (attempt 3/5)",
+            &["owner-endpoint-unreachable".into()],
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].line,
+            "retrying after owner-endpoint-unreachable (attempt 3/5)"
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_keeps_bare_quoted_keyword_standalone_marker() {
+        // Quoted-mention suppression must not eat a real marker-style keyword
+        // line that a runtime prints verbatim (no quotes, no cues).
+        let hits = collect_keyword_hits(
+            "boot",
+            "boot\nowner-endpoint-unreachable",
+            &["owner-endpoint-unreachable".into()],
+        );
+
+        assert_eq!(hits.len(), 1);
+    }
+    /// Adversarial boundary cases: each line shares a token with a suppressed
+    /// class but is a genuine runtime event, so it MUST still alert. These pin
+    /// the suppression rules against broad-suppression drift.
+    #[test]
+    fn collect_keyword_hits_keeps_near_positive_runtime_lines() {
+        let must_alert = [
+            // `error` is a flag-ish token but this is a real failure message.
+            "owner-endpoint-unreachable: runtime owner failed",
+            // Colon-summary shape an app may emit; not an em-dash summary.
+            "owner-endpoint-unreachable: retries exhausted",
+            // Mid-line mention with no narration cue.
+            "dial failed: owner-endpoint-unreachable after 3 attempts",
+            // Em-dash present but no `live watch` vocabulary — not a summary.
+            "owner-endpoint-unreachable — connection dropped",
+            // Mention of the monitor command inside a genuine failure log.
+            "FATAL: owner-endpoint-unreachable while starting watch",
+            // Failure line that itself contains the word `keyword`.
+            "keyword watch failed: owner-endpoint-unreachable",
+            // Runtime echo of an unrelated flag before the failure token.
+            "--format compact: owner-endpoint-unreachable",
+            // Uppercase failure line (case-insensitive matching must hold).
+            "OWNER-ENDPOINT-UNREACHABLE: runtime owner failed",
+            // Keyword preceded by an unmatched quote pair (narration rule
+            // requires matched quotes directly around the occurrence).
+            "error 'unterminated: owner-endpoint-unreachable at 04:50",
+        ];
+
+        for line in must_alert {
+            let hits = collect_keyword_hits(
+                "boot",
+                &format!("boot\n{line}"),
+                &["owner-endpoint-unreachable".into()],
+            );
+            assert_eq!(
+                hits.len(),
+                1,
+                "genuine runtime line was suppressed: {line:?}"
+            );
+            assert_eq!(hits[0].line, line);
+        }
+    }
+
+    #[test]
+    fn collect_keyword_hits_suppresses_flag_value_only_when_directly_flagged() {
+        // The occurrence must be the flag's value, not merely later in a line
+        // that mentions the flag elsewhere.
+        let suppressed = collect_keyword_hits(
+            "boot",
+            "boot\nclawhip tmux watch --keywords owner-endpoint-unreachable --session s",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert!(suppressed.is_empty());
+
+        let kept = collect_keyword_hits(
+            "boot",
+            "boot\n--keywords ignored-value; failure owner-endpoint-unreachable",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].line,
+            "--keywords ignored-value; failure owner-endpoint-unreachable"
+        );
+    }
+
+    #[test]
+    fn collect_keyword_hits_wrapped_prose_continuation_requires_cue_immediately_before() {
+        // A keyword-initial line after an unrelated line still alerts; only a
+        // previous line ending in a narration cue (or the --keywords flag) is
+        // treated as a wrapped continuation.
+        let kept = collect_keyword_hits(
+            "boot",
+            "boot\nsome unrelated prior line\nowner-endpoint-unreachable: runtime owner failed",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].line,
+            "owner-endpoint-unreachable: runtime owner failed"
         );
     }
 
