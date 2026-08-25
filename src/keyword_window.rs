@@ -1453,6 +1453,32 @@ panic: application failure";
         assert_eq!(hits.len(), 1, "genuine panic must be kept: {hits:?}");
         assert_eq!(hits[0].line, "panic: application failure");
         assert_eq!(hits[0].keyword, "panic");
+
+        // Pinning the second arm of the same fix (external review NIT): the
+        // remainder scan itself can end pending on a *new* value-taking flag
+        // (`--keywords` at end of row). The consumed origin (`--format`, not
+        // keyword-bearing) must not overwrite that newer pending state either.
+        let wrapped_pending_tail = "boot
+clawhip tmux watch --session s --format
+compact --keywords
+panic";
+        assert!(
+            collect_keyword_hits("boot", wrapped_pending_tail, &[keyword.into()]).is_empty(),
+            "scan-discovered pending value must survive the origin flag"
+        );
+
+        let tail_with_genuine_panic = "boot
+clawhip tmux watch --session s --format
+compact --keywords
+panic
+panic: application failure";
+        let tail_hits = collect_keyword_hits("boot", tail_with_genuine_panic, &[keyword.into()]);
+        assert_eq!(
+            tail_hits.len(),
+            1,
+            "genuine panic must be kept: {tail_hits:?}"
+        );
+        assert_eq!(tail_hits[0].line, "panic: application failure");
     }
     #[test]
     fn collect_keyword_hits_keeps_mid_line_application_occurrence_without_narration() {
