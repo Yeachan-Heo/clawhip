@@ -624,7 +624,18 @@ fn advance_monitor_argv(mut state: MonitorArgvState, line: &str) -> MonitorArgvS
         next.pending_value = false;
         if let Some((_, rest)) = command.split_once(char::is_whitespace) {
             let mut scanned = scan_monitor_argv(next, rest.trim_start());
-            scanned.pending_flag = origin_flag;
+            // The remainder can discover a newer pending state (e.g. a
+            // wrapped `--keywords` flag at end of row). Never clobber that
+            // newer discovery; retain the origin flag only where the scan
+            // created no newer pending state and it remains semantically
+            // needed (live quote span, completed argv, or carried origin)
+            // for downstream continuation gating (issue #345).
+            if scanned.pending_flag.is_none()
+                && !scanned.pending_value
+                && (scanned.quote.is_some() || scanned.complete || origin_flag.is_some())
+            {
+                scanned.pending_flag = origin_flag;
+            }
             scanned.remaining = scanned.remaining.saturating_sub(1);
             return scanned;
         }
@@ -1408,6 +1419,41 @@ owner-endpoint-unreachable: runtime owner failed";
         );
     }
 
+    /// Issue #345: a wrapped argv row that ends with a value-taking flag
+    /// (`--session`) enters the pending-value branch on the next row; that
+    /// row's remainder can itself discover a *newer* pending flag
+    /// (`--keywords`). The old origin flag must not overwrite the newer
+    /// discovery, or the row after it (the wrapped keyword value) loses its
+    /// verified-continuation suppression and alerts on self-echo.
+    #[test]
+    fn collect_keyword_hits_preserves_newly_pending_flag_across_wrapped_argv_rows() {
+        let keyword = "panic";
+
+        // Exact three-row wrapped argv: head row ends with the value-taking
+        // `--session`, the second row both supplies that value and discovers
+        // `--keywords`, the third row is the wrapped keyword value. All three
+        // rows are the monitor's own command echo: zero hits.
+        let wrapped_three_rows = "boot
+clawhip tmux watch --session
+worker --keywords
+panic";
+        assert!(
+            collect_keyword_hits("boot", wrapped_three_rows, &[keyword.into()]).is_empty(),
+            "wrapped argv rows must not self-alert"
+        );
+
+        // The same three rows followed by a genuine application panic after
+        // the completed command: exactly one hit, on the application line.
+        let with_genuine_panic = "boot
+clawhip tmux watch --session
+worker --keywords
+panic
+panic: application failure";
+        let hits = collect_keyword_hits("boot", with_genuine_panic, &[keyword.into()]);
+        assert_eq!(hits.len(), 1, "genuine panic must be kept: {hits:?}");
+        assert_eq!(hits[0].line, "panic: application failure");
+        assert_eq!(hits[0].keyword, "panic");
+    }
     #[test]
     fn collect_keyword_hits_keeps_mid_line_application_occurrence_without_narration() {
         // A genuine application line mentioning the keyword mid-line with no
