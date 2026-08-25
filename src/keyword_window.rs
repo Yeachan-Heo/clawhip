@@ -105,7 +105,9 @@ fn collect_keyword_hits_from_lines(
 
     // Empty or whitespace-only keywords match every line at offset 0 and can
     // never advance a scan cursor; config accepts them, so the matcher must
-    // filter them out itself (issue #342 review blocker 1).
+    // filter them out itself (issue #342 review blocker 1). The filtered list
+    // feeds every consumer, including the line-level argv filter, so no
+    // suppression path ever sees a raw empty keyword.
     let normalized_keywords = keywords
         .iter()
         .filter(|keyword| !keyword.trim().is_empty())
@@ -114,6 +116,10 @@ fn collect_keyword_hits_from_lines(
     if normalized_keywords.is_empty() {
         return Vec::new();
     }
+    let match_keywords = normalized_keywords
+        .iter()
+        .map(|(keyword, _)| keyword.as_str())
+        .collect::<Vec<_>>();
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
 
@@ -123,7 +129,7 @@ fn collect_keyword_hits_from_lines(
         // Cursor 0 is the overlap-boundary context line (already-seen output
         // prepended for wrapped-predecessor classification); it never hits.
         let is_context_line = line_cursor == Some(0);
-        if should_ignore_launcher_line(line, keywords) {
+        if should_ignore_launcher_line(line, &match_keywords) {
             previous_line = Some(line);
             continue;
         }
@@ -286,13 +292,26 @@ fn contains_bounded(haystack: &str, needle: &str) -> bool {
     false
 }
 
-fn should_ignore_launcher_line(line: &str, keywords: &[String]) -> bool {
+fn should_ignore_launcher_line(line: &str, keywords: &[&str]) -> bool {
     let trimmed = strip_pane_frame_chrome(line);
     LAUNCHER_NOISE_PATTERNS
         .iter()
         .any(|pattern| trimmed.contains(pattern))
         || is_tmux_watch_command_echo(trimmed)
         || is_wrapped_monitor_command_fragment(trimmed, keywords)
+        || is_tmux_keyword_notify_echo(trimmed)
+}
+
+/// Self-echo of the mono notify path: `clawhip tmux keyword --session …
+/// --keyword <kw> --line "<kw text>"` (driven by the shipped
+/// integrations/tmux notify/scan scripts). The `--line` payload quotes the
+/// monitored keyword text itself, so without this rule the monitor alerts on
+/// its own notification echo.
+fn is_tmux_keyword_notify_echo(line: &str) -> bool {
+    let command = strip_shell_prompt(line);
+    command.starts_with("clawhip tmux keyword ")
+        && command.contains(" --keyword ")
+        && command.contains(" --line ")
 }
 
 /// Trim tmux/GUI frame chrome (box-drawing rails, soft-wrap markers) plus
@@ -356,7 +375,7 @@ const MONITOR_ARGV_FLAGS: &[&str] = &[
 /// the monitored keywords is carried as a keyword-flag value, so a runtime
 /// failure that merely starts with a flag token (`--format compact: <kw>`)
 /// still alerts.
-fn is_wrapped_monitor_command_fragment(line: &str, keywords: &[String]) -> bool {
+fn is_wrapped_monitor_command_fragment(line: &str, keywords: &[&str]) -> bool {
     let fragment = strip_shell_prompt(line);
     let first_token = fragment.split_whitespace().next().unwrap_or("");
     if !MONITOR_ARGV_FLAGS.contains(&first_token) {
@@ -375,8 +394,15 @@ fn is_wrapped_monitor_command_fragment(line: &str, keywords: &[String]) -> bool 
 }
 
 /// True when `lower_keyword` occurs in `lower_fragment` directly as the value
-/// of a keyword flag (`--keywords <kw>[,…]`, `keywords=<kw>[,…]`).
+/// of a keyword flag (`--keywords <kw>[,…]`, `keywords=<kw>[,…]`). An empty
+/// needle matches at every offset without advancing the scan cursor, so it is
+/// rejected outright rather than looping (same class as the matcher guard in
+/// `keyword_occurrences`).
 fn is_keyword_flag_value(lower_fragment: &str, lower_keyword: &str) -> bool {
+    if lower_keyword.is_empty() {
+        return false;
+    }
+
     let mut search_start = 0;
     while let Some(relative_start) = lower_fragment[search_start..].find(lower_keyword) {
         let start = search_start + relative_start;
@@ -439,19 +465,25 @@ fn is_keyword_self_match_occurrence(
     // Quoted mention, only in proven prose/narration context: the occurrence
     // is wrapped in backticks or matched quotes AND the surrounding line is
     // prose about the keyword (a narration cue or the live-watch summary
-    // vocabulary), not a structured runtime field. Bare JSON/logfmt values
-    // like `{"error":"<kw>"}` stay alertable (issue #342 review blocker 2).
+    // vocabulary), not a structured runtime field. Structured quoting is
+    // field syntax — the char before the opening quote is `=`/`{`/`,`/`:`
+    // (JSON `"k":"v"`, logfmt `k="v"`) — and never counts as a mention,
+    // even when a narration cue is adjacent on this or the previous line
+    // (issue #342 review blocker 2 and re-review finding F2).
     let before = line[..occurrence_start].chars().next_back();
     let after = line[occurrence_end..].chars().next();
+    let before_quote = before
+        .and_then(|open| line[..occurrence_start].strip_suffix(open))
+        .and_then(|stripped| stripped.chars().next_back());
     if let (Some(open), Some(close)) = (before, after)
         && matches!(open, '`' | '\'' | '"')
         && open == close
+        && !matches!(before_quote, Some('=') | Some('{') | Some(',') | Some(':'))
         && (is_prose_about_keyword(line, lower_line, occurrence_start)
             || previous_line_is_narration_context(previous_line))
     {
         return true;
     }
-
     // Monitor status summary: `… <kw> — N live watch …` (em-dash directly
     // after the keyword plus the live-watch vocabulary on the same line).
     // `lower_line` comes from the caller, avoiding a per-occurrence
@@ -501,6 +533,14 @@ fn is_keyword_self_match_occurrence(
             // argv and never suppresses the next line, whatever its shape
             // (issue #342 review blocker 3; failure-shape guessing proved
             // insufficient: it still ate non-colon JSON failures).
+            //
+            // Accepted residual risk: a genuine keyword-initial runtime line
+            // that continues with monitor-named flags (e.g.
+            // `owner-endpoint-unreachable --attach --follow`) after a
+            // verified monitor argv predecessor is suppressed. There is no
+            // structural discriminator between that and the monitor's own
+            // wrapped `--keywords <value> --flag …` echo tail; the trade is
+            // pinned by test and accepted to keep wrapped self-echo quiet.
             let previous_tokens = dechromed_previous.split_whitespace().collect::<Vec<_>>();
             let previous_has_monitor_flag_chain = previous_tokens
                 .iter()
@@ -931,6 +971,71 @@ owner-endpoint-unreachable: runtime owner failed";
             hits[0].line,
             "owner-endpoint-unreachable: runtime owner failed"
         );
+
+        // The argv-fragment path (is_keyword_flag_value) must terminate too:
+        // a wrapped monitor echo containing a real keyword alongside an
+        // empty one must neither hang nor emit (re-review finding F1).
+        let wrapped_echo_current =
+            "boot\n│ --stale-minutes 60 --format compact --keywords owner-endpoint-unreachable │";
+        let echo_hits = collect_keyword_hits(
+            "boot",
+            wrapped_echo_current,
+            &["owner-endpoint-unreachable".into(), "".into()],
+        );
+        assert!(echo_hits.is_empty(), "got {echo_hits:?}");
+    }
+
+    /// Re-review finding F2: cue-adjacent structured output must still alert
+    /// — the field-syntax gate keeps quote suppression off JSON/logfmt values
+    /// even when a narration cue precedes on the previous line or shares the
+    /// line.
+    #[test]
+    fn collect_keyword_hits_keeps_structured_output_adjacent_to_narration_cues() {
+        // Cue on the previous line, JSON failure on this line.
+        let json_after_cue = collect_keyword_hits(
+            "boot\nfailures such as:",
+            "failures such as:\n{\"error\":\"owner-endpoint-unreachable\"}",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert_eq!(
+            json_after_cue.len(),
+            1,
+            "cue-adjacent JSON must alert: got {json_after_cue:?}"
+        );
+
+        // Cue on the previous line, logfmt failure on this line.
+        let logfmt_after_cue = collect_keyword_hits(
+            "boot\nerrors were logged, such as",
+            "errors were logged, such as\nmsg=\"owner-endpoint-unreachable: runtime owner failed\"",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert_eq!(
+            logfmt_after_cue.len(),
+            1,
+            "cue-adjacent logfmt must alert: got {logfmt_after_cue:?}"
+        );
+
+        // Prose backtick mention after the same cue stays suppressed.
+        let mention_after_cue = collect_keyword_hits(
+            "boot\nfailures such as:",
+            "failures such as:\nsee `owner-endpoint-unreachable` above",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert!(mention_after_cue.is_empty(), "got {mention_after_cue:?}");
+    }
+
+    /// Re-review finding F3: the mono notify path's own echo
+    /// (`clawhip tmux keyword ... --line "<kw text>"`) is a self-match.
+    #[test]
+    fn collect_keyword_hits_ignores_mono_keyword_notify_echo() {
+        let current = "boot
+clawhip tmux keyword --session omx --keyword panic --line \"panic: runtime panic in worker\"
+panic: genuine application panic";
+
+        let hits = collect_keyword_hits("boot", current, &["panic".into()]);
+
+        assert_eq!(hits.len(), 1, "got {hits:?}");
+        assert_eq!(hits[0].line, "panic: genuine application panic");
     }
 
     /// Review blocker 2: quoted structured runtime output (JSON/logfmt) is a
