@@ -1009,6 +1009,80 @@ async fn save_durable_tmux_registry(
     Ok(durable.len())
 }
 
+/// Tombstone schema for reconciled-away tmux watch registrations (#341).
+pub const TMUX_WATCH_AUDIT_SCHEMA: &str = "clawhip.tmux-watch-audit.v1";
+
+/// Bounded tombstone audit: oldest entries are dropped once this many exist,
+/// mirroring the gjc lane audit policy. Audit evidence is kept separate from
+/// the active registry so it can never resurrect as a ghost registration.
+const MAX_TMUX_WATCH_AUDIT_ENTRIES: usize = 256;
+
+/// Bounded, public-safe tombstone for a watch registration reconciled out of
+/// the active registry. Records who owned the watch and when it was retired
+/// without persisting pane text or routing payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TmuxWatchAuditEntry {
+    at: String,
+    session: String,
+    reason: String,
+    registration_source: String,
+    registered_at: String,
+    wrapper_owned: bool,
+    parent_pid: Option<u32>,
+    parent_name: Option<String>,
+    registration_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TmuxWatchAuditFile {
+    schema: String,
+    entries: Vec<TmuxWatchAuditEntry>,
+    dropped: u64,
+}
+
+impl Default for TmuxWatchAuditFile {
+    fn default() -> Self {
+        Self {
+            schema: TMUX_WATCH_AUDIT_SCHEMA.to_string(),
+            entries: Vec::new(),
+            dropped: 0,
+        }
+    }
+}
+
+/// Tombstone file kept beside the durable registry state.
+fn tmux_watch_audit_path(registry_state_path: &Path) -> PathBuf {
+    registry_state_path.with_extension("audit.json")
+}
+
+/// Append tombstones to the bounded audit file. Best-effort: a corrupt or
+/// unreadable file restarts the trail instead of blocking reconciliation,
+/// and the durable registry save has already happened by the time this runs.
+async fn record_tmux_watch_audit(path: &Path, appended: Vec<TmuxWatchAuditEntry>) -> Result<()> {
+    let mut audit = match tokio::fs::read(path).await {
+        Ok(content) => serde_json::from_slice::<TmuxWatchAuditFile>(&content).unwrap_or_default(),
+        Err(_) => TmuxWatchAuditFile::default(),
+    };
+    audit.schema = TMUX_WATCH_AUDIT_SCHEMA.to_string();
+    audit.entries.extend(appended);
+    if audit.entries.len() > MAX_TMUX_WATCH_AUDIT_ENTRIES {
+        let overflow = audit.entries.len() - MAX_TMUX_WATCH_AUDIT_ENTRIES;
+        audit.entries.drain(0..overflow);
+        audit.dropped += overflow as u64;
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let content = serde_json::to_vec_pretty(&audit)?;
+    let tmp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp_path, content).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
 pub async fn load_tmux_registry_state(
     path: &Path,
     registry: &SharedTmuxRegistry,
@@ -1075,6 +1149,54 @@ pub async fn load_tmux_registry_state(
             last_error: Some(error.to_string()),
         },
     }
+}
+
+/// Restart reconciliation (#341): after the durable registry is restored,
+/// reconcile runtime-gone dynamic registrations out of the active set so a
+/// daemon restart cannot resurrect ghost watches. The authoritative tmux
+/// session inventory is the lifecycle authority — never pane text. Only a
+/// definitive `Sessions` observation is acted on: with no server or a probe
+/// failure the source poll loop performs the identical reconciliation once
+/// evidence is available. Live registrations, config-monitor entries, and
+/// in-flight lane evidence are untouched.
+pub async fn reconcile_restored_tmux_registry(
+    registry: &SharedTmuxRegistry,
+    registry_state_path: &Path,
+) -> Result<usize> {
+    let sessions = match list_tmux_sessions().await {
+        Ok(TmuxSessionInventory::Sessions(sessions)) => sessions,
+        Ok(TmuxSessionInventory::NoServer) => return Ok(0),
+        Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                None,
+                Some(error.to_string()),
+            ));
+            eprintln!("clawhip source tmux restart reconcile skipped: {error}");
+            return Ok(0);
+        }
+    };
+    let snapshot = registry.read().await;
+    let mut candidates: Vec<AbsentRegistrationCandidate> = snapshot
+        .iter()
+        .filter(|(session, registration)| {
+            !sessions.contains(*session) && registration_is_reconcilable(registration)
+        })
+        .map(|(session, registration)| AbsentRegistrationCandidate {
+            session: session.clone(),
+            registration_generation: registration.registration_generation,
+        })
+        .collect();
+    drop(snapshot);
+    candidates.sort_by(|a, b| a.session.cmp(&b.session));
+    prune_absent_dynamic_registrations_with_reason(
+        registry,
+        registry_state_path,
+        &candidates,
+        "tmux session absent at daemon restart reconcile",
+    )
+    .await
 }
 
 pub async fn inspect_tmux_registry_state(path: &Path) -> TmuxRegistryStateDiagnostics {
@@ -1154,7 +1276,6 @@ pub async fn remove_tmux_registrations(
                     .lane
                     .as_ref()
                     .is_some_and(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced)
-                || (registration.lane.is_none() && registration_is_ownerless(registration))
         });
 
         if removable && next.remove(session).is_some() {
@@ -1179,15 +1300,28 @@ pub struct AbsentRegistrationCandidate {
     pub registration_generation: u64,
 }
 
-fn registration_is_ownerless(registration: &RegisteredTmuxSession) -> bool {
-    !registration.active_wrapper_monitor && registration.parent_process.is_none()
+/// Prune rule (#341): a dynamic watch registration is reconciled out of the
+/// active registry when its tmux session is definitively absent — session
+/// absence is the lifecycle authority, never pane text. Recorded wrapper
+/// ownership (`active_wrapper_monitor`, `parent_process`) does not retain a
+/// watch whose session no longer exists: wrapper processes exit without
+/// deregistering (kill, crash, closed lane), and a persisted parent pid is
+/// only the pid of the process that launched `clawhip tmux watch`, not proof
+/// of a live watch. Bounded tombstone evidence is written to the audit trail
+/// beside the registry so removal is auditable and reversible in review.
+fn registration_is_reconcilable(registration: &RegisteredTmuxSession) -> bool {
+    registration.registration_source != RegistrationSource::ConfigMonitor
+        && registration
+            .lane
+            .as_ref()
+            .is_none_or(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced)
 }
 
-/// Prune daemon-owned dynamic registrations and explicitly retired/quiesced
-/// lane registrations whose tmux session has been observed absent. Active and
-/// handoff lane evidence is preserved regardless of liveness to avoid
-/// destroying in-flight R0/R1/R2 lane evidence that is expected to exist
-/// before the tmux session is created.
+/// Prune dynamic (non-config-monitor) registrations and explicitly
+/// retired/quiesced lane registrations whose tmux session has been observed
+/// absent. Active and handoff lane evidence is preserved regardless of
+/// liveness to avoid destroying in-flight R0/R1/R2 lane evidence that is
+/// expected to exist before the tmux session is created.
 ///
 /// Config-monitor registrations are never selected or removed by this
 /// function — they are reconciled declaratively via
@@ -1197,6 +1331,21 @@ pub async fn prune_absent_dynamic_registrations(
     path: &Path,
     candidates: &[AbsentRegistrationCandidate],
 ) -> Result<usize> {
+    prune_absent_dynamic_registrations_with_reason(
+        registry,
+        path,
+        candidates,
+        "tmux session absent",
+    )
+    .await
+}
+
+pub async fn prune_absent_dynamic_registrations_with_reason(
+    registry: &SharedTmuxRegistry,
+    path: &Path,
+    candidates: &[AbsentRegistrationCandidate],
+    reason: &str,
+) -> Result<usize> {
     if candidates.is_empty() {
         return Ok(0);
     }
@@ -1204,27 +1353,45 @@ pub async fn prune_absent_dynamic_registrations(
     let mut next = registry.read().await.clone();
     let mut removed = 0;
     let mut first_removed: Option<&str> = None;
+    let mut tombstones: Vec<TmuxWatchAuditEntry> = Vec::new();
+    let removed_at = current_timestamp_rfc3339();
     for candidate in candidates {
         let removable = next.get(&candidate.session).is_some_and(|registration| {
             registration.registration_generation == candidate.registration_generation
-                && registration.registration_source != RegistrationSource::ConfigMonitor
-                && registration
-                    .lane
-                    .as_ref()
-                    .is_none_or(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced)
-                && (registration.lane.is_some() || registration_is_ownerless(registration))
+                && registration_is_reconcilable(registration)
         });
 
-        if removable && next.remove(&candidate.session).is_some() {
+        if removable && let Some(registration) = next.remove(&candidate.session) {
             if first_removed.is_none() {
                 first_removed = Some(candidate.session.as_str());
             }
             removed += 1;
+            tombstones.push(TmuxWatchAuditEntry {
+                at: removed_at.clone(),
+                session: registration.session.clone(),
+                reason: reason.to_string(),
+                registration_source: registration.registration_source.as_str().to_string(),
+                registered_at: registration.registered_at.clone(),
+                wrapper_owned: registration.active_wrapper_monitor,
+                parent_pid: registration
+                    .parent_process
+                    .as_ref()
+                    .map(|parent| parent.pid),
+                parent_name: registration
+                    .parent_process
+                    .as_ref()
+                    .and_then(|parent| parent.name.clone()),
+                registration_generation: registration.registration_generation,
+            });
         }
     }
     if removed > 0 {
         save_durable_tmux_registry(path, &next).await?;
         *registry.write().await = next;
+        if let Err(error) = record_tmux_watch_audit(&tmux_watch_audit_path(path), tombstones).await
+        {
+            eprintln!("clawhip tmux watch audit append failed: {error}");
+        }
         let mut record = source_record(
             telemetry::event_name::SOURCE_INVENTORY,
             "dynamic_registration_pruned_absent",
@@ -1820,36 +1987,31 @@ pub async fn list_active_tmux_registrations(
             // reconciliation so the generation captured for each candidate
             // matches the liveness observation.
             let snapshot = registry.read().await;
-            let retired_lane_candidates: Vec<AbsentRegistrationCandidate> = snapshot
+            // Absent dynamic registrations (wrapper-owned or ownerless) and
+            // retired/quiesced lanes are reconciled out of the active
+            // registry (#341): the tmux session inventory is the lifecycle
+            // authority, never pane text. Config-monitor entries are excluded
+            // — they are reconciled declaratively above.
+            let mut absent_candidates: Vec<AbsentRegistrationCandidate> = snapshot
                 .iter()
                 .filter(|(session, registration)| {
                     !available_sessions.contains(*session)
-                        && registration.lane.as_ref().is_some_and(|lane| {
-                            lane.workflow == LaneWorkflow::Retired && lane.quiesced
-                        })
+                        && registration_is_reconcilable(registration)
                 })
                 .map(|(session, registration)| AbsentRegistrationCandidate {
                     session: session.clone(),
                     registration_generation: registration.registration_generation,
                 })
                 .collect();
-            let mut orphaned_candidates: Vec<AbsentRegistrationCandidate> = snapshot
-                .iter()
-                .filter(|(session, registration)| {
-                    !available_sessions.contains(*session)
-                        && registration.registration_source != RegistrationSource::ConfigMonitor
-                        && registration.lane.is_none()
-                        && registration_is_ownerless(registration)
-                })
-                .map(|(session, registration)| AbsentRegistrationCandidate {
-                    session: session.clone(),
-                    registration_generation: registration.registration_generation,
-                })
-                .collect();
-            orphaned_candidates.extend(retired_lane_candidates);
+            absent_candidates.sort_by(|a, b| a.session.cmp(&b.session));
             drop(snapshot);
-            prune_absent_dynamic_registrations(registry, registry_state_path, &orphaned_candidates)
-                .await?;
+            prune_absent_dynamic_registrations_with_reason(
+                registry,
+                registry_state_path,
+                &absent_candidates,
+                "tmux session absent from list-sessions inventory",
+            )
+            .await?;
         }
         Err(error) => {
             telemetry::emit(source_record(
@@ -1928,14 +2090,12 @@ async fn poll_tmux(
                     Some(session_name),
                     None,
                 ));
-                let retired_lane = registration
-                    .lane
-                    .as_ref()
-                    .is_some_and(|lane| lane.workflow == LaneWorkflow::Retired && lane.quiesced);
-                if registration.registration_source != RegistrationSource::ConfigMonitor
-                    && ((registration.lane.is_none() && registration_is_ownerless(registration))
-                        || retired_lane)
-                {
+                // Session absence is definitive (#341): reconcile dynamic
+                // registrations — including wrapper-owned ones — out of the
+                // active registry. Only config monitors keep a durable
+                // session-less registration; they are reconciled
+                // declaratively and never pruned here.
+                if registration_is_reconcilable(registration) {
                     dynamic_prune_candidates.push(AbsentRegistrationCandidate {
                         session: session_name.clone(),
                         registration_generation: registration.registration_generation,
@@ -2084,10 +2244,11 @@ async fn poll_tmux(
         remove_tmux_registrations(registry, registry_state_path, &sessions_to_unregister).await?;
     }
     if !dynamic_prune_candidates.is_empty() {
-        prune_absent_dynamic_registrations(
+        prune_absent_dynamic_registrations_with_reason(
             registry,
             registry_state_path,
             &dynamic_prune_candidates,
+            "tmux session absent from has-session probe",
         )
         .await?;
     }
@@ -4427,13 +4588,10 @@ error: failed";
     }
 
     #[tokio::test]
-    async fn prune_absent_dynamic_preserves_live_owner_then_removes_ownerless_registration() {
+    async fn prune_absent_dynamic_removes_wrapper_owned_ghost_and_writes_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
         let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
-        let path = std::env::temp_dir().join(format!(
-            "clawhip-test-prune-cliwatch-{}.json",
-            std::process::id()
-        ));
-        let _ = tokio::fs::remove_file(&path).await;
         let registration = RegisteredTmuxSession {
             session: "dead-watch".into(),
             channel: Some("alerts".into()),
@@ -4447,11 +4605,10 @@ error: failed";
             registration_source: RegistrationSource::CliWatch,
             parent_process: Some(ParentProcessInfo {
                 pid: 42,
-                name: Some("clawhip-wrapper".into()),
+                name: Some("create.sh".into()),
             }),
-            registration_generation: 0,
+            registration_generation: 7,
             active_wrapper_monitor: true,
-
             lane: None,
         };
         registry
@@ -4460,35 +4617,30 @@ error: failed";
             .insert("dead-watch".into(), registration);
         let candidates = vec![AbsentRegistrationCandidate {
             session: "dead-watch".into(),
-            registration_generation: 0,
+            registration_generation: 7,
         }];
-        let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
-            .await
-            .unwrap();
-        assert_eq!(removed, 0);
-        assert!(registry.read().await.contains_key("dead-watch"));
-        registry
-            .write()
-            .await
-            .get_mut("dead-watch")
-            .unwrap()
-            .active_wrapper_monitor = false;
-        let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
-            .await
-            .unwrap();
-        assert_eq!(removed, 0);
-        registry
-            .write()
-            .await
-            .get_mut("dead-watch")
-            .unwrap()
-            .parent_process = None;
         let removed = prune_absent_dynamic_registrations(&registry, &path, &candidates)
             .await
             .unwrap();
         assert_eq!(removed, 1);
         assert!(registry.read().await.get("dead-watch").is_none());
-        let _ = tokio::fs::remove_file(&path).await;
+        // Durable registry no longer carries the ghost.
+        let persisted: BTreeMap<String, StoredTmuxRegistration> =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert!(!persisted.contains_key("dead-watch"));
+        // Bounded tombstone evidence is retained separately.
+        let audit_path = tmux_watch_audit_path(&path);
+        let audit: TmuxWatchAuditFile =
+            serde_json::from_slice(&tokio::fs::read(&audit_path).await.unwrap()).unwrap();
+        assert_eq!(audit.schema, TMUX_WATCH_AUDIT_SCHEMA);
+        assert_eq!(audit.entries.len(), 1);
+        let entry = &audit.entries[0];
+        assert_eq!(entry.session, "dead-watch");
+        assert_eq!(entry.registration_source, "cli-watch");
+        assert_eq!(entry.registration_generation, 7);
+        assert!(entry.wrapper_owned);
+        assert_eq!(entry.parent_pid, Some(42));
+        assert_eq!(entry.reason, "tmux session absent");
     }
 
     #[tokio::test]
@@ -4529,6 +4681,229 @@ error: failed";
         assert_eq!(removed, 0);
         assert!(registry.read().await.get("config-mon").is_some());
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn restart_reconcile_removes_absent_dynamics_and_keeps_live_and_config() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("registry.json");
+        let stub = dir.path().join("tmux-restart-stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"list-sessions\" ]; then printf 'live-watch\\n'; exit 0; fi\nexit 1\n",
+        )
+        .expect("write tmux restart stub");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod tmux restart stub");
+
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut ghost = registration(Vec::new());
+        ghost.session = "ghost-watch".into();
+        ghost.registration_source = RegistrationSource::CliWatch;
+        ghost.parent_process = Some(ParentProcessInfo {
+            pid: 905215,
+            name: Some("create.sh".into()),
+        });
+        ghost.active_wrapper_monitor = true;
+        ghost.registration_generation = 7;
+        let mut live = registration(Vec::new());
+        live.session = "live-watch".into();
+        live.registration_source = RegistrationSource::CliWatch;
+        live.registration_generation = 8;
+        let mut config_monitor = registration(Vec::new());
+        config_monitor.session = "config-mon".into();
+        config_monitor.registration_source = RegistrationSource::ConfigMonitor;
+        config_monitor.registration_generation = 9;
+        {
+            let mut write = registry.write().await;
+            write.insert(ghost.session.clone(), ghost);
+            write.insert(live.session.clone(), live);
+            write.insert(config_monitor.session.clone(), config_monitor);
+        }
+
+        let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
+        unsafe {
+            std::env::set_var("CLAWHIP_TMUX_BIN", &stub);
+        }
+        let removed = reconcile_restored_tmux_registry(&registry, &path)
+            .await
+            .unwrap();
+        unsafe {
+            match prior_tmux_bin {
+                Some(value) => std::env::set_var("CLAWHIP_TMUX_BIN", value),
+                None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+            }
+        }
+
+        assert_eq!(removed, 1);
+        let snapshot = registry.read().await;
+        assert!(snapshot.get("ghost-watch").is_none());
+        assert!(snapshot.get("live-watch").is_some());
+        assert!(snapshot.get("config-mon").is_some());
+        // Tombstone evidence survives the restart reconcile.
+        let audit: TmuxWatchAuditFile =
+            serde_json::from_slice(&tokio::fs::read(tmux_watch_audit_path(&path)).await.unwrap())
+                .unwrap();
+        assert_eq!(audit.entries.len(), 1);
+        assert_eq!(audit.entries[0].session, "ghost-watch");
+        assert!(audit.entries[0].wrapper_owned);
+        assert_eq!(
+            audit.entries[0].reason,
+            "tmux session absent at daemon restart reconcile"
+        );
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test]
+    async fn restart_reconcile_is_noop_on_probe_failure_and_no_server() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("registry.json");
+        let failing = dir.path().join("tmux-fail-stub.sh");
+        std::fs::write(&failing, "#!/bin/sh\nexit 3\n").expect("write failing stub");
+        let no_server = dir.path().join("tmux-noserver-stub.sh");
+        std::fs::write(
+            &no_server,
+            "#!/bin/sh\nif [ \"$1\" = \"list-sessions\" ]; then echo 'no server running on /tmp/tmux-1000/default' >&2; exit 1; fi\nexit 1\n",
+        )
+        .expect("write no-server stub");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod failing stub");
+        std::fs::set_permissions(&no_server, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod no-server stub");
+
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut ghost = registration(Vec::new());
+        ghost.session = "ghost-watch".into();
+        ghost.registration_source = RegistrationSource::CliWatch;
+        ghost.active_wrapper_monitor = true;
+        ghost.registration_generation = 7;
+        registry.write().await.insert("ghost-watch".into(), ghost);
+
+        for stub in [&failing, &no_server] {
+            let prior_tmux_bin = std::env::var("CLAWHIP_TMUX_BIN").ok();
+            unsafe {
+                std::env::set_var("CLAWHIP_TMUX_BIN", stub);
+            }
+            let removed = reconcile_restored_tmux_registry(&registry, &path)
+                .await
+                .unwrap();
+            unsafe {
+                match prior_tmux_bin {
+                    Some(value) => std::env::set_var("CLAWHIP_TMUX_BIN", value),
+                    None => std::env::remove_var("CLAWHIP_TMUX_BIN"),
+                }
+            }
+            assert_eq!(removed, 0, "no definitive inventory, nothing removed");
+        }
+        assert!(registry.read().await.contains_key("ghost-watch"));
+    }
+
+    #[tokio::test]
+    async fn watch_audit_trail_is_bounded() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("audit.json");
+        let entries: Vec<TmuxWatchAuditEntry> = (0..(MAX_TMUX_WATCH_AUDIT_ENTRIES + 50))
+            .map(|index| TmuxWatchAuditEntry {
+                at: format!("2026-08-25T00:00:{index:02}Z"),
+                session: format!("sess-{index}"),
+                reason: "tmux session absent".into(),
+                registration_source: "cli-watch".into(),
+                registered_at: "2026-08-01T00:00:00Z".into(),
+                wrapper_owned: true,
+                parent_pid: Some(index as u32),
+                parent_name: None,
+                registration_generation: index as u64,
+            })
+            .collect();
+        record_tmux_watch_audit(&path, entries).await.unwrap();
+        let audit: TmuxWatchAuditFile =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(audit.entries.len(), MAX_TMUX_WATCH_AUDIT_ENTRIES);
+        assert!(audit.dropped > 0);
+        // Oldest entries were dropped, newest retained.
+        assert_eq!(audit.entries[0].session, "sess-50");
+        assert_eq!(
+            audit.entries.last().unwrap().session,
+            format!("sess-{}", MAX_TMUX_WATCH_AUDIT_ENTRIES + 49)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_registration_that_arrives_after_observation() {
+        // Race: the absent-session observation was taken at generation 7, but
+        // a wrapper re-registered (generation 42) before the prune ran. The
+        // stale candidate must not remove the fresh registration.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut fresh = registration(Vec::new());
+        fresh.session = "raced-watch".into();
+        fresh.registration_source = RegistrationSource::CliWatch;
+        fresh.registration_generation = 42;
+        registry.write().await.insert("raced-watch".into(), fresh);
+
+        let removed = prune_absent_dynamic_registrations_with_reason(
+            &registry,
+            &path,
+            &[AbsentRegistrationCandidate {
+                session: "raced-watch".into(),
+                registration_generation: 7,
+            }],
+            "tmux session absent",
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 0);
+        assert!(registry.read().await.contains_key("raced-watch"));
+        // No durable save or tombstone happened.
+        assert!(tokio::fs::read(&path).await.is_err());
+        assert!(tokio::fs::read(tmux_watch_audit_path(&path)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn re_registration_after_ghost_removal_succeeds() {
+        // A wrapper may legitimately re-register the same session name after
+        // the ghost was reconciled away (e.g. tmux session recreated).
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("registry.json");
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut removed_ghost = registration(Vec::new());
+        removed_ghost.session = "rebind-watch".into();
+        removed_ghost.registration_source = RegistrationSource::CliWatch;
+        removed_ghost.registration_generation = 7;
+        registry
+            .write()
+            .await
+            .insert("rebind-watch".into(), removed_ghost);
+        prune_absent_dynamic_registrations(
+            &registry,
+            &path,
+            &[AbsentRegistrationCandidate {
+                session: "rebind-watch".into(),
+                registration_generation: 7,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let mut fresh = registration(Vec::new());
+        fresh.session = "rebind-watch".into();
+        fresh.registration_source = RegistrationSource::CliWatch;
+        fresh.active_wrapper_monitor = true;
+        fresh.parent_process = Some(ParentProcessInfo {
+            pid: 4242,
+            name: Some("create.sh".into()),
+        });
+        let durable = register_runtime_tmux_registration(&registry, &path, fresh)
+            .await
+            .unwrap();
+        assert_eq!(durable, 1);
+        assert!(registry.read().await.contains_key("rebind-watch"));
     }
 
     #[tokio::test]

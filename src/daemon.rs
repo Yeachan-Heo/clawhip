@@ -51,8 +51,8 @@ use crate::source::{
     SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
     default_github_ci_baseline_path, default_registry_state_path, inspect_tmux_registry_state,
     list_active_tmux_registrations, load_tmux_registry_state, new_shared_git_monitor_diagnostics,
-    register_runtime_tmux_registration, snapshot_git_monitor_diagnostics,
-    tmux_registry_diagnostics,
+    reconcile_restored_tmux_registry, register_runtime_tmux_registration,
+    snapshot_git_monitor_diagnostics, tmux_registry_diagnostics,
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
@@ -186,6 +186,15 @@ pub async fn run(
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
     let tmux_registry_state_path = default_registry_state_path(&cron_state_path);
     load_tmux_registry_state(&tmux_registry_state_path, &tmux_registry).await;
+    // #341: reconcile runtime-gone dynamic registrations out of the restored
+    // active set before the daemon serves or polls, so a restart cannot
+    // resurrect persisted ghost watches. Reconciled entries leave bounded
+    // tombstone evidence in the audit trail beside the registry state.
+    if let Err(error) =
+        reconcile_restored_tmux_registry(&tmux_registry, &tmux_registry_state_path).await
+    {
+        eprintln!("clawhip tmux restart reconcile failed: {error}");
+    }
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
     let native_observability = new_shared_native_hook_observability();
     let subscriptions = new_subscription_registry(config.as_ref(), tx.clone()).await;
