@@ -491,25 +491,32 @@ fn is_keyword_self_match_occurrence(
                 return true;
             }
 
-            // Wrapped `--keywords <value>` continuation: the previous line
-            // ends with the `--keywords`/`--keyword` flag itself and this
-            // line begins with that flag's value. Verified monitor argv is
-            // sufficient; otherwise (an application's own `logged option
-            // --keywords` log) the continuation is accepted only when this
-            // line is NOT failure-shaped — the keyword must not be followed
-            // by `: message`, so a genuine runtime failure still alerts
-            // (issue #342 review blocker 3).
+            // Wrapped `--keywords <value>` continuation requires explicit,
+            // verified monitor argv state: the previous line ends with the
+            // `--keywords`/`--keyword` flag AND carries a further monitor
+            // argv flag before it (the wrapped tail of the monitor's own
+            // command, e.g. `… │ --stale-minutes 60 --format compact
+            // --keywords`). A line whose only monitor token is the trailing
+            // `--keywords` — an application's own option log — is not monitor
+            // argv and never suppresses the next line, whatever its shape
+            // (issue #342 review blocker 3; failure-shape guessing proved
+            // insufficient: it still ate non-colon JSON failures).
             let previous_tokens = dechromed_previous.split_whitespace().collect::<Vec<_>>();
-            let previous_is_monitor_argv = previous_tokens
+            let previous_has_monitor_flag_chain = previous_tokens
+                .iter()
+                .take(previous_tokens.len().saturating_sub(1))
+                .any(|token| MONITOR_ARGV_FLAGS.contains(token));
+            // A pure-argv line consisting solely of monitor flags (a lone
+            // wrapped `--keywords`) is also verified monitor context.
+            let previous_is_pure_monitor_argv = previous_tokens
                 .first()
                 .is_some_and(|token| MONITOR_ARGV_FLAGS.contains(token))
-                && dechromed_previous.chars().all(is_monitor_argv_char);
-            let line_is_failure_shaped = line[occurrence_end..]
-                .chars()
-                .next()
-                .is_some_and(|ch| ch == ':');
-            if (lower_previous.ends_with("--keywords") || lower_previous.ends_with("--keyword"))
-                && (previous_is_monitor_argv || !line_is_failure_shaped)
+                && dechromed_previous.chars().all(is_monitor_argv_char)
+                && previous_tokens
+                    .iter()
+                    .all(|token| MONITOR_ARGV_FLAGS.contains(token));
+            if (previous_has_monitor_flag_chain || previous_is_pure_monitor_argv)
+                && (lower_previous.ends_with("--keywords") || lower_previous.ends_with("--keyword"))
             {
                 return true;
             }
@@ -981,8 +988,9 @@ owner-endpoint-unreachable: runtime owner failed";
             "owner-endpoint-unreachable: runtime owner failed"
         );
 
-        // The same prose predecessor still suppresses a non-failure-shaped
-        // flag-value continuation (wrapped echo fragment).
+        // The same prose predecessor must NOT suppress any non-argv
+        // continuation either — including a flag-shaped echo line, because
+        // "application logged option" is not verified monitor argv.
         let wrapped_echo = collect_keyword_hits(
             "boot",
             "boot
@@ -990,9 +998,24 @@ application logged option --keywords
 owner-endpoint-unreachable --channel 1508831529856663612",
             &["owner-endpoint-unreachable".into()],
         );
-        assert!(
-            wrapped_echo.is_empty(),
-            "non-failure continuation should stay suppressed, got {wrapped_echo:?}"
+        assert_eq!(
+            wrapped_echo.len(),
+            1,
+            "unrelated prior cue must never suppress: got {wrapped_echo:?}"
+        );
+
+        // Structured (non-colon) failure after the unrelated cue also alerts.
+        let json_after_cue = collect_keyword_hits(
+            "boot",
+            "boot
+application logged option --keywords
+{\"error\":\"owner-endpoint-unreachable\",\"message\":\"runtime owner failed\"}",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert_eq!(
+            json_after_cue.len(),
+            1,
+            "structured failure after unrelated cue must alert: got {json_after_cue:?}"
         );
 
         // A verified monitor argv predecessor ending in `--keywords` keeps
@@ -1053,6 +1076,59 @@ owner-endpoint-unreachable --channel 1508831529856663612",
             kept[0].line,
             "owner-endpoint-unreachable: runtime owner failed"
         );
+    }
+    /// Snapshot-boundary safety: identical snapshots, full overlap, no
+    /// overlap, and empty snapshots must neither emit nor panic.
+    #[test]
+    fn collect_keyword_hits_handles_snapshot_boundaries() {
+        let kw = &["owner-endpoint-unreachable".into()];
+
+        // current == previous: nothing appended.
+        assert!(collect_keyword_hits("a\nb\nc", "a\nb\nc", kw).is_empty());
+
+        // Full overlap: current is a strict scroll of previous.
+        assert!(collect_keyword_hits("x\na\nb\nc", "a\nb\nc", kw).is_empty());
+
+        // No overlap at all: everything is fresh.
+        let fresh = collect_keyword_hits(
+            "old",
+            "owner-endpoint-unreachable: runtime owner failed",
+            kw,
+        );
+        assert_eq!(fresh.len(), 1);
+
+        // Empty previous snapshot: everything is fresh, context line absent.
+        let from_empty = collect_keyword_hits(
+            "",
+            "boot\nowner-endpoint-unreachable: runtime owner failed",
+            kw,
+        );
+        assert_eq!(from_empty.len(), 1);
+        assert_eq!(
+            from_empty[0].line,
+            "owner-endpoint-unreachable: runtime owner failed"
+        );
+
+        // Empty current snapshot: no hits, no panic.
+        assert!(collect_keyword_hits("boot\nkw line", "", kw).is_empty());
+
+        // Provenance cursor numbering starts at the first appended line and
+        // the overlap context line cannot itself emit (cursor 0 excluded).
+        let hits = collect_keyword_hits_with_provenance(
+            "keep\nplain line",
+            "keep\nplain line\nowner-endpoint-unreachable: runtime owner failed",
+            kw,
+            KeywordMatchProvenance {
+                pane_id: "%2".into(),
+                pane_name: "0.1".into(),
+                cursor: None,
+                source: KeywordMatchSource::FreshOutput,
+            },
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].provenance.as_ref().unwrap().pane_id, "%2");
+        assert_eq!(hits[0].provenance.as_ref().unwrap().pane_name, "0.1");
+        assert_eq!(hits[0].provenance.as_ref().unwrap().cursor, Some(3));
     }
 
     /// Unicode/non-ASCII safety: occurrence offsets are computed on an
