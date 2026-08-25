@@ -71,7 +71,7 @@ pub fn collect_keyword_hits(previous: &str, current: &str, keywords: &[String]) 
     collect_keyword_hits_from_lines(
         appended_lines_with_cursors(previous, current)
             .into_iter()
-            .map(|(_, line)| (None, line))
+            .map(|(cursor, line)| (Some(cursor), line))
             .collect(),
         keywords,
         None,
@@ -103,16 +103,26 @@ fn collect_keyword_hits_from_lines(
         return Vec::new();
     }
 
+    // Empty or whitespace-only keywords match every line at offset 0 and can
+    // never advance a scan cursor; config accepts them, so the matcher must
+    // filter them out itself (issue #342 review blocker 1).
     let normalized_keywords = keywords
         .iter()
+        .filter(|keyword| !keyword.trim().is_empty())
         .map(|keyword| (keyword.clone(), keyword.to_ascii_lowercase()))
         .collect::<Vec<_>>();
+    if normalized_keywords.is_empty() {
+        return Vec::new();
+    }
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
 
     let mut previous_line: Option<&str> = None;
 
     for (line_cursor, line) in lines {
+        // Cursor 0 is the overlap-boundary context line (already-seen output
+        // prepended for wrapped-predecessor classification); it never hits.
+        let is_context_line = line_cursor == Some(0);
         if should_ignore_launcher_line(line, keywords) {
             previous_line = Some(line);
             continue;
@@ -120,7 +130,7 @@ fn collect_keyword_hits_from_lines(
 
         let lower_line = line.to_ascii_lowercase();
         for (keyword, lower_keyword) in &normalized_keywords {
-            if lower_line.contains(lower_keyword) {
+            if lower_line.contains(lower_keyword) && !is_context_line {
                 if is_negated_default_failure_match(lower_keyword, &lower_line)
                     || is_instruction_or_search_review_marker_prose(lower_keyword, line)
                 {
@@ -167,7 +177,13 @@ fn collect_keyword_hits_from_lines(
 /// Byte offsets of every occurrence of `lower_keyword` in `lower_line` (the
 /// caller's already-lowercased line). ASCII-only lowering keeps byte
 /// positions identical to the original line, so offsets slice both safely.
+/// An empty needle matches at every offset without ever advancing the scan
+/// cursor, so it is rejected outright rather than looping.
 fn keyword_occurrences(lower_line: &str, lower_keyword: &str) -> Vec<(usize, usize)> {
+    if lower_keyword.is_empty() {
+        return Vec::new();
+    }
+
     let mut occurrences = Vec::new();
     let mut search_start = 0;
     while let Some(relative_start) = lower_line[search_start..].find(lower_keyword) {
@@ -420,13 +436,18 @@ fn is_keyword_self_match_occurrence(
         return true;
     }
 
-    // Quoted mention: the occurrence is wrapped in backticks or matched
-    // quotes (`<kw>`, '<kw>', "<kw>") — a mention, not an event.
+    // Quoted mention, only in proven prose/narration context: the occurrence
+    // is wrapped in backticks or matched quotes AND the surrounding line is
+    // prose about the keyword (a narration cue or the live-watch summary
+    // vocabulary), not a structured runtime field. Bare JSON/logfmt values
+    // like `{"error":"<kw>"}` stay alertable (issue #342 review blocker 2).
     let before = line[..occurrence_start].chars().next_back();
     let after = line[occurrence_end..].chars().next();
     if let (Some(open), Some(close)) = (before, after)
         && matches!(open, '`' | '\'' | '"')
         && open == close
+        && (is_prose_about_keyword(line, lower_line, occurrence_start)
+            || previous_line_is_narration_context(previous_line))
     {
         return true;
     }
@@ -470,10 +491,26 @@ fn is_keyword_self_match_occurrence(
                 return true;
             }
 
-            // Wrapped monitor argv continuation: the previous line ends with
-            // the `--keywords`/`--keyword` flag itself, so this line begins
-            // with the flag's value.
-            if lower_previous.ends_with("--keywords") || lower_previous.ends_with("--keyword") {
+            // Wrapped `--keywords <value>` continuation: the previous line
+            // ends with the `--keywords`/`--keyword` flag itself and this
+            // line begins with that flag's value. Verified monitor argv is
+            // sufficient; otherwise (an application's own `logged option
+            // --keywords` log) the continuation is accepted only when this
+            // line is NOT failure-shaped — the keyword must not be followed
+            // by `: message`, so a genuine runtime failure still alerts
+            // (issue #342 review blocker 3).
+            let previous_tokens = dechromed_previous.split_whitespace().collect::<Vec<_>>();
+            let previous_is_monitor_argv = previous_tokens
+                .first()
+                .is_some_and(|token| MONITOR_ARGV_FLAGS.contains(token))
+                && dechromed_previous.chars().all(is_monitor_argv_char);
+            let line_is_failure_shaped = line[occurrence_end..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == ':');
+            if (lower_previous.ends_with("--keywords") || lower_previous.ends_with("--keyword"))
+                && (previous_is_monitor_argv || !line_is_failure_shaped)
+            {
                 return true;
             }
         }
@@ -482,17 +519,62 @@ fn is_keyword_self_match_occurrence(
     false
 }
 
+/// True when the wrapped-predecessor line is narration prose that introduces
+/// a mentioned keyword (ends with a narration cue), so a quoted occurrence at
+/// the start of the next line is a mention continuation, not a runtime event.
+fn previous_line_is_narration_context(previous_line: Option<&str>) -> bool {
+    previous_line.is_some_and(|previous| {
+        let lower_previous = strip_pane_frame_chrome(previous)
+            .to_ascii_lowercase()
+            .trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | ',' | ';' | ':'))
+            .to_string();
+        KEYWORD_NARRATION_CUES
+            .iter()
+            .any(|cue| lower_previous.ends_with(cue))
+    })
+}
+
+/// True when the line around a quoted keyword occurrence is prose about the
+/// keyword or the monitor (narration cues, live-watch summary vocabulary, or
+/// quoting/backticking a command example), as opposed to structured runtime
+/// output whose quoting is field syntax. Used to keep quote-suppression from
+/// eating valid JSON/logfmt failures.
+fn is_prose_about_keyword(line: &str, lower_line: &str, occurrence_start: usize) -> bool {
+    let lower_before = line[..occurrence_start].to_ascii_lowercase();
+    KEYWORD_NARRATION_CUES
+        .iter()
+        .any(|cue| lower_before.contains(cue))
+        || contains_bounded(lower_line, "live watch")
+        || lower_before.contains("example")
+        || lower_before.contains("e.g.")
+        || lower_before.contains("quoted")
+        || lower_before.contains("mention")
+}
+
+/// Fresh (appended) lines of `current` relative to the `previous` snapshot,
+/// with 1-based cursor positions into `current`. The line immediately before
+/// the first appended line — even when it is an *overlapped* line carried
+/// over from the previous snapshot — is prepended as line 0 so per-occurrence
+/// classification can see its wrapped-predecessor context across the
+/// snapshot-overlap boundary (issue #342 review blocker 4). Line 0 never
+/// produces a hit: it is already-seen output by construction.
 fn appended_lines_with_cursors<'a>(previous: &'a str, current: &'a str) -> Vec<(usize, &'a str)> {
     let previous_lines = previous.lines().collect::<Vec<_>>();
     let current_lines = current.lines().collect::<Vec<_>>();
     let overlap = overlapping_suffix_prefix_len(&previous_lines, &current_lines);
 
-    current_lines
-        .into_iter()
-        .enumerate()
-        .skip(overlap)
-        .map(|(index, line)| (index + 1, line))
-        .collect()
+    let mut lines = Vec::with_capacity(current_lines.len().saturating_sub(overlap) + 1);
+    if overlap > 0 && overlap < current_lines.len() {
+        lines.push((0, current_lines[overlap - 1]));
+    }
+    lines.extend(
+        current_lines
+            .into_iter()
+            .enumerate()
+            .skip(overlap)
+            .map(|(index, line)| (index + 1, line)),
+    );
+    lines
 }
 
 fn overlapping_suffix_prefix_len(previous: &[&str], current: &[&str]) -> usize {
@@ -806,6 +888,221 @@ owner-endpoint-unreachable: runtime owner failed";
         );
 
         assert_eq!(hits.len(), 1);
+    }
+
+    /// Review blocker 1: empty/whitespace keywords are accepted by config;
+    /// the matcher must filter them instead of spinning on `find("")` at a
+    /// never-advancing cursor.
+    #[test]
+    fn collect_keyword_hits_ignores_empty_and_whitespace_keywords() {
+        let current = "boot\nowner-endpoint-unreachable: runtime owner failed";
+
+        // Empty keyword alone: no hits, and crucially it terminates.
+        assert!(
+            collect_keyword_hits("boot", current, &["".into()]).is_empty(),
+            "empty keyword must be filtered before matching"
+        );
+        // Whitespace-only keyword: same.
+        assert!(
+            collect_keyword_hits("boot", current, &["   ".into(), "\t".into()]).is_empty(),
+            "whitespace-only keywords must be filtered before matching"
+        );
+        // Mixed list: the empty entries must not disable the real keyword.
+        let hits = collect_keyword_hits_with_provenance(
+            "boot",
+            current,
+            &["".into(), "owner-endpoint-unreachable".into(), " ".into()],
+            KeywordMatchProvenance {
+                pane_id: "%1".into(),
+                pane_name: "0.0".into(),
+                cursor: None,
+                source: KeywordMatchSource::FreshOutput,
+            },
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].line,
+            "owner-endpoint-unreachable: runtime owner failed"
+        );
+    }
+
+    /// Review blocker 2: quoted structured runtime output (JSON/logfmt) is a
+    /// valid failure surface; quote suppression applies only to prose about
+    /// the keyword.
+    #[test]
+    fn collect_keyword_hits_keeps_quoted_structured_runtime_fields() {
+        let must_alert = [
+            r#"{"error":"owner-endpoint-unreachable","message":"runtime owner failed"}"#,
+            r#"level=error msg="owner-endpoint-unreachable: runtime owner failed""#,
+            r#"{"event":"failure","detail":"owner-endpoint-unreachable"}"#,
+            // logfmt with the keyword as a bare value
+            r#"state=owner-endpoint-unreachable retries=3"#,
+            // quoted keyword at field position with surrounding JSON braces
+            r#"{"keyword":"owner-endpoint-unreachable"}"#,
+        ];
+        for line in must_alert {
+            let hits = collect_keyword_hits(
+                "boot",
+                &format!("boot\n{line}"),
+                &["owner-endpoint-unreachable".into()],
+            );
+            assert_eq!(
+                hits.len(),
+                1,
+                "structured runtime line was suppressed: {line:?}"
+            );
+            assert_eq!(hits[0].line, line);
+        }
+
+        // Prose quoting still suppressed: backticked example in narration.
+        let suppressed = collect_keyword_hits(
+            "boot",
+            "boot\nsee the example `owner-endpoint-unreachable` in the docs",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert!(suppressed.is_empty(), "got {suppressed:?}");
+    }
+
+    /// Review blocker 3: a prior line merely ending in `--keywords` (an
+    /// application's own option log) must not suppress the next line's
+    /// genuine failure.
+    #[test]
+    fn collect_keyword_hits_prior_keywords_cue_does_not_leak_into_failures() {
+        let previous = "boot";
+        let current = "boot
+application logged option --keywords
+owner-endpoint-unreachable: runtime owner failed";
+
+        let hits = collect_keyword_hits(previous, current, &["owner-endpoint-unreachable".into()]);
+
+        assert_eq!(hits.len(), 1, "got {hits:?}");
+        assert_eq!(
+            hits[0].line,
+            "owner-endpoint-unreachable: runtime owner failed"
+        );
+
+        // The same prose predecessor still suppresses a non-failure-shaped
+        // flag-value continuation (wrapped echo fragment).
+        let wrapped_echo = collect_keyword_hits(
+            "boot",
+            "boot
+application logged option --keywords
+owner-endpoint-unreachable --channel 1508831529856663612",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert!(
+            wrapped_echo.is_empty(),
+            "non-failure continuation should stay suppressed, got {wrapped_echo:?}"
+        );
+
+        // A verified monitor argv predecessor ending in `--keywords` keeps
+        // suppressing even a colon-shaped continuation, because it is the
+        // monitor's own wrapped echo.
+        let monitor_argv_echo = collect_keyword_hits(
+            "boot",
+            "boot
+--stale-minutes 60 --format compact --keywords
+owner-endpoint-unreachable --channel 1508831529856663612",
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert!(
+            monitor_argv_echo.is_empty(),
+            "verified monitor argv continuation should stay suppressed, got {monitor_argv_echo:?}"
+        );
+    }
+
+    /// Review blocker 4: the snapshot-overlap boundary must not discard the
+    /// narration predecessor of the first appended line.
+    #[test]
+    fn collect_keyword_hits_overlap_boundary_keeps_narration_context() {
+        // previous ends with the cue; current scrolls it up but repeats it as
+        // the overlapped predecessor of the appended example line.
+        let previous = "boot\nsuch as";
+        let current = "such as\nowner-endpoint-unreachable: runtime owner failed";
+
+        let hits = collect_keyword_hits(previous, current, &["owner-endpoint-unreachable".into()]);
+        assert!(
+            hits.is_empty(),
+            "overlap boundary lost narration context, got {hits:?}"
+        );
+
+        // The overlap context line itself must never produce a hit even when
+        // it contains the keyword (it is already-seen output).
+        let previous_kw = "boot\nsuch as owner-endpoint-unreachable";
+        let current_kw = "such as owner-endpoint-unreachable\nstill running";
+        assert!(
+            collect_keyword_hits(
+                previous_kw,
+                current_kw,
+                &["owner-endpoint-unreachable".into()]
+            )
+            .is_empty()
+        );
+
+        // Counter-case: overlap context must NOT suppress a genuine failure
+        // that merely follows an overlapped unrelated line.
+        let previous_plain = "boot\nplain overlap line";
+        let current_plain = "plain overlap line\nowner-endpoint-unreachable: runtime owner failed";
+        let kept = collect_keyword_hits(
+            previous_plain,
+            current_plain,
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].line,
+            "owner-endpoint-unreachable: runtime owner failed"
+        );
+    }
+
+    /// Unicode/non-ASCII safety: occurrence offsets are computed on an
+    /// ASCII-lowercased copy and sliced into the original line; non-ASCII
+    /// before/after the keyword must neither panic nor mis-slice, and
+    /// multi-occurrence lines must classify each occurrence independently.
+    #[test]
+    fn collect_keyword_hits_handles_non_ascii_and_multiple_occurrences() {
+        let must_alert = [
+            "日本語 owner-endpoint-unreachable: failed",
+            "emoji 🦞 owner-endpoint-unreachable: failed",
+            "café — owner-endpoint-unreachable",
+            "owner-endpoint-unreachable: 中文失败",
+        ];
+        for line in must_alert {
+            let hits = collect_keyword_hits(
+                "boot",
+                &format!("boot\n{line}"),
+                &["owner-endpoint-unreachable".into()],
+            );
+            assert_eq!(
+                hits.len(),
+                1,
+                "non-ASCII line misclassified: {line:?} -> {hits:?}"
+            );
+            assert_eq!(hits[0].line, line);
+        }
+
+        // One flag-value occurrence + one genuine failure on the same line:
+        // the `.all()` gate must NOT suppress the line, because the failure
+        // occurrence is not a self-match.
+        let mixed = "watch --keywords owner-endpoint-unreachable; owner-endpoint-unreachable: runtime owner failed";
+        let mixed_hits = collect_keyword_hits(
+            "boot",
+            &format!("boot\n{mixed}"),
+            &["owner-endpoint-unreachable".into()],
+        );
+        assert_eq!(mixed_hits.len(), 1, "got {mixed_hits:?}");
+        assert_eq!(mixed_hits[0].line, mixed);
+
+        // All occurrences are flag values (comma-separated list): suppressed.
+        let list = "--keywords owner-endpoint-unreachable,owner-endpoint-unreachable";
+        assert!(
+            collect_keyword_hits(
+                "boot",
+                &format!("boot\n{list}"),
+                &["owner-endpoint-unreachable".into()]
+            )
+            .is_empty()
+        );
     }
     /// Adversarial boundary cases: each line shares a token with a suppressed
     /// class but is a genuine runtime event, so it MUST still alert. These pin
