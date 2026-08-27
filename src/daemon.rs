@@ -51,8 +51,9 @@ use crate::source::{
     SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
     default_github_ci_baseline_path, default_registry_state_path, inspect_tmux_registry_state,
     list_active_tmux_registrations, load_tmux_registry_state, new_shared_git_monitor_diagnostics,
-    reconcile_restored_tmux_registry, register_runtime_tmux_registration,
-    snapshot_git_monitor_diagnostics, tmux_registry_diagnostics,
+    new_shared_github_monitor_auth_status, reconcile_restored_tmux_registry,
+    register_runtime_tmux_registration, snapshot_git_monitor_diagnostics,
+    snapshot_github_monitor_auth_status, tmux_registry_diagnostics,
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
@@ -231,14 +232,16 @@ pub async fn run(
         }
     });
     let git_monitor_diagnostics = new_shared_git_monitor_diagnostics();
+    let github_monitor_auth = new_shared_github_monitor_auth_status();
     spawn_source(
         GitSource::new(config.clone(), git_monitor_diagnostics.clone()),
         tx.clone(),
     );
     spawn_source(
-        GitHubSource::with_ci_baseline_path(
+        GitHubSource::with_ci_baseline_path_and_auth(
             config.clone(),
             default_github_ci_baseline_path(&cron_state_path),
+            github_monitor_auth.clone(),
         ),
         tx.clone(),
     );
@@ -745,7 +748,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let tmux = tmux_registry_diagnostics(&state.tmux_registry, registry_state).await;
     let subscriptions = subscription_snapshots(&state.subscription_registry()).await;
     let git_monitors = snapshot_git_monitor_diagnostics(&state.git_monitor_diagnostics);
-    Json(health_payload(
+    let github_monitor_auth =
+        snapshot_github_monitor_auth_status(&new_shared_github_monitor_auth_status());
+    let mut payload = health_payload(
         state.config.as_ref(),
         state.port,
         registered,
@@ -753,7 +758,14 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         json!(tmux),
         &subscriptions,
         git_monitors,
-    ))
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "github_monitor_auth".to_string(),
+            json!(github_monitor_auth),
+        );
+    }
+    Json(payload)
 }
 
 fn health_payload(
@@ -786,6 +798,11 @@ fn health_payload(
         "version": VERSION,
         "token_source": config.discord_token_source(),
         "token_precedence_warning": config.discord_token_env_shadow().map(discord_token_shadow_warning),
+        "github_monitor_auth": {
+            "ready": config.monitor_github_token().is_some(),
+            "source": if std::env::var("CLAWHIP_GITHUB_TOKEN").ok().is_some_and(|value| !value.trim().is_empty()) { "environment" } else if config.monitors.github_token.as_deref().is_some_and(|value| !value.trim().is_empty()) { "config" } else { "unavailable" },
+            "error": if config.monitor_github_token().is_some() { Value::Null } else { json!("GitHub monitor authentication has not been checked") },
+        },
         "expected_discord_bot_id": config.expected_discord_bot_id(),
         "webhook_routes_configured": config.has_webhook_routes(),
         "http_routes_configured": config.has_http_routes(),

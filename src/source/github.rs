@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK, USER_AGENT};
@@ -20,6 +20,124 @@ use crate::source::Source;
 use crate::source::git::{GitSnapshot, repo_display_name, snapshot_git_repo};
 use crate::telemetry;
 
+const GH_AUTH_TIMEOUT: Duration = Duration::from_secs(2);
+const GITHUB_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GitHubMonitorAuthStatus {
+    pub ready: bool,
+    pub source: &'static str,
+    pub error: Option<&'static str>,
+}
+
+pub type SharedGitHubMonitorAuthStatus = Arc<Mutex<GitHubMonitorAuthStatus>>;
+
+pub fn new_shared_github_monitor_auth_status() -> SharedGitHubMonitorAuthStatus {
+    static STATUS: OnceLock<SharedGitHubMonitorAuthStatus> = OnceLock::new();
+    STATUS
+        .get_or_init(|| {
+            Arc::new(Mutex::new(GitHubMonitorAuthStatus {
+                ready: false,
+                source: "unavailable",
+                error: Some("GitHub monitor authentication has not been checked"),
+            }))
+        })
+        .clone()
+}
+
+pub fn snapshot_github_monitor_auth_status(
+    status: &SharedGitHubMonitorAuthStatus,
+) -> GitHubMonitorAuthStatus {
+    status
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or(GitHubMonitorAuthStatus {
+            ready: false,
+            source: "unavailable",
+            error: Some("GitHub monitor authentication status is unavailable"),
+        })
+}
+
+fn explicit_monitor_github_token(config: &AppConfig) -> Option<(String, &'static str)> {
+    explicit_monitor_github_token_from(
+        std::env::var("CLAWHIP_GITHUB_TOKEN").ok(),
+        config.monitors.github_token.clone(),
+    )
+}
+
+fn explicit_monitor_github_token_from(
+    environment: Option<String>,
+    configured: Option<String>,
+) -> Option<(String, &'static str)> {
+    environment
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (value, "environment"))
+        .or_else(|| {
+            configured
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (value, "config"))
+        })
+}
+
+async fn resolve_monitor_github_token(
+    config: &AppConfig,
+) -> (Option<String>, GitHubMonitorAuthStatus) {
+    if let Some((token, source)) = explicit_monitor_github_token(config) {
+        return (
+            Some(token),
+            GitHubMonitorAuthStatus {
+                ready: true,
+                source,
+                error: None,
+            },
+        );
+    }
+
+    if let Ok(Ok(output)) = tokio::time::timeout(
+        GH_AUTH_TIMEOUT,
+        tokio::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output(),
+    )
+    .await
+        && output.status.success()
+    {
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !token.is_empty() {
+            return (
+                Some(token),
+                GitHubMonitorAuthStatus {
+                    ready: true,
+                    source: "gh_cli",
+                    error: None,
+                },
+            );
+        }
+    }
+
+    (
+        None,
+        GitHubMonitorAuthStatus {
+            ready: false,
+            source: "unavailable",
+            error: Some(
+                "No GitHub monitor credential available; set CLAWHIP_GITHUB_TOKEN, configure monitors.github_token, or run gh auth login",
+            ),
+        },
+    )
+}
+
+#[derive(Default)]
+struct GitHubRequestBackoff {
+    until: Option<std::time::Instant>,
+    reported: bool,
+}
+
+fn github_request_backoff() -> &'static Mutex<GitHubRequestBackoff> {
+    static BACKOFF: OnceLock<Mutex<GitHubRequestBackoff>> = OnceLock::new();
+    BACKOFF.get_or_init(|| Mutex::new(GitHubRequestBackoff::default()))
+}
+
 thread_local! {
     static SYNC_FILE_CALLS: Cell<u32> = const { Cell::new(0) };
 }
@@ -29,15 +147,30 @@ static WINDOW_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct GitHubSource {
     config: Arc<AppConfig>,
     ci_baseline_path: Option<PathBuf>,
+    auth_status: SharedGitHubMonitorAuthStatus,
 }
 
 impl GitHubSource {
     /// Restarts and re-enrollments reuse a persisted terminal-run baseline so
     /// historical workflow results never replay as fresh events (#317).
+    #[allow(dead_code)]
     pub fn with_ci_baseline_path(config: Arc<AppConfig>, ci_baseline_path: PathBuf) -> Self {
+        Self::with_ci_baseline_path_and_auth(
+            config,
+            ci_baseline_path,
+            new_shared_github_monitor_auth_status(),
+        )
+    }
+
+    pub fn with_ci_baseline_path_and_auth(
+        config: Arc<AppConfig>,
+        ci_baseline_path: PathBuf,
+        auth_status: SharedGitHubMonitorAuthStatus,
+    ) -> Self {
         Self {
             config,
             ci_baseline_path: Some(ci_baseline_path),
+            auth_status,
         }
     }
 }
@@ -49,7 +182,16 @@ impl Source for GitHubSource {
     }
 
     async fn run(&self, tx: mpsc::Sender<IncomingEvent>) -> Result<()> {
-        let github_client = match build_github_client(self.config.monitor_github_token()) {
+        let (token, auth_status) = resolve_monitor_github_token(self.config.as_ref()).await;
+        if let Ok(mut status) = self.auth_status.lock() {
+            *status = auth_status;
+        }
+        if token.is_none() {
+            eprintln!(
+                "clawhip source github: no monitor credential; set CLAWHIP_GITHUB_TOKEN, configure monitors.github_token, or run gh auth login"
+            );
+        }
+        let github_client = match build_github_client(token) {
             Ok(client) => Some(client),
             Err(error) => {
                 eprintln!("clawhip source github: failed to build GitHub client: {error}");
@@ -1915,13 +2057,8 @@ async fn run_github_poll_cycle(
         ci_baseline_path,
     )
     .await
+        && emit_source_degraded(None, &error.to_string())
     {
-        telemetry::emit(source_record(
-            telemetry::event_name::SOURCE_DEGRADED,
-            "source_poll_failed",
-            None,
-            Some(error.to_string()),
-        ));
         eprintln!("clawhip source github poll failed: {error}");
     }
 }
@@ -2201,16 +2338,12 @@ async fn poll_issues(
             Ok(issues)
         }
         Err(error) => {
-            telemetry::emit(source_record(
-                telemetry::event_name::SOURCE_DEGRADED,
-                "source_poll_failed",
-                Some(&repo.path),
-                Some(error.to_string()),
-            ));
-            eprintln!(
-                "clawhip source GitHub issue polling failed for {}: {error}",
-                repo.path
-            );
+            if emit_source_degraded(Some(&repo.path), &error.to_string()) {
+                eprintln!(
+                    "clawhip source GitHub issue polling failed for {}: {error}",
+                    repo.path
+                );
+            }
             Ok(previous
                 .map(|entry| entry.issues.clone())
                 .unwrap_or_default())
@@ -2270,16 +2403,12 @@ async fn poll_pull_requests(
             Ok((prs, complete))
         }
         Err(error) => {
-            telemetry::emit(source_record(
-                telemetry::event_name::SOURCE_DEGRADED,
-                "source_poll_failed",
-                Some(&repo.path),
-                Some(error.to_string()),
-            ));
-            eprintln!(
-                "clawhip source GitHub polling failed for {}: {error}",
-                repo.path
-            );
+            if emit_source_degraded(Some(&repo.path), &error.to_string()) {
+                eprintln!(
+                    "clawhip source GitHub polling failed for {}: {error}",
+                    repo.path
+                );
+            }
             Ok((
                 previous.map(|entry| entry.prs.clone()).unwrap_or_default(),
                 false,
@@ -2348,16 +2477,12 @@ async fn poll_ci_statuses(
             Ok((ci, established, window_complete))
         }
         Err(error) => {
-            telemetry::emit(source_record(
-                telemetry::event_name::SOURCE_DEGRADED,
-                "source_poll_failed",
-                Some(&repo.path),
-                Some(error.to_string()),
-            ));
-            eprintln!(
-                "clawhip source GitHub CI polling failed for {}: {error}",
-                repo.path
-            );
+            if emit_source_degraded(Some(&repo.path), &error.to_string()) {
+                eprintln!(
+                    "clawhip source GitHub CI polling failed for {}: {error}",
+                    repo.path
+                );
+            }
             // Keep the last snapshot for diffing but drop the established flag:
             // the failed poll may be a partial view (pagination/cursor loss), and
             // treating it as complete would replay whatever the next full poll
@@ -2413,6 +2538,36 @@ fn previous_snapshot_for_event<'a>(
     })
 }
 
+fn emit_source_degraded(repo_path: Option<&str>, error: &str) -> bool {
+    static LAST_REPORTS: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+    let reports = LAST_REPORTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = error.to_string();
+    let should_report = reports
+        .lock()
+        .map(|mut entries| {
+            let now = std::time::Instant::now();
+            if entries
+                .get(&key)
+                .is_some_and(|last| now.duration_since(*last) < GITHUB_RATE_LIMIT_BACKOFF)
+            {
+                false
+            } else {
+                entries.insert(key, now);
+                true
+            }
+        })
+        .unwrap_or(true);
+    if should_report {
+        telemetry::emit(source_record(
+            telemetry::event_name::SOURCE_DEGRADED,
+            "source_poll_failed",
+            repo_path,
+            Some(error.to_string()),
+        ));
+    }
+    should_report
+}
+
 fn source_record(
     event_name: &str,
     reason_code: &str,
@@ -2444,24 +2599,48 @@ async fn github_get(
     query: &[(&str, &str)],
     context: &str,
 ) -> Result<reqwest::Response> {
+    if let Ok(backoff) = github_request_backoff().lock()
+        && backoff
+            .until
+            .is_some_and(|until| until > std::time::Instant::now())
+    {
+        return Err("GitHub API rate limit backoff is active; retrying later".into());
+    }
     let url = format!(
         "{}/{}",
         api_base.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    eprintln!("clawhip source github: GET {url} ({context})");
+    eprintln!("clawhip source github: GET ({context})");
 
     let response = client.get(&url).query(query).send().await?;
     let status = response.status();
 
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        eprintln!("clawhip source github: GET {url} ({context}) failed with {status}: {body}");
-        return Err(format!("GitHub API request failed with {status}: {body}").into());
+        let rate_limited = status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        if rate_limited && let Ok(mut backoff) = github_request_backoff().lock() {
+            backoff.until = Some(std::time::Instant::now() + GITHUB_RATE_LIMIT_BACKOFF);
+            if !backoff.reported {
+                eprintln!(
+                    "clawhip source github: API rate limit reached; backing off for 60 seconds"
+                );
+                backoff.reported = true;
+            }
+        }
+        return Err(github_api_error(status).into());
     }
 
-    eprintln!("clawhip source github: GET {url} ({context}) -> {status}");
+    if let Ok(mut backoff) = github_request_backoff().lock() {
+        backoff.until = None;
+        backoff.reported = false;
+    }
+    eprintln!("clawhip source github: GET ({context}) -> {status}");
     Ok(response)
+}
+
+fn github_api_error(status: reqwest::StatusCode) -> String {
+    format!("GitHub API request failed with {status}")
 }
 
 fn collect_issue_events(
@@ -3253,6 +3432,61 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn explicit_auth_precedence_is_environment_then_config() {
+        assert_eq!(
+            explicit_monitor_github_token_from(
+                Some("environment-secret".into()),
+                Some("config-secret".into())
+            ),
+            Some(("environment-secret".into(), "environment"))
+        );
+        assert_eq!(
+            explicit_monitor_github_token_from(None, Some("config-secret".into())),
+            Some(("config-secret".into(), "config"))
+        );
+        assert_eq!(explicit_monitor_github_token_from(None, None), None);
+    }
+
+    #[test]
+    fn github_api_errors_are_redacted() {
+        let error = github_api_error(reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(error, "GitHub API request failed with 403 Forbidden");
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("token"));
+    }
+
+    #[test]
+    fn missing_auth_status_is_actionable_without_secret_material() {
+        let status = GitHubMonitorAuthStatus {
+            ready: false,
+            source: "unavailable",
+            error: Some(
+                "No GitHub monitor credential available; set CLAWHIP_GITHUB_TOKEN, configure monitors.github_token, or run gh auth login",
+            ),
+        };
+        let rendered = serde_json::to_string(&status).unwrap();
+        assert!(rendered.contains("gh auth login"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn repeated_rate_limit_requests_are_backed_off() {
+        if let Ok(mut backoff) = github_request_backoff().lock() {
+            backoff.until = Some(std::time::Instant::now() + Duration::from_secs(60));
+        }
+        let client = reqwest::Client::new();
+        let error = github_get(&client, "http://127.0.0.1:1", "rate-limit", &[], "test")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rate limit backoff is active"));
+        if let Ok(mut backoff) = github_request_backoff().lock() {
+            backoff.until = None;
+            backoff.reported = false;
+        }
+    }
     use crate::config::{DefaultsConfig, RouteRule};
     use crate::events::MessageFormat;
     use crate::router::Router;
