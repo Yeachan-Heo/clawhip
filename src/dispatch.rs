@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::Result;
 use crate::core::timer_wheel::{DelayedEntry, TimerWheel};
@@ -20,6 +21,7 @@ use crate::sink::{Sink, SinkMessage, SinkTarget, SinkTelemetry};
 use crate::telemetry;
 
 const DEFAULT_BATCH_TICK: Duration = Duration::from_secs(1);
+const MAX_ALERT_DESTINATION_KEY: usize = 512;
 
 pub struct Dispatcher {
     rx: mpsc::Receiver<IncomingEvent>,
@@ -31,6 +33,113 @@ pub struct Dispatcher {
     batch_tick: Duration,
     native_observability: SharedNativeHookObservability,
     ledger: Option<SharedEventLedger>,
+}
+
+static ALERT_ACCEPTANCE: OnceLock<Mutex<HashMap<String, Vec<oneshot::Sender<bool>>>>> =
+    OnceLock::new();
+
+/// Durable delivery ownership for a native pending alert. A destination is
+/// claimed before the sink call and transitions to one terminal outcome
+/// afterwards. Claimed destinations are intentionally not replayed: this
+/// preserves at-most-once delivery across a crash between the sink call and
+/// the durable outcome update, while explicit failures remain retryable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlertDeliveryState {
+    Claimed,
+    Delivered,
+    Failed,
+}
+
+pub(crate) trait AlertDeliveryJournal: Send + Sync {
+    fn state(&self, destination: &str) -> Option<AlertDeliveryState>;
+    fn claim(&self, destination: &str) -> bool;
+    fn record(&self, destination: &str, delivered: bool) -> bool;
+}
+
+type AlertDeliveryJournalMap = Mutex<HashMap<String, std::sync::Arc<dyn AlertDeliveryJournal>>>;
+
+static ALERT_DELIVERY_JOURNALS: OnceLock<AlertDeliveryJournalMap> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerAcceptance {
+    Accepted,
+    Duplicate,
+    Failed,
+    Unavailable,
+}
+
+pub(crate) fn register_alert_acceptance(event_id: &str) -> oneshot::Receiver<bool> {
+    let (sender, receiver) = oneshot::channel();
+    if let Ok(mut pending) = ALERT_ACCEPTANCE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        pending
+            .entry(event_id.to_string())
+            .or_default()
+            .push(sender);
+    }
+    receiver
+}
+
+pub(crate) fn register_alert_delivery_journal(
+    event_id: &str,
+    journal: std::sync::Arc<dyn AlertDeliveryJournal>,
+) {
+    if let Ok(mut pending) = ALERT_DELIVERY_JOURNALS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        pending.insert(event_id.to_string(), journal);
+    }
+}
+
+pub(crate) fn clear_alert_delivery_journal(event_id: &str) {
+    if let Ok(mut pending) = ALERT_DELIVERY_JOURNALS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        pending.remove(event_id);
+    }
+}
+
+fn alert_delivery_journal(
+    event: &IncomingEvent,
+) -> Option<std::sync::Arc<dyn AlertDeliveryJournal>> {
+    let event_id = event.payload.get("event_id").and_then(Value::as_str)?;
+    ALERT_DELIVERY_JOURNALS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|pending| pending.get(event_id).cloned())
+}
+
+fn resolve_alert_acceptance(event: &IncomingEvent, accepted: bool) {
+    let Some(event_id) = event.payload.get("event_id").and_then(Value::as_str) else {
+        return;
+    };
+    resolve_alert_acceptance_id(event_id, accepted);
+}
+
+pub(crate) fn resolve_alert_acceptance_id(event_id: &str, accepted: bool) {
+    if let Ok(mut pending) = ALERT_ACCEPTANCE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        && let Some(senders) = pending.remove(event_id)
+    {
+        for sender in senders {
+            let _ = sender.send(accepted);
+        }
+    }
+}
+
+pub(crate) fn cancel_alert_acceptance(event_id: &str) {
+    if let Ok(mut pending) = ALERT_ACCEPTANCE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        pending.remove(event_id);
+    }
 }
 
 impl Dispatcher {
@@ -87,18 +196,61 @@ impl Dispatcher {
                     match maybe_event {
                         Some(event) => {
                             let event = normalize_event(event);
-                            if !self.record_event(&event) {
-                                continue;
+                            let ledger_result = self.record_event_result(&event);
+                            match ledger_result {
+                                LedgerAcceptance::Duplicate => {
+                                    // A pending native alert owns its
+                                    // per-destination retry state outside the
+                                    // event ledger. Re-enter dispatch so a
+                                    // failed destination can retry while
+                                    // delivered destinations are skipped.
+                                    if alert_delivery_journal(&event).is_none() {
+                                        resolve_alert_acceptance(&event, true);
+                                        continue;
+                                    }
+                                }
+                                LedgerAcceptance::Failed => {
+                                    resolve_alert_acceptance(&event, false);
+                                    continue;
+                                }
+                                LedgerAcceptance::Accepted => {}
+                                LedgerAcceptance::Unavailable => {
+                                    // Delivery remains the acceptance boundary
+                                    // when the optional ledger is disabled.
+                                }
                             }
-
+                            let acceptance_event = event.clone();
                             let now_ms = now_ms();
                             self.flush_due_batches(now_ms).await?;
                             if self.is_ci_event(&event) {
                                 for flushed in self.ci_batcher.observe(event, now_ms) {
                                     self.deliver_event(flushed).await;
                                 }
+                                if matches!(
+                                    ledger_result,
+                                    LedgerAcceptance::Accepted
+                                        | LedgerAcceptance::Duplicate
+                                        | LedgerAcceptance::Unavailable
+                                ) {
+                                    resolve_alert_acceptance(&acceptance_event, true);
+                                }
                             } else {
-                                self.resolve_and_dispatch(event, now_ms).await;
+                                let routed = self.resolve_and_dispatch(event, now_ms).await;
+                                if let Some(event_id) = acceptance_event
+                                    .payload
+                                    .get("event_id")
+                                    .and_then(Value::as_str)
+                                {
+                                    clear_alert_delivery_journal(event_id);
+                                }
+                                if matches!(
+                                    ledger_result,
+                                    LedgerAcceptance::Accepted
+                                        | LedgerAcceptance::Duplicate
+                                        | LedgerAcceptance::Unavailable
+                                ) {
+                                    resolve_alert_acceptance(&acceptance_event, routed);
+                                }
                             }
                         }
                         None => {
@@ -117,23 +269,23 @@ impl Dispatcher {
         Ok(())
     }
 
-    fn record_event(&self, event: &IncomingEvent) -> bool {
+    fn record_event_result(&self, event: &IncomingEvent) -> LedgerAcceptance {
         let Some(ledger) = &self.ledger else {
-            return true;
+            return LedgerAcceptance::Unavailable;
         };
         let mut ledger = match ledger.lock() {
             Ok(ledger) => ledger,
             Err(_) => {
                 eprintln!("clawhip ledger rejected event: lock_poisoned");
-                return false;
+                return LedgerAcceptance::Failed;
             }
         };
         match ledger.append(event) {
-            Ok(AppendOutcome::Appended) => true,
-            Ok(AppendOutcome::Duplicate) => false,
+            Ok(AppendOutcome::Appended) => LedgerAcceptance::Accepted,
+            Ok(AppendOutcome::Duplicate) => LedgerAcceptance::Duplicate,
             Err(error) => {
                 eprintln!("clawhip ledger rejected event: {error}");
-                false
+                LedgerAcceptance::Failed
             }
         }
     }
@@ -210,7 +362,7 @@ impl Dispatcher {
         }
     }
 
-    async fn resolve_and_dispatch(&mut self, event: IncomingEvent, now_ms: u64) {
+    async fn resolve_and_dispatch(&mut self, event: IncomingEvent, now_ms: u64) -> bool {
         let provenance = is_native_hook_event(&event).then(|| self.router.explain(&event));
         let deliveries = match self.router.resolve(&event).await {
             Ok(deliveries) => {
@@ -240,16 +392,20 @@ impl Dispatcher {
                     "clawhip dispatcher failed to resolve {}: {error}",
                     event.canonical_kind()
                 );
-                return;
+                return false;
             }
         };
+        if deliveries.is_empty() {
+            return false;
+        }
 
+        let mut accepted = true;
         for delivery in deliveries {
             self.emit_route_trace(&event, &delivery);
             if self.should_batch_routine_delivery(&event, &delivery) {
                 self.emit_routine_deferred(&event, &delivery);
                 let Some(routine_batcher) = self.routine_batcher.as_mut() else {
-                    self.send_delivery(&event, &delivery).await;
+                    accepted &= self.send_delivery(&event, &delivery).await;
                     continue;
                 };
                 routine_batcher.observe(
@@ -262,8 +418,9 @@ impl Dispatcher {
                 continue;
             }
 
-            self.send_delivery(&event, &delivery).await;
+            accepted &= self.send_delivery(&event, &delivery).await;
         }
+        accepted
     }
 
     fn observe_native_route_outcome(
@@ -304,7 +461,35 @@ impl Dispatcher {
         );
     }
 
-    async fn send_delivery(&self, event: &IncomingEvent, delivery: &ResolvedDelivery) {
+    async fn send_delivery(&self, event: &IncomingEvent, delivery: &ResolvedDelivery) -> bool {
+        let journal = alert_delivery_journal(event);
+        let destination = journal.as_ref().map(|_| alert_destination_key(delivery));
+        if let (Some(journal), Some(destination)) = (journal.as_ref(), destination.as_deref()) {
+            if matches!(
+                journal.state(destination),
+                Some(AlertDeliveryState::Claimed | AlertDeliveryState::Delivered)
+            ) {
+                return true;
+            }
+            if !journal.claim(destination) {
+                self.emit_dispatch_failure(
+                    event,
+                    telemetry::reason::SINK_SEND_FAILED,
+                    Some(delivery),
+                    "durable alert delivery ownership unavailable".to_string(),
+                );
+                return false;
+            }
+        }
+
+        let finish = |delivered: bool| {
+            if let (Some(journal), Some(destination)) = (journal.as_ref(), destination.as_deref()) {
+                let persisted = journal.record(destination, delivered);
+                return delivered && persisted;
+            }
+            delivered
+        };
+
         let Some(sink) = self.sinks.get(delivery.sink.as_str()) else {
             self.emit_dispatch_failure(
                 event,
@@ -317,7 +502,7 @@ impl Dispatcher {
                 delivery.sink,
                 safe_target_for_log(&delivery.target)
             );
-            return;
+            return finish(false);
         };
 
         let content = match self
@@ -339,22 +524,24 @@ impl Dispatcher {
                     delivery.sink,
                     safe_target_for_log(&delivery.target)
                 );
-                return;
+                return finish(false);
             }
         };
 
-        self.send_sink_message(
-            sink.as_ref(),
-            &delivery.target,
-            SinkMessage {
-                event_kind: event.canonical_kind().to_string(),
-                format: delivery.format.clone(),
-                content,
-                payload: event.payload.clone(),
-                telemetry: Some(sink_telemetry_for(event, delivery, None)),
-            },
+        finish(
+            self.send_sink_message(
+                sink.as_ref(),
+                &delivery.target,
+                SinkMessage {
+                    event_kind: event.canonical_kind().to_string(),
+                    format: delivery.format.clone(),
+                    content,
+                    payload: event.payload.clone(),
+                    telemetry: Some(sink_telemetry_for(event, delivery, None)),
+                },
+            )
+            .await,
         )
-        .await;
     }
 
     async fn send_routine_batch(&self, batch: FlushedRoutineDeliveryBatch) {
@@ -487,7 +674,12 @@ impl Dispatcher {
         }
     }
 
-    async fn send_sink_message(&self, sink: &dyn Sink, target: &SinkTarget, message: SinkMessage) {
+    async fn send_sink_message(
+        &self,
+        sink: &dyn Sink,
+        target: &SinkTarget,
+        message: SinkMessage,
+    ) -> bool {
         if let Err(error) = sink.send(target, &message).await {
             let mut record = telemetry::record(
                 telemetry::event_name::DISPATCH_FAILURE,
@@ -500,7 +692,9 @@ impl Dispatcher {
             record.insert("error".to_string(), json!(error.to_string()));
             telemetry::emit(record);
             eprintln!("clawhip dispatcher delivery failed to {safe_target}: {error}");
+            return false;
         }
+        true
     }
 
     fn emit_route_trace(&self, event: &IncomingEvent, delivery: &ResolvedDelivery) {
@@ -597,6 +791,7 @@ impl Dispatcher {
         self.routine_batcher.is_some()
             && delivery.sink == "discord"
             && !self.is_ci_event(event)
+            && alert_delivery_journal(event).is_none()
             && !should_bypass_routine_batch(event)
     }
 }
@@ -994,7 +1189,11 @@ fn ci_run_job_count(payload: &Value) -> usize {
 fn should_bypass_routine_batch(event: &IncomingEvent) -> bool {
     let kind = event.canonical_kind();
     kind.ends_with(".failed")
+        || kind.ends_with("-failed")
         || kind.ends_with(".blocked")
+        || kind.ends_with(".stalled")
+        || kind.ends_with(".retry-needed")
+        || kind.starts_with("session.")
         || kind == "tmux.stale"
         || kind.starts_with("github.ci-")
         // GJC SDK question/gate notifications (#324) are operator-facing
@@ -1146,6 +1345,25 @@ fn sink_target_key(target: &SinkTarget) -> String {
         SinkTarget::HttpEndpoint(endpoint) => format!("http-endpoint:{endpoint}"),
         SinkTarget::LocalFile(path) => format!("localfile:{path}"),
     }
+}
+
+fn alert_destination_key(delivery: &ResolvedDelivery) -> String {
+    let safe_target = telemetry::safe_target_id(&delivery.target);
+    // A route index distinguishes two fanout entries that intentionally use
+    // the same sink target but different templates/mentions. The target is
+    // still redacted before it crosses the durable boundary.
+    let key = format!(
+        "route:{}:{safe_target}",
+        delivery
+            .trace
+            .matched_route_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "fallback".to_string())
+    );
+    if key.len() <= MAX_ALERT_DESTINATION_KEY {
+        return key;
+    }
+    telemetry::stable_correlation_id("gjc.alert.destination", &json!({"key": key}))
 }
 
 fn now_ms() -> u64 {
@@ -2189,8 +2407,14 @@ mod tests {
             template: None,
             payload: json!({"event_id":"one","repo":"owner/repo","summary":"private text"}),
         };
-        assert!(dispatcher.record_event(&first));
-        assert!(!dispatcher.record_event(&first));
+        assert_eq!(
+            dispatcher.record_event_result(&first),
+            LedgerAcceptance::Accepted
+        );
+        assert_eq!(
+            dispatcher.record_event_result(&first),
+            LedgerAcceptance::Duplicate
+        );
         let second = IncomingEvent {
             kind: "agent.failed".into(),
             channel: None,
@@ -2199,13 +2423,160 @@ mod tests {
             template: None,
             payload: json!({"event_id":"two","repo":"owner/repo"}),
         };
-        assert!(!dispatcher.record_event(&second));
+        assert_eq!(
+            dispatcher.record_event_result(&second),
+            LedgerAcceptance::Failed
+        );
         assert_eq!(ledger.lock().unwrap().status().records, 1);
         let persisted = std::fs::read_dir(dir.path().join("raw"))
             .unwrap()
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
             .collect::<String>();
         assert!(!persisted.contains("private text"));
+    }
+
+    #[tokio::test]
+    async fn native_alert_fanout_retries_only_failed_destinations() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TestJournal {
+            states: Mutex<HashMap<String, AlertDeliveryState>>,
+        }
+
+        impl AlertDeliveryJournal for TestJournal {
+            fn state(&self, destination: &str) -> Option<AlertDeliveryState> {
+                self.states
+                    .lock()
+                    .expect("journal")
+                    .get(destination)
+                    .copied()
+            }
+
+            fn claim(&self, destination: &str) -> bool {
+                let mut states = self.states.lock().expect("journal");
+                match states.get(destination) {
+                    Some(AlertDeliveryState::Claimed | AlertDeliveryState::Delivered) => true,
+                    _ => {
+                        states.insert(destination.to_string(), AlertDeliveryState::Claimed);
+                        true
+                    }
+                }
+            }
+
+            fn record(&self, destination: &str, delivered: bool) -> bool {
+                self.states.lock().expect("journal").insert(
+                    destination.to_string(),
+                    if delivered {
+                        AlertDeliveryState::Delivered
+                    } else {
+                        AlertDeliveryState::Failed
+                    },
+                );
+                true
+            }
+        }
+
+        struct TestSink {
+            calls: Arc<Mutex<Vec<String>>>,
+            failed_once: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Sink for TestSink {
+            async fn send(&self, target: &SinkTarget, _message: &SinkMessage) -> crate::Result<()> {
+                let target = safe_target_for_log(target);
+                self.calls.lock().expect("calls").push(target.clone());
+                if target.contains("channel:b")
+                    && self.failed_once.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    return Err("deterministic sink failure".into());
+                }
+                Ok(())
+            }
+        }
+
+        let config = AppConfig {
+            routes: vec![
+                RouteRule {
+                    event: "session.failed".into(),
+                    sink: "discord".into(),
+                    channel: Some("a".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "session.failed".into(),
+                    sink: "discord".into(),
+                    channel: Some("b".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let (_tx, rx) = mpsc::channel(1);
+        let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        sinks.insert(
+            "discord".into(),
+            Box::new(TestSink {
+                calls: calls.clone(),
+                failed_once: AtomicUsize::new(0),
+            }),
+        );
+        let mut dispatcher = Dispatcher::new(
+            rx,
+            Router::new(Arc::new(config)),
+            Box::new(DefaultRenderer),
+            sinks,
+            Duration::from_secs(30),
+            None,
+            new_shared_native_hook_observability(),
+        );
+        let journal = Arc::new(TestJournal {
+            states: Mutex::new(HashMap::new()),
+        });
+        let event = IncomingEvent {
+            kind: "session.failed".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({"event_id": "fanout-retry", "provider": "codex"}),
+        };
+
+        register_alert_delivery_journal(
+            event.payload["event_id"].as_str().unwrap(),
+            journal.clone(),
+        );
+        assert!(
+            !dispatcher
+                .resolve_and_dispatch(event.clone(), now_ms())
+                .await
+        );
+        let first_calls = calls.lock().expect("calls").clone();
+        assert_eq!(first_calls.len(), 2);
+        assert_eq!(
+            journal.state("route:0:discord:channel:a"),
+            Some(AlertDeliveryState::Delivered)
+        );
+        assert_eq!(
+            journal.state("route:1:discord:channel:b"),
+            Some(AlertDeliveryState::Failed)
+        );
+
+        clear_alert_delivery_journal("fanout-retry");
+        register_alert_delivery_journal("fanout-retry", journal.clone());
+        assert!(dispatcher.resolve_and_dispatch(event, now_ms()).await);
+        assert_eq!(calls.lock().expect("calls").len(), 3);
+        assert_eq!(
+            journal.state("route:0:discord:channel:a"),
+            Some(AlertDeliveryState::Delivered)
+        );
+        assert_eq!(
+            journal.state("route:1:discord:channel:b"),
+            Some(AlertDeliveryState::Delivered)
+        );
+        clear_alert_delivery_journal("fanout-retry");
     }
 
     #[tokio::test]

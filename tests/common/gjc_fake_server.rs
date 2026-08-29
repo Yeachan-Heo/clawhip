@@ -134,6 +134,7 @@ struct FakeState {
     phase: Option<FakePhase>,
 
     acked_controls: Vec<(String, bool)>,
+    control_requests: Vec<(String, String, String)>,
     resolved_controls: Vec<(String, &'static str)>,
     connections_total: u64,
     reject_next_auth: bool,
@@ -239,11 +240,12 @@ impl FakeGjcServer {
 
     /// Write a valid owner-only metadata file under `<worktree>/.gjc/state/sdk/`.
     pub fn write_metadata(&self, worktree: &std::path::Path) -> std::path::PathBuf {
-        write_metadata_file(
+        write_metadata_file_for_session(
             worktree,
             &self.metadata_url(),
             FIXTURE_TOKEN,
             Some(std::process::id()),
+            &self.script.session_id,
         )
     }
 
@@ -281,6 +283,10 @@ impl FakeGjcServer {
 
     pub async fn acked_controls(&self) -> Vec<(String, bool)> {
         self.state.lock().await.acked_controls.clone()
+    }
+
+    pub async fn control_requests(&self) -> Vec<(String, String, String)> {
+        self.state.lock().await.control_requests.clone()
     }
 
     pub async fn resolved_controls(&self) -> Vec<(String, &'static str)> {
@@ -372,6 +378,13 @@ fn sections_for(phase: FakePhase, script: &FakeScript) -> FakeSections {
     FakeSections {
         metadata_session_id: script.session_id.clone(),
         turn_id: script.turn_id.clone(),
+        revision: match phase {
+            FakePhase::Idle => 1,
+            FakePhase::Running => 2,
+            FakePhase::Question => 3,
+            FakePhase::Completed => 4,
+            FakePhase::Retired => 5,
+        },
         turn_status: phase.turn_status(),
         gate: match phase {
             FakePhase::Question => Some(FakeGateSection {
@@ -439,6 +452,21 @@ async fn handle_request(
             {
                 let mut guard = state.lock().await;
                 guard.acked_controls.push((frame.id.clone(), accepted));
+                guard.control_requests.push((
+                    operation.to_string(),
+                    frame
+                        .input
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    frame
+                        .input
+                        .get("idempotency_key")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
                 guard
                     .resolved_controls
                     .push((frame.id.clone(), outcome_kind));
@@ -451,6 +479,7 @@ async fn handle_request(
                 accepted,
                 json!({
                     "accepted": accepted,
+                    "session_id": script.session_id,
                     "operation": operation,
                     "command_id": frame.input.get("idempotency_key").cloned().unwrap_or(Value::Null),
                 }),
@@ -490,12 +519,22 @@ pub fn write_metadata_file(
     token: &str,
     pid: Option<u32>,
 ) -> std::path::PathBuf {
+    write_metadata_file_for_session(worktree, url, token, pid, &FakeScript::default().session_id)
+}
+
+/// Write owner-only metadata for an explicit session identity.
+pub fn write_metadata_file_for_session(
+    worktree: &std::path::Path,
+    url: &str,
+    token: &str,
+    pid: Option<u32>,
+    session_id: &str,
+) -> std::path::PathBuf {
     let sdk_dir = worktree.join(".gjc/state/sdk");
     std::fs::create_dir_all(&sdk_dir).expect("create .gjc/state/sdk");
-    let session_id = FakeScript::default().session_id;
     let file = EndpointMetadataFile {
         version: 1,
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         url: url.to_string(),
         token: token.to_string(),
         pid,

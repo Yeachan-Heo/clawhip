@@ -254,6 +254,10 @@ pub struct GjcResponse {
 #[async_trait]
 pub trait GjcTransport: Send + Sync {
     async fn round_trip(&self, request: GjcRequest) -> std::result::Result<GjcResponse, GjcError>;
+
+    fn endpoint_generation(&self) -> Option<u64> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +349,8 @@ impl GjcError {
                 format!("gjc reply correlation failed for {method}")
             }
             GjcError::InvalidPeerReply { method, reason } => {
-                format!("gjc reply rejected for {method}: {reason}")
+                let _ = reason;
+                format!("gjc reply rejected for {method}")
             }
             GjcError::MissingCapability { capability } => {
                 format!("required gjc capability is missing: {capability}")
@@ -517,6 +522,8 @@ impl GjcPromptStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowGate {
     pub gate_id: String,
+    #[serde(default)]
+    pub kind: Option<String>,
     pub workflow_id: Option<String>,
     pub state: WorkflowGateState,
     pub title: Option<String>,
@@ -545,6 +552,8 @@ pub struct GoalTodoSnapshot {
 pub struct SessionTurn {
     pub turn_id: String,
     pub status: GjcPromptStatus,
+    #[serde(default)]
+    pub prompt_accepted: bool,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     /// Terminal outcome payload; present only on terminal statuses.
@@ -562,12 +571,18 @@ pub struct SessionTurnOutcome {
 /// is requested by name; missing surfaces stay `None` instead of guessed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionQuery {
+    #[serde(default)]
+    pub revision: Option<u64>,
     pub metadata: Option<SessionMetadata>,
     pub stats: Option<SessionStats>,
     pub model_profile: Option<SessionModelProfile>,
     pub turn: Option<SessionTurn>,
+    #[serde(skip)]
+    pub turn_present: bool,
     pub queue: Option<QueueSnapshot>,
     pub workflow_gates: Option<Vec<WorkflowGate>>,
+    #[serde(skip)]
+    pub workflow_gates_present: bool,
     pub goal_todo: Option<GoalTodoSnapshot>,
 }
 

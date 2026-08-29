@@ -63,8 +63,25 @@ router → sinks (Discord/Slack/local-file). The response reports what happened:
 | `prompt` | object? | `{command_id, status: accepted\|progressing}` — acceptance evidence for the submitted control command. |
 | `gate` | object? | `{id, kind: ask\|workflow, revision, status: open\|resolved, summary}` — question/gate episode with the identifiers #323 answers against. |
 | `model`, `profile` | string? | Public-safe identifiers; changes are announced once per transition. |
+
+Query section presence is significant for reconciliation. An omitted `turn` or
+`workflow_gates` member means that surface was not observed and does not clear
+durable state; a present `turn: null` is an authoritative no-current-turn
+observation, and a present `workflow_gates: []` resolves retained gate state.
+Full adapter queries fail closed when the required `turn` member is omitted.
+Turn-level `succeeded` and `failed` results do not retire a lane: without an
+authoritative session-level terminal field, the session remains reusable for
+later turns. Retirement requires explicit watch/process lifecycle evidence or
+operator action.
 | `endpoint` | object? | `{health: ok\|degraded\|failed, detail}` — no URLs, no credentials. |
 | `repo_name`, `repo_path`, `worktree_path`, `branch` | string? | Routing identity copied onto every emitted event. |
+
+Gate metadata remains intentionally bounded to the fields present in the
+authoritative SDK wire contract (`id`, `kind`, `revision`, `status`, and
+summary). `workflow_id`, option lists, and answer metadata are not synthesized
+from local state; they require an additive native SDK contract before they can
+be exposed safely. Until then, multiple simultaneous ready gates are rejected
+as invalid state rather than projected ambiguously.
 | `observed_at` | RFC3339 string? | Preserved as `event_timestamp`. |
 | `summary` | string? | Optional public-safe lane summary. |
 
@@ -92,12 +109,11 @@ tracked but deliberately emit no event: they would be noise on Discord.
   higher gate revision; a different gate id starts a new episode.
 - Every event carries a deterministic `event_id` (FNV-1a over
   `kind|session|revision|turn|gate|transition`) plus `idempotency_key`.
-  The event ledger dedupes on this identity, so replaying the same
-  authoritative feed after a daemon restart produces ledger-level duplicates:
-  no second Discord delivery.
-- Known limitation: an endpoint-failure episode that spans a daemon restart
-  can re-notify once, because the bridge keeps its alert flag in memory.
-  #325's durable reconciler closes this gap by seeding last observed state.
+  The event ledger dedupes on this identity. Native pending alerts additionally
+  persist per-destination `claimed`, `delivered`, and `failed` state, so a
+  replay retries only failed destinations and does not resend destinations
+  already delivered before a restart. Ledger-disabled replay uses the same
+  durable pending-alert journal.
 
 ## Sibling integration (landed surfaces)
 

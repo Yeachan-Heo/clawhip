@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use serde_json::Value;
 
 use super::model::{GjcError, GjcRequest, GjcResponse, GjcResult, GjcTransport};
 use crate::gjc_sdk::{
@@ -20,16 +21,75 @@ use crate::gjc_sdk::{
 #[derive(Debug)]
 pub struct SdkEndpointTransport {
     metadata: EndpointMetadata,
+    /// Discovery root used to revalidate the endpoint lease around mutating
+    /// exchanges. Static construction remains available for unit-test seams;
+    /// production discovery always supplies this root.
+    state_root: Option<StateRoot>,
 }
 
 impl SdkEndpointTransport {
+    #[allow(dead_code)]
     pub fn new(metadata: EndpointMetadata) -> Self {
-        Self { metadata }
+        Self {
+            metadata,
+            state_root: None,
+        }
+    }
+
+    fn from_discovery(state_root: &StateRoot, metadata: EndpointMetadata) -> Self {
+        Self {
+            metadata,
+            state_root: Some(state_root.clone()),
+        }
     }
 
     /// Public-safe session identifier this endpoint is bound to.
     pub fn session_id(&self) -> &str {
         self.metadata.session_id()
+    }
+
+    pub fn endpoint_generation(&self) -> u64 {
+        self.metadata.generation()
+    }
+
+    /// Re-read the enrolled endpoint metadata and reject any rotation or
+    /// identity change before trusting a mutating exchange. The metadata
+    /// itself is the lease: a changed generation means the old transport is
+    /// no longer an unambiguous peer for this command.
+    fn validate_lease(&self) -> GjcResult<()> {
+        let Some(state_root) = self.state_root.as_ref() else {
+            return Ok(());
+        };
+        let current = gjc_sdk::discover_all(state_root)
+            .map_err(|error| map_transport_error("endpoint.validate", &error))?
+            .into_iter()
+            .find(|metadata| metadata.session_id() == self.session_id());
+        let Some(current) = current else {
+            return Err(GjcError::StaleEndpoint {
+                capability: crate::gjc::model::CAP_ENDPOINT.into(),
+            });
+        };
+        if current.generation() != self.endpoint_generation() {
+            return Err(GjcError::StaleEndpoint {
+                capability: crate::gjc::model::CAP_ENDPOINT.into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_request_session(&self, request: &GjcRequest) -> GjcResult<()> {
+        let Some(requested) = request.params.get("session_id").and_then(Value::as_str) else {
+            return Err(GjcError::InvalidPeerReply {
+                method: request.method.clone(),
+                reason: "mutating request session identity is missing".into(),
+            });
+        };
+        if requested != self.session_id() {
+            return Err(GjcError::SessionMismatch {
+                expected: self.session_id().to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -65,7 +125,19 @@ fn map_transport_error(method: &str, error: &crate::DynError) -> GjcError {
 
 #[async_trait]
 impl GjcTransport for SdkEndpointTransport {
+    fn endpoint_generation(&self) -> Option<u64> {
+        Some(self.endpoint_generation())
+    }
+
     async fn round_trip(&self, request: GjcRequest) -> std::result::Result<GjcResponse, GjcError> {
+        let mutating = request.method.starts_with("control.");
+        // The lease must still describe the enrolled session immediately
+        // before opening the authenticated connection. A stale command stays
+        // reserved and is never replayed against a replacement endpoint.
+        if mutating {
+            self.validate_request_session(&request)?;
+            self.validate_lease()?;
+        }
         // v3 wire mapping: `control.*` methods become control_request
         // frames; every other method is a query_request. The correlation ID
         // is minted inside the typed frame and echoed by the peer.
@@ -93,6 +165,13 @@ impl GjcTransport for SdkEndpointTransport {
             .await
             .map_err(|error| map_transport_error(&request.method, &error))?;
 
+        // A peer may rotate its metadata while the exchange is in flight. Do
+        // not accept an otherwise valid ack from an endpoint whose identity
+        // changed during this non-idempotent operation.
+        if mutating {
+            self.validate_lease()?;
+        }
+
         // Defense in depth: the transport already enforces correlation;
         // re-check before trusting the payload.
         if reply.id.as_deref() != Some(correlation_id.as_str()) {
@@ -105,6 +184,16 @@ impl GjcTransport for SdkEndpointTransport {
                 .error
                 .and_then(|error| error.code)
                 .unwrap_or_else(|| "unknown".into());
+            if reason == "session_not_found" {
+                return Err(GjcError::SessionNotFound {
+                    session_id: request
+                        .params
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                });
+            }
             return Err(GjcError::InvalidPeerReply {
                 method: request.method.clone(),
                 reason: format!("peer rejected request: {reason}"),
@@ -121,15 +210,33 @@ impl GjcTransport for SdkEndpointTransport {
 /// unrelated root. Outcomes map directly onto control-plane failures so the
 /// daemon never guesses.
 pub fn discover_endpoint(worktree: &Path) -> GjcResult<SdkEndpointTransport> {
-    let discovery = gjc_sdk::discover(&StateRoot::for_worktree(worktree))
+    let state_root = StateRoot::for_worktree(worktree);
+    let discovery = gjc_sdk::discover(&state_root)
         .map_err(|error| map_transport_error("endpoint.discover", &error))?;
     match discovery {
-        Discovery::Live(metadata) => Ok(SdkEndpointTransport::new(metadata)),
+        Discovery::Live(metadata) => {
+            Ok(SdkEndpointTransport::from_discovery(&state_root, metadata))
+        }
         Discovery::Stale { .. } => Err(GjcError::StaleEndpoint {
             capability: super::model::CAP_ENDPOINT.into(),
         }),
         Discovery::Malformed | Discovery::NoMetadata => Err(GjcError::TransportUnavailable),
     }
+}
+
+pub fn discover_endpoint_for_session(
+    worktree: &Path,
+    session_id: &str,
+) -> GjcResult<SdkEndpointTransport> {
+    let state_root = StateRoot::for_worktree(worktree);
+    let metadata = gjc_sdk::discover_all(&state_root)
+        .map_err(|error| map_transport_error("endpoint.discover", &error))?
+        .into_iter()
+        .find(|metadata| metadata.session_id() == session_id)
+        .ok_or_else(|| GjcError::SessionNotFound {
+            session_id: session_id.to_string(),
+        })?;
+    Ok(SdkEndpointTransport::from_discovery(&state_root, metadata))
 }
 
 #[cfg(test)]
@@ -275,5 +382,146 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.error_code(), "transport_unavailable");
+    }
+
+    #[tokio::test]
+    async fn mutating_exchange_rejects_rotation_before_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_metadata(
+            temp.path(),
+            "sess-lane-1",
+            "ws://127.0.0.1:1/",
+            "tok-before",
+        );
+        let transport = discover_endpoint_for_session(temp.path(), "sess-lane-1").unwrap();
+
+        // Resolve the endpoint first, then rotate its metadata before the
+        // mutation reaches the websocket. The lease check must fail closed
+        // without attempting a connection to either endpoint.
+        std::fs::write(
+            &path,
+            json!({
+                "version": 1,
+                "sessionId": "sess-lane-1",
+                "url": "ws://127.0.0.1:2/",
+                "token": "tok-after",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let error = transport
+            .round_trip(GjcRequest::new(
+                "rotation-corr",
+                "control.prompt",
+                json!({"session_id": "sess-lane-1"}),
+                1_000,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error_code(), "stale_endpoint");
+    }
+
+    #[tokio::test]
+    async fn mutating_exchange_rejects_foreign_session_before_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let _ = write_metadata(
+            temp.path(),
+            "sess-lane-1",
+            "ws://127.0.0.1:1/",
+            "tok-session",
+        );
+        let transport = discover_endpoint_for_session(temp.path(), "sess-lane-1").unwrap();
+        let error = transport
+            .round_trip(GjcRequest::new(
+                "identity-corr",
+                "control.prompt",
+                json!({"session_id": "sess-foreign"}),
+                1_000,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error_code(), "session_mismatch");
+    }
+
+    #[tokio::test]
+    async fn mutating_exchange_rejects_rotation_before_acknowledgement() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = write_metadata(
+            temp.path(),
+            "sess-lane-1",
+            &format!("ws://{addr}/"),
+            "tok-before-ack",
+        );
+        let server_metadata = metadata.clone();
+        let server = tokio::spawn(async move {
+            use tokio_tungstenite::tungstenite::Message;
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut stream) = ws.split();
+            sink.send(Message::text(
+                r#"{"type":"hello","connectionId":"ack-rotation"}"#,
+            ))
+            .await
+            .unwrap();
+            let Some(Ok(Message::Text(text))) = stream.next().await else {
+                return;
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            std::fs::write(
+                &server_metadata,
+                json!({
+                    "version": 1,
+                    "sessionId": "sess-lane-1",
+                    "url": format!("ws://{addr}/"),
+                    "token": "tok-after-ack",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&server_metadata, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            sink.send(Message::text(
+                json!({
+                    "type": "control_response",
+                    "id": value["id"],
+                    "ok": true,
+                    "result": {
+                        "accepted": true,
+                        "session_id": "sess-lane-1"
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let transport = discover_endpoint_for_session(temp.path(), "sess-lane-1").unwrap();
+        let error = transport
+            .round_trip(GjcRequest::new(
+                "ack-rotation-corr",
+                "control.prompt",
+                json!({"session_id": "sess-lane-1"}),
+                1_000,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error_code(), "stale_endpoint");
+        server.await.unwrap();
     }
 }

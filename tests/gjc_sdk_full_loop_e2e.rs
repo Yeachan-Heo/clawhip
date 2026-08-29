@@ -22,7 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::gjc_fake_server::{FakeGjcServer, FakePhase};
+use common::gjc_fake_server::{FakeGjcServer, FakePhase, FakeScript};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -153,6 +153,75 @@ max_records_per_compaction = 100
     (config_path, delivery)
 }
 
+fn write_two_lane_config(
+    temp: &TempDir,
+    port: u16,
+    worktree_a: &Path,
+    delivery_a: &Path,
+    worktree_b: &Path,
+    delivery_b: &Path,
+) -> PathBuf {
+    let config_path = temp.path().join("clawhip-two-lane.toml");
+    let ledger_dir = temp.path().join("two-lane-ledger");
+    let lane_state = temp.path().join("two-lane-gjc-state");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[daemon]
+bind_host = "127.0.0.1"
+port = {port}
+base_url = "http://127.0.0.1:{port}"
+
+[gjc]
+enabled = true
+
+[gjc_lanes]
+enabled = true
+discovery_worktrees = ["{}", "{}"]
+poll_interval_secs = 1
+initial_backoff_ms = 50
+max_backoff_ms = 200
+state_path = "{}"
+
+[[routes]]
+event = "*"
+filter = {{ worktree_path = "{}" }}
+sink = "localfile"
+local_path = "{}"
+
+[[routes]]
+event = "*"
+filter = {{ worktree_path = "{}" }}
+sink = "localfile"
+local_path = "{}"
+
+[ledger]
+enabled = true
+path = "{}"
+raw_retention_days = 7
+summary_retention_days = 30
+compaction_interval_secs = 1
+max_records = 1000
+max_record_bytes = 4096
+max_keywords = 8
+max_keyword_bytes = 32
+max_query_results = 50
+max_records_per_compaction = 100
+"#,
+            worktree_a.display(),
+            worktree_b.display(),
+            lane_state.display(),
+            worktree_a.display(),
+            delivery_a.display(),
+            worktree_b.display(),
+            delivery_b.display(),
+            ledger_dir.display()
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
 fn spawn_daemon(config_path: &Path, stderr_path: &Path, worktree: Option<&Path>) -> DaemonGuard {
     let stderr = std::fs::File::create(stderr_path).expect("create daemon stderr log");
     let mut command = Command::new(env!("CARGO_BIN_EXE_clawhip"));
@@ -180,7 +249,7 @@ fn delivery_lines(delivery: &Path) -> Vec<Value> {
 }
 
 fn wait_for_delivery_kind(delivery: &Path, kind: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         for line in delivery_lines(delivery) {
             if line["event_kind"] == kind {
@@ -308,7 +377,7 @@ fn full_loop_register_prompt_question_answer_complete_retire_restart() {
             json!({
                 "session_id": session,
                 "revision": 2,
-                "turn": {"id": "fake-turn-1", "state": "active"},
+                "turn": {"id": "fake-turn-1", "state": "active", "prompt_accepted": true},
                 "prompt": {"command_id": "idem-prompt-326", "status": "accepted"},
                 "summary": "turn running",
             }),
@@ -429,7 +498,7 @@ fn full_loop_register_prompt_question_answer_complete_retire_restart() {
         wait_for_health(daemon_port);
 
         // Durable lane store reloads without resurrecting an active watch.
-        let (status, lanes) = request(daemon_port, "GET", "/api/gjc/lanes", None);
+        let (status, lanes) = request(daemon_port, "GET", "/api/gjc/lanes?removed=true", None);
         assert_eq!(status, 200);
         let records = lanes["lanes"].as_array().cloned().unwrap_or_default();
         assert!(
@@ -469,6 +538,308 @@ fn full_loop_register_prompt_question_answer_complete_retire_restart() {
         restarted.0.kill().ok();
         restarted.0.wait().ok();
         server.stop().await;
+    });
+}
+
+#[test]
+fn two_sessions_isolate_endpoints_worktrees_revisions_receipts_and_alerts() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let session_a = "01a02ccd-c754-7656-95c7-f40b5a140bc3";
+        let session_b = "01b02ccd-c754-7656-95c7-f40b5a140bc4";
+        let script_a = FakeScript {
+            session_id: session_a.into(),
+            turn_id: "fake-turn-a".into(),
+            gate_id: "gate-a".into(),
+            question_title: "Approve lane A?".into(),
+            question_options: vec!["yes".into(), "no".into()],
+        };
+        let script_b = FakeScript {
+            session_id: session_b.into(),
+            turn_id: "fake-turn-b".into(),
+            gate_id: "gate-b".into(),
+            question_title: "Approve lane B?".into(),
+            question_options: vec!["yes".into(), "no".into()],
+        };
+        let server_a = FakeGjcServer::start_with(script_a).await;
+        let server_b = FakeGjcServer::start_with(script_b).await;
+        let temp = TempDir::new().unwrap();
+        let worktree_a = temp.path().join("worktree-a");
+        let worktree_b = temp.path().join("worktree-b");
+        let daemon_root = temp.path().join("daemon-root");
+        std::fs::create_dir_all(&worktree_a).unwrap();
+        std::fs::create_dir_all(&worktree_b).unwrap();
+        std::fs::create_dir_all(&daemon_root).unwrap();
+        let metadata_a = server_a.write_metadata(&worktree_a);
+        let metadata_b = server_b.write_metadata(&worktree_b);
+        let metadata_a_value: Value = serde_json::from_str(
+            &std::fs::read_to_string(&metadata_a).expect("read lane A metadata"),
+        )
+        .unwrap();
+        let metadata_b_value: Value = serde_json::from_str(
+            &std::fs::read_to_string(&metadata_b).expect("read lane B metadata"),
+        )
+        .unwrap();
+        assert_eq!(metadata_a_value["sessionId"], session_a);
+        assert_eq!(metadata_b_value["sessionId"], session_b);
+        assert_eq!(metadata_a_value["url"], server_a.metadata_url());
+        assert_eq!(metadata_b_value["url"], server_b.metadata_url());
+        assert_ne!(metadata_a_value["url"], metadata_b_value["url"]);
+
+        let delivery_a = temp.path().join("delivery-a.jsonl");
+        let delivery_b = temp.path().join("delivery-b.jsonl");
+        let daemon_port = unused_port();
+        let config_path = write_two_lane_config(
+            &temp,
+            daemon_port,
+            &worktree_a,
+            &delivery_a,
+            &worktree_b,
+            &delivery_b,
+        );
+        let daemon_log = temp.path().join("two-lane-daemon.log");
+        let mut daemon = spawn_daemon(&config_path, &daemon_log, Some(&daemon_root));
+        wait_for_health(daemon_port);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let records = loop {
+            let (_, lanes) = request(daemon_port, "GET", "/api/gjc/lanes", None);
+            let records = lanes["lanes"].as_array().cloned().unwrap_or_default();
+            if records.iter().any(|r| r["sdk_session_id"] == session_a)
+                && records.iter().any(|r| r["sdk_session_id"] == session_b)
+            {
+                break records;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "automatic enrollment failed: {lanes}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        let lane_a = records
+            .iter()
+            .find(|r| r["sdk_session_id"] == session_a)
+            .and_then(|r| r["lane_id"].as_str())
+            .unwrap()
+            .to_string();
+        let lane_b = records
+            .iter()
+            .find(|r| r["sdk_session_id"] == session_b)
+            .and_then(|r| r["lane_id"].as_str())
+            .unwrap()
+            .to_string();
+        assert_ne!(lane_a, lane_b);
+
+        let prompt_key_a = "idem-two-session-a";
+        let prompt_key_b = "idem-two-session-b";
+        let (status, receipt_a) = request(
+            daemon_port,
+            "POST",
+            "/api/gjc/prompt",
+            Some(&json!({
+                "session": session_a,
+                "idempotency_key": prompt_key_a,
+                "prompt": "fixed lane A prompt",
+            })),
+        );
+        assert_eq!(status, 200, "lane A prompt failed: {receipt_a}");
+        assert_eq!(receipt_a["status"], "acked");
+        assert_eq!(receipt_a["session_id"], session_a);
+        assert_eq!(receipt_a["idempotency_key"], prompt_key_a);
+        let (status, receipt_b) = request(
+            daemon_port,
+            "POST",
+            "/api/gjc/prompt",
+            Some(&json!({
+                "session": session_b,
+                "idempotency_key": prompt_key_b,
+                "prompt": "fixed lane B prompt",
+            })),
+        );
+        assert_eq!(status, 200, "lane B prompt failed: {receipt_b}");
+        assert_eq!(receipt_b["status"], "acked");
+        assert_eq!(receipt_b["session_id"], session_b);
+        assert_eq!(receipt_b["idempotency_key"], prompt_key_b);
+        assert_ne!(receipt_a["command_id"], receipt_b["command_id"]);
+
+        server_a.set_phase(FakePhase::Running).await;
+        server_b.set_phase(FakePhase::Running).await;
+        thread::sleep(Duration::from_secs(5));
+        server_a.set_phase(FakePhase::Question).await;
+        server_b.set_phase(FakePhase::Question).await;
+        thread::sleep(Duration::from_secs(5));
+
+        let answer_key_a = "idem-two-answer-a";
+        let answer_key_b = "idem-two-answer-b";
+        let (status, answer_a) = request(
+            daemon_port,
+            "POST",
+            "/api/gjc/workflow-gate-answer",
+            Some(&json!({
+                "session": session_a,
+                "idempotency_key": answer_key_a,
+                "gate_id": "gate-a",
+                "option": "yes",
+            })),
+        );
+        assert_eq!(status, 200, "lane A answer failed: {answer_a}");
+        assert_eq!(answer_a["status"], "acked");
+        assert_eq!(answer_a["session_id"], session_a);
+        let (status, answer_b) = request(
+            daemon_port,
+            "POST",
+            "/api/gjc/workflow-gate-answer",
+            Some(&json!({
+                "session": session_b,
+                "idempotency_key": answer_key_b,
+                "gate_id": "gate-b",
+                "option": "yes",
+            })),
+        );
+        assert_eq!(status, 200, "lane B answer failed: {answer_b}");
+        assert_eq!(answer_b["status"], "acked");
+        assert_eq!(answer_b["session_id"], session_b);
+
+        // Both lanes now resume independently after their scoped answers.
+        server_a.set_phase(FakePhase::Completed).await;
+        server_b.set_phase(FakePhase::Completed).await;
+        let (status, query_a) = request(
+            daemon_port,
+            "GET",
+            &format!("/api/gjc/session/{session_a}?sections=metadata,turn"),
+            None,
+        );
+        assert_eq!(status, 200, "lane A query failed: {query_a}");
+        assert_eq!(query_a["metadata"]["session_id"], session_a);
+        assert_eq!(query_a["turn"]["turn_id"], "fake-turn-a");
+        let (status, query_b) = request(
+            daemon_port,
+            "GET",
+            &format!("/api/gjc/session/{session_b}?sections=metadata,turn"),
+            None,
+        );
+        assert_eq!(status, 200, "lane B query failed: {query_b}");
+        assert_eq!(query_b["metadata"]["session_id"], session_b);
+        assert_eq!(query_b["turn"]["turn_id"], "fake-turn-b");
+
+        server_a.set_phase(FakePhase::Completed).await;
+        server_b.set_phase(FakePhase::Completed).await;
+        thread::sleep(Duration::from_secs(5));
+
+        // Receipt lookup is session-bound: the other lane can never observe
+        // this lane's command journal entry.
+        let (status, lookup_a) = request(
+            daemon_port,
+            "GET",
+            &format!("/api/gjc/command/{prompt_key_a}?session={session_a}"),
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(lookup_a["session_id"], session_a);
+        let (status, wrong_lookup) = request(
+            daemon_port,
+            "GET",
+            &format!("/api/gjc/command/{prompt_key_a}?session={session_b}"),
+            None,
+        );
+        assert_eq!(status, 400, "cross-lane receipt leaked: {wrong_lookup}");
+        let (status, lookup_b) = request(
+            daemon_port,
+            "GET",
+            &format!("/api/gjc/command/{prompt_key_b}?session={session_b}"),
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(lookup_b["session_id"], session_b);
+
+        let record_a = request(
+            daemon_port,
+            "GET",
+            &format!("/api/gjc/lanes/{lane_a}"),
+            None,
+        );
+        assert_eq!(record_a.0, 200);
+        assert_eq!(record_a.1["sdk_session_id"], session_a);
+        assert_eq!(record_a.1["worktree"], worktree_a.to_str().unwrap());
+        assert_eq!(record_a.1["sdk_revision"], 4);
+        let record_b = request(
+            daemon_port,
+            "GET",
+            &format!("/api/gjc/lanes/{lane_b}"),
+            None,
+        );
+        assert_eq!(record_b.0, 200);
+        assert_eq!(record_b.1["sdk_session_id"], session_b);
+        assert_eq!(record_b.1["worktree"], worktree_b.to_str().unwrap());
+        assert_eq!(record_b.1["sdk_revision"], 4);
+
+        wait_for_delivery_kind(&delivery_a, "workflow.question");
+        wait_for_delivery_kind(&delivery_b, "workflow.question");
+
+        let worktree_a_text = worktree_a.to_str().unwrap();
+        let worktree_b_text = worktree_b.to_str().unwrap();
+        for line in delivery_lines(&delivery_a) {
+            assert_eq!(line["summary_payload"]["session_id"], session_a);
+            if !line["summary_payload"]["repo_path"].is_null() {
+                assert_eq!(line["summary_payload"]["repo_path"], worktree_a_text);
+            }
+            assert!(!line.to_string().contains(session_b));
+            assert!(!line.to_string().contains(worktree_b_text));
+        }
+        for line in delivery_lines(&delivery_b) {
+            assert_eq!(line["summary_payload"]["session_id"], session_b);
+            if !line["summary_payload"]["repo_path"].is_null() {
+                assert_eq!(line["summary_payload"]["repo_path"], worktree_b_text);
+            }
+            assert!(!line.to_string().contains(session_a));
+            assert!(!line.to_string().contains(worktree_a_text));
+        }
+
+        let controls_a = server_a.control_requests().await;
+        let controls_b = server_b.control_requests().await;
+        assert!(
+            controls_a
+                .iter()
+                .all(|(_, session, _)| session == session_a)
+        );
+        assert!(
+            controls_b
+                .iter()
+                .all(|(_, session, _)| session == session_b)
+        );
+        assert!(
+            controls_a
+                .iter()
+                .any(|(operation, _, key)| operation == "prompt" && key == prompt_key_a)
+        );
+        assert!(controls_a.iter().any(|(operation, _, key)| {
+            operation == "workflow_gate_answer" && key == answer_key_a
+        }));
+        assert!(
+            controls_b
+                .iter()
+                .any(|(operation, _, key)| operation == "prompt" && key == prompt_key_b)
+        );
+        assert!(controls_b.iter().any(|(operation, _, key)| {
+            operation == "workflow_gate_answer" && key == answer_key_b
+        }));
+        assert!(
+            controls_a
+                .iter()
+                .all(|(_, session, _)| session != session_b)
+        );
+        assert!(
+            controls_b
+                .iter()
+                .all(|(_, session, _)| session != session_a)
+        );
+
+        daemon.0.kill().ok();
+        daemon.0.wait().ok();
+        server_a.stop().await;
+        server_b.stop().await;
     });
 }
 

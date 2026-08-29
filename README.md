@@ -1,5 +1,11 @@
 # clawhip
 
+Clawhip is a GJC-first event router. It automatically discovers and binds live
+native GJC SDK sessions, routes authoritative lifecycle, question, gate, and
+failure events through the normal ledger/router/sink pipeline, and preserves
+loopback-only credentials and public-safe projections. GJC remains the process
+owner; Clawhip observes and controls only through the SDK contract.
+
 <p align="center">
   <img src="assets/clawhip-mascot.jpg" width="400" alt="clawhip mascot" />
 </p>

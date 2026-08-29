@@ -239,10 +239,13 @@ pub async fn run(config: Arc<AppConfig>, command: GjcCommands) -> Result<()> {
             render_receipt(&body, mutation.json)
         }
         GjcCommands::Receipt {
+            session,
             idempotency_key,
             json,
         } => {
-            let body = client.gjc_command_receipt(&idempotency_key).await?;
+            let body = client
+                .gjc_command_receipt(&session, &idempotency_key)
+                .await?;
             render_receipt(&body, json)
         }
     }

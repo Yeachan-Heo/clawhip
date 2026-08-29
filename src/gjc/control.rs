@@ -1,24 +1,370 @@
 //! Control plane over the typed GJC contract: idempotent command registry,
 //! capability gating, session-mismatch guards, and the mutation verbs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::model::{
     AbortAndPromptRequest, AskAnswerRequest, CommandId, CommandReceipt, ControlRequestEnvelope,
     GJC_CONTROL_SCHEMA, GjcCommandKind, GjcCommandStatus, GjcError, GjcPromptStatus, GjcRequest,
     GjcResponse, GjcResult, GjcTransport, IdempotencyKey, ModelSelectionRequest, PromptRequest,
-    SessionId, SessionQuery, SteerRequest, WorkflowGateAnswerRequest,
+    SessionId, SessionQuery, SteerRequest, TurnId, WorkflowGateAnswerRequest,
 };
 
 pub type SharedGjcCommandRegistry = Arc<RwLock<HashMap<String, CommandReceipt>>>;
+const MAX_COMMAND_RECEIPTS: usize = 4096;
+const RECEIPT_JOURNAL_FILENAME: &str = "gjc-command-receipts.json";
+const RECEIPT_JOURNAL_SCHEMA: &str = "clawhip.gjc-command-receipts.v1";
+const MAX_RECEIPT_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RECEIPT_BYTES: usize = 16 * 1024;
 
 pub fn new_shared_command_registry() -> SharedGjcCommandRegistry {
     Arc::new(RwLock::new(HashMap::new()))
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ReceiptJournalFile {
+    schema: String,
+    receipts: BTreeMap<String, CommandReceipt>,
+}
+
+struct ReceiptJournalState {
+    pending: Option<GjcResult<BTreeMap<String, CommandReceipt>>>,
+    loaded: bool,
+    error: Option<GjcError>,
+}
+
+/// Durable receipt state is only attached to production worktree-scoped
+/// planes. Static transports intentionally remain memory-only test seams.
+struct ReceiptJournal {
+    path: PathBuf,
+    state: Mutex<ReceiptJournalState>,
+    persist_lock: std::sync::Mutex<()>,
+}
+
+impl ReceiptJournal {
+    fn for_worktree(worktree: &Path) -> Self {
+        let state_dir = worktree.join(".gjc").join("state");
+        let path = state_dir.join(RECEIPT_JOURNAL_FILENAME);
+        let pending = load_receipt_journal(worktree, &path);
+        Self {
+            path,
+            state: Mutex::new(ReceiptJournalState {
+                pending: Some(pending),
+                loaded: false,
+                error: None,
+            }),
+            persist_lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn initialize(&self, registry: &SharedGjcCommandRegistry) {
+        let Ok(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if state.loaded || state.error.is_some() {
+            return;
+        }
+        let Some(pending) = state.pending.take() else {
+            return;
+        };
+        let receipts = match pending {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                state.error = Some(error);
+                return;
+            }
+        };
+        let Ok(mut write) = registry.try_write() else {
+            state.pending = Some(Ok(receipts));
+            return;
+        };
+        if let Err(error) = merge_loaded_receipts(&mut write, receipts) {
+            state.error = Some(error);
+            return;
+        }
+        state.loaded = true;
+    }
+
+    async fn ensure_loaded(&self, registry: &SharedGjcCommandRegistry) -> GjcResult<()> {
+        let mut state = self.state.lock().await;
+        if let Some(error) = state.error.clone() {
+            return Err(error);
+        }
+        if state.loaded {
+            return Ok(());
+        }
+        let pending = state
+            .pending
+            .take()
+            .expect("receipt journal initialization state must be present");
+        let receipts = match pending {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                state.error = Some(error.clone());
+                return Err(error);
+            }
+        };
+        let mut write = registry.write().await;
+        if let Err(error) = merge_loaded_receipts(&mut write, receipts) {
+            state.error = Some(error.clone());
+            return Err(error);
+        }
+        state.loaded = true;
+        Ok(())
+    }
+
+    fn persist(&self, registry: &HashMap<String, CommandReceipt>) -> GjcResult<()> {
+        let _guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| receipt_journal_error("receipt journal lock failed"))?;
+        let mut receipts = BTreeMap::new();
+        for (key, receipt) in registry {
+            validate_loaded_receipt(key, receipt)?;
+            receipts.insert(key.clone(), receipt.clone());
+        }
+        if receipts.len() > MAX_COMMAND_RECEIPTS {
+            return Err(receipt_journal_error("receipt journal exceeds capacity"));
+        }
+        let journal = ReceiptJournalFile {
+            schema: RECEIPT_JOURNAL_SCHEMA.into(),
+            receipts,
+        };
+        let bytes = serde_json::to_vec_pretty(&journal)
+            .map_err(|_| receipt_journal_error("receipt journal serialization failed"))?;
+        if bytes.len() as u64 > MAX_RECEIPT_JOURNAL_BYTES {
+            return Err(receipt_journal_error("receipt journal exceeds size limit"));
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| receipt_journal_error("receipt journal path is invalid"))?;
+        validate_state_directory(parent)?;
+        let temp_path = parent.join(format!(
+            ".{}.{}.tmp",
+            RECEIPT_JOURNAL_FILENAME,
+            Uuid::new_v4()
+        ));
+        let result = (|| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temp_path)
+                .map_err(|_| receipt_journal_error("receipt journal write failed"))?;
+            file.write_all(&bytes)
+                .and_then(|_| file.flush())
+                .and_then(|_| file.sync_all())
+                .map_err(|_| receipt_journal_error("receipt journal write failed"))?;
+            drop(file);
+            fs::rename(&temp_path, &self.path)
+                .map_err(|_| receipt_journal_error("receipt journal replace failed"))?;
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| receipt_journal_error("receipt journal directory sync failed"))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
+    }
+}
+
+fn merge_loaded_receipts(
+    registry: &mut HashMap<String, CommandReceipt>,
+    receipts: BTreeMap<String, CommandReceipt>,
+) -> GjcResult<()> {
+    if receipts.len() > MAX_COMMAND_RECEIPTS {
+        return Err(receipt_journal_error("receipt journal exceeds capacity"));
+    }
+    let additions = receipts
+        .keys()
+        .filter(|key| !registry.contains_key(*key))
+        .count();
+    if registry.len().saturating_add(additions) > MAX_COMMAND_RECEIPTS {
+        return Err(receipt_journal_error("receipt journal exceeds capacity"));
+    }
+    for (key, receipt) in &receipts {
+        if let Some(existing) = registry.get(key)
+            && serde_json::to_value(existing).ok() != serde_json::to_value(receipt).ok()
+        {
+            return Err(receipt_journal_error(
+                "receipt journal conflicts with live state",
+            ));
+        }
+    }
+    for (key, receipt) in receipts {
+        registry.entry(key).or_insert(receipt);
+    }
+    Ok(())
+}
+
+fn receipt_journal_error(reason: &str) -> GjcError {
+    GjcError::InvalidRequest {
+        field: "receipt_journal",
+        reason: reason.into(),
+    }
+}
+
+fn load_receipt_journal(
+    worktree: &Path,
+    path: &Path,
+) -> GjcResult<BTreeMap<String, CommandReceipt>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| receipt_journal_error("receipt journal path is invalid"))?;
+    ensure_state_directory(worktree, parent)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(_) => return Err(receipt_journal_error("receipt journal cannot be inspected")),
+    };
+    if metadata.is_symlink() || !metadata.is_file() {
+        return Err(receipt_journal_error(
+            "receipt journal is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = metadata.uid();
+        let current = unsafe { libc::getuid() };
+        if owner != 0 && current != 0 && owner != current {
+            return Err(receipt_journal_error(
+                "receipt journal owner is not trusted",
+            ));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(receipt_journal_error(
+                "receipt journal permissions are not trusted",
+            ));
+        }
+    }
+    if metadata.len() > MAX_RECEIPT_JOURNAL_BYTES {
+        return Err(receipt_journal_error("receipt journal exceeds size limit"));
+    }
+    let bytes =
+        fs::read(path).map_err(|_| receipt_journal_error("receipt journal cannot be read"))?;
+    if bytes.len() as u64 > MAX_RECEIPT_JOURNAL_BYTES {
+        return Err(receipt_journal_error("receipt journal exceeds size limit"));
+    }
+    let journal: ReceiptJournalFile = serde_json::from_slice(&bytes)
+        .map_err(|_| receipt_journal_error("receipt journal is malformed"))?;
+    if journal.schema != RECEIPT_JOURNAL_SCHEMA {
+        return Err(receipt_journal_error(
+            "receipt journal schema is unsupported",
+        ));
+    }
+    if journal.receipts.len() > MAX_COMMAND_RECEIPTS {
+        return Err(receipt_journal_error("receipt journal exceeds capacity"));
+    }
+    for (key, receipt) in &journal.receipts {
+        validate_loaded_receipt(key, receipt)?;
+    }
+    Ok(journal.receipts)
+}
+
+fn ensure_state_directory(worktree: &Path, state_dir: &Path) -> GjcResult<()> {
+    let gjc_dir = worktree.join(".gjc");
+    for directory in [&gjc_dir, state_dir] {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_symlink() || !metadata.is_dir() => {
+                return Err(receipt_journal_error(
+                    "receipt state directory is not trusted",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(directory).map_err(|_| {
+                    receipt_journal_error("receipt state directory cannot be created")
+                })?;
+            }
+            Err(_) => {
+                return Err(receipt_journal_error(
+                    "receipt state directory cannot be inspected",
+                ));
+            }
+        }
+    }
+    validate_state_directory(state_dir)
+}
+
+fn validate_state_directory(state_dir: &Path) -> GjcResult<()> {
+    let metadata = fs::symlink_metadata(state_dir)
+        .map_err(|_| receipt_journal_error("receipt state directory cannot be inspected"))?;
+    if metadata.is_symlink() || !metadata.is_dir() {
+        return Err(receipt_journal_error(
+            "receipt state directory is not trusted",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o002 != 0 {
+            return Err(receipt_journal_error(
+                "receipt state directory is writable by others",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_loaded_receipt(key: &str, receipt: &CommandReceipt) -> GjcResult<()> {
+    IdempotencyKey::new(key.to_string())
+        .map_err(|_| receipt_journal_error("receipt idempotency key is invalid"))?;
+    if receipt.schema != GJC_CONTROL_SCHEMA || receipt.idempotency_key != key {
+        return Err(receipt_journal_error("receipt identity is invalid"));
+    }
+    CommandId::new(receipt.command_id.clone())
+        .map_err(|_| receipt_journal_error("receipt command id is invalid"))?;
+    SessionId::new(receipt.session_id.clone())
+        .map_err(|_| receipt_journal_error("receipt session id is invalid"))?;
+    if !matches!(
+        receipt.kind.as_str(),
+        "prompt"
+            | "steer"
+            | "abort_and_prompt"
+            | "workflow_gate_answer"
+            | "ask_answer"
+            | "model_selection"
+    ) {
+        return Err(receipt_journal_error("receipt command kind is invalid"));
+    }
+    if let Some(turn_id) = receipt.turn_id.as_ref() {
+        TurnId::new(turn_id.clone())
+            .map_err(|_| receipt_journal_error("receipt turn id is invalid"))?;
+    }
+    OffsetDateTime::parse(&receipt.created_at, &Rfc3339)
+        .map_err(|_| receipt_journal_error("receipt timestamp is invalid"))?;
+    if receipt.status.is_terminal() != receipt.outcome.is_some() {
+        return Err(receipt_journal_error("receipt outcome state is invalid"));
+    }
+    if let Some(outcome) = receipt.outcome.as_ref()
+        && public_outcome(outcome) != *outcome
+    {
+        return Err(receipt_journal_error("receipt outcome is not public-safe"));
+    }
+    let bytes = serde_json::to_vec(receipt)
+        .map_err(|_| receipt_journal_error("receipt cannot be serialized"))?;
+    if bytes.len() > MAX_RECEIPT_BYTES {
+        return Err(receipt_journal_error("receipt exceeds size limit"));
+    }
+    Ok(())
 }
 
 fn now_rfc3339() -> String {
@@ -41,8 +387,9 @@ enum TransportSource {
 /// A live transport binding: the resolved endpoint and the session it serves.
 #[derive(Clone)]
 struct BoundTransport {
-    session_id: Option<String>,
     transport: Arc<dyn GjcTransport>,
+    session_id: Option<String>,
+    worktree: Option<PathBuf>,
 }
 
 /// The authoritative control plane. One instance per daemon; CLI paths go
@@ -52,6 +399,7 @@ pub struct GjcControlPlane {
     source: TransportSource,
     bound: Arc<RwLock<Option<BoundTransport>>>,
     registry: SharedGjcCommandRegistry,
+    journal: Option<Arc<ReceiptJournal>>,
 }
 
 impl GjcControlPlane {
@@ -62,6 +410,7 @@ impl GjcControlPlane {
             source: TransportSource::Static(transport),
             bound: Arc::new(RwLock::new(None)),
             registry,
+            journal: None,
         }
     }
 
@@ -72,17 +421,51 @@ impl GjcControlPlane {
             source: TransportSource::Unavailable,
             bound: Arc::new(RwLock::new(None)),
             registry,
+            journal: None,
         }
     }
 
     /// Production constructor: resolve the lane endpoint under `worktree`
     /// through the #322 discovery surface on demand.
     pub fn for_worktree(worktree: &std::path::Path, registry: SharedGjcCommandRegistry) -> Self {
+        let journal = Arc::new(ReceiptJournal::for_worktree(worktree));
+        journal.initialize(&registry);
         Self {
             source: TransportSource::Discovery(worktree.to_path_buf()),
             bound: Arc::new(RwLock::new(None)),
             registry,
+            journal: Some(journal),
         }
+    }
+
+    /// Scope a control plane to an enrolled lane's worktree while retaining
+    /// the shared command registry used for idempotent receipts. Public
+    /// daemon handlers use this after resolving the session through the
+    /// durable lane store; callers must not derive the worktree from the
+    /// daemon's current directory.
+    pub fn scoped_to_worktree(&self, worktree: &std::path::Path) -> Self {
+        let journal = Arc::new(ReceiptJournal::for_worktree(worktree));
+        journal.initialize(&self.registry);
+        Self {
+            source: TransportSource::Discovery(worktree.to_path_buf()),
+            bound: Arc::new(RwLock::new(None)),
+            registry: self.registry.clone(),
+            journal: Some(journal),
+        }
+    }
+
+    async fn ensure_receipt_journal(&self) -> GjcResult<()> {
+        if let Some(journal) = self.journal.as_ref() {
+            journal.ensure_loaded(&self.registry).await?;
+        }
+        Ok(())
+    }
+
+    fn persist_receipts(&self, registry: &HashMap<String, CommandReceipt>) -> GjcResult<()> {
+        if let Some(journal) = self.journal.as_ref() {
+            journal.persist(registry)?;
+        }
+        Ok(())
     }
 
     /// Resolve a usable transport, enforcing session binding for
@@ -94,23 +477,18 @@ impl GjcControlPlane {
     ) -> GjcResult<Option<BoundTransport>> {
         match &self.source {
             TransportSource::Static(transport) => Ok(Some(BoundTransport {
-                session_id: None,
                 transport: transport.clone(),
+                session_id: None,
+                worktree: None,
             })),
             TransportSource::Unavailable => Ok(None),
             TransportSource::Discovery(root) => {
-                let cached = self.bound.read().await.clone();
-                if let Some(bound) = cached {
-                    let matches = match (bound.session_id.as_deref(), wanted) {
-                        (_, None) => true,
-                        (None, _) => true,
-                        (Some(bound_session), Some(wanted)) => bound_session == wanted.as_str(),
-                    };
-                    if matches {
-                        return Ok(Some(bound));
-                    }
-                }
-                match super::transport::discover_endpoint(root) {
+                let discovered = if let Some(wanted) = wanted {
+                    super::transport::discover_endpoint_for_session(root, wanted.as_str())
+                } else {
+                    super::transport::discover_endpoint(root)
+                };
+                match discovered {
                     Ok(endpoint) => {
                         if let Some(wanted) = wanted {
                             let endpoint_session = endpoint.session_id().to_string();
@@ -121,8 +499,9 @@ impl GjcControlPlane {
                             }
                         }
                         let bound = BoundTransport {
-                            session_id: Some(endpoint.session_id().to_string()),
                             transport: Arc::new(endpoint),
+                            session_id: wanted.map(|session| session.as_str().to_string()),
+                            worktree: Some(root.clone()),
                         };
                         *self.bound.write().await = Some(bound.clone());
                         Ok(Some(bound))
@@ -140,6 +519,14 @@ impl GjcControlPlane {
             self.resolve_transport(None).await,
             Ok(Some(_)) | Err(GjcError::SessionMismatch { .. })
         );
+        super::model::Capabilities::for_transport(implemented)
+    }
+
+    pub async fn capabilities_for_session(
+        &self,
+        session: &SessionId,
+    ) -> super::model::Capabilities {
+        let implemented = matches!(self.resolve_transport(Some(session)).await, Ok(Some(_)));
         super::model::Capabilities::for_transport(implemented)
     }
     // -----------------------------------------------------------------
@@ -171,8 +558,32 @@ impl GjcControlPlane {
             )
             .await?;
         let result = reply.result;
-        let mut query = SessionQuery::default();
-        if let Some(value) = result.get("metadata") {
+        let Some(result) = result.as_object() else {
+            return Err(GjcError::InvalidPeerReply {
+                method: "session.get".into(),
+                reason: "result must be an object".into(),
+            });
+        };
+        if sections.contains(&"metadata")
+            && !result
+                .get("metadata")
+                .is_some_and(|value| value.is_object())
+        {
+            return Err(GjcError::InvalidPeerReply {
+                method: "session.get".into(),
+                reason: "metadata identity section is required".into(),
+            });
+        }
+        let mut query = SessionQuery {
+            revision: result.get("revision").and_then(Value::as_u64),
+            workflow_gates_present: sections.contains(&"workflow_gates")
+                && result.contains_key("workflow_gates"),
+            turn_present: sections.contains(&"turn") && result.contains_key("turn"),
+            ..SessionQuery::default()
+        };
+        if sections.contains(&"metadata")
+            && let Some(value) = result.get("metadata")
+        {
             query.metadata = serde_json::from_value(value.clone()).map_err(|error| {
                 GjcError::InvalidPeerReply {
                     method: "session.get".into(),
@@ -180,7 +591,9 @@ impl GjcControlPlane {
                 }
             })?;
         }
-        if let Some(value) = result.get("stats") {
+        if sections.contains(&"stats")
+            && let Some(value) = result.get("stats")
+        {
             query.stats = serde_json::from_value(value.clone()).map_err(|error| {
                 GjcError::InvalidPeerReply {
                     method: "session.get".into(),
@@ -188,7 +601,9 @@ impl GjcControlPlane {
                 }
             })?;
         }
-        if let Some(value) = result.get("model_profile") {
+        if sections.contains(&"model_profile")
+            && let Some(value) = result.get("model_profile")
+        {
             query.model_profile = serde_json::from_value(value.clone()).map_err(|error| {
                 GjcError::InvalidPeerReply {
                     method: "session.get".into(),
@@ -196,7 +611,9 @@ impl GjcControlPlane {
                 }
             })?;
         }
-        if let Some(value) = result.get("turn") {
+        if sections.contains(&"turn")
+            && let Some(value) = result.get("turn")
+        {
             query.turn = serde_json::from_value(value.clone()).map_err(|error| {
                 GjcError::InvalidPeerReply {
                     method: "session.get".into(),
@@ -204,7 +621,9 @@ impl GjcControlPlane {
                 }
             })?;
         }
-        if let Some(value) = result.get("queue") {
+        if sections.contains(&"queue")
+            && let Some(value) = result.get("queue")
+        {
             query.queue = serde_json::from_value(value.clone()).map_err(|error| {
                 GjcError::InvalidPeerReply {
                     method: "session.get".into(),
@@ -212,7 +631,15 @@ impl GjcControlPlane {
                 }
             })?;
         }
-        if let Some(value) = result.get("workflow_gates") {
+        if sections.contains(&"workflow_gates")
+            && let Some(value) = result.get("workflow_gates")
+        {
+            if value.is_null() {
+                return Err(GjcError::InvalidPeerReply {
+                    method: "session.get".into(),
+                    reason: "workflow_gates section must be an array when present".into(),
+                });
+            }
             query.workflow_gates = serde_json::from_value(value.clone()).map_err(|error| {
                 GjcError::InvalidPeerReply {
                     method: "session.get".into(),
@@ -220,7 +647,9 @@ impl GjcControlPlane {
                 }
             })?;
         }
-        if let Some(value) = result.get("goal_todo") {
+        if sections.contains(&"goal_todo")
+            && let Some(value) = result.get("goal_todo")
+        {
             query.goal_todo = serde_json::from_value(value.clone()).map_err(|error| {
                 GjcError::InvalidPeerReply {
                     method: "session.get".into(),
@@ -234,6 +663,7 @@ impl GjcControlPlane {
 
     /// Terminal outcome receipt for one turn.
     pub async fn turn_outcome(&self, session: &SessionId, turn_id: &str) -> GjcResult<Value> {
+        let requested_turn = TurnId::new(turn_id.to_string())?;
         let transport = self
             .resolve_transport(Some(session))
             .await?
@@ -259,7 +689,33 @@ impl GjcControlPlane {
                     method: "turn.outcome".into(),
                     reason: "outcome missing".into(),
                 })?;
-        Ok(outcome)
+        let status = outcome
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| GjcError::InvalidPeerReply {
+                method: "turn.outcome".into(),
+                reason: "outcome status missing".into(),
+            })?;
+        if !matches!(status, "succeeded" | "failed" | "aborted") {
+            return Err(GjcError::InvalidPeerReply {
+                method: "turn.outcome".into(),
+                reason: "outcome is not terminal".into(),
+            });
+        }
+        if let Some(echoed) = outcome.get("turn_id").and_then(Value::as_str) {
+            let echoed_turn =
+                TurnId::new(echoed.to_string()).map_err(|_| GjcError::InvalidPeerReply {
+                    method: "turn.outcome".into(),
+                    reason: "outcome turn identity is malformed".into(),
+                })?;
+            if echoed_turn != requested_turn {
+                return Err(GjcError::InvalidPeerReply {
+                    method: "turn.outcome".into(),
+                    reason: "outcome turn identity mismatch".into(),
+                });
+            }
+        }
+        Ok(public_outcome(&outcome))
     }
 
     // -----------------------------------------------------------------
@@ -359,6 +815,7 @@ impl GjcControlPlane {
 
     /// Replay an accepted command by idempotency key.
     pub async fn command_receipt(&self, key: &IdempotencyKey) -> GjcResult<CommandReceipt> {
+        self.ensure_receipt_journal().await?;
         self.registry
             .read()
             .await
@@ -366,16 +823,6 @@ impl GjcControlPlane {
             .cloned()
             .ok_or(GjcError::SessionNotFound {
                 session_id: key.as_str().to_string(),
-            })
-            .and_then(|receipt| {
-                if receipt.status.is_terminal() {
-                    Ok(receipt)
-                } else {
-                    Err(GjcError::InvalidRequest {
-                        field: "idempotency_key",
-                        reason: "command has not reached a terminal state".into(),
-                    })
-                }
             })
     }
 
@@ -401,6 +848,41 @@ impl GjcControlPlane {
         Ok(reply)
     }
 
+    /// Re-read the discovery record for a mutating exchange and compare it to
+    /// the endpoint captured during resolution. This is deliberately called
+    /// after the durable reservation and both immediately before dispatch and
+    /// immediately before trusting an acknowledgement; any ambiguity leaves
+    /// the non-terminal reservation intact and never triggers a replay.
+    async fn validate_mutation_lease(
+        &self,
+        transport: &BoundTransport,
+        session: &SessionId,
+    ) -> GjcResult<()> {
+        let TransportSource::Discovery(root) = &self.source else {
+            return Ok(());
+        };
+        if transport.session_id.as_deref() != Some(session.as_str())
+            || transport.worktree.as_deref() != Some(root.as_path())
+        {
+            return Err(GjcError::SessionMismatch {
+                expected: session.as_str().to_string(),
+            });
+        }
+        let current = super::transport::discover_endpoint_for_session(root, session.as_str())
+            .map_err(|error| match error {
+                GjcError::SessionNotFound { .. } => GjcError::StaleEndpoint {
+                    capability: super::model::CAP_ENDPOINT.into(),
+                },
+                other => other,
+            })?;
+        if transport.transport.endpoint_generation() != Some(current.endpoint_generation()) {
+            return Err(GjcError::StaleEndpoint {
+                capability: super::model::CAP_ENDPOINT.into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Shared mutation path: capability gate, session guard, idempotent
     /// replay, bounded exchange, receipt recording with forward-only
     /// status progression.
@@ -410,7 +892,35 @@ impl GjcControlPlane {
         kind: GjcCommandKind,
         params: Value,
     ) -> GjcResult<CommandReceipt> {
+        self.ensure_receipt_journal().await?;
         envelope.validate()?;
+        if let Some(expected) = envelope.expected_session.as_ref()
+            && expected.as_str() != envelope.session.as_str()
+        {
+            return Err(GjcError::SessionMismatch {
+                expected: envelope.session.as_str().to_string(),
+            });
+        }
+        if let Some(existing) = self
+            .registry
+            .read()
+            .await
+            .get(envelope.idempotency_key.as_str())
+        {
+            if existing.session_id != envelope.session.as_str() || existing.kind != kind.as_str() {
+                return Err(GjcError::InvalidRequest {
+                    field: "idempotency_key",
+                    reason: "key is bound to another session or command kind".into(),
+                });
+            }
+            if existing.status.is_terminal() {
+                return Ok(existing.clone());
+            }
+            return Err(GjcError::InvalidRequest {
+                field: "idempotency_key",
+                reason: "command is already in flight".into(),
+            });
+        }
         // Capability gate: mutations fail closed on missing capability
         // before any session or transport work happens.
         self.capabilities()
@@ -420,27 +930,6 @@ impl GjcControlPlane {
             .resolve_transport(Some(&envelope.session))
             .await?
             .ok_or(GjcError::TransportUnavailable)?;
-
-        // Idempotent replay: the identical key returns the recorded receipt.
-        if let Some(existing) = self
-            .registry
-            .read()
-            .await
-            .get(envelope.idempotency_key.as_str())
-            && existing.status.is_terminal()
-        {
-            return Ok(existing.clone());
-        }
-
-        // Expected-session guard: fail closed before any dispatch when the
-        // caller's belief disagrees with the addressed session.
-        if let Some(expected) = envelope.expected_session.as_ref()
-            && expected.as_str() != envelope.session.as_str()
-        {
-            return Err(GjcError::SessionMismatch {
-                expected: envelope.session.as_str().to_string(),
-            });
-        }
 
         let mut request_params = json!({
             "session_id": envelope.session.as_str(),
@@ -468,22 +957,86 @@ impl GjcControlPlane {
             outcome: None,
             created_at: now_rfc3339(),
         };
-        self.registry.write().await.insert(
-            envelope.idempotency_key.as_str().to_string(),
-            receipt.clone(),
-        );
+        // Replay checking and reservation share one write lock so concurrent
+        // callers cannot both claim the same key.
+        let mut registry = self.registry.write().await;
+        if let Some(existing) = registry.get(envelope.idempotency_key.as_str()) {
+            if existing.session_id != envelope.session.as_str() || existing.kind != kind.as_str() {
+                return Err(GjcError::InvalidRequest {
+                    field: "idempotency_key",
+                    reason: "key is bound to another session or command kind".into(),
+                });
+            }
+            if existing.status.is_terminal() {
+                return Ok(existing.clone());
+            }
+            return Err(GjcError::InvalidRequest {
+                field: "idempotency_key",
+                reason: "command is already in flight".into(),
+            });
+        }
+        if registry.len() >= MAX_COMMAND_RECEIPTS {
+            let evictable = registry
+                .iter()
+                .find(|(_, receipt)| receipt.status.is_terminal())
+                .map(|(key, _)| key.clone());
+            let Some(evictable) = evictable else {
+                return Err(GjcError::InvalidRequest {
+                    field: "idempotency_key",
+                    reason: "command receipt capacity is exhausted by active commands".into(),
+                });
+            };
+            let evicted = registry
+                .remove(&evictable)
+                .expect("receipt eviction key must still exist");
+            registry.insert(
+                envelope.idempotency_key.as_str().to_string(),
+                receipt.clone(),
+            );
+            if let Err(error) = self.persist_receipts(&registry) {
+                registry.remove(envelope.idempotency_key.as_str());
+                registry.insert(evictable, evicted);
+                return Err(error);
+            }
+        } else {
+            registry.insert(
+                envelope.idempotency_key.as_str().to_string(),
+                receipt.clone(),
+            );
+            if let Err(error) = self.persist_receipts(&registry) {
+                registry.remove(envelope.idempotency_key.as_str());
+                return Err(error);
+            }
+        }
+        drop(registry);
+        // The reservation is durable before any peer exchange begins.
+
+        // Revalidate the enrolled worktree/session/generation at the final
+        // dispatch boundary. Rotation is stale rather than retryable: this
+        // command remains reserved and is never sent to a replacement peer.
+        self.validate_mutation_lease(&transport, &envelope.session)
+            .await?;
 
         // Transport exchange with bounded timeout semantics owned by the
         // transport implementation (#322). Ambiguous or malformed acks fail
         // closed; the recorded receipt stays non-terminal so a replay does
         // not fabricate an outcome.
-        let reply = self
+        let reply = match self
             .round_trip(
                 &transport,
                 &format!("control.{}", kind.as_str()),
                 request_params,
                 envelope.timeout_ms,
             )
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => return Err(error),
+        };
+        // Revalidate again before accepting the acknowledgement. If metadata
+        // rotated while the exchange was in flight, the reservation remains
+        // Accepted and the control is never replayed automatically.
+        self.validate_mutation_lease(&transport, &envelope.session)
             .await?;
 
         let acked = reply
@@ -499,9 +1052,12 @@ impl GjcControlPlane {
 
         // Ack-side session guard: an ack naming a different session is
         // treated as a mismatch and fails closed.
-        if let Some(echoed) = reply.result.get("session_id").and_then(Value::as_str)
-            && echoed != envelope.session.as_str()
-        {
+        let Some(echoed) = reply.result.get("session_id").and_then(Value::as_str) else {
+            return Err(GjcError::AmbiguousAck {
+                method: kind.as_str().into(),
+            });
+        };
+        if echoed != envelope.session.as_str() {
             return Err(GjcError::SessionMismatch {
                 expected: envelope.session.as_str().to_string(),
             });
@@ -513,26 +1069,37 @@ impl GjcControlPlane {
             .get("turn_id")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let outcome = reply.result.get("outcome").cloned();
+        let outcome = reply.result.get("outcome").map(public_outcome);
 
         let mut write = self.registry.write().await;
-        let entry =
-            write
-                .get_mut(envelope.idempotency_key.as_str())
-                .ok_or(GjcError::InvalidRequest {
+        let previous;
+        let acked_entry = {
+            let entry = write.get_mut(envelope.idempotency_key.as_str()).ok_or(
+                GjcError::InvalidRequest {
                     field: "idempotency_key",
                     reason: "command registry entry vanished mid-flight".into(),
-                })?;
-        if !entry.status.can_transition_to(GjcCommandStatus::Acked) {
-            return Err(GjcError::AmbiguousAck {
-                method: kind.as_str().into(),
-            });
+                },
+            )?;
+            if !entry.status.can_transition_to(GjcCommandStatus::Acked) {
+                return Err(GjcError::AmbiguousAck {
+                    method: kind.as_str().into(),
+                });
+            }
+            previous = entry.clone();
+            entry.status = GjcCommandStatus::Acked;
+            if let Some(turn_id) = turn_id.clone() {
+                entry.turn_id = Some(turn_id);
+            }
+            entry.clone()
+        };
+        let snapshot = write.clone();
+        if let Err(error) = self.persist_receipts(&snapshot) {
+            if let Some(entry) = write.get_mut(envelope.idempotency_key.as_str()) {
+                *entry = previous;
+            }
+            return Err(error);
         }
-        entry.status = GjcCommandStatus::Acked;
-        if let Some(turn_id) = turn_id.clone() {
-            entry.turn_id = Some(turn_id);
-        }
-        let mut updated = entry.clone();
+        let mut updated = acked_entry;
         drop(write);
 
         // Terminal receipt: a peer outcome is only trusted when it carries
@@ -558,12 +1125,26 @@ impl GjcControlPlane {
                 }
             };
             let mut write = self.registry.write().await;
-            if let Some(entry) = write.get_mut(envelope.idempotency_key.as_str())
+            let previous_and_updated = if let Some(entry) =
+                write.get_mut(envelope.idempotency_key.as_str())
                 && entry.status.can_transition_to(terminal)
             {
+                let previous = entry.clone();
                 entry.status = terminal;
                 entry.outcome = Some(outcome);
-                updated = entry.clone();
+                Some((previous, entry.clone()))
+            } else {
+                None
+            };
+            if let Some((previous, terminal_entry)) = previous_and_updated {
+                let snapshot = write.clone();
+                if let Err(error) = self.persist_receipts(&snapshot) {
+                    if let Some(entry) = write.get_mut(envelope.idempotency_key.as_str()) {
+                        *entry = previous;
+                    }
+                    return Err(error);
+                }
+                updated = terminal_entry;
             }
         }
 
@@ -583,6 +1164,70 @@ impl GjcControlPlane {
         }
         Ok(())
     }
+}
+
+pub(crate) fn public_outcome(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return json!({"status": "unknown", "summary": "details redacted"});
+    };
+    let mut safe = serde_json::Map::new();
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| {
+            matches!(
+                *status,
+                "queued" | "running" | "succeeded" | "failed" | "aborted"
+            )
+        })
+        .unwrap_or("unknown");
+    safe.insert("status".into(), Value::String(status.into()));
+    if let Some(Value::String(text)) = object.get("turn_id")
+        && text.len() <= 128
+        && !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        safe.insert("turn_id".into(), Value::String(text.clone()));
+    }
+    if let Some(Value::String(text)) = object.get("finished_at")
+        && let Ok(parsed) = OffsetDateTime::parse(text, &Rfc3339)
+        && let Ok(canonical) = parsed.format(&Rfc3339)
+    {
+        safe.insert("finished_at".into(), Value::String(canonical));
+    }
+    if let Some(Value::String(summary)) = object.get("summary") {
+        let lower = summary.to_ascii_lowercase();
+        let compact: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
+        let safe_summary = if summary.len() <= 128
+            && !lower.contains("token")
+            && !lower.contains("secret")
+            && !lower.contains("password")
+            && !lower.contains("api_key")
+            && !lower.contains("api-key")
+            && !lower.contains("private_key")
+            && !lower.contains("authorization")
+            && !lower.contains("apikey")
+            && !lower.contains("credential")
+            && !lower.contains("passwd")
+            && !lower.contains("auth:")
+            && !compact.contains("privatekey")
+            && !lower.contains("auth=")
+            && !lower.contains("bearer")
+            && !lower.contains("://")
+            && summary.is_ascii()
+        {
+            summary
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect()
+        } else {
+            "details redacted".to_string()
+        };
+        safe.insert("summary".into(), Value::String(safe_summary));
+    }
+    Value::Object(safe)
 }
 
 fn parse_prompt_status(raw: &str) -> Option<GjcPromptStatus> {
@@ -652,7 +1297,7 @@ mod tests {
     fn ack_reply(turn_id: &str) -> GjcResult<GjcResponse> {
         Ok(GjcResponse {
             correlation_id: String::new(),
-            result: json!({"accepted": true, "turn_id": turn_id}),
+            result: json!({"accepted": true, "session_id": "sess-1", "turn_id": turn_id}),
         })
     }
 
@@ -661,6 +1306,7 @@ mod tests {
             correlation_id: String::new(),
             result: json!({
                 "accepted": true,
+                "session_id": "sess-1",
                 "turn_id": turn_id,
                 "outcome": {"status": status, "summary": summary},
             }),
@@ -709,6 +1355,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_session_allows_omitted_optional_surfaces() {
+        let (plane, _transport) = implemented_plane_with(vec![Ok(GjcResponse {
+            correlation_id: String::new(),
+            result: json!({
+                "metadata": {"session_id": "sess-1"}
+            }),
+        })])
+        .await;
+        let query = plane
+            .query_session(
+                &SessionId::new("sess-1").unwrap(),
+                &["metadata", "stats", "turn", "workflow_gates"],
+            )
+            .await
+            .unwrap();
+        assert!(query.stats.is_none());
+        assert!(query.turn.is_none());
+        assert!(query.workflow_gates.is_none());
+        assert!(!query.turn_present);
+    }
+
+    #[tokio::test]
+    async fn query_session_preserves_explicit_null_turn_presence() {
+        let (plane, _transport) = implemented_plane_with(vec![Ok(GjcResponse {
+            correlation_id: String::new(),
+            result: json!({
+                "metadata": {"session_id": "sess-1"},
+                "turn": null
+            }),
+        })])
+        .await;
+        let query = plane
+            .query_session(&SessionId::new("sess-1").unwrap(), &["metadata", "turn"])
+            .await
+            .unwrap();
+        assert!(query.turn_present);
+        assert!(query.turn.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_session_ignores_unrequested_sections() {
+        let (plane, _transport) = implemented_plane_with(vec![Ok(GjcResponse {
+            correlation_id: String::new(),
+            result: json!({
+                "metadata": {"session_id": "sess-1"},
+                "turn": {"id": "not-returned", "state": "invalid"},
+                "goal_todo": {"raw": "not-returned"}
+            }),
+        })])
+        .await;
+        let query = plane
+            .query_session(&SessionId::new("sess-1").unwrap(), &["metadata"])
+            .await
+            .unwrap();
+        assert!(query.turn.is_none());
+        assert!(query.goal_todo.is_none());
+    }
+
+    #[tokio::test]
     async fn prompt_accepts_and_records_acked_receipt() {
         let key = IdempotencyKey::new("idem-key-0100").unwrap();
         let (plane, _transport) = implemented_plane_with(vec![ack_reply("turn-100")]).await;
@@ -722,9 +1427,8 @@ mod tests {
         assert_eq!(receipt.status, GjcCommandStatus::Acked);
         assert_eq!(receipt.turn_id.as_deref(), Some("turn-100"));
         assert!(!receipt.status.is_terminal());
-        // Non-terminal receipts are not replayable as outcomes.
-        let error = plane.command_receipt(&key).await.unwrap_err();
-        assert_eq!(error.error_code(), "invalid_request");
+        let recorded = plane.command_receipt(&key).await.unwrap();
+        assert_eq!(recorded.status, GjcCommandStatus::Acked);
     }
 
     #[tokio::test]
@@ -760,6 +1464,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idempotency_key_cannot_replay_across_sessions() {
+        let (plane, _transport) =
+            implemented_plane_with(vec![terminal_ack_reply("turn-102", "succeeded", "done")]).await;
+        plane
+            .prompt(PromptRequest {
+                envelope: envelope("idem-key-cross-session"),
+                prompt: "once".into(),
+            })
+            .await
+            .unwrap();
+        let mut cross_session = envelope("idem-key-cross-session");
+        cross_session.session = SessionId::new("sess-2").unwrap();
+        let error = plane
+            .prompt(PromptRequest {
+                envelope: cross_session,
+                prompt: "replay".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.error_code(), "session_mismatch");
+    }
+
+    #[tokio::test]
     async fn ambiguous_ack_fails_closed_without_fabricating_outcome() {
         let (plane, _transport) = implemented_plane_with(vec![Ok(GjcResponse {
             correlation_id: String::new(),
@@ -774,15 +1501,15 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.error_code(), "ambiguous_ack");
-        let receipt = plane
-            .registry
-            .read()
-            .await
-            .get("idem-key-0102")
-            .cloned()
-            .expect("record kept");
-        // The record stays non-terminal so a replay cannot fake success.
-        assert_eq!(receipt.status, GjcCommandStatus::Accepted);
+        assert_eq!(
+            plane
+                .registry
+                .read()
+                .await
+                .get("idem-key-0102")
+                .map(|receipt| receipt.status),
+            Some(GjcCommandStatus::Accepted)
+        );
     }
 
     #[tokio::test]
@@ -1018,5 +1745,255 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(transport.timeouts.lock().unwrap()[0], 4_321);
+    }
+
+    #[tokio::test]
+    async fn endpoint_rotation_after_resolution_rejects_lease_and_keeps_reservation() {
+        let worktree = tempfile::tempdir().unwrap();
+        let sdk_dir = worktree.path().join(".gjc").join("state").join("sdk");
+        std::fs::create_dir_all(&sdk_dir).unwrap();
+        let metadata = sdk_dir.join("sess-1.json");
+        std::fs::write(
+            &metadata,
+            json!({
+                "version": 1,
+                "sessionId": "sess-1",
+                "url": "ws://127.0.0.1:1/",
+                "token": "lease-before",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let plane = GjcControlPlane::for_worktree(worktree.path(), new_shared_command_registry());
+        let session = SessionId::new("sess-1").unwrap();
+        let bound = plane
+            .resolve_transport(Some(&session))
+            .await
+            .unwrap()
+            .unwrap();
+        plane.registry.write().await.insert(
+            "idem-lease-001".into(),
+            stored_receipt("idem-lease-001", GjcCommandStatus::Accepted),
+        );
+
+        std::fs::write(
+            &metadata,
+            json!({
+                "version": 1,
+                "sessionId": "sess-1",
+                "url": "ws://127.0.0.1:2/",
+                "token": "lease-after",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let error = plane
+            .validate_mutation_lease(&bound, &session)
+            .await
+            .unwrap_err();
+        assert_eq!(error.error_code(), "stale_endpoint");
+        assert_eq!(
+            plane
+                .registry
+                .read()
+                .await
+                .get("idem-lease-001")
+                .map(|receipt| receipt.status),
+            Some(GjcCommandStatus::Accepted)
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_mutation_lease_rejects_worktree_mismatch() {
+        let worktree = tempfile::tempdir().unwrap();
+        let sdk_dir = worktree.path().join(".gjc").join("state").join("sdk");
+        std::fs::create_dir_all(&sdk_dir).unwrap();
+        let metadata = sdk_dir.join("sess-1.json");
+        std::fs::write(
+            &metadata,
+            json!({
+                "version": 1,
+                "sessionId": "sess-1",
+                "url": "ws://127.0.0.1:1/",
+                "token": "worktree-bound",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let plane = GjcControlPlane::for_worktree(worktree.path(), new_shared_command_registry());
+        let session = SessionId::new("sess-1").unwrap();
+        let bound = plane
+            .resolve_transport(Some(&session))
+            .await
+            .unwrap()
+            .unwrap();
+        let foreign_worktree = tempfile::tempdir().unwrap();
+        let foreign_plane = plane.scoped_to_worktree(foreign_worktree.path());
+        let error = foreign_plane
+            .validate_mutation_lease(&bound, &session)
+            .await
+            .unwrap_err();
+        assert_eq!(error.error_code(), "session_mismatch");
+    }
+
+    fn stored_receipt(key: &str, status: GjcCommandStatus) -> CommandReceipt {
+        CommandReceipt {
+            schema: GJC_CONTROL_SCHEMA.into(),
+            command_id: format!("cmd-{key}"),
+            idempotency_key: key.into(),
+            kind: "prompt".into(),
+            session_id: "sess-1".into(),
+            status,
+            turn_id: (!matches!(status, GjcCommandStatus::Accepted)).then(|| format!("turn-{key}")),
+            outcome: status.is_terminal().then(|| {
+                json!({
+                    "status": if status == GjcCommandStatus::Completed {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    },
+                    "summary": "stored",
+                })
+            }),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn production_receipt_journal_reloads_reserved_receipt() {
+        let worktree = tempfile::tempdir().unwrap();
+        let registry = new_shared_command_registry();
+        let plane = GjcControlPlane::for_worktree(worktree.path(), registry.clone());
+        plane.ensure_receipt_journal().await.unwrap();
+        let receipt = stored_receipt("reload-key-0001", GjcCommandStatus::Accepted);
+        registry
+            .write()
+            .await
+            .insert(receipt.idempotency_key.clone(), receipt.clone());
+        let snapshot = registry.read().await.clone();
+        plane.persist_receipts(&snapshot).unwrap();
+        drop(plane);
+
+        let reloaded =
+            GjcControlPlane::for_worktree(worktree.path(), new_shared_command_registry());
+        assert_eq!(
+            reloaded
+                .command_receipt(&IdempotencyKey::new("reload-key-0001").unwrap())
+                .await
+                .unwrap()
+                .command_id,
+            receipt.command_id
+        );
+    }
+
+    #[tokio::test]
+    async fn production_receipt_journal_retains_active_and_ambiguous_entries() {
+        let worktree = tempfile::tempdir().unwrap();
+        let registry = new_shared_command_registry();
+        let plane = GjcControlPlane::for_worktree(worktree.path(), registry.clone());
+        plane.ensure_receipt_journal().await.unwrap();
+        let accepted = stored_receipt("active-key-0001", GjcCommandStatus::Accepted);
+        let acked = stored_receipt("ambiguous-key-001", GjcCommandStatus::Acked);
+        {
+            let mut write = registry.write().await;
+            write.insert(accepted.idempotency_key.clone(), accepted.clone());
+            write.insert(acked.idempotency_key.clone(), acked.clone());
+        }
+        let snapshot = registry.read().await.clone();
+        plane.persist_receipts(&snapshot).unwrap();
+        drop(plane);
+
+        let reloaded =
+            GjcControlPlane::for_worktree(worktree.path(), new_shared_command_registry());
+        reloaded.ensure_receipt_journal().await.unwrap();
+        let write = reloaded.registry.read().await;
+        assert_eq!(
+            write.get("active-key-0001").unwrap().status,
+            GjcCommandStatus::Accepted
+        );
+        assert_eq!(
+            write.get("ambiguous-key-001").unwrap().status,
+            GjcCommandStatus::Acked
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_production_receipt_journal_fails_closed() {
+        let worktree = tempfile::tempdir().unwrap();
+        let state = worktree.path().join(".gjc").join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let path = state.join(RECEIPT_JOURNAL_FILENAME);
+        std::fs::write(&path, b"not-json").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let plane = GjcControlPlane::for_worktree(worktree.path(), new_shared_command_registry());
+        let error = plane
+            .command_receipt(&IdempotencyKey::new("malformed-key-001").unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.error_code(), "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn receipt_capacity_evicts_terminal_entries_only() {
+        let worktree = tempfile::tempdir().unwrap();
+        let (mut plane, _transport) =
+            implemented_plane_with(vec![ack_reply("turn-capacity")]).await;
+        plane.journal = Some(Arc::new(ReceiptJournal::for_worktree(worktree.path())));
+        plane.ensure_receipt_journal().await.unwrap();
+        {
+            let mut write = plane.registry.write().await;
+            write.insert(
+                "active-key-0002".into(),
+                stored_receipt("active-key-0002", GjcCommandStatus::Accepted),
+            );
+            for index in 0..(MAX_COMMAND_RECEIPTS - 1) {
+                let key = format!("terminal-{index:04}");
+                write.insert(
+                    key.clone(),
+                    stored_receipt(&key, GjcCommandStatus::Completed),
+                );
+            }
+        }
+        let result = plane
+            .prompt(PromptRequest {
+                envelope: envelope("capacity-key-001"),
+                prompt: "bounded".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, GjcCommandStatus::Acked);
+        let write = plane.registry.read().await;
+        assert_eq!(write.len(), MAX_COMMAND_RECEIPTS);
+        assert!(write.contains_key("active-key-0002"));
+        assert!(write.contains_key("capacity-key-001"));
+        assert_eq!(
+            write
+                .values()
+                .filter(|receipt| receipt.status.is_terminal())
+                .count(),
+            MAX_COMMAND_RECEIPTS - 2
+        );
     }
 }

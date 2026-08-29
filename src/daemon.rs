@@ -30,8 +30,8 @@ use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 
 use crate::gjc_lane::{
-    GjcLaneRegistrationRequest, GjcLaneStore, GjcReconciler, SharedGjcLaneStore,
-    SharedGjcReconciler,
+    GjcControlPlaneAdapter, GjcLaneRegistrationRequest, GjcLaneStore, GjcReconciler,
+    SharedGjcLaneStore, SharedGjcReconciler,
 };
 use crate::gjc_lane::{default_gjc_lane_state_path, health_json as gjc_health_json};
 use crate::sink::{DiscordSink, HttpSink, LocalFileSink, Sink, SlackSink};
@@ -89,9 +89,14 @@ fn shared_event_ledger() -> Option<SharedEventLedger> {
 /// sibling tracks reduce here into lifecycle/question/notification events that
 /// flow through the normal accept pipeline (ledger -> router -> sinks).
 static GJC_SDK_BRIDGE: OnceLock<std::sync::Mutex<GjcEventBridge>> = OnceLock::new();
+static GJC_BRIDGE_INGRESS: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn gjc_bridge_slot() -> &'static std::sync::Mutex<GjcEventBridge> {
     GJC_SDK_BRIDGE.get_or_init(|| std::sync::Mutex::new(GjcEventBridge::new()))
+}
+
+fn gjc_bridge_ingress() -> &'static tokio::sync::Mutex<()> {
+    GJC_BRIDGE_INGRESS.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 const STALE_NATIVE_REPLAY_GRACE: Duration = Duration::from_secs(5 * 60);
@@ -269,6 +274,23 @@ pub async fn run(
             update::run_checker(config, tx, pending).await;
         });
     }
+    let gjc_registry = crate::gjc::control::new_shared_command_registry();
+    let gjc_control = match std::env::current_dir() {
+        Ok(cwd) => Arc::new(crate::gjc::control::GjcControlPlane::for_worktree(
+            &cwd,
+            gjc_registry.clone(),
+        )),
+        // Without a resolvable worktree anchor the plane stays explicitly
+        // unavailable instead of silently re-scoping the trust boundary.
+        Err(_) => Arc::new(crate::gjc::control::GjcControlPlane::unavailable(
+            gjc_registry.clone(),
+        )),
+    };
+    if config.gjc.enabled && config.gjc_lanes.enabled {
+        let _ = crate::gjc_lane::register_gjc_control_plane(Arc::new(GjcControlPlaneAdapter::new(
+            gjc_registry.clone(),
+        )));
+    }
     let (gjc_store, gjc_reconciler) =
         spawn_gjc_lane_reconciler(config.clone(), cron_state_path.clone(), tx.clone()).await?;
 
@@ -351,18 +373,7 @@ pub async fn run(
         discord_watch_lock: Arc::new(Mutex::new(())),
         subscriptions: subscriptions.clone(),
         git_monitor_diagnostics,
-        gjc: match std::env::current_dir() {
-            Ok(cwd) => crate::gjc::control::GjcControlPlane::for_worktree(
-                &cwd,
-                crate::gjc::control::new_shared_command_registry(),
-            ),
-            // Without a resolvable worktree anchor the plane stays
-            // explicitly unavailable instead of silently re-scoping the
-            // trust boundary to ".".
-            Err(_) => crate::gjc::control::GjcControlPlane::unavailable(
-                crate::gjc::control::new_shared_command_registry(),
-            ),
-        },
+        gjc: (*gjc_control).clone(),
         gjc_store,
         gjc_reconciler,
     });
@@ -488,13 +499,20 @@ async fn spawn_gjc_lane_reconciler(
     let pr_resolver: Option<std::sync::Arc<dyn crate::gjc_lane::GjcLanePrResolver>> =
         crate::gjc_lane::GithubApiPrResolver::from_config(&config.gjc_lanes.pr)?
             .map(|resolver| resolver as _);
-    let reconciler = Arc::new(GjcReconciler::new(
-        plane,
-        pr_resolver,
-        store.clone(),
-        tx,
-        config.gjc_lanes.polling_policy(),
-    ));
+    let reconciler = Arc::new(
+        GjcReconciler::new(
+            plane,
+            pr_resolver,
+            store.clone(),
+            tx,
+            config.gjc_lanes.polling_policy(),
+        )
+        .with_auto_enrollment({
+            let mut worktrees = vec![std::env::current_dir().unwrap_or_default()];
+            worktrees.extend(config.gjc_lanes.discovery_worktrees.iter().cloned());
+            worktrees
+        }),
+    );
     {
         let runner = reconciler.clone();
         tokio::spawn(async move {
@@ -585,6 +603,35 @@ async fn register_gjc_lane_handler(
     };
     match store.register_lane(&request, &crate::gjc_lane::now_rfc3339()) {
         Ok(record) => Json(record).into_response(),
+        Err(error) if error.to_string().contains("registration conflict") => {
+            let Some(record) = store.record_for_session(&request.sdk_session_id) else {
+                return gjc_lane_error(error).into_response();
+            };
+            let same_owner = record.ownership.owner_id == request.owner_id;
+            let same_endpoint = request
+                .endpoint_generation
+                .is_none_or(|generation| record.endpoint_generation == generation);
+            let same_worktree = record.worktree == request.worktree;
+            let same_pr = record
+                .pr
+                .as_ref()
+                .map(|pr| {
+                    request.pr.as_ref().is_some_and(|input| {
+                        pr.repo == input.repo
+                            && pr.number == input.number
+                            && pr.head_sha == input.head_sha.to_ascii_lowercase()
+                            && pr.base_branch == input.base_branch
+                    })
+                })
+                .unwrap_or(request.pr.is_none());
+            if record.watch_removed_at.is_some() || record.terminal_disposition.is_some() {
+                gjc_lane_error("lane registration conflict: session is retired").into_response()
+            } else if same_owner && same_endpoint && same_worktree && same_pr {
+                Json(record).into_response()
+            } else {
+                gjc_lane_error(error).into_response()
+            }
+        }
         Err(error) => gjc_lane_error(error).into_response(),
     }
 }
@@ -624,6 +671,7 @@ async fn retire_gjc_lane_handler(
 async fn reconcile_gjc_lanes_handler(
     _peer: LoopbackLanePeer,
     State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let Some(reconciler) = &state.gjc_reconciler else {
         return (
@@ -632,6 +680,13 @@ async fn reconcile_gjc_lanes_handler(
         )
             .into_response();
     };
+    if params
+        .get("force_resume")
+        .is_some_and(|value| value == "true")
+        && let Some(store) = &state.gjc_store
+    {
+        store.resume_suspended(&crate::gjc_lane::now_rfc3339());
+    }
     match reconciler.poll_once(OffsetDateTime::now_utc()).await {
         Ok(outcome) => Json(json!({"ok": true, "outcome": outcome})).into_response(),
         Err(_) => (
@@ -1054,11 +1109,82 @@ fn gjc_error_response(error: &crate::gjc::model::GjcError) -> axum::response::Re
         .into_response()
 }
 
+/// Resolve the authoritative control plane for an enrolled SDK session.
+///
+/// The daemon's startup control plane is anchored to its own current working
+/// directory, which is not necessarily the worktree owning a requested lane.
+/// Public session handlers must first consult the durable lane store, reject
+/// sessions that are not enrolled (or whose watch has been retired), then
+/// scope transport discovery to the stored worktree. Missing worktree
+/// identity is treated as an invisible session rather than falling back to
+/// the daemon CWD.
+fn gjc_control_for_session(
+    state: &AppState,
+    session: &crate::gjc::model::SessionId,
+) -> crate::gjc::model::GjcResult<crate::gjc::control::GjcControlPlane> {
+    gjc_control_for_session_with_policy(state, session, true)
+}
+
+fn gjc_read_control_for_session(
+    state: &AppState,
+    session: &crate::gjc::model::SessionId,
+) -> crate::gjc::model::GjcResult<crate::gjc::control::GjcControlPlane> {
+    gjc_control_for_session_with_policy(state, session, false)
+}
+
+fn gjc_control_for_session_with_policy(
+    state: &AppState,
+    session: &crate::gjc::model::SessionId,
+    reject_terminal: bool,
+) -> crate::gjc::model::GjcResult<crate::gjc::control::GjcControlPlane> {
+    let not_found = || crate::gjc::model::GjcError::SessionNotFound {
+        session_id: session.as_str().to_string(),
+    };
+    let Some(store) = state.gjc_store.as_ref() else {
+        if state.config.gjc_lanes.enabled {
+            return Err(not_found());
+        }
+        // Preserve pre-#349 configurations where [gjc] was enabled without
+        // [gjc_lanes]. The lane-scoped store is unavailable there, so the
+        // existing daemon-CWD control plane remains the explicit legacy
+        // boundary instead of silently disabling established controls.
+        return Ok(state.gjc.clone());
+    };
+    let Some(record) = store.record_for_session(session.as_str()) else {
+        return Err(not_found());
+    };
+    if record.watch_removed_at.is_some()
+        || (reject_terminal && record.terminal_disposition.is_some())
+    {
+        return Err(not_found());
+    }
+    let Some(worktree) = record
+        .worktree
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return Err(not_found());
+    };
+    Ok(state.gjc.scoped_to_worktree(std::path::Path::new(worktree)))
+}
+
 async fn gjc_capabilities(
     _control: SubscriptionControlRequest,
     State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
-    let caps = state.gjc.capabilities().await;
+    let caps = if let Some(session) = params.get("session") {
+        let session_id = match crate::gjc::model::SessionId::new(session) {
+            Ok(session_id) => session_id,
+            Err(error) => return gjc_error_response(&error),
+        };
+        match gjc_control_for_session(&state, &session_id) {
+            Ok(control) => control.capabilities_for_session(&session_id).await,
+            Err(error) => return gjc_error_response(&error),
+        }
+    } else {
+        state.gjc.capabilities().await
+    };
     Json(crate::gjc::api::capabilities_body(&caps)).into_response()
 }
 
@@ -1068,30 +1194,43 @@ async fn gjc_session_query(
     axum::extract::Path(session): axum::extract::Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
+    let session_id = match crate::gjc::model::SessionId::new(&session) {
+        Ok(session) => session,
+        Err(error) => return gjc_error_response(&error),
+    };
+    let sections = match crate::gjc::api::parse_sections(params.get("sections").map(String::as_str))
+    {
+        Ok(sections) => sections,
+        Err(error) => return gjc_error_response(&error),
+    };
+    let control = match gjc_read_control_for_session(&state, &session_id) {
+        Ok(control) => control,
+        Err(error) => return gjc_error_response(&error),
+    };
+    let refs = sections.iter().map(String::as_str).collect::<Vec<_>>();
     // Full-section reads feed the #324 event bridge from the same authoritative
     // evidence they return; partial `sections` reads skip the bridge because a
     // reducer fed partial state could derive wrong transitions.
     if !params.contains_key("sections") {
-        match state
-            .gjc
-            .query_session(
-                &match crate::gjc::model::SessionId::new(&session) {
-                    Ok(session) => session,
-                    Err(error) => return gjc_error_response(&error),
-                },
-                crate::gjc::api::SESSION_SECTIONS,
-            )
-            .await
-        {
+        match control.query_session(&session_id, &refs).await {
             Ok(query) => {
-                feed_gjc_bridge_from_query(&state, &session, &query).await;
+                if state.gjc_store.is_none() {
+                    return Json(crate::gjc::api::session_query_body(&query)).into_response();
+                }
+                if !feed_gjc_bridge_from_query(&state, &session, &query).await {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"ok": false, "error": "gjc bridge delivery unavailable"})),
+                    )
+                        .into_response();
+                }
                 return Json(crate::gjc::api::session_query_body(&query)).into_response();
             }
             Err(error) => return gjc_error_response(&error),
         }
     }
     match crate::gjc::api::run_session_query(
-        &state.gjc,
+        &control,
         &session,
         params.get("sections").map(String::as_str),
     )
@@ -1110,38 +1249,69 @@ async fn feed_gjc_bridge_from_query(
     state: &AppState,
     sdk_session_id: &str,
     query: &crate::gjc::model::SessionQuery,
-) {
+) -> bool {
     let Some(store) = state.gjc_store.as_ref() else {
-        return;
+        return false;
     };
     let lane_id = crate::gjc_lane::gjc_lane_id(sdk_session_id);
     let Some(record) = store.record(&lane_id) else {
-        return;
+        return false;
     };
     let identity = GjcSnapshotIdentity {
         repo_name: record.pr.as_ref().map(|pr| pr.repo.clone()),
+        repo_path: record.worktree.clone(),
         worktree_path: record.worktree.clone(),
-        ..GjcSnapshotIdentity::default()
+        branch: record.branch.clone(),
     };
-    // sdk_revision (the SDK's own monotonic counter) keeps the query feed in
-    // the same revision space as push-ingress payloads so interleaved seams
-    // cannot suppress each other's transitions.
-    let snapshot =
-        snapshot_from_session_query(sdk_session_id, record.sdk_revision, query, &identity);
-    let outcome = {
-        let Ok(mut bridge) = gjc_bridge_slot().lock() else {
-            return;
+    let _ingress_guard = gjc_bridge_ingress().lock().await;
+    let Some(query_revision) = query.revision else {
+        return false;
+    };
+    let (candidate, events) = {
+        let Ok(bridge) = gjc_bridge_slot().lock() else {
+            return false;
         };
-        bridge.observe(&snapshot)
+        let Some(record) = store.record(&lane_id) else {
+            return false;
+        };
+        if query_revision <= record.sdk_revision {
+            return true;
+        }
+        let snapshot =
+            snapshot_from_session_query(sdk_session_id, query_revision, query, &identity);
+        let mut candidate = bridge.clone();
+        let Ok(outcome) = candidate.observe(&snapshot) else {
+            return false;
+        };
+        (candidate, outcome.events)
     };
-    let Ok(outcome) = outcome else {
-        return;
-    };
-    for event in outcome.events {
-        // Awaited send like every other ingress: bridge dedupe state has
-        // already advanced, so a silently dropped event would never re-emit.
-        let _ = enqueue_event(&state.tx, normalize_event(event)).await;
+    for event in &events {
+        if enqueue_event(&state.tx, normalize_event(event.clone()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
     }
+    let Some(current) = store.record(&lane_id) else {
+        return false;
+    };
+    if store
+        .set_sdk_revision_if(
+            &lane_id,
+            current.sdk_revision,
+            query_revision,
+            &crate::gjc_lane::now_rfc3339(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(mut bridge) = gjc_bridge_slot().lock() else {
+        return false;
+    };
+    *bridge = candidate;
+    true
 }
 
 async fn gjc_turn_outcome(
@@ -1159,7 +1329,11 @@ async fn gjc_turn_outcome(
             reason: "must be 1..=128 bytes".into(),
         });
     }
-    match state.gjc.turn_outcome(&session, &turn).await {
+    let control = match gjc_read_control_for_session(&state, &session) {
+        Ok(control) => control,
+        Err(error) => return gjc_error_response(&error),
+    };
+    match control.turn_outcome(&session, &turn).await {
         Ok(outcome) => Json(crate::gjc::api::outcome_body(&outcome)).into_response(),
         Err(error) => gjc_error_response(&error),
     }
@@ -1171,10 +1345,18 @@ async fn gjc_prompt(
     Json(dto): Json<crate::gjc::api::PromptDto>,
 ) -> axum::response::Response {
     match dto.into_request() {
-        Ok(request) => match state.gjc.prompt(request).await {
-            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
-            Err(error) => gjc_error_response(&error),
-        },
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.prompt(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
         Err(error) => gjc_error_response(&error),
     }
 }
@@ -1185,10 +1367,18 @@ async fn gjc_steer(
     Json(dto): Json<crate::gjc::api::SteerDto>,
 ) -> axum::response::Response {
     match dto.into_request() {
-        Ok(request) => match state.gjc.steer(request).await {
-            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
-            Err(error) => gjc_error_response(&error),
-        },
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.steer(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
         Err(error) => gjc_error_response(&error),
     }
 }
@@ -1199,10 +1389,18 @@ async fn gjc_abort_and_prompt(
     Json(dto): Json<crate::gjc::api::AbortAndPromptDto>,
 ) -> axum::response::Response {
     match dto.into_request() {
-        Ok(request) => match state.gjc.abort_and_prompt(request).await {
-            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
-            Err(error) => gjc_error_response(&error),
-        },
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.abort_and_prompt(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
         Err(error) => gjc_error_response(&error),
     }
 }
@@ -1213,10 +1411,18 @@ async fn gjc_workflow_gate_answer(
     Json(dto): Json<crate::gjc::api::WorkflowGateAnswerDto>,
 ) -> axum::response::Response {
     match dto.into_request() {
-        Ok(request) => match state.gjc.answer_workflow_gate(request).await {
-            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
-            Err(error) => gjc_error_response(&error),
-        },
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.answer_workflow_gate(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
         Err(error) => gjc_error_response(&error),
     }
 }
@@ -1227,10 +1433,18 @@ async fn gjc_ask_answer(
     Json(dto): Json<crate::gjc::api::AskAnswerDto>,
 ) -> axum::response::Response {
     match dto.into_request() {
-        Ok(request) => match state.gjc.answer_ask(request).await {
-            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
-            Err(error) => gjc_error_response(&error),
-        },
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.answer_ask(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
         Err(error) => gjc_error_response(&error),
     }
 }
@@ -1241,10 +1455,24 @@ async fn gjc_model_selection(
     Json(dto): Json<crate::gjc::api::ModelSelectionDto>,
 ) -> axum::response::Response {
     match dto.into_request() {
-        Ok(request) => match state.gjc.select_model(request).await {
-            Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
-            Err(error) => gjc_error_response(&error),
-        },
+        Ok(request) => {
+            if request.model.is_none() == request.profile.is_none() {
+                return gjc_error_response(&crate::gjc::model::GjcError::InvalidRequest {
+                    field: "model",
+                    reason: "exactly one of model or profile must be provided".into(),
+                });
+            }
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.select_model(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
         Err(error) => gjc_error_response(&error),
     }
 }
@@ -1253,13 +1481,37 @@ async fn gjc_command_receipt(
     _control: SubscriptionControlRequest,
     State(state): State<AppState>,
     axum::extract::Path(key): axum::extract::Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
+    let Some(session) = params.get("session") else {
+        return gjc_error_response(&crate::gjc::model::GjcError::InvalidRequest {
+            field: "session",
+            reason: "receipt lookup requires a session".into(),
+        });
+    };
     let key = match crate::gjc::model::IdempotencyKey::new(key) {
         Ok(key) => key,
         Err(error) => return gjc_error_response(&error),
     };
+    if let Some(store) = &state.gjc_store
+        && store
+            .record_for_session(session)
+            .is_none_or(|record| record.watch_removed_at.is_some())
+    {
+        return gjc_error_response(&crate::gjc::model::GjcError::SessionNotFound {
+            session_id: session.clone(),
+        });
+    }
     match state.gjc.command_receipt(&key).await {
-        Ok(receipt) => Json(crate::gjc::api::command_receipt_body(&receipt)).into_response(),
+        Ok(receipt) => {
+            if receipt.session_id != *session {
+                return gjc_error_response(&crate::gjc::model::GjcError::InvalidRequest {
+                    field: "session",
+                    reason: "receipt is bound to another session".into(),
+                });
+            }
+            Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+        }
         Err(error) => gjc_error_response(&error),
     }
 }
@@ -1451,7 +1703,10 @@ async fn post_gjc_bridge(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> axum::response::Response {
-    let snapshot = match snapshot_from_response_payload(&payload) {
+    if !state.config.gjc.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut snapshot = match snapshot_from_response_payload(&payload) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return (
@@ -1462,19 +1717,62 @@ async fn post_gjc_bridge(
         }
     };
     let session_id = snapshot.session_id.trim().to_string();
+    let _ingress_guard = gjc_bridge_ingress().lock().await;
+    let mut push_lane_id = None;
+    if state.config.gjc_lanes.enabled {
+        let Some(store) = &state.gjc_store else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc lane reconciliation is disabled"})),
+            )
+                .into_response();
+        };
+        if store.record_for_session(&session_id).is_none_or(|record| {
+            record.watch_removed_at.is_some()
+                || record.terminal_disposition.is_some()
+                || record
+                    .worktree
+                    .as_deref()
+                    .is_none_or(|worktree| worktree.trim().is_empty())
+        }) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"ok": false, "error": "gjc session is not enrolled"})),
+            )
+                .into_response();
+        }
+        let record = store
+            .record_for_session(&session_id)
+            .expect("membership checked");
+        push_lane_id = Some(record.lane_id.clone());
+        if snapshot.revision <= record.sdk_revision {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"ok": false, "error": "stale or non-authoritative bridge revision"})),
+            )
+                .into_response();
+        }
+        snapshot.repo_name = record.pr.as_ref().map(|pr| pr.repo.clone());
+        snapshot.repo_path = record.worktree.clone();
+        snapshot.worktree_path = record.worktree.clone();
+        snapshot.branch = record.branch.clone();
+    }
     let revision = snapshot.revision;
     let outcome = {
-        let Ok(mut bridge) = gjc_bridge_slot().lock() else {
+        let Ok(bridge) = gjc_bridge_slot().lock() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"ok": false, "error": "gjc_bridge_unavailable"})),
             )
                 .into_response();
         };
-        bridge.observe(&snapshot)
+        let mut candidate = bridge.clone();
+        candidate
+            .observe(&snapshot)
+            .map(|outcome| (candidate, outcome))
     };
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
+    let (candidate, outcome) = match outcome {
+        Ok(result) => result,
         Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1501,11 +1799,6 @@ async fn post_gjc_bridge(
             rejected.push(json!({"type": kind, "event_id": event_id}));
         }
     }
-    let totals = gjc_bridge_slot()
-        .lock()
-        .map(|bridge| bridge.stats())
-        .unwrap_or_default();
-
     let mut record = telemetry::record(
         "gjc_bridge_snapshot",
         if rejected.is_empty() {
@@ -1528,10 +1821,46 @@ async fn post_gjc_bridge(
     );
     telemetry::emit(record);
 
+    let response_status = if rejected.is_empty() {
+        if let Some(lane_id) = push_lane_id.as_deref()
+            && let Some(store) = &state.gjc_store
+            && let Some(current) = store.record(lane_id)
+            && store
+                .set_sdk_revision_if(
+                    lane_id,
+                    current.sdk_revision,
+                    revision,
+                    &crate::gjc_lane::now_rfc3339(),
+                )
+                .is_err()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc bridge watermark conflict"})),
+            )
+                .into_response();
+        }
+        if let Ok(mut bridge) = gjc_bridge_slot().lock() {
+            *bridge = candidate;
+        } else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc_bridge_unavailable"})),
+            )
+                .into_response();
+        }
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let totals = gjc_bridge_slot()
+        .lock()
+        .map(|bridge| bridge.stats())
+        .unwrap_or_default();
     (
-        StatusCode::OK,
+        response_status,
         Json(json!({
-            "ok": true,
+            "ok": rejected.is_empty(),
             "session_id": session_id,
             "revision": revision,
             "duplicate": outcome.duplicate,
@@ -2164,6 +2493,9 @@ fn local_control_error() -> (StatusCode, Json<Value>) {
 
 fn is_loopback_host(host: &str) -> bool {
     let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
     host.parse::<std::net::IpAddr>().is_ok_and(|ip| {
         ip.is_loopback()
             || matches!(ip, std::net::IpAddr::V6(ip) if ip.to_ipv4().is_some_and(|ip| ip.is_loopback()))
@@ -2235,6 +2567,11 @@ impl<S: Send + Sync> FromRequestParts<S> for LoopbackLanePeer {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
+        if parts.uri.path().starts_with("/api/gjc/") {
+            return SubscriptionControlRequest::from_request_parts(parts, _state)
+                .await
+                .map(|_| Self);
+        }
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
@@ -2804,6 +3141,7 @@ mod tests {
     use crate::sink::SinkTarget;
     use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
+    use futures_util::{SinkExt, StreamExt};
     use serial_test::serial;
 
     use std::fs;
@@ -2840,6 +3178,16 @@ mod tests {
             parts
                 .extensions
                 .insert(ConnectInfo(address.parse::<SocketAddr>().unwrap()));
+            parts
+                .headers
+                .insert(axum::http::header::HOST, "127.0.0.1:25294".parse().unwrap());
+            parts.headers.insert(
+                axum::http::header::ORIGIN,
+                "http://127.0.0.1:25294".parse().unwrap(),
+            );
+            parts
+                .headers
+                .insert(LOCAL_CONTROL_HEADER, "1".parse().unwrap());
             assert!(
                 LoopbackLanePeer::from_request_parts(&mut parts, &())
                     .await
@@ -5053,9 +5401,13 @@ mod tests {
         let (state, _rx) = native_hook_test_state();
 
         // Capabilities surface is honest about the missing transport.
-        let response = gjc_capabilities(SubscriptionControlRequest, State(state.clone()))
-            .await
-            .into_response();
+        let response = gjc_capabilities(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
@@ -5063,7 +5415,8 @@ mod tests {
         assert_eq!(body["transport_implemented"], Value::Bool(false));
         assert_eq!(body["capabilities"], json!([]));
 
-        // Session queries require a transport and fail closed with 503.
+        // Legacy configurations without lane reconciliation retain the
+        // daemon-CWD control boundary; this test plane has no transport.
         let response = gjc_session_query(
             SubscriptionControlRequest,
             State(state.clone()),
@@ -5101,7 +5454,8 @@ mod tests {
                 .unwrap();
         assert_eq!(body["error_code"], "invalid_request");
 
-        // Well-formed mutations still fail closed without a transport.
+        // Well-formed mutations still fail closed when the session is not
+        // enrolled; no daemon-CWD transport is consulted.
         let valid = crate::gjc::api::PromptDto {
             base: crate::gjc::api::MutationDto {
                 session: "sess-1".into(),
@@ -5118,26 +5472,185 @@ mod tests {
         )
         .await
         .into_response();
-        // Capability gate fires before the transport check: with no
-        // transport nothing is exercisable, so mutations are 501.
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
-        // Unknown receipts are 404; malformed keys are 400.
+        // Receipt lookups require a session before key resolution.
         let response = gjc_command_receipt(
             SubscriptionControlRequest,
             State(state.clone()),
             axum::extract::Path("idem-key-missing".into()),
-        )
-        .await
-        .into_response();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let response = gjc_command_receipt(
-            SubscriptionControlRequest,
-            State(state),
-            axum::extract::Path("bad key!".into()),
+            Query(std::collections::HashMap::new()),
         )
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = gjc_command_receipt(
+            SubscriptionControlRequest,
+            State(state),
+            axum::extract::Path("bad key!".into()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gjc_session_query_uses_enrolled_external_worktree() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut stream) = websocket.split();
+            sink.send(tokio_tungstenite::tungstenite::Message::text(
+                r#"{"type":"hello","connectionId":"external-query"}"#,
+            ))
+            .await
+            .unwrap();
+            let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(request))) =
+                stream.next().await
+            else {
+                return;
+            };
+            let request: Value = serde_json::from_str(request.as_ref()).unwrap();
+            sink.send(tokio_tungstenite::tungstenite::Message::text(
+                json!({
+                    "type": "query_response",
+                    "id": request["id"],
+                    "ok": true,
+                    "result": {
+                        "metadata": {
+                            "session_id": "external-session",
+                            "title": "external lane"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let worktree = tempdir().unwrap();
+        let sdk_dir = worktree.path().join(".gjc").join("state").join("sdk");
+        fs::create_dir_all(&sdk_dir).unwrap();
+        let metadata = sdk_dir.join("external-session.json");
+        fs::write(
+            &metadata,
+            json!({
+                "version": 1,
+                "sessionId": "external-session",
+                "url": format!("ws://{address}/"),
+                "token": "external-token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&metadata, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let lane_state = tempdir().unwrap();
+        let store = Arc::new(GjcLaneStore::open(&lane_state.path().join("lanes.json")).unwrap());
+        store
+            .register_lane(
+                &GjcLaneRegistrationRequest {
+                    sdk_session_id: "external-session".into(),
+                    worktree: Some(worktree.path().display().to_string()),
+                    endpoint_generation: None,
+                    owner_id: None,
+                    pr: None,
+                },
+                "2026-08-29T00:00:00Z",
+            )
+            .unwrap();
+        let (mut state, _rx) = native_hook_test_state();
+        state.gjc_store = Some(store);
+
+        let response = gjc_session_query(
+            SubscriptionControlRequest,
+            State(state),
+            axum::extract::Path("external-session".into()),
+            Query(std::collections::HashMap::from([(
+                "sections".into(),
+                "metadata".into(),
+            )])),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["metadata"]["title"], "external lane");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gjc_handlers_reject_unbound_and_retired_sessions() {
+        let lane_state = tempdir().unwrap();
+        let store = Arc::new(GjcLaneStore::open(&lane_state.path().join("lanes.json")).unwrap());
+        store
+            .register_lane(
+                &GjcLaneRegistrationRequest {
+                    sdk_session_id: "unbound-session".into(),
+                    worktree: None,
+                    endpoint_generation: None,
+                    owner_id: None,
+                    pr: None,
+                },
+                "2026-08-29T00:00:00Z",
+            )
+            .unwrap();
+        let retired = store
+            .register_lane(
+                &GjcLaneRegistrationRequest {
+                    sdk_session_id: "retired-session".into(),
+                    worktree: Some("/tmp/retired-worktree".into()),
+                    endpoint_generation: None,
+                    owner_id: None,
+                    pr: None,
+                },
+                "2026-08-29T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .retire_lane(
+                &retired.lane_id,
+                retired.revision,
+                "test retirement",
+                "2026-08-29T00:00:01Z",
+            )
+            .unwrap();
+
+        let (mut state, _rx) = native_hook_test_state();
+        state.gjc_store = Some(store);
+        for session in ["unbound-session", "retired-session"] {
+            let response = gjc_prompt(
+                SubscriptionControlRequest,
+                State(state.clone()),
+                Json(crate::gjc::api::PromptDto {
+                    base: crate::gjc::api::MutationDto {
+                        session: session.into(),
+                        idempotency_key: format!("idem-{session}-0001"),
+                        expected_session: None,
+                        timeout_ms: None,
+                    },
+                    prompt: "hello".into(),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error_code"], "session_not_found");
+        }
     }
 }

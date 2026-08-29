@@ -151,6 +151,7 @@ impl DaemonClient {
             .http
             .post(format!("{}{}", self.base_url, path))
             .header(LOCAL_CONTROL_HEADER, "1")
+            .header(reqwest::header::ORIGIN, &self.base_url)
             .json(payload)
             .send()
             .await?;
@@ -180,8 +181,11 @@ impl DaemonClient {
     }
 
     pub async fn gjc_reconcile(&self) -> Result<Value> {
-        self.private_post_json("/api/gjc/lane/reconcile", &serde_json::json!({}))
-            .await
+        self.private_post_json(
+            "/api/gjc/lane/reconcile?force_resume=true",
+            &serde_json::json!({}),
+        )
+        .await
     }
 
     pub async fn gjc_retire(&self, lane: &str, reason: Option<&str>) -> Result<Value> {
@@ -265,6 +269,8 @@ impl DaemonClient {
         let response = self
             .http
             .get(format!("{}/api/ledger/query", self.base_url))
+            .header(crate::daemon::LOCAL_CONTROL_HEADER, "1")
+            .header(reqwest::header::ORIGIN, &self.base_url)
             .query(params)
             .send()
             .await?;
@@ -332,10 +338,14 @@ impl DaemonClient {
         .await
     }
 
-    pub async fn gjc_command_receipt(&self, key: &str) -> Result<Value> {
+    pub async fn gjc_command_receipt(&self, session: &str, key: &str) -> Result<Value> {
         self.gjc_private_request(
             reqwest::Method::GET,
-            &format!("/api/gjc/command/{}", urlencoding_lite(key)),
+            &format!(
+                "/api/gjc/command/{}?session={}",
+                urlencoding_lite(key),
+                urlencoding_lite(session)
+            ),
             None,
         )
         .await
@@ -379,6 +389,8 @@ impl DaemonClient {
         let response = self
             .http
             .get(format!("{}{}", self.base_url, path))
+            .header(crate::daemon::LOCAL_CONTROL_HEADER, "1")
+            .header(reqwest::header::ORIGIN, &self.base_url)
             .send()
             .await?;
         if response.status().is_success() {
@@ -410,6 +422,7 @@ impl DaemonClient {
             .http
             .post(format!("{}{}", self.base_url, path))
             .header(LOCAL_CONTROL_HEADER, "1")
+            .header(reqwest::header::ORIGIN, &self.base_url)
             .json(payload)
             .send()
             .await?;
@@ -583,6 +596,7 @@ mod tests {
             let request = String::from_utf8_lossy(&request[..size]);
             assert!(request.starts_with("POST /api/subscriptions/safe/start HTTP/1.1"));
             assert!(request.contains("x-clawhip-local-control: 1\r\n"));
+            assert!(request.contains("origin: http://127.0.0.1:"));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 44\r\nConnection: close\r\n\r\n{\"ok\":true,\"name\":\"safe\",\"reason\":\"started\"}",

@@ -549,9 +549,15 @@ fn route_candidates(kind: &str) -> Vec<&str> {
         "agent.started" | "agent.blocked" | "agent.finished" | "agent.failed" => {
             vec![kind, "agent.*", "session.*"]
         }
-        "session.started" | "session.blocked" | "session.finished" | "session.failed" => {
+        "session.started"
+        | "session.blocked"
+        | "session.finished"
+        | "session.failed"
+        | "session.endpoint-failed"
+        | "session.stalled" => {
             vec![kind, "session.*", "agent.*"]
         }
+        "workflow.question" | "workflow.gate" => vec![kind, "workflow.*"],
         "session.retry-needed"
         | "session.pr-created"
         | "session.test-started"
@@ -1734,6 +1740,25 @@ mod tests {
         assert_eq!(channel, "agent-route");
         assert_eq!(format, MessageFormat::Compact);
         assert!(content.contains("omx issue-65 finished"));
+    }
+
+    #[test]
+    fn gjc_alerts_and_workflow_events_have_wildcard_candidates() {
+        for kind in [
+            "session.endpoint-failed",
+            "session.stalled",
+            "session.retry-needed",
+            "workflow.question",
+            "workflow.gate",
+        ] {
+            let candidates = route_candidates(kind);
+            assert_eq!(candidates.first().copied(), Some(kind));
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| { *candidate == "session.*" || *candidate == "workflow.*" })
+            );
+        }
     }
 
     #[tokio::test]

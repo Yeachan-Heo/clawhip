@@ -125,7 +125,9 @@ fn wait_for_ledger_and_delivery(
                 .map(|content| content.lines().count())
                 .unwrap_or(0);
             last = Some((value.clone(), deliveries));
-            if value["records"] == expected_records
+            let retained_records = value["records"].as_u64().unwrap_or(0)
+                + value["compacted_records"].as_u64().unwrap_or(0);
+            if retained_records == expected_records
                 && value["duplicates"] == expected_duplicates
                 && deliveries == expected_deliveries
             {
@@ -231,7 +233,7 @@ fn snapshot(revision: u64) -> Value {
         "worktree_path": "/wt/issue-324",
         "branch": "feat/issue-324",
         "observed_at": "2026-08-23T00:00:00Z",
-        "turn": {"id": "t1", "state": "active", "attempt": 0},
+        "turn": {"id": "t1", "state": "active", "attempt": 0, "prompt_accepted": true},
         "prompt": {"command_id": "c1", "status": "accepted"}
     })
 }
@@ -287,7 +289,8 @@ fn gjc_bridge_ingest_dedupes_replay_stale_and_restart_boundaries() {
 
     // Question gate carries stable identifiers through to the ledger surface.
     let mut question = snapshot(2);
-    question["turn"] = json!({"id": "t1", "state": "waiting_input", "attempt": 0});
+    question["turn"] =
+        json!({"id": "t1", "state": "waiting_input", "attempt": 0, "prompt_accepted": true});
     question["gate"] = json!({
         "id": "q-1",
         "kind": "ask",
@@ -309,7 +312,8 @@ fn gjc_bridge_ingest_dedupes_replay_stale_and_restart_boundaries() {
 
     // Completion closes the turn.
     let mut completion = snapshot(3);
-    completion["turn"] = json!({"id": "t1", "state": "complete", "attempt": 0});
+    completion["turn"] =
+        json!({"id": "t1", "state": "complete", "attempt": 0, "prompt_accepted": true});
     completion["prompt"] = json!(null);
     completion["gate"] = json!({
         "id": "q-1",
