@@ -174,13 +174,19 @@ pub struct WorkflowGateAnswerDto {
 
 impl WorkflowGateAnswerDto {
     pub fn into_request(self) -> GjcResult<WorkflowGateAnswerRequest> {
-        if self.gate_id.is_empty() || self.gate_id.len() > 128 {
+        if self.gate_id.is_empty()
+            || self.gate_id.len() > 128
+            || self.gate_id.chars().any(|ch| ch.is_control())
+        {
             return Err(GjcError::InvalidRequest {
                 field: "gate_id",
                 reason: "must be 1..=128 bytes".into(),
             });
         }
-        if self.option.is_empty() || self.option.len() > 256 {
+        if self.option.is_empty()
+            || self.option.len() > 128
+            || self.option.chars().any(|ch| ch.is_control())
+        {
             return Err(GjcError::InvalidRequest {
                 field: "option",
                 reason: "must be 1..=256 bytes".into(),
@@ -207,7 +213,10 @@ pub struct AskAnswerDto {
 
 impl AskAnswerDto {
     pub fn into_request(self) -> GjcResult<AskAnswerRequest> {
-        if self.ask_id.is_empty() || self.ask_id.len() > 128 {
+        if self.ask_id.is_empty()
+            || self.ask_id.len() > 128
+            || self.ask_id.chars().any(|ch| ch.is_control())
+        {
             return Err(GjcError::InvalidRequest {
                 field: "ask_id",
                 reason: "must be 1..=128 bytes".into(),
@@ -226,7 +235,10 @@ impl AskAnswerDto {
                 .choices
                 .into_iter()
                 .map(|option| {
-                    if option.is_empty() || option.len() > 256 {
+                    if option.is_empty()
+                        || option.len() > 256
+                        || option.chars().any(|ch| ch.is_control())
+                    {
                         Err(GjcError::InvalidRequest {
                             field: "choices",
                             reason: "each choice must be 1..=256 bytes".into(),
@@ -252,7 +264,9 @@ impl ModelSelectionDto {
     pub fn into_request(self) -> GjcResult<ModelSelectionRequest> {
         for (field, value) in [("model", &self.model), ("profile", &self.profile)] {
             if let Some(value) = value.as_deref()
-                && (value.is_empty() || value.len() > 128)
+                && (value.is_empty()
+                    || value.len() > 128
+                    || value.chars().any(|ch| ch.is_control()))
             {
                 return Err(GjcError::InvalidRequest {
                     field: "model",
@@ -287,8 +301,14 @@ pub fn session_query_body(query: &SessionQuery) -> Value {
         metadata.provider_metadata = metadata
             .provider_metadata
             .iter()
-            .filter(|(_, value)| {
-                value.is_string() || value.is_number() || value.is_boolean() || value.is_null()
+            .filter(|(key, value)| {
+                matches!(
+                    key.as_str(),
+                    "provider" | "model" | "profile" | "status" | "region"
+                ) && (value.is_string()
+                    || value.is_number()
+                    || value.is_boolean()
+                    || value.is_null())
             })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
@@ -298,26 +318,94 @@ pub fn session_query_body(query: &SessionQuery) -> Value {
         body["stats"] = serde_json::to_value(stats).unwrap_or(Value::Null);
     }
     if let Some(model_profile) = query.model_profile.as_ref() {
-        body["model_profile"] = serde_json::to_value(model_profile).unwrap_or(Value::Null);
+        body["model_profile"] = json!({
+            "model": if model_profile.model.len() <= 128
+                && !model_profile.model.chars().any(|ch| ch.is_control())
+            {
+                model_profile.model.clone()
+            } else {
+                "redacted".to_string()
+            },
+            "profile": model_profile.profile.as_deref().filter(|profile| {
+                profile.len() <= 128 && !profile.chars().any(|ch| ch.is_control())
+            }),
+        });
     }
     if let Some(turn) = query.turn.as_ref() {
-        body["turn"] = serde_json::to_value(turn).unwrap_or(Value::Null);
+        let mut turn_body = serde_json::to_value(turn).unwrap_or(Value::Null);
+        if let Some(outcome) = turn_body.get("outcome").cloned() {
+            turn_body["outcome"] = crate::gjc::control::public_outcome(&outcome);
+        }
+        body["turn"] = turn_body;
+    } else if query.turn_present {
+        body["turn"] = Value::Null;
     }
     if let Some(queue) = query.queue.as_ref() {
-        body["queue"] = serde_json::to_value(queue).unwrap_or(Value::Null);
+        body["queue"] = json!({
+            "depth": queue.depth,
+            "entries": queue
+                .entries
+                .iter()
+                .take(64)
+                .map(|entry| json!({
+                    "position": entry.position,
+                    "kind": if entry.kind.len() <= 128
+                        && !entry.kind.chars().any(|ch| ch.is_control())
+                    {
+                        entry.kind.clone()
+                    } else {
+                        "redacted".to_string()
+                    },
+                    "summary": entry.summary.as_deref().filter(|summary| {
+                        summary.len() <= 256 && !summary.chars().any(|ch| ch.is_control())
+                    }),
+                }))
+                .collect::<Vec<_>>(),
+        });
     }
     if let Some(gates) = query.workflow_gates.as_ref() {
-        body["workflow_gates"] = serde_json::to_value(gates).unwrap_or(Value::Null);
+        body["workflow_gates"] = Value::Array(
+            gates
+                .iter()
+                .map(|gate| {
+                    let title = gate.title.as_deref().filter(|value| {
+                        value.len() <= 256 && !value.chars().any(|ch| ch.is_control())
+                    });
+                    let options = gate
+                        .options
+                        .iter()
+                        .filter(|value| {
+                            !value.is_empty()
+                                && value.len() <= 256
+                                && !value.chars().any(|ch| ch.is_control())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    json!({
+                        "gate_id": gate.gate_id,
+                        "state": gate.state,
+                        "title": title,
+                        "options": options,
+                    })
+                })
+                .collect(),
+        );
     }
     if let Some(goal_todo) = query.goal_todo.as_ref() {
-        body["goal_todo"] = serde_json::to_value(goal_todo).unwrap_or(Value::Null);
+        body["goal_todo"] = serde_json::json!({
+            "todo_count": goal_todo.todos.len(),
+        });
     }
     body
 }
 
 /// Command receipt response body.
 pub fn command_receipt_body(receipt: &CommandReceipt) -> Value {
-    serde_json::to_value(receipt).unwrap_or(Value::Null)
+    let mut body = serde_json::to_value(receipt).unwrap_or(Value::Null);
+    if let Some(outcome) = body.get("outcome").cloned() {
+        body["outcome"] = crate::gjc::control::public_outcome(&outcome);
+    }
+    body
 }
 
 /// Terminal outcome response body.
@@ -373,6 +461,19 @@ mod tests {
         .into_request()
         .unwrap_err();
         assert_eq!(error.error_code(), "invalid_request");
+
+        let invalid_id = AskAnswerDto {
+            base: base_dto(),
+            ask_id: "ask-\n1".into(),
+            choices: vec!["yes".into()],
+        };
+        assert!(invalid_id.into_request().is_err());
+        let invalid_choice = AskAnswerDto {
+            base: base_dto(),
+            ask_id: "ask-1".into(),
+            choices: vec!["yes\u{7f}".into()],
+        };
+        assert!(invalid_choice.into_request().is_err());
     }
 
     #[test]
@@ -398,6 +499,15 @@ mod tests {
         .into_request()
         .unwrap_err();
         assert_eq!(error.error_code(), "invalid_request");
+        let mut bad_control = WorkflowGateAnswerDto {
+            base: base_dto(),
+            gate_id: "gate-\n1".into(),
+            option: "ok".into(),
+        };
+        assert!(bad_control.clone().into_request().is_err());
+        bad_control.gate_id = "gate-1".into();
+        bad_control.option = "ok\u{7f}".into();
+        assert!(bad_control.into_request().is_err());
     }
 
     #[test]
@@ -422,6 +532,12 @@ mod tests {
         // DTO-level validation passes; exactly-one is enforced by the
         // control plane (and surfaced as invalid_request there).
         assert!(dto.clone().into_request().is_ok());
+        let invalid = ModelSelectionDto {
+            base: base_dto(),
+            model: Some("model\nname".into()),
+            profile: None,
+        };
+        assert!(invalid.into_request().is_err());
     }
 
     #[test]
@@ -435,7 +551,7 @@ mod tests {
                 last_active_at: None,
                 lane: None,
                 provider_metadata: [
-                    ("safe".to_string(), Value::String("v".into())),
+                    ("provider".to_string(), Value::String("v".into())),
                     ("nested".to_string(), json!({"secret": true})),
                 ]
                 .into_iter()
@@ -444,11 +560,35 @@ mod tests {
             ..SessionQuery::default()
         };
         let body = session_query_body(&query);
-        assert_eq!(body["metadata"]["provider_metadata"]["safe"], "v");
+        assert_eq!(body["metadata"]["provider_metadata"]["provider"], "v");
         assert!(
             body["metadata"]["provider_metadata"]
                 .get("nested")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn session_query_body_preserves_present_null_turn() {
+        let query = SessionQuery {
+            turn_present: true,
+            ..SessionQuery::default()
+        };
+        assert_eq!(session_query_body(&query)["turn"], Value::Null);
+    }
+
+    #[test]
+    fn session_query_body_never_exposes_raw_goal_or_todo_values() {
+        let query = SessionQuery {
+            goal_todo: Some(crate::gjc::model::GoalTodoSnapshot {
+                goal: Some(serde_json::json!("prompt=secret")),
+                todos: vec![serde_json::json!("token=secret")],
+            }),
+            ..SessionQuery::default()
+        };
+        assert_eq!(
+            session_query_body(&query)["goal_todo"],
+            serde_json::json!({"todo_count": 1})
         );
     }
 

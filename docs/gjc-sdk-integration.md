@@ -1,11 +1,9 @@
 # Clawhip ↔ GJC SDK Integration — Operator Guide
 
-Status: staged on lane `test/issue-326-gjc-sdk-e2e` (issue #326, parent epic #321).
-The endpoint discovery/transport layer itself landed with #322
-(`src/gjc_sdk.rs`); control-plane (#323), event bridge (#324), and durable
-reconciliation (#325) are sibling-owned. **Open regression #328 tracks the
-transport against the real GJC SDK v3 endpoint** — the live-session steps in
-the dogfood checklist below stay gated until #328's repaired dev merge.
+Status: supported. Clawhip is the GJC-first event router: native SDK endpoint
+discovery, authoritative control, event projection, and durable reconciliation
+are one daemon path. The individual #322-#325 surfaces remain documented by
+their module ownership, but are no longer staged or manually wired.
 
 ## 1. What this integration is
 
@@ -48,6 +46,30 @@ enabled = true
 ```
 
 Legacy configs without `[gjc]` keep parsing byte-stable; absent means off.
+
+### Session enrollment for external creators (#349)
+
+Session creators remain process owners. The daemon automatically discovers and
+enrolls live metadata in its trusted worktree on startup and on each poll. For
+an external creator that needs an immediate explicit enrollment, the same
+stable local API (or equivalent CLI) is available:
+
+```sh
+clawhip gjc register \
+  --session "$GJC_SESSION_ID" \
+  --worktree "$PWD"
+```
+
+The same contract is available as an authenticated local `POST /api/gjc/lanes`
+with JSON fields `sdk_session_id` and `worktree` (plus optional `owner_id`,
+Registration is idempotent at the daemon API for the session identity. The daemon queries the authoritative SDK control plane during
+durable reconciliation; it does not scrape tmux panes or take ownership of the
+creator's process. Endpoint outages produce one deduped
+`session.endpoint-failed` alert with a bounded public-safe summary.
+
+For a daemon serving several repositories, add trusted roots under
+`[gjc_lanes].discovery_worktrees`; the daemon scans the current worktree and
+those roots on every reconciliation pass.
 
 ### Question delivery (existing surface)
 
@@ -105,7 +127,7 @@ names, or token values. For endpoint-level diagnostics use
 | `stale` | `kill -0 <pid>` | Session process exited without cleanup; retire the stale metadata file. |
 | `malformed` | validate JSON schema | Metadata edited by hand or truncated; republish from the SDK CLI. |
 | Probe `endpoint_unauthorized` | token mismatch | The `?token=` credential does not match the metadata file; republish. |
-| Probe `timeout` / `connection_closed` | endpoint liveness | Endpoint died mid-exchange; see #328 for the open v3 regression. |
+| Probe `timeout` / `connection_closed` | endpoint liveness | Endpoint died mid-exchange; Clawhip emits a deduped endpoint-failed alert. |
 | Subscription `retry_exhausted` | `GET /api/subscriptions/<name>` | Endpoint unreachable for the full reconnect budget; restart the daemon after the endpoint returns. |
 | Question delivered without summary | projection keys | Projection must select `/questionId` and `/summary` from notification frames. |
 
@@ -119,8 +141,9 @@ names, or token values. For endpoint-level diagnostics use
 
 ## 8. Live dogfood checklist (bounded)
 
-Preconditions: real GJC session in this worktree; dev head with #328's
-transport repair merged; `[gjc] enabled = true`; question route configured.
+Preconditions: real GJC session in this worktree; `[gjc] enabled = true` and
+`[gjc_lanes] enabled = true` (the official setup enables both); question route
+configured when testing bidirectional gates.
 
 1. `clawhip gjc inspect --probe --json` → expect `"status":"live"` with
    correlated probe results.

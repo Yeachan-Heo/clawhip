@@ -2061,6 +2061,7 @@ impl AppConfig {
     /// so no endpoint or secret is ever written into the config file.
     pub fn apply_gjc_sdk_setup(&mut self) {
         self.gjc.enabled = true;
+        self.gjc_lanes.enabled = true;
     }
 
     pub fn scaffold_webhook_quickstart(&mut self, webhook: String) -> Result<()> {

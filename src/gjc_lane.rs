@@ -29,7 +29,16 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 
+use crate::dispatch::{
+    AlertDeliveryJournal, AlertDeliveryState, cancel_alert_acceptance,
+    clear_alert_delivery_journal, register_alert_acceptance, register_alert_delivery_journal,
+};
 use crate::events::IncomingEvent;
+use crate::gjc_sdk_events::{
+    GjcEventBridge, GjcSdkEndpoint, GjcSdkEndpointHealth, GjcSdkGate, GjcSdkGateKind,
+    GjcSdkGateStatus, GjcSdkStateSnapshot, GjcSdkTurn, GjcSdkTurnPhase, gate_revision,
+    valid_gate_id,
+};
 
 pub const GJC_LANE_STATE_SCHEMA: &str = "clawhip.gjc-lane-state.v1";
 pub const GJC_LANE_STATUS_EVENT: &str = "gjc.lane.status";
@@ -38,6 +47,12 @@ pub const GJC_LANE_HEALTH_SCHEMA: &str = "clawhip.gjc-health.v1";
 
 /// Audit trail is bounded: oldest entries are dropped once this many exist.
 pub const MAX_AUDIT_ENTRIES: usize = 512;
+/// Pending alerts are retained until the reconciler's send succeeds. Refuse
+/// to grow beyond this bound rather than dropping an operator-visible alert.
+const MAX_PENDING_ALERTS: usize = 64;
+const MAX_PENDING_ALERT_DELIVERIES: usize = 64;
+const MAX_LANES: usize = 1024;
+const ALERT_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SESSION_LEN: usize = 128;
 const MAX_WORKTREE_LEN: usize = 4096;
 const MAX_OWNER_LEN: usize = 64;
@@ -96,6 +111,7 @@ pub enum GjcTurnState {
     AwaitingInput,
     Complete,
     Failed,
+    Aborted,
 }
 
 /// Workflow-gate state reported by the SDK.
@@ -122,13 +138,23 @@ pub enum GjcSessionDisposition {
 pub struct GjcSdkObservation {
     pub session_id: String,
     pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub branch_observed: bool,
     pub endpoint_generation: u64,
     pub revision: u64,
     pub turn_state: GjcTurnState,
     pub turn_id: Option<String>,
+    pub prompt_accepted: bool,
     pub gate_state: Option<GjcGateState>,
+    pub gate_section_present: bool,
     pub gate_id: Option<String>,
+    pub gate_revision: u64,
+    pub gate_kind: Option<GjcSdkGateKind>,
+    pub gate_workflow_id: Option<String>,
+    pub gate_title: Option<String>,
+    pub gate_options: Vec<String>,
     pub disposition: GjcSessionDisposition,
+    pub error_summary: Option<String>,
 }
 
 /// Query failure kinds. Only `SessionNotFound` is authoritative about the
@@ -148,6 +174,7 @@ pub enum GjcSdkQueryError {
         observed: u64,
     },
     Ambiguous(String),
+    InvalidState(String),
 }
 
 impl fmt::Display for GjcSdkQueryError {
@@ -160,6 +187,7 @@ impl fmt::Display for GjcSdkQueryError {
                 write!(f, "stale endpoint generation; observed {observed}")
             }
             Self::Ambiguous(detail) => write!(f, "ambiguous response: {detail}"),
+            Self::InvalidState(detail) => write!(f, "invalid control-plane state: {detail}"),
         }
     }
 }
@@ -175,6 +203,216 @@ pub trait GjcSdkControlPlane: Send + Sync {
         &self,
         query: &GjcLaneQuery,
     ) -> std::result::Result<GjcSdkObservation, GjcSdkQueryError>;
+}
+
+/// Adapter that makes the authoritative #323 control plane usable by the
+/// durable #325 reconciler. Keeping this adapter at the seam prevents the
+/// reconciler from learning transport or websocket details.
+pub struct GjcControlPlaneAdapter {
+    registry: crate::gjc::control::SharedGjcCommandRegistry,
+}
+
+impl GjcControlPlaneAdapter {
+    pub fn new(registry: crate::gjc::control::SharedGjcCommandRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl GjcSdkControlPlane for GjcControlPlaneAdapter {
+    async fn query_lane(
+        &self,
+        query: &GjcLaneQuery,
+    ) -> std::result::Result<GjcSdkObservation, GjcSdkQueryError> {
+        let session = crate::gjc::model::SessionId::new(query.sdk_session_id.clone())
+            .map_err(|_| GjcSdkQueryError::SessionNotFound("invalid session identity".into()))?;
+        let worktree =
+            query.worktree.as_deref().map(Path::new).ok_or_else(|| {
+                GjcSdkQueryError::EndpointUnavailable("worktree unavailable".into())
+            })?;
+        let endpoint_generation =
+            crate::gjc::transport::discover_endpoint_for_session(worktree, &query.sdk_session_id)
+                .map_err(map_control_error)?
+                .endpoint_generation();
+        if query.known_endpoint_generation != 0
+            && query.known_endpoint_generation != endpoint_generation
+        {
+            return Err(GjcSdkQueryError::StaleEndpointGeneration {
+                observed: endpoint_generation,
+            });
+        }
+        let control =
+            crate::gjc::control::GjcControlPlane::for_worktree(worktree, self.registry.clone());
+        let session_query = control
+            .query_session(&session, &["metadata", "stats", "turn", "workflow_gates"])
+            .await
+            .map_err(map_control_error)?;
+        let confirmed_generation =
+            crate::gjc::transport::discover_endpoint_for_session(worktree, &query.sdk_session_id)
+                .map_err(map_control_error)?
+                .endpoint_generation();
+        if confirmed_generation != endpoint_generation {
+            return Err(GjcSdkQueryError::StaleEndpointGeneration {
+                observed: confirmed_generation,
+            });
+        }
+        if !session_query.turn_present {
+            return Err(GjcSdkQueryError::InvalidState(
+                "authoritative session query omitted turn".to_string(),
+            ));
+        }
+        let turn = session_query.turn.as_ref();
+        let (turn_state, turn_id, disposition, error_summary, prompt_accepted) = match turn {
+            Some(turn) => match turn.status {
+                crate::gjc::model::GjcPromptStatus::Queued => (
+                    GjcTurnState::Running,
+                    Some(turn.turn_id.clone()),
+                    GjcSessionDisposition::Live,
+                    None,
+                    turn.prompt_accepted,
+                ),
+                crate::gjc::model::GjcPromptStatus::Running => (
+                    GjcTurnState::Running,
+                    Some(turn.turn_id.clone()),
+                    GjcSessionDisposition::Live,
+                    None,
+                    turn.prompt_accepted,
+                ),
+                crate::gjc::model::GjcPromptStatus::Succeeded => (
+                    GjcTurnState::Complete,
+                    Some(turn.turn_id.clone()),
+                    GjcSessionDisposition::Live,
+                    turn.outcome
+                        .as_ref()
+                        .and_then(|outcome| outcome.summary.clone()),
+                    turn.prompt_accepted,
+                ),
+                crate::gjc::model::GjcPromptStatus::Failed => (
+                    GjcTurnState::Failed,
+                    Some(turn.turn_id.clone()),
+                    GjcSessionDisposition::Live,
+                    turn.outcome
+                        .as_ref()
+                        .and_then(|outcome| outcome.summary.clone()),
+                    turn.prompt_accepted,
+                ),
+                crate::gjc::model::GjcPromptStatus::Aborted => (
+                    GjcTurnState::Aborted,
+                    Some(turn.turn_id.clone()),
+                    GjcSessionDisposition::Live,
+                    turn.outcome
+                        .as_ref()
+                        .and_then(|outcome| outcome.summary.clone()),
+                    turn.prompt_accepted,
+                ),
+            },
+            None => (
+                GjcTurnState::Idle,
+                None,
+                GjcSessionDisposition::Live,
+                None,
+                false,
+            ),
+        };
+        let gates = session_query.workflow_gates.as_deref().unwrap_or_default();
+        if gates
+            .iter()
+            .filter(|gate| gate.state == crate::gjc::model::WorkflowGateState::Ready)
+            .count()
+            > 1
+        {
+            return Err(GjcSdkQueryError::InvalidState(
+                "multiple ready workflow gates".to_string(),
+            ));
+        }
+        if gates
+            .iter()
+            .any(|gate| !valid_gate_id(&gate.gate_id) || gate_revision(gate) == 0)
+        {
+            return Err(GjcSdkQueryError::InvalidState(
+                "workflow gate identity or revision is malformed".to_string(),
+            ));
+        }
+        let gate = gates
+            .iter()
+            .find(|gate| gate.state == crate::gjc::model::WorkflowGateState::Ready)
+            .or_else(|| {
+                session_query
+                    .workflow_gates
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .max_by_key(|gate| crate::gjc_sdk_events::gate_revision(gate))
+            });
+        let (branch_observed, branch) = match query.worktree.as_deref() {
+            Some(worktree) => match current_git_branch(worktree) {
+                Ok(branch) => (true, branch),
+                Err(_) => (false, None),
+            },
+            None => (false, None),
+        };
+        Ok(GjcSdkObservation {
+            session_id: query.sdk_session_id.clone(),
+            worktree: query.worktree.clone(),
+            branch_observed,
+            branch,
+            endpoint_generation,
+            revision: session_query.revision.ok_or_else(|| {
+                GjcSdkQueryError::InvalidState(
+                    "authoritative session query omitted revision".to_string(),
+                )
+            })?,
+            turn_state: if gate
+                .is_some_and(|gate| gate.state == crate::gjc::model::WorkflowGateState::Ready)
+            {
+                GjcTurnState::AwaitingInput
+            } else {
+                turn_state
+            },
+            turn_id,
+            gate_state: gate.map(|gate| {
+                if gate.state == crate::gjc::model::WorkflowGateState::Ready {
+                    GjcGateState::Ready
+                } else {
+                    GjcGateState::Answered
+                }
+            }),
+            gate_section_present: session_query.workflow_gates_present,
+            gate_id: gate.map(|gate| gate.gate_id.clone()),
+            gate_revision: gate.map(crate::gjc_sdk_events::gate_revision).unwrap_or(0),
+            gate_kind: gate.and_then(|gate| match gate.kind.as_deref() {
+                Some("ask") => Some(GjcSdkGateKind::Ask),
+                Some("workflow") => Some(GjcSdkGateKind::Workflow),
+                _ => None,
+            }),
+            gate_workflow_id: gate.and_then(|gate| gate.workflow_id.clone()),
+            gate_title: gate.and_then(|gate| gate.title.clone()),
+            gate_options: gate.map(|gate| gate.options.clone()).unwrap_or_default(),
+            disposition,
+            error_summary,
+            prompt_accepted,
+        })
+    }
+}
+
+fn map_control_error(error: crate::gjc::model::GjcError) -> GjcSdkQueryError {
+    use crate::gjc::model::GjcError;
+    match error {
+        GjcError::SessionNotFound { .. } => {
+            GjcSdkQueryError::SessionNotFound("session not found".into())
+        }
+        GjcError::Timeout { .. } => GjcSdkQueryError::Timeout("control-plane timeout".into()),
+        GjcError::TransportUnavailable | GjcError::StaleEndpoint { .. } => {
+            GjcSdkQueryError::EndpointUnavailable("sdk endpoint unavailable".into())
+        }
+        GjcError::AmbiguousAck { .. }
+        | GjcError::InvalidPeerReply { .. }
+        | GjcError::MissingCapability { .. }
+        | GjcError::SessionMismatch { .. }
+        | GjcError::InvalidRequest { .. } => {
+            GjcSdkQueryError::Ambiguous("control-plane response was not authoritative".into())
+        }
+    }
 }
 
 /// Inputs the control plane needs to locate one SDK session.
@@ -247,6 +485,8 @@ pub struct GjcPrBinding {
 pub struct GjcTurnSnapshot {
     pub state: GjcTurnState,
     pub turn_id: Option<String>,
+    #[serde(default)]
+    pub prompt_accepted: bool,
     pub observed_at: String,
 }
 
@@ -254,6 +494,8 @@ pub struct GjcTurnSnapshot {
 pub struct GjcGateSnapshot {
     pub state: GjcGateState,
     pub gate_id: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
     pub observed_at: String,
 }
 
@@ -283,15 +525,74 @@ pub struct GjcReconcileAuditEntry {
     pub detail: String,
 }
 
+/// One alert durably staged before attempting delivery. The event payload is
+/// already public-safe and carries its deterministic `event_id`; keeping the
+/// complete payload here makes crash recovery independent of a fresh SDK
+/// observation or bridge process-local reducer state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GjcPendingAlert {
+    pub event_id: String,
+    pub kind: String,
+    pub payload: Value,
+    #[serde(default)]
+    pub queued_at: String,
+    #[serde(default)]
+    pub attempts: u32,
+    /// Per-destination ownership and terminal outcome. The map is durable so
+    /// a replay can skip destinations already claimed or delivered while
+    /// independently retrying destinations whose sink returned an error.
+    #[serde(default)]
+    pub deliveries: BTreeMap<String, GjcPendingAlertDelivery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GjcPendingAlertDeliveryState {
+    Claimed,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GjcPendingAlertDelivery {
+    pub state: GjcPendingAlertDeliveryState,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+impl GjcPendingAlert {
+    fn incoming_event(&self) -> IncomingEvent {
+        IncomingEvent {
+            kind: self.kind.clone(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
 /// Durable record for one GJC SDK-backed lane watch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GjcLaneRecord {
     pub lane_id: String,
     pub sdk_session_id: String,
     pub worktree: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
     /// Last observed SDK endpoint generation; a bump invalidates stale
     /// review/owner evidence captured under the previous generation.
     pub endpoint_generation: u64,
+    /// Monotonic durable endpoint failure episode. It changes only after a
+    /// successful endpoint observation followed by a new failure, never on a
+    /// local CAS mutation.
+    #[serde(default)]
+    pub endpoint_episode: u64,
+    #[serde(default)]
+    pub endpoint_alerted: bool,
     /// Local durable-record revision for optimistic concurrency (CAS).
     pub revision: u64,
     /// Last observed SDK-side session revision.
@@ -313,6 +614,9 @@ pub struct GjcLaneRecord {
     pub watch_removed_at: Option<String>,
     pub registered_at: String,
     pub updated_at: String,
+    /// Alerts staged before delivery; bounded and replayed until acknowledged.
+    #[serde(default)]
+    pub pending_alerts: Vec<GjcPendingAlert>,
 }
 
 /// Registration input accepted by the store and daemon API.
@@ -353,6 +657,8 @@ struct GjcLaneStateFile {
     schema: String,
     generation: u64,
     lanes: BTreeMap<String, GjcLaneRecord>,
+    #[serde(default)]
+    lane_id_aliases: BTreeMap<String, String>,
     audit: Vec<GjcReconcileAuditEntry>,
     audit_entries_dropped: u64,
 }
@@ -382,7 +688,13 @@ pub fn now_rfc3339() -> String {
 
 /// Stable, filesystem-safe lane id derived from the SDK session identity.
 pub fn gjc_lane_id(sdk_session_id: &str) -> String {
-    format!("gjc-{:016x}", Sha256::digest(sdk_session_id.as_bytes())[0])
+    let digest = Sha256::digest(sdk_session_id.as_bytes());
+    let hex: String = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("gjc-{hex}")
 }
 
 fn fingerprint(value: &str) -> String {
@@ -405,16 +717,24 @@ fn valid_id(value: &str) -> bool {
 }
 
 fn valid_session_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_SESSION_LEN
-        && value.is_ascii()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    value.len() <= MAX_SESSION_LEN && crate::gjc::model::SessionId::new(value).is_ok()
 }
 
 fn valid_worktree(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_WORKTREE_LEN && !value.chars().any(char::is_control)
+    if value.is_empty() || value.len() > MAX_WORKTREE_LEN || value.chars().any(char::is_control) {
+        return false;
+    }
+    let path = std::path::Path::new(value);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    path.canonicalize()
+        .map(|canonical| canonical == path)
+        .unwrap_or(true)
 }
 
 fn valid_hex_sha(value: &str) -> bool {
@@ -429,16 +749,251 @@ fn default_true() -> bool {
     true
 }
 
+fn migrate_lane_ids(state: &mut GjcLaneStateFile) -> Result<bool> {
+    for (alias, target) in &state.lane_id_aliases {
+        if alias == target || state.lanes.contains_key(alias) {
+            bail!("lane id migration alias collides with canonical lane");
+        }
+        if state.lane_id_aliases.contains_key(target) {
+            bail!("lane id migration alias chain is not supported");
+        }
+        if !state.lanes.contains_key(target) {
+            bail!("lane id migration alias target is missing");
+        }
+    }
+    let canonical_ids = state
+        .lanes
+        .values()
+        .map(|record| gjc_lane_id(&record.sdk_session_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut migrated = false;
+    let mut lanes = BTreeMap::new();
+    for (old_id, mut record) in std::mem::take(&mut state.lanes) {
+        let new_id = gjc_lane_id(&record.sdk_session_id);
+        if old_id != new_id && canonical_ids.contains(&old_id) {
+            bail!("lane id migration alias collision for canonical lane");
+        }
+        if old_id != new_id || record.lane_id != new_id {
+            migrated = true;
+            record.lane_id = new_id.clone();
+        }
+        if lanes.insert(new_id.clone(), record).is_some() {
+            bail!("lane id migration collision for session identity");
+        }
+        if old_id != new_id {
+            state.lane_id_aliases.insert(old_id, new_id);
+        }
+    }
+    state.lanes = lanes;
+    for target in state.lane_id_aliases.values() {
+        if state.lane_id_aliases.contains_key(target) {
+            bail!("lane id migration alias chain is not supported");
+        }
+        if !state.lanes.contains_key(target) {
+            bail!("lane id migration alias target is missing");
+        }
+    }
+    Ok(migrated)
+}
+
+fn current_git_branch(worktree: &str) -> Result<Option<String>> {
+    let output = std::process::Command::new("git")
+        .args(["-C", worktree, "branch", "--show-current"])
+        .output()
+        .context("git branch probe failed")?;
+    if !output.status.success() {
+        bail!("git branch probe returned non-success");
+    }
+    let branch = String::from_utf8(output.stdout)
+        .context("git branch probe returned invalid output")?
+        .trim()
+        .to_string();
+    Ok((!branch.is_empty() && branch.len() <= 128).then_some(branch))
+}
+
+fn canonical_lane_id(state: &GjcLaneStateFile, lane_id: &str) -> String {
+    state
+        .lane_id_aliases
+        .get(lane_id)
+        .cloned()
+        .unwrap_or_else(|| lane_id.to_string())
+}
+
+fn observation_snapshot(
+    record: &GjcLaneRecord,
+    previous: Option<&GjcLaneRecord>,
+    observation: &GjcSdkObservation,
+    now: &str,
+    endpoint: Option<GjcSdkEndpoint>,
+) -> GjcSdkStateSnapshot {
+    let turn_id = observation.turn_id.clone().or_else(|| {
+        previous
+            .and_then(|record| record.last_turn.as_ref())
+            .and_then(|turn| turn.turn_id.clone())
+    });
+    let turn = turn_id.map(|id| GjcSdkTurn {
+        id,
+        state: match observation.turn_state {
+            GjcTurnState::Running => {
+                if observation.prompt_accepted {
+                    GjcSdkTurnPhase::Active
+                } else {
+                    GjcSdkTurnPhase::Idle
+                }
+            }
+            GjcTurnState::AwaitingInput => GjcSdkTurnPhase::WaitingInput,
+            GjcTurnState::Complete => GjcSdkTurnPhase::Complete,
+            GjcTurnState::Failed => GjcSdkTurnPhase::Failed,
+            GjcTurnState::Idle => GjcSdkTurnPhase::Idle,
+            GjcTurnState::Aborted => GjcSdkTurnPhase::Aborted,
+        },
+        prompt_accepted: observation.prompt_accepted,
+        attempt: 0,
+        error_summary: observation.error_summary.clone(),
+    });
+    let gate = observation.gate_id.as_ref().map(|gate_id| GjcSdkGate {
+        id: gate_id.clone(),
+        kind: observation.gate_kind.unwrap_or(GjcSdkGateKind::Workflow),
+        revision: observation.gate_revision,
+        status: if observation.gate_state == Some(GjcGateState::Ready) {
+            GjcSdkGateStatus::Open
+        } else {
+            GjcSdkGateStatus::Resolved
+        },
+        summary: observation.gate_title.clone(),
+        workflow_id: observation.gate_workflow_id.clone(),
+        title: observation.gate_title.clone(),
+        options: observation.gate_options.clone(),
+    });
+    GjcSdkStateSnapshot {
+        session_id: observation.session_id.clone(),
+        revision: observation.revision,
+        endpoint_episode: record.endpoint_episode,
+        turn,
+        gate,
+        endpoint,
+        repo_name: record.pr.as_ref().map(|pr| pr.repo.clone()),
+        worktree_path: record.worktree.clone(),
+        branch: record.branch.clone(),
+        observed_at: Some(now.to_string()),
+        summary: observation.error_summary.clone(),
+        ..GjcSdkStateSnapshot::default()
+    }
+}
+
+fn pending_from_event(event: IncomingEvent, now: &str) -> Result<GjcPendingAlert> {
+    let event_id = event
+        .payload
+        .get("event_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("gjc alert missing deterministic event id"))?
+        .to_string();
+    Ok(GjcPendingAlert {
+        event_id,
+        kind: event.kind,
+        payload: event.payload,
+        queued_at: now.to_string(),
+        attempts: 0,
+        deliveries: BTreeMap::new(),
+    })
+}
+
+fn queue_pending_alert(record: &mut GjcLaneRecord, alert: GjcPendingAlert) -> Result<()> {
+    if record
+        .pending_alerts
+        .iter()
+        .any(|existing| existing.event_id == alert.event_id)
+    {
+        return Ok(());
+    }
+    if record.pending_alerts.len() >= MAX_PENDING_ALERTS {
+        bail!("gjc pending alert queue is full");
+    }
+    record.pending_alerts.push(alert);
+    Ok(())
+}
+
+struct GjcPendingAlertJournal {
+    store: SharedGjcLaneStore,
+    lane_id: String,
+    event_id: String,
+}
+
+impl AlertDeliveryJournal for GjcPendingAlertJournal {
+    fn state(&self, destination: &str) -> Option<AlertDeliveryState> {
+        self.store
+            .pending_alert_delivery_state(&self.lane_id, &self.event_id, destination)
+            .map(|state| match state {
+                GjcPendingAlertDeliveryState::Claimed => AlertDeliveryState::Claimed,
+                GjcPendingAlertDeliveryState::Delivered => AlertDeliveryState::Delivered,
+                GjcPendingAlertDeliveryState::Failed => AlertDeliveryState::Failed,
+            })
+    }
+
+    fn claim(&self, destination: &str) -> bool {
+        self.store
+            .claim_pending_alert_delivery(&self.lane_id, &self.event_id, destination)
+            .unwrap_or(false)
+    }
+
+    fn record(&self, destination: &str, delivered: bool) -> bool {
+        self.store
+            .record_pending_alert_delivery(&self.lane_id, &self.event_id, destination, delivered)
+            .unwrap_or(false)
+    }
+}
+
+fn bridge_alerts(
+    previous: Option<&GjcSdkStateSnapshot>,
+    snapshot: &GjcSdkStateSnapshot,
+) -> Result<Vec<IncomingEvent>> {
+    let mut bridge = GjcEventBridge::new();
+    if let Some(previous) = previous {
+        bridge
+            .observe(previous)
+            .map_err(|error| anyhow!("build prior sdk alert state: {error}"))?;
+    }
+    Ok(bridge
+        .observe(snapshot)
+        .map_err(|error| anyhow!("build sdk alert: {error}"))?
+        .events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "session.failed"
+                    | "session.stalled"
+                    | "session.endpoint-failed"
+                    | "workflow.gate"
+                    | "workflow.question"
+            )
+        })
+        .collect())
+}
+
 impl GjcLaneStore {
     /// Open (or initialize) the durable lane-state file. Invalid content fails
     /// open as `IgnoredInvalid` rather than blocking the daemon, mirroring the
     /// tmux watch registry contract.
     pub fn open(path: &Path) -> Result<Self> {
-        let (state, status) = match std::fs::read(path) {
+        let (mut state, status) = match std::fs::read(path) {
             Ok(content) => match serde_json::from_slice::<GjcLaneStateFile>(&content) {
                 Ok(parsed) if parsed.schema == GJC_LANE_STATE_SCHEMA => {
-                    let lanes = parsed.lanes.len();
-                    (parsed, GjcLaneStoreStatus::Loaded { lanes })
+                    match validate_loaded_state(&parsed) {
+                        Ok(()) => {
+                            let lanes = parsed.lanes.len();
+                            (parsed, GjcLaneStoreStatus::Loaded { lanes })
+                        }
+                        Err(error) => (
+                            GjcLaneStateFile {
+                                schema: GJC_LANE_STATE_SCHEMA.to_string(),
+                                ..Default::default()
+                            },
+                            GjcLaneStoreStatus::IgnoredInvalid {
+                                error: error.to_string(),
+                            },
+                        ),
+                    }
                 }
                 Ok(parsed) => (
                     GjcLaneStateFile {
@@ -470,11 +1025,20 @@ impl GjcLaneStore {
                 return Err(error).context(format!("failed to read {}", path.display()));
             }
         };
-        Ok(Self {
+        let migrated = migrate_lane_ids(&mut state)?;
+        let store = Self {
             path: path.to_path_buf(),
             state: Mutex::new(state),
             status,
-        })
+        };
+        if migrated {
+            let mut state = store
+                .state
+                .lock()
+                .map_err(|_| anyhow!("lane store poisoned"))?;
+            store.persist_locked(&mut state)?;
+        }
+        Ok(store)
     }
 
     pub fn status(&self) -> &GjcLaneStoreStatus {
@@ -501,7 +1065,62 @@ impl GjcLaneStore {
     }
 
     pub fn record(&self, lane_id: &str) -> Option<GjcLaneRecord> {
-        self.state.lock().ok()?.lanes.get(lane_id).cloned()
+        let state = self.state.lock().ok()?;
+        let canonical = state
+            .lane_id_aliases
+            .get(lane_id)
+            .map(String::as_str)
+            .unwrap_or(lane_id);
+        state.lanes.get(canonical).cloned()
+    }
+
+    pub fn record_for_session(&self, session_id: &str) -> Option<GjcLaneRecord> {
+        let state = self.state.lock().ok()?;
+        state
+            .lanes
+            .values()
+            .find(|record| record.sdk_session_id == session_id)
+            .cloned()
+    }
+
+    pub fn set_sdk_revision_if(
+        &self,
+        lane_id: &str,
+        expected_sdk_revision: u64,
+        new_sdk_revision: u64,
+        now: &str,
+    ) -> Result<GjcLaneRecord> {
+        let current = self
+            .record(lane_id)
+            .ok_or_else(|| anyhow!("lane not found"))?;
+        self.mutate(lane_id, current.revision, now, |mut record| {
+            if record.sdk_revision != expected_sdk_revision
+                || new_sdk_revision <= record.sdk_revision
+            {
+                bail!("sdk revision watermark conflict");
+            }
+            record.sdk_revision = new_sdk_revision;
+            Ok(multi_audit(record, vec![]))
+        })
+    }
+
+    pub fn resume_suspended(&self, now: &str) -> usize {
+        let records = self.snapshot_watches(true);
+        records
+            .into_iter()
+            .filter(|record| record.polling_suspended)
+            .filter_map(|record| {
+                self.mutate(&record.lane_id, record.revision, now, |mut updated| {
+                    updated.polling_suspended = false;
+                    updated.consecutive_unavailable_polls = 0;
+                    Ok(multi_audit(
+                        updated,
+                        vec![(GjcAuditKind::PollingResumed, "manual force-resume".into())],
+                    ))
+                })
+                .ok()
+            })
+            .count()
     }
 
     pub fn audit(&self) -> Vec<GjcReconcileAuditEntry> {
@@ -539,6 +1158,9 @@ impl GjcLaneStore {
         request: &GjcLaneRegistrationRequest,
         now: &str,
     ) -> Result<GjcLaneRecord> {
+        if let GjcLaneStoreStatus::IgnoredInvalid { .. } = self.status() {
+            bail!("lane store is quarantined after invalid persisted state");
+        }
         let lane_id = gjc_lane_id(&request.sdk_session_id);
         validate_registration(request)?;
         let mut state = self
@@ -574,7 +1196,13 @@ impl GjcLaneStore {
             lane_id: lane_id.clone(),
             sdk_session_id: request.sdk_session_id.clone(),
             worktree: request.worktree.clone(),
+            branch: request
+                .worktree
+                .as_deref()
+                .and_then(|worktree| current_git_branch(worktree).ok().flatten()),
             endpoint_generation: request.endpoint_generation.unwrap_or(0),
+            endpoint_episode: 0,
+            endpoint_alerted: false,
             revision: 1,
             sdk_revision: 0,
             last_turn: None,
@@ -592,6 +1220,7 @@ impl GjcLaneStore {
             watch_removed_at: None,
             registered_at: now.to_string(),
             updated_at: now.to_string(),
+            pending_alerts: Vec::new(),
         };
         state.push_audit(GjcReconcileAuditEntry {
             at: now.to_string(),
@@ -666,12 +1295,58 @@ impl GjcLaneStore {
             evidence_invalidated: false,
         };
         let record = self.mutate(lane_id, expected_revision, now, |mut record| {
-            if observation.endpoint_generation < record.endpoint_generation {
-                // Never regress generation; treat as ambiguous upstream state.
-                bail!("lane revision conflict: endpoint generation regressed");
+            let previous_record = record.clone();
+            let observation = observation.clone();
+            #[cfg(not(test))]
+            {
+                if observation.session_id != record.sdk_session_id {
+                    bail!("sdk observation session identity mismatch");
+                }
+                if let Some(turn_id) = observation.turn_id.as_deref() {
+                    crate::gjc::model::TurnId::new(turn_id.to_string()).map_err(|_| {
+                        anyhow::anyhow!("sdk observation turn identity malformed")
+                    })?;
+                }
+                if let (Some(observed), Some(enrolled)) =
+                    (observation.worktree.as_deref(), record.worktree.as_deref())
+                    && observed != enrolled
+                {
+                    bail!("sdk observation worktree identity mismatch");
+                }
             }
+            if observation.revision < record.sdk_revision {
+                bail!("stale sdk observation revision");
+            }
+            if matches!(
+                (observation.disposition, observation.turn_state),
+                (GjcSessionDisposition::Complete, state)
+                    if state != GjcTurnState::Complete
+            ) || matches!(
+                (observation.disposition, observation.turn_state),
+                (GjcSessionDisposition::Failed, state) if state != GjcTurnState::Failed
+            ) {
+                bail!("sdk observation disposition conflicts with turn state");
+            }
+            match observation.gate_state {
+                Some(_) => {
+                    if observation
+                        .gate_id
+                        .as_deref()
+                        .is_none_or(|gate_id| !valid_gate_id(gate_id))
+                        || observation.gate_revision == 0
+                    {
+                        bail!("gate observation lacks canonical identity or revision");
+                    }
+                }
+                None => {
+                    if observation.gate_id.is_some() || observation.gate_revision != 0 {
+                        bail!("gate observation has identity without state");
+                    }
+                }
+            }
+            let mut generation_audit = Vec::new();
             let previous_generation = record.endpoint_generation;
-            if observation.endpoint_generation > previous_generation
+            if observation.endpoint_generation != previous_generation
                 && (record.review_evidence_valid || record.owner_evidence_valid)
             {
                 record.review_evidence_valid = false;
@@ -679,34 +1354,69 @@ impl GjcLaneStore {
                 record.evidence_revision += 1;
                 outcome.evidence_invalidated = true;
                 record.endpoint_generation = observation.endpoint_generation;
-                return Ok(multi_audit(
-                    record,
-                    vec![(
-                        GjcAuditKind::EvidenceInvalidated,
-                        format!(
-                            "endpoint generation {previous_generation} -> {}; stale review/owner evidence invalidated",
-                            observation.endpoint_generation
-                        ),
-                    )],
+                generation_audit.push((
+                    GjcAuditKind::EvidenceInvalidated,
+                    format!(
+                        "endpoint generation {previous_generation} -> {}; stale review/owner evidence invalidated",
+                        observation.endpoint_generation
+                    ),
                 ));
             }
             record.sdk_revision = observation.revision;
-            record.endpoint_generation = record.endpoint_generation.max(observation.endpoint_generation);
+            record.endpoint_generation = observation.endpoint_generation;
+            // A successful authoritative observation closes the current
+            // endpoint-failure episode. The next transport failure receives a
+            // fresh durable episode identity.
+            record.endpoint_alerted = false;
             record.consecutive_unavailable_polls = 0;
             record.last_query_at = Some(now.to_string());
+            if observation.branch_observed {
+                record.branch = observation.branch.clone();
+            }
             let resumed = record.polling_suspended;
             record.polling_suspended = false;
 
             record.last_turn = Some(GjcTurnSnapshot {
                 state: observation.turn_state,
                 turn_id: observation.turn_id.clone(),
+                prompt_accepted: observation.prompt_accepted,
                 observed_at: now.to_string(),
             });
-            record.last_gate = observation.gate_state.map(|gate_state| GjcGateSnapshot {
-                state: gate_state,
-                gate_id: observation.gate_id.clone(),
-                observed_at: now.to_string(),
-            });
+            if let Some(gate_state) = observation.gate_state {
+                let update_gate = match record.last_gate.as_ref() {
+                    None => true,
+                    Some(previous) if previous.gate_id != observation.gate_id => true,
+                    Some(previous) if observation.gate_revision < previous.revision => false,
+                    Some(previous) if observation.gate_revision == previous.revision => {
+                        if previous.state != gate_state
+                            && !(previous.state == GjcGateState::Ready
+                                && gate_state == GjcGateState::Answered)
+                        {
+                            bail!("conflicting equal gate revision");
+                        }
+                        previous.state != gate_state
+                    }
+                    Some(_) => true,
+                };
+                if update_gate {
+                    record.last_gate = Some(GjcGateSnapshot {
+                        state: gate_state,
+                        gate_id: observation.gate_id.clone(),
+                        revision: observation.gate_revision,
+                        observed_at: now.to_string(),
+                    });
+                }
+            } else if observation.gate_section_present
+                && record.last_gate.as_ref().is_some_and(|gate| {
+                    gate.state == GjcGateState::Ready
+                        && (observation.gate_id.is_none()
+                            || gate.gate_id == observation.gate_id)
+                })
+                && let Some(gate) = record.last_gate.as_mut()
+            {
+                gate.state = GjcGateState::Answered;
+                gate.observed_at = now.to_string();
+            }
 
             let previous_phase = record.phase;
             let previous_terminal = record.terminal_disposition.as_ref().map(|d| d.kind);
@@ -726,12 +1436,12 @@ impl GjcLaneStore {
                 }
             }
 
-            record.phase = Some(classify_lane(&record, Some(observation)));
+            record.phase = Some(classify_lane(&record, Some(&observation)));
             if record.phase != previous_phase {
                 outcome.phase_changed = record.phase;
             }
 
-            let mut audit = Vec::new();
+            let mut audit = generation_audit;
             if resumed {
                 audit.push((
                     GjcAuditKind::PollingResumed,
@@ -756,6 +1466,115 @@ impl GjcLaneStore {
                         outcome.terminal_set, observation.revision
                     ),
                 ));
+            }
+
+            // Stage alert transitions in the same atomic write as the
+            // observation. This closes the crash window between durable state
+            // update and the reconciler's send attempt.
+            let current_snapshot = observation_snapshot(
+                &record,
+                Some(&previous_record),
+                &observation,
+                now,
+                None,
+            );
+            let new_failed_turn = observation.prompt_accepted
+                && observation.turn_state == GjcTurnState::Failed
+                && previous_record
+                    .last_turn
+                    .as_ref()
+                    .map(|turn| {
+                        turn.state != GjcTurnState::Failed
+                            || turn.turn_id.as_deref() != observation.turn_id.as_deref()
+                    })
+                    .unwrap_or(true);
+            if outcome.terminal_set.is_some() || new_failed_turn {
+                for event in bridge_alerts(None, &current_snapshot)? {
+                    queue_pending_alert(&mut record, pending_from_event(event, now)?)?;
+                }
+            }
+            let previous_turn_active = previous_record
+                .last_turn
+                .as_ref()
+                .map(|turn| {
+                    turn.prompt_accepted
+                        && matches!(turn.state, GjcTurnState::Running | GjcTurnState::AwaitingInput)
+                })
+                .unwrap_or(false);
+            let same_turn = previous_record
+                .last_turn
+                .as_ref()
+                .and_then(|turn| turn.turn_id.as_deref())
+                .zip(observation.turn_id.as_deref())
+                .map(|(left, right)| left == right)
+                .unwrap_or_else(|| {
+                    previous_record
+                        .last_turn
+                        .as_ref()
+                        .and_then(|turn| turn.turn_id.as_deref())
+                        == current_snapshot.turn.as_ref().map(|turn| turn.id.as_str())
+                });
+            if previous_turn_active
+                && same_turn
+                && matches!(observation.turn_state, GjcTurnState::Idle | GjcTurnState::Aborted)
+            {
+                let previous_snapshot = observation_snapshot(
+                    &previous_record,
+                    None,
+                    &GjcSdkObservation {
+                        session_id: previous_record.sdk_session_id.clone(),
+                        worktree: previous_record.worktree.clone(),
+                        branch: previous_record.branch.clone(),
+                        branch_observed: false,
+                        endpoint_generation: previous_record.endpoint_generation,
+                        revision: previous_record.sdk_revision,
+                        turn_state: previous_record
+                            .last_turn
+                            .as_ref()
+                            .map(|turn| turn.state)
+                            .unwrap_or(GjcTurnState::Running),
+                        turn_id: previous_record
+                            .last_turn
+                            .as_ref()
+                            .and_then(|turn| turn.turn_id.clone()),
+                        prompt_accepted: true,
+                        gate_revision: previous_record
+                            .last_gate
+                            .as_ref()
+                            .map(|gate| gate.revision)
+                            .unwrap_or(0),
+                        gate_state: previous_record.last_gate.as_ref().map(|gate| gate.state),
+                        gate_section_present: true,
+                        gate_id: previous_record
+                            .last_gate
+                            .as_ref()
+                            .and_then(|gate| gate.gate_id.clone()),
+                        gate_kind: None,
+                        gate_workflow_id: None,
+                        gate_title: None,
+                        gate_options: Vec::new(),
+                        disposition: GjcSessionDisposition::Live,
+                        error_summary: None,
+                    },
+                    now,
+                    None,
+                );
+                for event in bridge_alerts(Some(&previous_snapshot), &current_snapshot)? {
+                    queue_pending_alert(&mut record, pending_from_event(event, now)?)?;
+                }
+            }
+            let new_gate_episode = observation.gate_state == Some(GjcGateState::Ready)
+                && match previous_record.last_gate.as_ref() {
+                    Some(previous) => {
+                        previous.gate_id != observation.gate_id
+                            || observation.gate_revision > previous.revision
+                    }
+                    None => true,
+                };
+            if new_gate_episode {
+                for event in bridge_alerts(None, &current_snapshot)? {
+                    queue_pending_alert(&mut record, pending_from_event(event, now)?)?;
+                }
             }
             audit.push((
                 GjcAuditKind::ObservationApplied,
@@ -791,6 +1610,27 @@ impl GjcLaneStore {
             record.last_query_at = Some(now.to_string());
             record.consecutive_unavailable_polls =
                 record.consecutive_unavailable_polls.saturating_add(1);
+            if !record.endpoint_alerted {
+                record.endpoint_episode = record.endpoint_episode.saturating_add(1);
+                let snapshot = GjcSdkStateSnapshot {
+                    session_id: record.sdk_session_id.clone(),
+                    revision: record.sdk_revision,
+                    endpoint_episode: record.endpoint_episode,
+                    endpoint: Some(GjcSdkEndpoint {
+                        health: GjcSdkEndpointHealth::Failed,
+                        detail: Some(reason.to_string()),
+                    }),
+                    repo_name: record.pr.as_ref().map(|pr| pr.repo.clone()),
+                    worktree_path: record.worktree.clone(),
+                    branch: record.branch.clone(),
+                    observed_at: Some(now.to_string()),
+                    ..GjcSdkStateSnapshot::default()
+                };
+                for event in bridge_alerts(None, &snapshot)? {
+                    queue_pending_alert(&mut record, pending_from_event(event, now)?)?;
+                }
+                record.endpoint_alerted = true;
+            }
             if !record.polling_suspended && record.consecutive_unavailable_polls >= suspend_after {
                 record.polling_suspended = true;
                 newly_suspended = true;
@@ -812,13 +1652,221 @@ impl GjcLaneStore {
                 GjcAuditKind::ObservationApplied,
                 format!(
                     "unavailable (attempt {}): {}",
-                    record.consecutive_unavailable_polls,
-                    bounded_text(reason)
+                    record.consecutive_unavailable_polls, "sdk endpoint unavailable"
                 ),
             ));
             Ok(multi_audit(record, audit))
         })?;
         Ok((record, newly_suspended))
+    }
+
+    /// Durably stage an endpoint failure without changing lane classification.
+    /// Ambiguous control-plane replies use this fail-closed path.
+    pub fn enqueue_endpoint_failure(
+        &self,
+        lane_id: &str,
+        expected_revision: u64,
+        reason: &str,
+        now: &str,
+    ) -> Result<GjcLaneRecord> {
+        self.mutate(lane_id, expected_revision, now, |mut record| {
+            if !record.endpoint_alerted {
+                record.endpoint_episode = record.endpoint_episode.saturating_add(1);
+                let snapshot = GjcSdkStateSnapshot {
+                    session_id: record.sdk_session_id.clone(),
+                    revision: record.sdk_revision,
+                    endpoint_episode: record.endpoint_episode,
+                    endpoint: Some(GjcSdkEndpoint {
+                        health: GjcSdkEndpointHealth::Failed,
+                        detail: Some(reason.to_string()),
+                    }),
+                    repo_name: record.pr.as_ref().map(|pr| pr.repo.clone()),
+                    worktree_path: record.worktree.clone(),
+                    branch: record.branch.clone(),
+                    observed_at: Some(now.to_string()),
+                    ..GjcSdkStateSnapshot::default()
+                };
+                for event in bridge_alerts(None, &snapshot)? {
+                    queue_pending_alert(&mut record, pending_from_event(event, now)?)?;
+                }
+                record.endpoint_alerted = true;
+            }
+            Ok(multi_audit(record, vec![]))
+        })
+    }
+
+    /// Acknowledge one pending alert only after the reconciler's channel send
+    /// succeeds. A repeated acknowledgement is an idempotent no-op.
+    pub fn acknowledge_pending_alert(
+        &self,
+        lane_id: &str,
+        expected_revision: u64,
+        event_id: &str,
+        now: &str,
+    ) -> Result<GjcLaneRecord> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("lane store poisoned"))?;
+        let canonical_id = canonical_lane_id(&state, lane_id);
+        let mut record = state
+            .lanes
+            .get(&canonical_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("lane not found: {lane_id}"))?;
+        if record.revision != expected_revision {
+            bail!(
+                "lane revision conflict: expected {expected_revision}, current {}",
+                record.revision
+            );
+        }
+        let original_len = record.pending_alerts.len();
+        record
+            .pending_alerts
+            .retain(|alert| alert.event_id != event_id);
+        if record.pending_alerts.len() == original_len {
+            return Ok(record);
+        }
+        record.revision = record
+            .revision
+            .checked_add(1)
+            .context("revision overflow")?;
+        record.updated_at = now.to_string();
+        state.lanes.insert(canonical_id, record.clone());
+        self.persist_locked(&mut state)?;
+        Ok(record)
+    }
+
+    pub(crate) fn pending_alert_delivery_state(
+        &self,
+        lane_id: &str,
+        event_id: &str,
+        destination: &str,
+    ) -> Option<GjcPendingAlertDeliveryState> {
+        let state = self.state.lock().ok()?;
+        let canonical_id = canonical_lane_id(&state, lane_id);
+        state
+            .lanes
+            .get(&canonical_id)?
+            .pending_alerts
+            .iter()
+            .find(|alert| alert.event_id == event_id)
+            .and_then(|alert| alert.deliveries.get(destination))
+            .map(|delivery| delivery.state)
+    }
+
+    pub(crate) fn claim_pending_alert_delivery(
+        &self,
+        lane_id: &str,
+        event_id: &str,
+        destination: &str,
+    ) -> Result<bool> {
+        self.update_pending_alert_delivery(
+            lane_id,
+            event_id,
+            destination,
+            GjcPendingAlertDeliveryState::Claimed,
+        )
+    }
+
+    pub(crate) fn record_pending_alert_delivery(
+        &self,
+        lane_id: &str,
+        event_id: &str,
+        destination: &str,
+        delivered: bool,
+    ) -> Result<bool> {
+        self.update_pending_alert_delivery(
+            lane_id,
+            event_id,
+            destination,
+            if delivered {
+                GjcPendingAlertDeliveryState::Delivered
+            } else {
+                GjcPendingAlertDeliveryState::Failed
+            },
+        )
+    }
+
+    fn update_pending_alert_delivery(
+        &self,
+        lane_id: &str,
+        event_id: &str,
+        destination: &str,
+        next_state: GjcPendingAlertDeliveryState,
+    ) -> Result<bool> {
+        if destination.is_empty()
+            || destination.len() > 512
+            || destination.chars().any(char::is_control)
+        {
+            bail!("invalid pending alert destination");
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("lane store poisoned"))?;
+        let canonical_id = canonical_lane_id(&state, lane_id);
+        let record = state
+            .lanes
+            .get(&canonical_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("lane not found: {lane_id}"))?;
+        let mut updated = record.clone();
+        let alert = updated
+            .pending_alerts
+            .iter_mut()
+            .find(|alert| alert.event_id == event_id)
+            .ok_or_else(|| anyhow!("pending alert not found: {event_id}"))?;
+        if let Some(existing) = alert.deliveries.get(destination) {
+            if existing.state == GjcPendingAlertDeliveryState::Delivered
+                || (existing.state == GjcPendingAlertDeliveryState::Claimed
+                    && next_state == GjcPendingAlertDeliveryState::Claimed)
+            {
+                return Ok(true);
+            }
+        } else if alert.deliveries.len() >= MAX_PENDING_ALERT_DELIVERIES {
+            bail!("pending alert delivery map is full");
+        }
+        let attempts = alert
+            .deliveries
+            .get(destination)
+            .map(|delivery| delivery.attempts)
+            .unwrap_or_default()
+            .saturating_add((next_state == GjcPendingAlertDeliveryState::Claimed) as u32);
+        alert.deliveries.insert(
+            destination.to_string(),
+            GjcPendingAlertDelivery {
+                state: next_state,
+                attempts,
+                updated_at: now_rfc3339(),
+            },
+        );
+        updated.revision = updated
+            .revision
+            .checked_add(1)
+            .context("revision overflow")?;
+        updated.updated_at = now_rfc3339();
+        state.lanes.insert(canonical_id, updated);
+        self.persist_locked(&mut state)?;
+        Ok(true)
+    }
+
+    pub fn note_pending_alert_attempt(
+        &self,
+        lane_id: &str,
+        expected_revision: u64,
+        event_id: &str,
+        now: &str,
+    ) -> Result<GjcLaneRecord> {
+        self.mutate(lane_id, expected_revision, now, |mut record| {
+            let alert = record
+                .pending_alerts
+                .iter_mut()
+                .find(|alert| alert.event_id == event_id)
+                .ok_or_else(|| anyhow!("pending alert not found: {event_id}"))?;
+            alert.attempts = alert.attempts.saturating_add(1);
+            Ok(multi_audit(record, vec![]))
+        })
     }
 
     /// Mark a lane whose SDK session authoritatively no longer exists while
@@ -882,6 +1930,9 @@ impl GjcLaneStore {
             if record.terminal_disposition.is_none() {
                 bail!("only terminal lanes qualify for ghost watch removal");
             }
+            if !record.pending_alerts.is_empty() {
+                bail!("pending alerts must be acknowledged before ghost removal");
+            }
             record.watch_removed_at = Some(now.to_string());
             record.phase = Some(match record.terminal_disposition.as_ref() {
                 Some(disposition) => match disposition.kind {
@@ -894,6 +1945,71 @@ impl GjcLaneStore {
             Ok(multi_audit(
                 record,
                 vec![(GjcAuditKind::GhostWatchRemoved, bounded_text(reason))],
+            ))
+        })
+    }
+
+    pub fn reclaim_tombstone(
+        &self,
+        lane_id: &str,
+        expected_revision: u64,
+        endpoint_generation: u64,
+        worktree: Option<String>,
+        now: &str,
+    ) -> Result<GjcLaneRecord> {
+        self.mutate(lane_id, expected_revision, now, |mut record| {
+            if record.watch_removed_at.is_none() {
+                bail!("lane is not a removed tombstone");
+            }
+            record.watch_removed_at = None;
+            record.terminal_disposition = None;
+            record.phase = None;
+            record.worktree = worktree;
+            record.branch = None;
+            record.pr = None;
+            record.endpoint_generation = endpoint_generation;
+            record.endpoint_episode = 0;
+            record.sdk_revision = 0;
+            record.last_turn = None;
+            record.last_gate = None;
+            record.evidence_revision = 0;
+            record.review_evidence_valid = true;
+            record.owner_evidence_valid = true;
+            record.ownership = GjcLaneOwnership::default();
+            record.consecutive_unavailable_polls = 0;
+            record.endpoint_alerted = false;
+            Ok(multi_audit(
+                record,
+                vec![(
+                    GjcAuditKind::LaneRegistered,
+                    "removed tombstone reclaimed for native session re-enrollment".into(),
+                )],
+            ))
+        })
+    }
+
+    pub fn note_endpoint_rotation(
+        &self,
+        lane_id: &str,
+        expected_revision: u64,
+        endpoint_generation: u64,
+        now: &str,
+    ) -> Result<GjcLaneRecord> {
+        self.mutate(lane_id, expected_revision, now, |mut record| {
+            if endpoint_generation == record.endpoint_generation {
+                return Ok((record, vec![]));
+            }
+            record.endpoint_generation = endpoint_generation;
+            record.endpoint_episode = record.endpoint_episode.saturating_add(1);
+            record.endpoint_alerted = false;
+            record.review_evidence_valid = false;
+            record.owner_evidence_valid = false;
+            Ok(multi_audit(
+                record,
+                vec![(
+                    GjcAuditKind::EvidenceInvalidated,
+                    "endpoint generation changed; awaiting authoritative query".into(),
+                )],
             ))
         })
     }
@@ -1054,9 +2170,10 @@ impl GjcLaneStore {
             .state
             .lock()
             .map_err(|_| anyhow!("lane store poisoned"))?;
+        let canonical_id = canonical_lane_id(&state, lane_id);
         let record = state
             .lanes
-            .get(lane_id)
+            .get(&canonical_id)
             .cloned()
             .ok_or_else(|| anyhow!("lane not found: {lane_id}"))?;
         if record.revision != expected_revision {
@@ -1074,12 +2191,12 @@ impl GjcLaneStore {
         for (kind, detail) in audit {
             state.push_audit(GjcReconcileAuditEntry {
                 at: now.to_string(),
-                lane_id: lane_id.to_string(),
+                lane_id: canonical_id.clone(),
                 kind,
                 detail,
             });
         }
-        state.lanes.insert(lane_id.to_string(), updated.clone());
+        state.lanes.insert(canonical_id, updated.clone());
         self.persist_locked(&mut state)?;
         Ok(updated)
     }
@@ -1094,8 +2211,17 @@ impl GjcLaneStore {
         let tmp_path = self.path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &serialized)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        std::fs::File::open(&tmp_path)
+            .and_then(|file| file.sync_all())
+            .with_context(|| format!("failed to sync {}", tmp_path.display()))?;
         std::fs::rename(&tmp_path, &self.path)
             .with_context(|| format!("failed to persist {}", self.path.display()))?;
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|file| file.sync_all())
+                .with_context(|| format!("failed to sync {}", parent.display()))?;
+        }
         Ok(())
     }
 }
@@ -1154,10 +2280,12 @@ pub fn classify_lane(
         GjcSessionDisposition::Complete => GjcLanePhase::Complete,
         GjcSessionDisposition::Live => {
             if observation.gate_state == Some(GjcGateState::Ready)
-                || observation.turn_state == GjcTurnState::AwaitingInput
+                || (observation.turn_state == GjcTurnState::AwaitingInput
+                    && observation.prompt_accepted)
             {
                 GjcLanePhase::Blocked
-            } else if observation.turn_state == GjcTurnState::Running {
+            } else if observation.turn_state == GjcTurnState::Running && observation.prompt_accepted
+            {
                 GjcLanePhase::Active
             } else {
                 GjcLanePhase::Idle
@@ -1256,6 +2384,9 @@ pub struct GjcLanesConfig {
     /// Optional state-file override; defaults beside the cron state file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_path: Option<PathBuf>,
+    /// Additional trusted worktrees whose native SDK endpoints are enrolled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_worktrees: Vec<PathBuf>,
     /// PR head/base reconciliation settings.
     #[serde(default)]
     pub pr: GjcLanesPrConfig,
@@ -1271,6 +2402,7 @@ impl Default for GjcLanesConfig {
             max_consecutive_attempts: default_gjc_max_consecutive_attempts(),
             ghost_grace_polls: default_gjc_ghost_grace_polls(),
             state_path: None,
+            discovery_worktrees: Vec::new(),
             pr: GjcLanesPrConfig::default(),
         }
     }
@@ -1278,7 +2410,10 @@ impl Default for GjcLanesConfig {
 
 impl GjcLanesConfig {
     pub fn is_empty(&self) -> bool {
-        !self.enabled && self.state_path.is_none() && self.pr.is_empty()
+        !self.enabled
+            && self.state_path.is_none()
+            && self.discovery_worktrees.is_empty()
+            && self.pr.is_empty()
     }
 
     pub fn polling_policy(&self) -> GjcPollingPolicy {
@@ -1376,6 +2511,8 @@ pub struct GjcReconciler {
     store: SharedGjcLaneStore,
     tx: mpsc::Sender<IncomingEvent>,
     policy: GjcPollingPolicy,
+    auto_enrollment: bool,
+    discovery_worktrees: Vec<PathBuf>,
 }
 
 pub type SharedGjcReconciler = Arc<GjcReconciler>;
@@ -1394,7 +2531,15 @@ impl GjcReconciler {
             store,
             tx,
             policy,
+            auto_enrollment: false,
+            discovery_worktrees: Vec::new(),
         }
+    }
+
+    pub fn with_auto_enrollment(mut self, worktrees: Vec<PathBuf>) -> Self {
+        self.auto_enrollment = true;
+        self.discovery_worktrees = worktrees;
+        self
     }
 
     /// Long-running loop: one bounded pass per interval. Runs until the task
@@ -1417,10 +2562,34 @@ impl GjcReconciler {
         let now_text = now
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+        if self.auto_enrollment {
+            self.auto_enroll_native_sessions(&now_text);
+        }
         let mut outcome = GjcReconcileOutcome::default();
-        let records = self.store.snapshot_watches(false);
+        let records = self
+            .store
+            .snapshot_watches(true)
+            .into_iter()
+            .filter(|record| record.watch_removed_at.is_none())
+            .collect::<Vec<_>>();
         for snapshot in records {
-            if snapshot.polling_suspended {
+            let snapshot = self.replay_pending_alerts(&snapshot, &now_text).await;
+            if snapshot.terminal_disposition.as_ref().map(|d| d.kind)
+                == Some(GjcTerminalKind::Retired)
+                && snapshot.pending_alerts.is_empty()
+            {
+                if let Ok(updated) = self.store.remove_ghost_watch(
+                    &snapshot.lane_id,
+                    snapshot.revision,
+                    "retired watch cleanup",
+                    &now_text,
+                ) {
+                    outcome.ghost_watches_removed += 1;
+                    self.emit_status(&updated, &now_text);
+                }
+                continue;
+            }
+            if snapshot.polling_suspended && self.suspension_defers(&snapshot, now) {
                 continue;
             }
             if self.backoff_defers(&snapshot, now) {
@@ -1435,38 +2604,49 @@ impl GjcReconciler {
             };
             let expected = snapshot.revision;
             match self.plane.query_lane(&query).await {
-                Ok(observation) => match self.store.apply_observation(
-                    &snapshot.lane_id,
-                    expected,
-                    &observation,
-                    &now_text,
-                ) {
-                    Ok((record, applied)) => {
+                Ok(observation) => {
+                    if observation.revision <= snapshot.sdk_revision {
                         outcome.retained += 1;
-                        if applied.terminal_set.is_some() {
-                            outcome.terminal_set += 1;
+                        continue;
+                    }
+                    match self.store.apply_observation(
+                        &snapshot.lane_id,
+                        expected,
+                        &observation,
+                        &now_text,
+                    ) {
+                        Ok((record, applied)) => {
+                            outcome.retained += 1;
+                            let record = self.replay_pending_alerts(&record, &now_text).await;
+                            if applied.terminal_set.is_some() {
+                                outcome.terminal_set += 1;
+                                self.emit_status(&record, &now_text);
+                                continue;
+                            }
+                            if applied.evidence_invalidated {
+                                outcome.evidence_invalidations += 1;
+                            }
                             self.emit_status(&record, &now_text);
-                            continue;
+                            self.reconcile_pr(&record, &now_text, &mut outcome).await;
                         }
-                        if applied.evidence_invalidated {
-                            outcome.evidence_invalidations += 1;
+                        Err(error) => {
+                            if error.to_string().contains("revision conflict") {
+                                outcome.skipped_conflicts += 1;
+                                self.store.note_revision_conflict(
+                                    &snapshot.lane_id,
+                                    expected,
+                                    &now_text,
+                                );
+                            } else {
+                                outcome.retained += 1;
+                                eprintln!(
+                                    "clawhip gjc lane observation retained after validation failure: {}",
+                                    bounded_text(&error.to_string())
+                                );
+                            }
                         }
-                        self.emit_status(&record, &now_text);
-                        self.reconcile_pr(&record, &now_text, &mut outcome).await;
                     }
-                    Err(error) => {
-                        if error.to_string().contains("revision conflict") {
-                            outcome.skipped_conflicts += 1;
-                            self.store.note_revision_conflict(
-                                &snapshot.lane_id,
-                                expected,
-                                &now_text,
-                            );
-                        } else {
-                            return Err(error);
-                        }
-                    }
-                },
+                }
                 Err(GjcSdkQueryError::SessionNotFound(detail)) => {
                     if snapshot.terminal_disposition.is_some() {
                         // Definitive evidence the terminal session is gone:
@@ -1489,6 +2669,12 @@ impl GjcReconciler {
                                         expected,
                                         &now_text,
                                     );
+                                } else if !snapshot.pending_alerts.is_empty() {
+                                    outcome.retained += 1;
+                                    eprintln!(
+                                        "clawhip gjc terminal watch retained with pending alerts: {}",
+                                        bounded_text(&error.to_string())
+                                    );
                                 } else {
                                     return Err(error);
                                 }
@@ -1505,6 +2691,7 @@ impl GjcReconciler {
                                 outcome.runtime_gone += 1;
                                 outcome.terminal_set += 1;
                                 outcome.evidence_invalidations += 1;
+                                let _ = self.replay_pending_alerts(&record, &now_text).await;
                                 self.emit_status(&record, &now_text);
                             }
                             Err(error) => {
@@ -1523,30 +2710,15 @@ impl GjcReconciler {
                     }
                 }
                 Err(GjcSdkQueryError::StaleEndpointGeneration { observed }) => {
-                    match self.store.apply_observation(
+                    match self.store.note_endpoint_rotation(
                         &snapshot.lane_id,
                         expected,
-                        &GjcSdkObservation {
-                            session_id: snapshot.sdk_session_id.clone(),
-                            worktree: snapshot.worktree.clone(),
-                            endpoint_generation: observed,
-                            revision: snapshot.sdk_revision,
-                            turn_state: snapshot
-                                .last_turn
-                                .as_ref()
-                                .map(|turn| turn.state)
-                                .unwrap_or(GjcTurnState::Idle),
-                            turn_id: None,
-                            gate_state: snapshot.last_gate.as_ref().map(|gate| gate.state),
-                            gate_id: None,
-                            disposition: GjcSessionDisposition::Live,
-                        },
+                        observed,
                         &now_text,
                     ) {
-                        Ok((_, applied)) => {
-                            if applied.evidence_invalidated {
-                                outcome.evidence_invalidations += 1;
-                            }
+                        Ok(record) => {
+                            outcome.evidence_invalidations += 1;
+                            self.emit_status(&record, &now_text);
                         }
                         Err(error) => {
                             if error.to_string().contains("revision conflict") {
@@ -1568,10 +2740,39 @@ impl GjcReconciler {
                         // Ghost-watch grace: terminal watches survive only a
                         // bounded number of consecutive transport failures.
                         let misses = snapshot.consecutive_unavailable_polls + 1;
+                        let (record, _) = match self.store.mark_unavailable(
+                            &snapshot.lane_id,
+                            expected,
+                            &detail,
+                            u32::MAX,
+                            &now_text,
+                        ) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                if error.to_string().contains("revision conflict") {
+                                    outcome.skipped_conflicts += 1;
+                                    self.store.note_revision_conflict(
+                                        &snapshot.lane_id,
+                                        expected,
+                                        &now_text,
+                                    );
+                                    continue;
+                                }
+                                return Err(error);
+                            }
+                        };
+                        let record = self.replay_pending_alerts(&record, &now_text).await;
                         if misses >= self.policy.ghost_grace_polls {
+                            if !record.pending_alerts.is_empty() {
+                                // Never tombstone a watch while an alert is
+                                // still waiting for delivery; the pending
+                                // payload is the durable replay source.
+                                outcome.retained += 1;
+                                continue;
+                            }
                             match self.store.remove_ghost_watch(
                                 &snapshot.lane_id,
-                                expected,
+                                record.revision,
                                 &format!(
                                     "terminal watch exceeded ghost grace after {misses} unavailable polls: {detail}"
                                 ),
@@ -1586,7 +2787,7 @@ impl GjcReconciler {
                                         outcome.skipped_conflicts += 1;
                                         self.store.note_revision_conflict(
                                             &snapshot.lane_id,
-                                            expected,
+                                            record.revision,
                                             &now_text,
                                         );
                                     } else {
@@ -1595,27 +2796,7 @@ impl GjcReconciler {
                                 }
                             }
                         } else {
-                            match self.store.mark_unavailable(
-                                &snapshot.lane_id,
-                                expected,
-                                &detail,
-                                u32::MAX,
-                                &now_text,
-                            ) {
-                                Ok(_) => outcome.retained += 1,
-                                Err(error) => {
-                                    if error.to_string().contains("revision conflict") {
-                                        outcome.skipped_conflicts += 1;
-                                        self.store.note_revision_conflict(
-                                            &snapshot.lane_id,
-                                            expected,
-                                            &now_text,
-                                        );
-                                    } else {
-                                        return Err(error);
-                                    }
-                                }
-                            }
+                            outcome.retained += 1;
                         }
                     } else {
                         match self.store.mark_unavailable(
@@ -1625,7 +2806,8 @@ impl GjcReconciler {
                             self.policy.max_consecutive_attempts,
                             &now_text,
                         ) {
-                            Ok((_, suspended)) => {
+                            Ok((record, suspended)) => {
+                                let _ = self.replay_pending_alerts(&record, &now_text).await;
                                 if suspended {
                                     outcome.suspended += 1;
                                 }
@@ -1646,12 +2828,35 @@ impl GjcReconciler {
                         }
                     }
                 }
+                Err(GjcSdkQueryError::InvalidState(_)) => {
+                    outcome.retained += 1;
+                }
                 Err(GjcSdkQueryError::Ambiguous(detail)) => {
                     // Fail closed: no classification change without
                     // authoritative evidence.
-                    self.store
-                        .note_revision_conflict(&snapshot.lane_id, expected, &now_text);
-                    let _ = detail;
+                    if detail == "multiple ready workflow gates" {
+                        outcome.retained += 1;
+                        continue;
+                    }
+                    match self.store.enqueue_endpoint_failure(
+                        &snapshot.lane_id,
+                        expected,
+                        &detail,
+                        &now_text,
+                    ) {
+                        Ok(record) => {
+                            let _ = self.replay_pending_alerts(&record, &now_text).await;
+                        }
+                        Err(error) if error.to_string().contains("revision conflict") => {
+                            outcome.skipped_conflicts += 1;
+                            self.store.note_revision_conflict(
+                                &snapshot.lane_id,
+                                expected,
+                                &now_text,
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                     outcome.retained += 1;
                 }
             }
@@ -1672,6 +2877,80 @@ impl GjcReconciler {
                 .policy
                 .backoff_after(record.consecutive_unavailable_polls)
                 .as_millis() as u64
+    }
+
+    fn suspension_defers(&self, record: &GjcLaneRecord, now: OffsetDateTime) -> bool {
+        let Some(last_query) = &record.last_query_at else {
+            return false;
+        };
+        let Ok(parsed) = OffsetDateTime::parse(last_query, &Rfc3339) else {
+            return false;
+        };
+        (now - parsed).whole_seconds() < self.policy.poll_interval_secs.saturating_mul(60) as i64
+    }
+
+    fn auto_enroll_native_sessions(&self, now_text: &str) {
+        let known = self.store.snapshot_watches(true);
+        for worktree in &self.discovery_worktrees {
+            let endpoints = match crate::gjc_sdk::discover_all(
+                &crate::gjc_sdk::StateRoot::for_worktree(worktree),
+            ) {
+                Ok(endpoints) => endpoints,
+                Err(_) => {
+                    eprintln!(
+                        "clawhip GJC auto-enrollment skipped unreadable worktree metadata: {}",
+                        worktree.display()
+                    );
+                    continue;
+                }
+            };
+            for endpoint in endpoints {
+                if let Some(record) = known.iter().find(|record| {
+                    record.watch_removed_at.is_some()
+                        && record.sdk_session_id == endpoint.session_id()
+                        && record
+                            .terminal_disposition
+                            .as_ref()
+                            .is_some_and(|disposition| {
+                                disposition.kind == GjcTerminalKind::Retired
+                                    && disposition.evidence.starts_with("runtime gone:")
+                            })
+                }) {
+                    let _ = self.store.reclaim_tombstone(
+                        &record.lane_id,
+                        record.revision,
+                        endpoint.generation(),
+                        Some(worktree.to_string_lossy().into_owned()),
+                        now_text,
+                    );
+                }
+                if known.iter().any(|record| {
+                    record.watch_removed_at.is_none()
+                        && record.sdk_session_id == endpoint.session_id()
+                }) {
+                    continue;
+                }
+                if self
+                    .store
+                    .register_lane(
+                        &GjcLaneRegistrationRequest {
+                            sdk_session_id: endpoint.session_id().to_string(),
+                            worktree: Some(worktree.to_string_lossy().into_owned()),
+                            endpoint_generation: Some(endpoint.generation()),
+                            owner_id: None,
+                            pr: None,
+                        },
+                        now_text,
+                    )
+                    .is_err()
+                {
+                    eprintln!(
+                        "clawhip GJC auto-enrollment rejected endpoint in worktree: {}",
+                        worktree.display()
+                    );
+                }
+            }
+        }
     }
 
     async fn reconcile_pr(
@@ -1740,6 +3019,77 @@ impl GjcReconciler {
             payload,
         });
     }
+
+    async fn replay_pending_alerts(
+        &self,
+        initial: &GjcLaneRecord,
+        now_text: &str,
+    ) -> GjcLaneRecord {
+        let mut current = initial.clone();
+        while let Some(alert) = current.pending_alerts.first().cloned() {
+            current = match self.store.note_pending_alert_attempt(
+                &current.lane_id,
+                current.revision,
+                &alert.event_id,
+                now_text,
+            ) {
+                Ok(updated) => updated,
+                Err(_) => break,
+            };
+            register_alert_delivery_journal(
+                &alert.event_id,
+                Arc::new(GjcPendingAlertJournal {
+                    store: self.store.clone(),
+                    lane_id: current.lane_id.clone(),
+                    event_id: alert.event_id.clone(),
+                }),
+            );
+            let acceptance = register_alert_acceptance(&alert.event_id);
+            let send = tokio::time::timeout(
+                ALERT_ACCEPTANCE_TIMEOUT,
+                self.tx.send(alert.incoming_event()),
+            )
+            .await;
+            if !matches!(send, Ok(Ok(()))) {
+                cancel_alert_acceptance(&alert.event_id);
+                clear_alert_delivery_journal(&alert.event_id);
+                break;
+            }
+            let accepted = matches!(
+                tokio::time::timeout(ALERT_ACCEPTANCE_TIMEOUT, acceptance).await,
+                Ok(Ok(true))
+            );
+            if !accepted {
+                cancel_alert_acceptance(&alert.event_id);
+                clear_alert_delivery_journal(&alert.event_id);
+                current = self.store.record(&current.lane_id).unwrap_or(current);
+                break;
+            }
+            clear_alert_delivery_journal(&alert.event_id);
+            match self.store.acknowledge_pending_alert(
+                &current.lane_id,
+                current.revision,
+                &alert.event_id,
+                now_text,
+            ) {
+                Ok(updated) => current = updated,
+                Err(error) if error.to_string().contains("revision conflict") => {
+                    let latest = self.store.record(&current.lane_id).unwrap_or(current);
+                    current = match self.store.acknowledge_pending_alert(
+                        &latest.lane_id,
+                        latest.revision,
+                        &alert.event_id,
+                        now_text,
+                    ) {
+                        Ok(updated) => updated,
+                        Err(_) => latest,
+                    };
+                }
+                Err(_) => break,
+            }
+        }
+        current
+    }
 }
 
 fn validate_registration(request: &GjcLaneRegistrationRequest) -> Result<()> {
@@ -1766,8 +3116,61 @@ fn validate_registration(request: &GjcLaneRegistrationRequest) -> Result<()> {
         if !valid_hex_sha(&pr.head_sha) {
             bail!("invalid PR head sha");
         }
-        if pr.base_branch.is_empty() || pr.base_branch.len() > 128 {
+        if pr.base_branch.is_empty()
+            || pr.base_branch.len() > 128
+            || pr.base_branch.chars().any(|ch| ch.is_control())
+        {
             bail!("invalid PR base branch");
+        }
+    }
+    Ok(())
+}
+
+fn validate_loaded_state(state: &GjcLaneStateFile) -> Result<()> {
+    if state.lanes.len() > MAX_LANES {
+        bail!("lane-state contains too many lanes");
+    }
+    for (lane_id, record) in &state.lanes {
+        if !valid_session_id(&record.sdk_session_id)
+            || lane_id.is_empty()
+            || lane_id.len() > MAX_SESSION_LEN
+            || lane_id.chars().any(|ch| ch.is_control())
+        {
+            bail!("lane-state contains an invalid lane identity");
+        }
+        if let Some(worktree) = &record.worktree
+            && !valid_worktree(worktree)
+        {
+            bail!("lane-state contains an invalid worktree");
+        }
+        if let Some(gate) = &record.last_gate
+            && (gate
+                .gate_id
+                .as_deref()
+                .is_none_or(|gate_id| !valid_gate_id(gate_id))
+                || gate.revision == 0)
+        {
+            bail!("lane-state contains an invalid gate identity");
+        }
+        if record.pending_alerts.len() > MAX_PENDING_ALERTS {
+            bail!("lane-state contains too many pending alerts");
+        }
+        for alert in &record.pending_alerts {
+            if alert.event_id.is_empty()
+                || alert.event_id.len() > 256
+                || alert.event_id.chars().any(|ch| ch.is_control())
+                || alert.payload.to_string().len() > 64 * 1024
+                || alert.deliveries.len() > MAX_PENDING_ALERT_DELIVERIES
+            {
+                bail!("lane-state contains an invalid pending alert");
+            }
+            if alert.deliveries.keys().any(|destination| {
+                destination.is_empty()
+                    || destination.len() > 512
+                    || destination.chars().any(char::is_control)
+            }) {
+                bail!("lane-state contains an invalid pending alert destination");
+            }
         }
     }
     Ok(())
@@ -1778,7 +3181,7 @@ pub fn health_json(store: &SharedGjcLaneStore, plane_registered: bool) -> Value 
     let records = store.snapshot();
     let mut phases: BTreeMap<String, usize> = BTreeMap::new();
     for record in &records {
-        if record.watch_removed_at.is_some() {
+        if record.watch_removed_at.is_some() || record.terminal_disposition.is_some() {
             continue;
         }
         let key = record
@@ -1789,9 +3192,12 @@ pub fn health_json(store: &SharedGjcLaneStore, plane_registered: bool) -> Value 
     }
     let active = records
         .iter()
-        .filter(|r| r.watch_removed_at.is_none())
+        .filter(|r| r.watch_removed_at.is_none() && r.terminal_disposition.is_none())
         .count();
-    let removed = records.len() - active;
+    let removed = records
+        .iter()
+        .filter(|record| record.watch_removed_at.is_some())
+        .count();
     json!({
         "schema": GJC_LANE_HEALTH_SCHEMA,
         "store": {
@@ -2024,13 +3430,26 @@ mod tests {
         GjcSdkObservation {
             session_id: "sess-1".to_string(),
             worktree: Some("/tmp/worktree".to_string()),
+            branch: Some("feature/test".to_string()),
+            branch_observed: false,
             endpoint_generation: 3,
             revision: 10,
             turn_state: turn,
             turn_id: Some("turn-1".to_string()),
+            prompt_accepted: matches!(
+                turn,
+                GjcTurnState::Running | GjcTurnState::AwaitingInput | GjcTurnState::Failed
+            ),
             gate_state: None,
+            gate_section_present: true,
             gate_id: None,
+            gate_revision: 0,
+            gate_kind: None,
+            gate_workflow_id: None,
+            gate_title: None,
+            gate_options: Vec::new(),
             disposition,
+            error_summary: None,
         }
     }
 
@@ -2245,6 +3664,234 @@ mod tests {
     }
 
     #[test]
+    fn failed_alert_is_staged_before_send_and_survives_restart() {
+        let (dir, store, lane_id) = store_with_lane("failed-alert");
+        let record = store.record(&lane_id).expect("record");
+        let (failed, _) = store
+            .apply_observation(
+                &lane_id,
+                record.revision,
+                &observation(GjcTurnState::Failed, GjcSessionDisposition::Failed),
+                &ts(1_200),
+            )
+            .expect("failed observation");
+        assert_eq!(failed.pending_alerts.len(), 1);
+        assert_eq!(failed.pending_alerts[0].kind, "session.failed");
+        let event_id = failed.pending_alerts[0].event_id.clone();
+
+        drop(store);
+        let reopened = GjcLaneStore::open(&dir.path().join("gjc-lane-state.json")).expect("reopen");
+        let restored = reopened.record(&lane_id).expect("restored record");
+        assert_eq!(restored.pending_alerts.len(), 1);
+        assert_eq!(restored.pending_alerts[0].event_id, event_id);
+    }
+
+    #[test]
+    fn pending_alert_delivery_ownership_is_partial_and_restart_safe() {
+        let (dir, store, lane_id) = store_with_lane("delivery-ownership");
+        let record = store.record(&lane_id).expect("record");
+        let (failed, _) = store
+            .apply_observation(
+                &lane_id,
+                record.revision,
+                &observation(GjcTurnState::Failed, GjcSessionDisposition::Failed),
+                &ts(1_200),
+            )
+            .expect("failed observation");
+        let event_id = failed.pending_alerts[0].event_id.clone();
+
+        assert!(
+            store
+                .claim_pending_alert_delivery(&lane_id, &event_id, "discord:channel:a")
+                .expect("claim a")
+        );
+        assert!(
+            store
+                .record_pending_alert_delivery(&lane_id, &event_id, "discord:channel:a", true)
+                .expect("deliver a")
+        );
+        assert!(
+            store
+                .claim_pending_alert_delivery(&lane_id, &event_id, "discord:channel:b")
+                .expect("claim b")
+        );
+        assert!(
+            store
+                .record_pending_alert_delivery(&lane_id, &event_id, "discord:channel:b", false)
+                .expect("fail b")
+        );
+
+        let partial = store.record(&lane_id).expect("partial record");
+        let alert = &partial.pending_alerts[0];
+        assert_eq!(
+            alert.deliveries["discord:channel:a"].state,
+            GjcPendingAlertDeliveryState::Delivered
+        );
+        assert_eq!(
+            alert.deliveries["discord:channel:b"].state,
+            GjcPendingAlertDeliveryState::Failed
+        );
+
+        drop(store);
+        let reopened =
+            Arc::new(GjcLaneStore::open(&dir.path().join("gjc-lane-state.json")).expect("reopen"));
+        assert_eq!(
+            reopened.pending_alert_delivery_state(&lane_id, &event_id, "discord:channel:a"),
+            Some(GjcPendingAlertDeliveryState::Delivered)
+        );
+        assert_eq!(
+            reopened.pending_alert_delivery_state(&lane_id, &event_id, "discord:channel:b"),
+            Some(GjcPendingAlertDeliveryState::Failed)
+        );
+        assert!(
+            reopened
+                .claim_pending_alert_delivery(&lane_id, &event_id, "discord:channel:b")
+                .expect("retry b")
+        );
+        assert_eq!(
+            reopened.pending_alert_delivery_state(&lane_id, &event_id, "discord:channel:b"),
+            Some(GjcPendingAlertDeliveryState::Claimed)
+        );
+        assert!(
+            reopened
+                .record_pending_alert_delivery(&lane_id, &event_id, "discord:channel:b", true)
+                .expect("deliver b")
+        );
+        assert_eq!(
+            reopened.pending_alert_delivery_state(&lane_id, &event_id, "discord:channel:a"),
+            Some(GjcPendingAlertDeliveryState::Delivered)
+        );
+        assert_eq!(
+            reopened.pending_alert_delivery_state(&lane_id, &event_id, "discord:channel:b"),
+            Some(GjcPendingAlertDeliveryState::Delivered)
+        );
+    }
+
+    #[test]
+    fn clean_success_and_initial_idle_remain_silent() {
+        let (_dir, store, lane_id) = store_with_lane("silent-lane");
+        let record = store.record(&lane_id).expect("record");
+        let (idle, _) = store
+            .apply_observation(
+                &lane_id,
+                record.revision,
+                &observation(GjcTurnState::Idle, GjcSessionDisposition::Live),
+                &ts(1_100),
+            )
+            .expect("idle observation");
+        assert!(idle.pending_alerts.is_empty());
+        let (complete, _) = store
+            .apply_observation(
+                &lane_id,
+                idle.revision,
+                &observation(GjcTurnState::Complete, GjcSessionDisposition::Complete),
+                &ts(1_200),
+            )
+            .expect("complete observation");
+        assert!(complete.pending_alerts.is_empty());
+    }
+
+    #[test]
+    fn endpoint_alerts_dedupe_until_recovery_then_start_new_episode() {
+        let (_dir, store, lane_id) = store_with_lane("endpoint-alert");
+        let record = store.record(&lane_id).expect("record");
+        let (first, _) = store
+            .mark_unavailable(&lane_id, record.revision, "timeout", u32::MAX, &ts(1_100))
+            .expect("first failure");
+        assert_eq!(first.pending_alerts.len(), 1);
+        let first_id = first.pending_alerts[0].event_id.clone();
+        let (second, _) = store
+            .mark_unavailable(
+                &lane_id,
+                first.revision,
+                "connection closed",
+                u32::MAX,
+                &ts(1_200),
+            )
+            .expect("repeat failure");
+        assert_eq!(second.pending_alerts.len(), 1);
+        assert_eq!(second.pending_alerts[0].event_id, first_id);
+
+        let (recovered, _) = store
+            .apply_observation(
+                &lane_id,
+                second.revision,
+                &observation(GjcTurnState::Idle, GjcSessionDisposition::Live),
+                &ts(1_300),
+            )
+            .expect("recovery");
+        let (new_episode, _) = store
+            .mark_unavailable(
+                &lane_id,
+                recovered.revision,
+                "timeout",
+                u32::MAX,
+                &ts(1_400),
+            )
+            .expect("new failure");
+        assert_eq!(new_episode.pending_alerts.len(), 2);
+        assert_ne!(new_episode.pending_alerts[1].event_id, first_id);
+    }
+
+    #[tokio::test]
+    async fn restarted_reconciler_replays_staged_failed_alert_once() {
+        let (dir, store, lane_id) = store_with_lane("failed-replay");
+        let record = store.record(&lane_id).expect("record");
+        let (failed, _) = store
+            .apply_observation(
+                &lane_id,
+                record.revision,
+                &observation(GjcTurnState::Failed, GjcSessionDisposition::Failed),
+                &ts(1_200),
+            )
+            .expect("failed observation");
+        let event_id = failed.pending_alerts[0].event_id.clone();
+        drop(store);
+        let reopened =
+            Arc::new(GjcLaneStore::open(&dir.path().join("gjc-lane-state.json")).expect("reopen"));
+        let plane = Arc::new(ScriptedPlane {
+            responses: Mutex::new(VecDeque::from(vec![Ok(observation(
+                GjcTurnState::Failed,
+                GjcSessionDisposition::Failed,
+            ))])),
+        });
+        let (tx, sink, mut rx) = event_channel(8);
+        let callback_sink = sink.clone();
+        let callback = tokio::spawn(async move {
+            if let Some(event) = rx.recv().await {
+                callback_sink.lock().expect("sink").push(event.clone());
+                crate::dispatch::resolve_alert_acceptance_id(
+                    event.payload["event_id"].as_str().expect("event id"),
+                    true,
+                );
+            }
+        });
+        let reconciler = GjcReconciler::new(
+            plane,
+            None,
+            reopened.clone(),
+            tx,
+            GjcPollingPolicy::default(),
+        );
+        reconciler.poll_once(fixed_now(10_000)).await.expect("poll");
+        callback.await.expect("callback");
+        let events = sink.lock().expect("sink");
+        let alerts = events
+            .iter()
+            .filter(|event| event.kind == "session.failed")
+            .collect::<Vec<_>>();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].payload["event_id"], event_id);
+        assert!(
+            reopened
+                .record(&lane_id)
+                .expect("record")
+                .pending_alerts
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn endpoint_generation_bump_invalidates_stale_review_owner_evidence() {
         let (_dir, store, lane_id) = store_with_lane("sess-1");
         let record = store.record(&lane_id).expect("record");
@@ -2261,13 +3908,127 @@ mod tests {
         assert!(!updated.owner_evidence_valid);
         assert_eq!(updated.evidence_revision, 2);
 
-        // Generation regression is rejected as conflicting upstream state.
+        // Opaque fingerprints are not numerically ordered; a lower value is
+        // still a distinct replacement generation and must be accepted.
         let mut regressed = advanced.clone();
         regressed.endpoint_generation = 2;
-        let error = store
+        let (_, outcome) = store
             .apply_observation(&lane_id, updated.revision, &regressed, &ts(1_300))
-            .expect_err("regression rejected");
-        assert!(error.to_string().contains("regressed"));
+            .expect("replacement generation accepted");
+        assert!(!outcome.evidence_invalidated);
+    }
+
+    #[test]
+    fn gate_revisions_ignore_stale_and_conflicting_equal_observations() {
+        let (_dir, store, lane_id) = store_with_lane("gate-ordering");
+        let mut opened = observation(GjcTurnState::Idle, GjcSessionDisposition::Live);
+        opened.gate_state = Some(GjcGateState::Ready);
+        opened.gate_id = Some("gate-1".into());
+        opened.gate_revision = 5;
+        let record = store.record(&lane_id).expect("record");
+        let (record, _) = store
+            .apply_observation(&lane_id, record.revision, &opened, &ts(1_200))
+            .expect("open gate");
+
+        let mut stale = opened.clone();
+        stale.gate_state = Some(GjcGateState::Closed);
+        stale.gate_revision = 4;
+        let (record, _) = store
+            .apply_observation(&lane_id, record.revision, &stale, &ts(1_300))
+            .expect("ignore stale gate");
+        assert_eq!(record.last_gate.as_ref().expect("gate").revision, 5);
+        assert_eq!(
+            record.last_gate.as_ref().expect("gate").state,
+            GjcGateState::Ready
+        );
+
+        let mut conflicting = opened.clone();
+        conflicting.gate_state = Some(GjcGateState::Closed);
+        assert!(
+            store
+                .apply_observation(&lane_id, record.revision, &conflicting, &ts(1_400))
+                .is_err()
+        );
+
+        let mut newer = opened;
+        newer.gate_state = Some(GjcGateState::Closed);
+        newer.gate_revision = 6;
+        let record = store
+            .apply_observation(&lane_id, record.revision, &newer, &ts(1_500))
+            .expect("new gate revision")
+            .0;
+        assert_eq!(record.last_gate.as_ref().expect("gate").revision, 6);
+        assert_eq!(
+            record.last_gate.as_ref().expect("gate").state,
+            GjcGateState::Closed
+        );
+    }
+
+    #[test]
+    fn malformed_gate_identity_is_rejected_before_durable_mutation() {
+        let (_dir, store, lane_id) = store_with_lane("sess-1");
+        let before = store.record(&lane_id).expect("record");
+
+        let mut malformed_id = observation(GjcTurnState::Idle, GjcSessionDisposition::Live);
+        malformed_id.gate_state = Some(GjcGateState::Ready);
+        malformed_id.gate_id = Some("gate invalid".to_string());
+        malformed_id.gate_revision = 1;
+        let error = store
+            .apply_observation(&lane_id, before.revision, &malformed_id, &ts(1_200))
+            .expect_err("malformed gate id must fail closed");
+        assert!(error.to_string().contains("canonical identity"));
+
+        let mut malformed_revision = malformed_id;
+        malformed_revision.gate_id = Some("gate-1".to_string());
+        malformed_revision.gate_revision = 0;
+        let error = store
+            .apply_observation(&lane_id, before.revision, &malformed_revision, &ts(1_201))
+            .expect_err("zero gate revision must fail closed");
+        assert!(error.to_string().contains("canonical identity"));
+        assert_eq!(store.record(&lane_id).expect("record"), before);
+    }
+
+    #[test]
+    fn gate_episode_deduplication_survives_restart_and_reopens_on_higher_revision() {
+        let (dir, store, lane_id) = store_with_lane("sess-1");
+        let mut opened = observation(GjcTurnState::Idle, GjcSessionDisposition::Live);
+        opened.gate_state = Some(GjcGateState::Ready);
+        opened.gate_id = Some("gate-1".to_string());
+        opened.gate_revision = 7;
+        let record = store.record(&lane_id).expect("record");
+        let (record, _) = store
+            .apply_observation(&lane_id, record.revision, &opened, &ts(1_200))
+            .expect("open gate");
+        assert_eq!(record.pending_alerts.len(), 1);
+        let first_event = record.pending_alerts[0].event_id.clone();
+
+        // Remove the staged event as a successful delivery would, leaving the
+        // durable gate episode watermark behind for restart reconciliation.
+        let record = store
+            .acknowledge_pending_alert(&lane_id, record.revision, &first_event, &ts(1_201))
+            .expect("acknowledge first gate alert");
+        drop(store);
+        let reopened =
+            Arc::new(GjcLaneStore::open(&dir.path().join("gjc-lane-state.json")).expect("reopen"));
+
+        // Replaying the same gate at a newer session revision remains quiet.
+        let mut replay = opened.clone();
+        replay.revision += 1;
+        let (record, _) = reopened
+            .apply_observation(&lane_id, record.revision, &replay, &ts(1_202))
+            .expect("replay gate");
+        assert!(record.pending_alerts.is_empty());
+
+        // Reopening the same id requires a strictly higher gate revision.
+        let mut higher = replay;
+        higher.revision += 1;
+        higher.gate_revision = 8;
+        let record = reopened
+            .apply_observation(&lane_id, record.revision, &higher, &ts(1_203))
+            .expect("higher gate revision")
+            .0;
+        assert_eq!(record.pending_alerts.len(), 1);
+        assert_ne!(record.pending_alerts[0].event_id, first_event);
     }
 
     #[test]
@@ -2429,6 +4190,17 @@ mod tests {
                 .iter()
                 .any(|entry| entry.kind == GjcAuditKind::GhostWatchRemoved)
         );
+        let reclaimed = reopened
+            .reclaim_tombstone(
+                &lane_id,
+                tombstone.revision,
+                tombstone.endpoint_generation,
+                tombstone.worktree.clone(),
+                &ts(1_500),
+            )
+            .expect("reclaim tombstone");
+        assert!(reclaimed.watch_removed_at.is_none());
+        assert!(reclaimed.terminal_disposition.is_none());
     }
 
     #[test]
@@ -2441,10 +4213,11 @@ mod tests {
             GjcLaneStoreStatus::IgnoredInvalid { .. } => {}
             other => panic!("expected ignored-invalid, got {other:?}"),
         }
-        // And remains usable: registrations proceed on the recovered file.
-        store
-            .register_lane(&registration("after-junk"), &ts(1_000))
-            .expect("usable");
+        assert!(
+            store
+                .register_lane(&registration("after-junk"), &ts(1_000))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2462,6 +4235,13 @@ mod tests {
             GjcLaneRegistrationRequest {
                 sdk_session_id: "bad id with spaces".to_string(),
                 worktree: None,
+                endpoint_generation: None,
+                owner_id: None,
+                pr: None,
+            },
+            GjcLaneRegistrationRequest {
+                sdk_session_id: "ok".to_string(),
+                worktree: Some("relative/../worktree".to_string()),
                 endpoint_generation: None,
                 owner_id: None,
                 pr: None,
@@ -2488,6 +4268,18 @@ mod tests {
                     number: 0,
                     head_sha: "a".repeat(40),
                     base_branch: "dev".to_string(),
+                }),
+            },
+            GjcLaneRegistrationRequest {
+                sdk_session_id: "ok".to_string(),
+                worktree: None,
+                endpoint_generation: None,
+                owner_id: None,
+                pr: Some(GjcPrBindingInput {
+                    repo: "Yeachan-Heo/clawhip".to_string(),
+                    number: 1,
+                    head_sha: "a".repeat(40),
+                    base_branch: "dev\nbranch".to_string(),
                 }),
             },
         ] {
@@ -2612,18 +4404,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_enrollment_discovers_native_session_before_polling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worktree = dir.path().join("worktree");
+        let sdk_dir = worktree.join(".gjc/state/sdk");
+        std::fs::create_dir_all(&sdk_dir).expect("sdk state");
+        let session = "01a02ccd-c754-7656-95c7-f40b5a140bc3";
+        std::fs::write(
+            sdk_dir.join(format!("{session}.json")),
+            format!(
+                r#"{{"version":1,"sessionId":"{session}","url":"ws://127.0.0.1:1/","token":"test","pid":{}}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("metadata");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                sdk_dir.join(format!("{session}.json")),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .expect("metadata permissions");
+        }
+        assert_eq!(
+            crate::gjc_sdk::discover_all(&crate::gjc_sdk::StateRoot::for_worktree(&worktree))
+                .expect("discover metadata")
+                .len(),
+            1
+        );
+        let store =
+            Arc::new(GjcLaneStore::open(&dir.path().join("lane-state.json")).expect("open store"));
+        let (tx, _sink, _rx) = event_channel(8);
+        let mut live = observation(GjcTurnState::Running, GjcSessionDisposition::Live);
+        live.session_id = session.to_string();
+        live.worktree = Some(worktree.to_string_lossy().into_owned());
+        live.revision = 1;
+        let reconciler = GjcReconciler::new(
+            Arc::new(ScriptedPlane {
+                responses: Mutex::new(VecDeque::from([Ok(live)])),
+            }),
+            None,
+            store.clone(),
+            tx,
+            GjcPollingPolicy::default(),
+        )
+        .with_auto_enrollment(vec![worktree]);
+        reconciler.auto_enroll_native_sessions("2026-08-30T00:00:00Z");
+        assert!(store.record_for_session(session).is_some());
+        let outcome = reconciler.poll_once(fixed_now(1_000)).await.expect("poll");
+        assert_eq!(outcome.examined, 1);
+        assert_eq!(store.record_for_session(session).unwrap().sdk_revision, 1);
+    }
+
+    #[tokio::test]
     async fn reconciler_applies_live_evidence_then_removes_terminal_ghost_watch() {
         let (_dir, store, lane_id) = store_with_lane("sess-1");
+        let mut complete_observation =
+            observation(GjcTurnState::Complete, GjcSessionDisposition::Complete);
+        complete_observation.revision = 11;
         let plane = Arc::new(ScriptedPlane {
             responses: Mutex::new(VecDeque::from(vec![
                 Ok(observation(
                     GjcTurnState::Running,
                     GjcSessionDisposition::Live,
                 )),
-                Ok(observation(
-                    GjcTurnState::Complete,
-                    GjcSessionDisposition::Complete,
-                )),
+                Ok(complete_observation),
                 Err(GjcSdkQueryError::SessionNotFound(
                     "session reaped".to_string(),
                 )),
@@ -2854,15 +4700,39 @@ mod tests {
             reconciled.examined
         };
         assert!(total >= 1);
-        assert_eq!(
-            store.record(&lane_id).expect("final").revision,
-            snapshot_revision + 1
+        assert!(
+            store.record(&lane_id).expect("final").revision > snapshot_revision,
+            "one or both concurrent CAS writers must commit"
         );
         // Durable file stays valid JSON after the race.
         let content =
             std::fs::read_to_string(dir.path().join("gjc-lane-state.json")).expect("read state");
         let parsed: Value = serde_json::from_str(&content).expect("valid json after race");
         assert_eq!(parsed["schema"], GJC_LANE_STATE_SCHEMA);
+    }
+
+    #[test]
+    fn migrated_lane_id_remains_a_lookup_and_mutation_alias() {
+        let (dir, store, canonical_id) = store_with_lane("legacy-alias");
+        let legacy_id = "legacy-lane-id".to_string();
+        {
+            let mut state = store.state.lock().expect("state");
+            let mut record = state.lanes.remove(&canonical_id).expect("record");
+            record.lane_id = legacy_id.clone();
+            state.lanes.insert(legacy_id.clone(), record);
+            store.persist_locked(&mut state).expect("persist");
+        }
+
+        let reopened = GjcLaneStore::open(&dir.path().join("gjc-lane-state.json")).expect("reopen");
+        let record = reopened.record(&legacy_id).expect("legacy lookup");
+        assert_eq!(record.lane_id, canonical_id);
+        let updated = reopened
+            .mutate(&legacy_id, record.revision, &ts(80_000), |mut record| {
+                record.phase = Some(GjcLanePhase::Unavailable);
+                Ok(multi_audit(record, vec![]))
+            })
+            .expect("legacy mutation");
+        assert_eq!(updated.phase, Some(GjcLanePhase::Unavailable));
     }
 
     #[test]

@@ -203,6 +203,7 @@ fn decode_notification(value: &Value) -> Option<NotificationFrame> {
 pub struct FakeSections {
     pub metadata_session_id: String,
     pub turn_id: String,
+    pub revision: u64,
     /// queued | running | succeeded | failed | aborted
     pub turn_status: &'static str,
     pub gate: Option<FakeGateSection>,
@@ -222,6 +223,7 @@ impl FakeSections {
         let mut turn = serde_json::json!({
             "turn_id": self.turn_id,
             "status": self.turn_status,
+            "prompt_accepted": true,
             "started_at": "2026-08-23T00:00:00Z",
         });
         if matches!(self.turn_status, "succeeded" | "failed") {
@@ -233,6 +235,7 @@ impl FakeSections {
             });
         }
         let mut result = serde_json::json!({
+            "revision": self.revision,
             "metadata": {"session_id": self.metadata_session_id},
             "turn": turn,
         });
@@ -240,6 +243,7 @@ impl FakeSections {
             result["workflow_gates"] = serde_json::json!([{
                 "gate_id": gate.gate_id,
                 "workflow_id": "workflow-326",
+                "kind": "ask",
                 "state": gate.state,
                 "title": gate.title,
                 "options": gate.options,
@@ -315,6 +319,7 @@ mod tests {
         let sections = FakeSections {
             metadata_session_id: "sess-326".into(),
             turn_id: "turn-1".into(),
+            revision: 1,
             turn_status: "running",
             gate: Some(FakeGateSection {
                 gate_id: "gate-326".into(),

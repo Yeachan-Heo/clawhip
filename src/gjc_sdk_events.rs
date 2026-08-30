@@ -13,10 +13,10 @@
 //! The bridge owns no transport, polling loop, or durable lane state: sibling
 //! tracks (#322 transport, #323 control, #325 reconciler) feed snapshots in and
 //! enqueue the emitted [`IncomingEvent`]s through the normal daemon pipeline
-//! (router -> ledger -> sinks). Transitions are deduped per session/turn/gate
-//! revision, and every emitted event carries a deterministic `event_id` plus
-//! `idempotency_key` derived from the transition identity so the event ledger
-//! suppresses replays across restarts.
+//! (router -> ledger -> sinks). Transitions are deduped per authoritative
+//! session/turn/gate episode, and every emitted event carries a deterministic
+//! `event_id` plus `idempotency_key` derived from that identity so the event
+//! ledger suppresses replays across restarts.
 //!
 //! Payloads are whitelist-only and public-safe: bounded summaries, collapsed
 //! control characters, and never raw prompts, tokens, or endpoint URLs.
@@ -43,6 +43,7 @@ pub enum GjcSdkTurnPhase {
     WaitingInput,
     Complete,
     Failed,
+    Aborted,
 }
 
 /// Acceptance/progression state of the last submitted prompt.
@@ -85,6 +86,8 @@ pub struct GjcSdkTurn {
     pub id: String,
     pub state: GjcSdkTurnPhase,
     #[serde(default)]
+    pub prompt_accepted: bool,
+    #[serde(default)]
     pub attempt: u64,
     #[serde(default)]
     pub error_summary: Option<String>,
@@ -106,6 +109,12 @@ pub struct GjcSdkGate {
     pub status: GjcSdkGateStatus,
     #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub workflow_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 /// Typed endpoint-health slice (no URLs, no credentials).
@@ -124,12 +133,21 @@ pub struct GjcSdkEndpoint {
 pub struct GjcSdkStateSnapshot {
     pub session_id: String,
     pub revision: u64,
+    /// Durable endpoint failure episode identity. This is not a local CAS
+    /// revision; callers increment it only when authoritative endpoint health
+    /// recovers and fails again so retries retain one event identity.
+    #[serde(default)]
+    pub endpoint_episode: u64,
     #[serde(default)]
     pub turn: Option<GjcSdkTurn>,
+    #[serde(skip)]
+    pub turn_present: bool,
     #[serde(default)]
     pub prompt: Option<GjcSdkPrompt>,
     #[serde(default)]
     pub gate: Option<GjcSdkGate>,
+    #[serde(skip)]
+    pub gate_present: bool,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -148,6 +166,11 @@ pub struct GjcSdkStateSnapshot {
     pub observed_at: Option<String>,
     #[serde(default)]
     pub summary: Option<String>,
+    /// Internal mapper failure. A malformed authoritative query is carried
+    /// as a rejected snapshot so callers that use the historical infallible
+    /// mapper cannot accidentally advance a watermark or emit a guessed gate.
+    #[serde(skip)]
+    pub(crate) mapping_error: Option<String>,
 }
 
 /// Result of feeding one snapshot to the bridge.
@@ -167,23 +190,28 @@ pub struct BridgeStats {
     pub emitted: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct SessionTrack {
     last_revision: Option<u64>,
     turn_id: Option<String>,
     attempts: u64,
     terminal_emitted_turn: Option<String>,
     prompt_command: Option<String>,
+    prompt_turn_id: Option<String>,
+    last_prompt_command: Option<String>,
     gate_episode: Option<(String, u64)>,
     model: Option<String>,
     profile: Option<String>,
     endpoint_health: Option<GjcSdkEndpointHealth>,
     endpoint_alerted: bool,
+    endpoint_episode: u64,
     session_started_emitted: bool,
+    in_flight_turn: Option<String>,
+    unexpected_idle_emitted_turn: Option<String>,
 }
 
 /// Per-session transition reducer mapping SDK snapshots onto Clawhip events.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GjcEventBridge {
     sessions: HashMap<String, SessionTrack>,
     stats: BridgeStats,
@@ -202,9 +230,28 @@ impl GjcEventBridge {
     /// the snapshot was suppressed as a duplicate or stale/out-of-order input.
     pub fn observe(&mut self, snapshot: &GjcSdkStateSnapshot) -> Result<BridgeOutcome, String> {
         self.stats.snapshots += 1;
+        if let Some(error) = snapshot.mapping_error.as_deref() {
+            return Err(error.to_string());
+        }
+        crate::gjc::model::SessionId::new(snapshot.session_id.clone())
+            .map_err(|_| "gjc_bridge_invalid_session_id".to_string())?;
         let session_id = sanitize(&snapshot.session_id);
         if session_id.is_empty() || session_id.chars().count() > MAX_ID_CHARS {
             return Err("gjc_bridge_invalid_session_id".to_string());
+        }
+        if let Some(gate) = &snapshot.gate {
+            if !valid_gate_id(&gate.id) {
+                return Err("gjc_bridge_invalid_gate_id".to_string());
+            }
+            if gate.revision == 0 {
+                return Err("gjc_bridge_invalid_gate_revision".to_string());
+            }
+        }
+        if let Some(prompt) = &snapshot.prompt {
+            let prompt_id = sanitize(&prompt.command_id);
+            if prompt_id.is_empty() || prompt_id.chars().count() > MAX_ID_CHARS {
+                return Err("gjc_bridge_invalid_prompt_id".to_string());
+            }
         }
 
         let track = self.sessions.entry(session_id.clone()).or_default();
@@ -237,9 +284,11 @@ impl GjcEventBridge {
                 track.turn_id = Some(turn_id.clone());
                 track.attempts = 0;
                 track.terminal_emitted_turn = None;
+                track.prompt_command = None;
             }
+            let prompt_accepted = turn.prompt_accepted || track.prompt_command.is_some();
 
-            if turn.attempt > track.attempts {
+            if prompt_accepted && turn.attempt > track.attempts {
                 events.push(lifecycle_event(
                     &context,
                     "session.retry-needed",
@@ -257,7 +306,9 @@ impl GjcEventBridge {
                 track.terminal_emitted_turn.as_deref() == Some(turn_id.as_str());
             match turn.state {
                 GjcSdkTurnPhase::Active => {
-                    if !track.session_started_emitted {
+                    track.in_flight_turn = prompt_accepted.then_some(turn_id.clone());
+                    track.unexpected_idle_emitted_turn = None;
+                    if prompt_accepted && !track.session_started_emitted {
                         events.push(lifecycle_event(
                             &context,
                             "session.started",
@@ -272,7 +323,7 @@ impl GjcEventBridge {
                     }
                 }
                 GjcSdkTurnPhase::Complete | GjcSdkTurnPhase::Failed => {
-                    if !terminal_already_emitted {
+                    if prompt_accepted && !terminal_already_emitted {
                         let failed = turn.state == GjcSdkTurnPhase::Failed;
                         let kind = if failed {
                             "session.failed"
@@ -284,31 +335,98 @@ impl GjcEventBridge {
                             turn.error_summary
                                 .as_deref()
                                 .or(snapshot.summary.as_deref())
-                                .map(sanitize)
+                                .map(public_failure_summary)
                                 .filter(|value| !value.is_empty())
-                                .unwrap_or_else(|| "turn failed".to_string())
+                                .unwrap_or_else(|| "provider turn failed".to_string())
                         });
                         events.push(lifecycle_event(
                             &context,
                             kind,
                             status,
                             0,
-                            snapshot.summary.clone(),
+                            if failed {
+                                error.clone()
+                            } else {
+                                snapshot.summary.clone()
+                            },
                             error,
                             &[if failed { "failed" } else { "complete" }],
                             &[],
                         ));
                         track.terminal_emitted_turn = Some(turn_id);
                     }
+                    track.in_flight_turn = None;
                 }
-                GjcSdkTurnPhase::Idle | GjcSdkTurnPhase::WaitingInput => {}
+                GjcSdkTurnPhase::Idle | GjcSdkTurnPhase::Aborted => {
+                    if track.in_flight_turn.as_deref() == Some(turn_id.as_str())
+                        && track.unexpected_idle_emitted_turn.as_deref() != Some(turn_id.as_str())
+                    {
+                        let mut error = turn
+                            .error_summary
+                            .as_deref()
+                            .map(public_failure_summary)
+                            .unwrap_or_else(|| {
+                                "accepted turn became idle without a terminal receipt".to_string()
+                            });
+                        if turn.state == GjcSdkTurnPhase::Aborted {
+                            error =
+                                "accepted turn was aborted without a successful terminal receipt"
+                                    .to_string();
+                        }
+                        events.push(lifecycle_event(
+                            &context,
+                            "session.stalled",
+                            "unexpected-idle",
+                            0,
+                            Some(error.clone()),
+                            Some(error),
+                            &["unexpected-idle"],
+                            &[],
+                        ));
+                        track.unexpected_idle_emitted_turn = Some(turn_id.clone());
+                    }
+                    track.in_flight_turn = None;
+                }
+                GjcSdkTurnPhase::WaitingInput => {
+                    if prompt_accepted && track.in_flight_turn.is_none() {
+                        track.in_flight_turn = Some(turn_id);
+                    }
+                }
             }
+        }
+
+        if snapshot.turn_present
+            && snapshot.turn.is_none()
+            && let Some(turn_id) = track.in_flight_turn.take()
+            && track.unexpected_idle_emitted_turn.as_deref() != Some(turn_id.as_str())
+        {
+            let message = "accepted turn disappeared without a terminal receipt".to_string();
+            events.push(lifecycle_event(
+                &context,
+                "session.stalled",
+                "unexpected-idle",
+                0,
+                Some(message.clone()),
+                Some(message),
+                &[turn_id.as_str(), "unexpected-idle"],
+                &[],
+            ));
+            track.unexpected_idle_emitted_turn = Some(turn_id);
         }
 
         if let Some(prompt) = &snapshot.prompt {
             let command_id = sanitize(&prompt.command_id);
+            let current_turn_id = snapshot.turn.as_ref().map(|turn| turn.id.as_str());
             if !command_id.is_empty()
                 && prompt.status == GjcSdkPromptStatus::Accepted
+                && snapshot.turn.as_ref().is_some_and(|turn| {
+                    matches!(
+                        turn.state,
+                        GjcSdkTurnPhase::Active | GjcSdkTurnPhase::WaitingInput
+                    )
+                })
+                && (track.last_prompt_command.as_deref() != Some(command_id.as_str())
+                    || track.prompt_turn_id.as_deref() == current_turn_id)
                 && track.prompt_command.as_deref() != Some(command_id.as_str())
             {
                 events.push(lifecycle_event(
@@ -318,18 +436,17 @@ impl GjcEventBridge {
                     0,
                     snapshot.summary.clone(),
                     None,
-                    &[],
+                    &[command_id.as_str()],
                     &[("command_id", Value::from(command_id.as_str()))],
                 ));
                 track.prompt_command = Some(command_id);
+                track.prompt_turn_id = current_turn_id.map(str::to_string);
+                track.last_prompt_command = track.prompt_command.clone();
             }
         }
 
         if let Some(gate) = &snapshot.gate {
-            let gate_id = sanitize(&gate.id);
-            if gate_id.is_empty() || gate_id.chars().count() > MAX_ID_CHARS {
-                return Err("gjc_bridge_invalid_gate_id".to_string());
-            }
+            let gate_id = gate.id.clone();
             match gate.status {
                 GjcSdkGateStatus::Open => {
                     let new_episode = match &track.gate_episode {
@@ -368,13 +485,25 @@ impl GjcEventBridge {
         }
 
         if let Some(endpoint) = &snapshot.endpoint {
+            track.endpoint_episode = track.endpoint_episode.max(snapshot.endpoint_episode);
             let escalated = track.endpoint_health == Some(GjcSdkEndpointHealth::Degraded)
                 && endpoint.health == GjcSdkEndpointHealth::Failed;
             match endpoint.health {
                 GjcSdkEndpointHealth::Ok => track.endpoint_alerted = false,
                 GjcSdkEndpointHealth::Degraded | GjcSdkEndpointHealth::Failed => {
                     if !track.endpoint_alerted || escalated {
-                        events.push(endpoint_failed_event(&context, endpoint));
+                        if !track.endpoint_alerted
+                            && (track.endpoint_health.is_none()
+                                || track.endpoint_health == Some(GjcSdkEndpointHealth::Ok))
+                        {
+                            track.endpoint_episode =
+                                track.endpoint_episode.saturating_add(1).max(1);
+                        }
+                        events.push(endpoint_failed_event(
+                            &context,
+                            endpoint,
+                            track.endpoint_episode,
+                        ));
                         track.endpoint_alerted = true;
                     }
                 }
@@ -400,7 +529,7 @@ pub fn snapshot_from_response_payload(payload: &Value) -> Result<GjcSdkStateSnap
     if !payload.is_object() {
         return Err("gjc_bridge_snapshot_payload_not_object".to_string());
     }
-    let snapshot: GjcSdkStateSnapshot =
+    let mut snapshot: GjcSdkStateSnapshot =
         serde_json::from_value(payload.clone()).map_err(|error| {
             format!(
                 "gjc_bridge_snapshot_malformed: {}",
@@ -409,6 +538,21 @@ pub fn snapshot_from_response_payload(payload: &Value) -> Result<GjcSdkStateSnap
         })?;
     if snapshot.session_id.trim().is_empty() {
         return Err("gjc_bridge_snapshot_missing_session_id".to_string());
+    }
+    crate::gjc::model::SessionId::new(snapshot.session_id.clone())
+        .map_err(|_| "gjc_bridge_invalid_session_id".to_string())?;
+    snapshot.turn_present = payload.get("turn").is_some();
+    snapshot.gate_present = payload.get("gate").is_some();
+    if snapshot
+        .turn
+        .as_ref()
+        .is_some_and(|turn| turn.prompt_accepted)
+        && snapshot
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.status != GjcSdkPromptStatus::Accepted)
+    {
+        return Err("gjc_bridge_contradictory_prompt_acceptance".to_string());
     }
     Ok(snapshot)
 }
@@ -426,24 +570,52 @@ pub struct GjcSnapshotIdentity {
 /// typed snapshot input. `revision` is caller-supplied monotonic lane state
 /// (the reconciler's store revision); git routing identity comes from lane
 /// registration because the control-plane model does not carry it. Gate
-/// revisions are synthesized from `raised_at` timestamps so re-raised gates
-/// form new dedupe episodes.
+/// revisions are derived from authoritative `raised_at` timestamps so
+/// re-raised gates form new dedupe episodes. Queries with ambiguous ready
+/// gates or malformed gate identity are carried as rejected snapshots rather
+/// than projected into guessed state.
 pub fn snapshot_from_session_query(
     session_id: &str,
     revision: u64,
     query: &crate::gjc::model::SessionQuery,
     identity: &GjcSnapshotIdentity,
 ) -> GjcSdkStateSnapshot {
+    let gates = query.workflow_gates.as_deref().unwrap_or_default();
+    let ready_count = gates
+        .iter()
+        .filter(|gate| gate.state == crate::gjc::model::WorkflowGateState::Ready)
+        .count();
+    if ready_count > 1 {
+        return rejected_snapshot(
+            session_id,
+            revision,
+            identity,
+            "gjc_bridge_ambiguous_workflow_gates",
+        );
+    }
+    if gates
+        .iter()
+        .any(|gate| !valid_gate_id(&gate.gate_id) || gate_revision(gate) == 0)
+    {
+        return rejected_snapshot(
+            session_id,
+            revision,
+            identity,
+            "gjc_bridge_invalid_gate_identity",
+        );
+    }
+
     let turn = query.turn.as_ref().map(|turn| GjcSdkTurn {
         id: turn.turn_id.clone(),
         state: match turn.status {
-            crate::gjc::model::GjcPromptStatus::Queued
-            | crate::gjc::model::GjcPromptStatus::Running => GjcSdkTurnPhase::Active,
+            crate::gjc::model::GjcPromptStatus::Queued => GjcSdkTurnPhase::Active,
+            crate::gjc::model::GjcPromptStatus::Running => GjcSdkTurnPhase::Active,
             crate::gjc::model::GjcPromptStatus::Succeeded => GjcSdkTurnPhase::Complete,
             crate::gjc::model::GjcPromptStatus::Failed => GjcSdkTurnPhase::Failed,
             crate::gjc::model::GjcPromptStatus::Aborted => GjcSdkTurnPhase::Idle,
         },
         attempt: 0,
+        prompt_accepted: turn.prompt_accepted,
         error_summary: matches!(
             turn.status,
             crate::gjc::model::GjcPromptStatus::Failed
@@ -457,7 +629,6 @@ pub fn snapshot_from_session_query(
         .flatten(),
     });
 
-    let gates = query.workflow_gates.as_deref().unwrap_or_default();
     let gate = gates
         .iter()
         .find(|gate| gate.state == crate::gjc::model::WorkflowGateState::Ready)
@@ -470,18 +641,27 @@ pub fn snapshot_from_session_query(
         })
         .map(|(gate, status)| GjcSdkGate {
             id: gate.gate_id.clone(),
-            kind: GjcSdkGateKind::Workflow,
+            kind: match gate.kind.as_deref() {
+                Some("ask") => GjcSdkGateKind::Ask,
+                _ => GjcSdkGateKind::Workflow,
+            },
             revision: gate_revision(gate),
             status,
             summary: gate.title.clone(),
+            workflow_id: gate.workflow_id.clone(),
+            title: gate.title.clone(),
+            options: gate.options.clone(),
         });
 
     GjcSdkStateSnapshot {
         session_id: session_id.to_string(),
         revision,
+        endpoint_episode: 0,
         turn,
+        turn_present: query.turn_present,
         prompt: None,
         gate,
+        gate_present: query.workflow_gates_present,
         model: query
             .model_profile
             .as_ref()
@@ -503,17 +683,47 @@ pub fn snapshot_from_session_query(
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.title.clone()),
+        mapping_error: None,
     }
 }
 
-/// Deterministic gate episode revision: unix seconds of `raised_at` when it
-/// parses, otherwise a stable fallback that keeps episodes distinct per gate.
-fn gate_revision(gate: &crate::gjc::model::WorkflowGate) -> u64 {
+fn rejected_snapshot(
+    session_id: &str,
+    revision: u64,
+    identity: &GjcSnapshotIdentity,
+    error: &str,
+) -> GjcSdkStateSnapshot {
+    GjcSdkStateSnapshot {
+        session_id: session_id.to_string(),
+        revision,
+        gate_present: true,
+        repo_name: identity.repo_name.clone(),
+        repo_path: identity.repo_path.clone(),
+        worktree_path: identity.worktree_path.clone(),
+        branch: identity.branch.clone(),
+        mapping_error: Some(error.to_string()),
+        ..GjcSdkStateSnapshot::default()
+    }
+}
+
+/// Deterministic gate episode revision: nanoseconds of the authoritative
+/// `raised_at` timestamp. A missing or malformed timestamp is invalid rather
+/// than replaced with a locally invented revision.
+pub(crate) fn gate_revision(gate: &crate::gjc::model::WorkflowGate) -> u64 {
     gate.raised_at
         .as_deref()
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-        .map(|time| time.unix_timestamp().max(0) as u64)
-        .unwrap_or(1)
+        .and_then(|time| u64::try_from(time.unix_timestamp_nanos()).ok())
+        .filter(|revision| *revision > 0)
+        .unwrap_or(0)
+}
+
+pub(crate) fn valid_gate_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ID_CHARS
+        && value
+            .chars()
+            .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
 struct SnapshotContext<'a> {
@@ -527,9 +737,8 @@ impl<'a> SnapshotContext<'a> {
         let timestamp = snapshot
             .observed_at
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
+            .and_then(|value| OffsetDateTime::parse(value.trim(), &Rfc3339).ok())
+            .and_then(|value| value.format(&Rfc3339).ok())
             .unwrap_or_else(rfc3339_now);
         Self {
             session_id,
@@ -550,7 +759,13 @@ fn lifecycle_event(
     identity_parts: &[&str],
     extra_fields: &[(&str, Value)],
 ) -> IncomingEvent {
-    let mut object = base_object(context, kind, status, identity_parts);
+    let attempt_component = attempt.to_string();
+    let mut event_identity = Vec::with_capacity(identity_parts.len() + usize::from(attempt > 0));
+    if attempt > 0 {
+        event_identity.push(attempt_component.as_str());
+    }
+    event_identity.extend_from_slice(identity_parts);
+    let mut object = base_object(context, kind, status, &event_identity);
     if attempt > 0 {
         object.insert("attempt".to_string(), Value::from(attempt));
     }
@@ -573,7 +788,7 @@ fn gate_event(context: &SnapshotContext<'_>, kind: &str, gate: &GjcSdkGate) -> I
     let summary = gate
         .summary
         .as_deref()
-        .map(sanitize)
+        .map(public_text)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| match gate.kind {
             GjcSdkGateKind::Ask => "operator input requested".to_string(),
@@ -591,6 +806,9 @@ fn gate_event(context: &SnapshotContext<'_>, kind: &str, gate: &GjcSdkGate) -> I
             "kind": gate_kind,
             "revision": gate.revision,
             "summary": summary.clone(),
+            "workflow_id": gate.workflow_id,
+            "title": gate.title,
+            "options": gate.options.iter().map(|option| public_text(option)).collect::<Vec<_>>(),
         }),
     );
     object.insert("question_id".to_string(), Value::from(gate_id.clone()));
@@ -616,7 +834,11 @@ fn gate_event(context: &SnapshotContext<'_>, kind: &str, gate: &GjcSdkGate) -> I
 fn endpoint_failed_event(
     context: &SnapshotContext<'_>,
     endpoint: &GjcSdkEndpoint,
+    endpoint_episode: u64,
 ) -> IncomingEvent {
+    let endpoint_episode = endpoint_episode
+        .max(context.snapshot.endpoint_episode)
+        .max(1);
     let health = match endpoint.health {
         GjcSdkEndpointHealth::Ok => "ok",
         GjcSdkEndpointHealth::Degraded => "degraded",
@@ -625,14 +847,13 @@ fn endpoint_failed_event(
     let detail = endpoint
         .detail
         .as_deref()
-        .map(sanitize)
-        .filter(|value| !value.is_empty())
+        .map(public_endpoint_detail)
         .unwrap_or_else(|| "sdk endpoint unavailable".to_string());
     let mut object = base_object(
         context,
         "session.endpoint-failed",
         "endpoint-failed",
-        &[health],
+        &[health, &format!("episode-{endpoint_episode}")],
     );
     object.insert("endpoint_health".to_string(), Value::from(health));
     object.insert("error_message".to_string(), Value::from(detail.clone()));
@@ -669,6 +890,10 @@ fn model_change_event(
         return None;
     }
 
+    let previous_model = tracked_model.as_deref().unwrap_or("unset").to_string();
+    let previous_profile = tracked_profile.as_deref().unwrap_or("unset").to_string();
+    let current_model = model.as_deref().unwrap_or("unset").to_string();
+    let current_profile = profile.as_deref().unwrap_or("unset").to_string();
     let mut parts = Vec::new();
     if model != *tracked_model {
         parts.push(format!(
@@ -691,8 +916,10 @@ fn model_change_event(
         "session.model-changed",
         "model-changed",
         &[
-            model.as_deref().unwrap_or("unset"),
-            profile.as_deref().unwrap_or("unset"),
+            previous_model.as_str(),
+            current_model.as_str(),
+            previous_profile.as_str(),
+            current_profile.as_str(),
         ],
     );
     if let Some(model) = &model {
@@ -751,13 +978,27 @@ fn base_object(
     let gate_component = gate
         .map(|gate| format!("{}|{}", sanitize(&gate.id), gate.revision))
         .unwrap_or_default();
+    let routing_identity = [
+        context.snapshot.repo_name.as_deref().unwrap_or_default(),
+        context.snapshot.repo_path.as_deref().unwrap_or_default(),
+        context
+            .snapshot
+            .worktree_path
+            .as_deref()
+            .unwrap_or_default(),
+        context.snapshot.branch.as_deref().unwrap_or_default(),
+    ]
+    .into_iter()
+    .map(sanitize)
+    .collect::<Vec<_>>()
+    .join("|");
     let identity = format!(
         "{}|{}|{}|{}|{}|{}",
         kind,
         context.session_id,
-        context.snapshot.revision,
         turn,
         gate_component,
+        routing_identity,
         identity_parts.join("|"),
     );
     let event_id = format!(
@@ -788,7 +1029,7 @@ fn finish_event(kind: &str, object: Map<String, Value>) -> IncomingEvent {
 fn insert_summary(object: &mut Map<String, Value>, summary: Option<String>) {
     if let Some(summary) = summary
         .as_deref()
-        .map(sanitize)
+        .map(public_text)
         .filter(|value| !value.is_empty())
     {
         object.insert("summary".to_string(), Value::from(summary));
@@ -811,6 +1052,60 @@ fn sanitize(value: &str) -> String {
         collapsed.push(mapped);
     }
     collapsed.trim().chars().take(MAX_SUMMARY_CHARS).collect()
+}
+
+fn public_text(value: &str) -> String {
+    let sanitized = sanitize(value);
+    let lower = sanitized.to_ascii_lowercase();
+    let compact: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
+    if lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("api_key")
+        || lower.contains("api-key")
+        || lower.contains("authorization")
+        || lower.contains("apikey")
+        || lower.contains("credential")
+        || lower.contains("passwd")
+        || lower.contains("auth:")
+        || compact.contains("privatekey")
+        || lower.contains("auth=")
+        || lower.contains("bearer")
+        || lower.contains("://")
+    {
+        "details redacted".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn public_failure_summary(value: &str) -> String {
+    let normalized = sanitize(value).to_ascii_lowercase();
+    if normalized.contains("401") || normalized.contains("unauthorized") {
+        return "provider authorization failed (401)".to_string();
+    }
+    if normalized.contains("402") && !normalized.contains("403")
+        || (normalized.contains("payment")
+            || normalized.contains("billing")
+            || normalized.contains("credit"))
+            && !normalized.contains("403")
+    {
+        return "provider credits or billing unavailable (402)".to_string();
+    }
+    if normalized.contains("403") || normalized.contains("forbidden") {
+        return "provider access denied (403)".to_string();
+    }
+    if normalized.contains("429")
+        || normalized.contains("rate limit")
+        || normalized.contains("quota")
+    {
+        return "provider rate limit or quota exceeded (429)".to_string();
+    }
+    "provider turn failed".to_string()
+}
+
+fn public_endpoint_detail(_value: &str) -> String {
+    "sdk endpoint unavailable".to_string()
 }
 
 fn rfc3339_now() -> String {
@@ -854,6 +1149,7 @@ mod tests {
         GjcSdkTurn {
             id: id.to_string(),
             state,
+            prompt_accepted: true,
             attempt,
             error_summary: None,
         }
@@ -894,6 +1190,7 @@ mod tests {
         snapshot.turn = Some(GjcSdkTurn {
             id: "t2".to_string(),
             state: GjcSdkTurnPhase::Failed,
+            prompt_accepted: true,
             attempt: 0,
             error_summary: Some("boom".to_string()),
         });
@@ -901,9 +1198,55 @@ mod tests {
         assert_eq!(kinds(&outcome.events), vec!["session.failed".to_string()]);
         assert_eq!(
             outcome.events[0].payload["error_message"],
-            Value::from("boom")
+            Value::from("provider turn failed")
         );
         assert_eq!(bridge.stats().emitted, 4);
+    }
+
+    #[test]
+    fn accepted_turn_becoming_idle_emits_one_unexpected_idle_alert() {
+        let mut bridge = GjcEventBridge::new();
+        let mut snapshot = base_snapshot("sess-idle", 1);
+        snapshot.turn = Some(turn("turn-1", GjcSdkTurnPhase::Active, 0));
+        bridge.observe(&snapshot).unwrap();
+
+        snapshot.revision = 2;
+        snapshot.turn = Some(turn("turn-1", GjcSdkTurnPhase::Idle, 0));
+        let outcome = bridge.observe(&snapshot).unwrap();
+        assert_eq!(kinds(&outcome.events), vec!["session.stalled"]);
+        assert_eq!(outcome.events[0].payload["status"], "unexpected-idle");
+
+        snapshot.revision = 3;
+        assert!(bridge.observe(&snapshot).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn provider_credit_and_auth_failures_are_public_safe() {
+        let mut bridge = GjcEventBridge::new();
+        for (revision, detail, expected) in [
+            (
+                1,
+                "provider HTTP 403: credit card token=secret",
+                "provider access denied (403)",
+            ),
+            (
+                2,
+                "provider quota exceeded",
+                "provider rate limit or quota exceeded (429)",
+            ),
+        ] {
+            let mut snapshot = base_snapshot("sess-provider", revision);
+            snapshot.turn = Some(GjcSdkTurn {
+                id: format!("turn-{revision}"),
+                state: GjcSdkTurnPhase::Failed,
+                prompt_accepted: true,
+                attempt: 0,
+                error_summary: Some(detail.to_string()),
+            });
+            let events = bridge.observe(&snapshot).unwrap().events;
+            assert_eq!(events[0].payload["error_message"], expected);
+            assert!(!events[0].payload.to_string().contains("secret"));
+        }
     }
 
     #[test]
@@ -972,6 +1315,9 @@ mod tests {
             revision: 3,
             status: GjcSdkGateStatus::Open,
             summary: Some("Approve the deploy?\nsecond line".to_string()),
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
         });
 
         let outcome = bridge.observe(&snapshot).unwrap();
@@ -1024,6 +1370,9 @@ mod tests {
             revision: 7,
             status: GjcSdkGateStatus::Open,
             summary: None,
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
         });
         let outcome = bridge.observe(&snapshot).unwrap();
         assert_eq!(
@@ -1046,6 +1395,9 @@ mod tests {
             revision: 2,
             status: GjcSdkGateStatus::Open,
             summary: None,
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
         });
         let outcome = bridge.observe(&snapshot).unwrap();
         assert_eq!(kinds(&outcome.events), vec!["workflow.gate".to_string()]);
@@ -1121,7 +1473,7 @@ mod tests {
         );
         assert_eq!(
             outcome.events[0].payload["error_message"],
-            Value::from("connect refused")
+            Value::from("sdk endpoint unavailable")
         );
 
         snapshot.revision = 42;
@@ -1154,6 +1506,39 @@ mod tests {
     }
 
     #[test]
+    fn alert_event_ids_ignore_local_snapshot_revisions() {
+        let mut first = base_snapshot("stable-id", 10);
+        first.turn = Some(turn("turn-1", GjcSdkTurnPhase::Failed, 0));
+        let mut second = first.clone();
+        second.revision = 11_000;
+        let left = GjcEventBridge::new().observe(&first).unwrap().events;
+        let right = GjcEventBridge::new().observe(&second).unwrap().events;
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 1);
+        assert_eq!(left[0].payload["event_id"], right[0].payload["event_id"]);
+
+        let mut prompt_a = base_snapshot("stable-prompt", 1);
+        prompt_a.turn = Some(turn("turn-1", GjcSdkTurnPhase::Active, 0));
+        prompt_a.prompt = Some(GjcSdkPrompt {
+            command_id: "command-1".to_string(),
+            status: GjcSdkPromptStatus::Accepted,
+        });
+        let mut prompt_b = prompt_a.clone();
+        prompt_b.revision = 99;
+        let left = GjcEventBridge::new().observe(&prompt_a).unwrap().events;
+        let right = GjcEventBridge::new().observe(&prompt_b).unwrap().events;
+        let left = left
+            .iter()
+            .find(|event| event.kind == "session.prompt-submitted")
+            .unwrap();
+        let right = right
+            .iter()
+            .find(|event| event.kind == "session.prompt-submitted")
+            .unwrap();
+        assert_eq!(left.payload["event_id"], right.payload["event_id"]);
+    }
+
+    #[test]
     fn restart_produces_identical_event_ids_for_ledger_dedupe() {
         let feed = || {
             let mut snapshots = Vec::new();
@@ -1172,6 +1557,9 @@ mod tests {
                 revision: 4,
                 status: GjcSdkGateStatus::Open,
                 summary: Some("Proceed?".to_string()),
+                workflow_id: None,
+                title: None,
+                options: Vec::new(),
             });
             snapshots.push(snapshot.clone());
             snapshot.revision = 3;
@@ -1235,6 +1623,7 @@ mod tests {
         snapshot.turn = Some(GjcSdkTurn {
             id: "t1".to_string(),
             state: GjcSdkTurnPhase::Failed,
+            prompt_accepted: true,
             attempt: 0,
             error_summary: Some("raw\r\nerror\twith control chars".to_string()),
         });
@@ -1254,7 +1643,7 @@ mod tests {
                 assert!(!summary.contains("secret-token-value"));
             }
             if let Some(error) = object.get("error_message").and_then(Value::as_str) {
-                assert_eq!(error, "raw error with control chars");
+                assert_eq!(error, "provider turn failed");
             }
         }
     }
@@ -1281,6 +1670,9 @@ mod tests {
             revision: 1,
             status: GjcSdkGateStatus::Open,
             summary: Some("Answer me?".to_string()),
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
         });
         snapshots.push(snapshot);
 
@@ -1322,6 +1714,9 @@ mod tests {
             revision: 1,
             status: GjcSdkGateStatus::Open,
             summary: None,
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
         });
         snapshot.endpoint = Some(GjcSdkEndpoint {
             health: GjcSdkEndpointHealth::Failed,
@@ -1354,10 +1749,126 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gate_replays_and_reopens_use_gate_revision_not_snapshot_revision() {
+        let mut bridge = GjcEventBridge::new();
+        let mut snapshot = base_snapshot("gate-replay", 1);
+        snapshot.gate = Some(GjcSdkGate {
+            id: "gate-1".to_string(),
+            kind: GjcSdkGateKind::Workflow,
+            revision: 7,
+            status: GjcSdkGateStatus::Open,
+            summary: None,
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
+        });
+        assert_eq!(bridge.observe(&snapshot).unwrap().events.len(), 1);
+
+        // A replay at a newer session revision is still the same gate episode.
+        snapshot.revision = 2;
+        assert!(bridge.observe(&snapshot).unwrap().events.is_empty());
+
+        // A lower gate revision cannot regress or create a second episode.
+        snapshot.revision = 3;
+        snapshot.gate.as_mut().unwrap().revision = 6;
+        assert!(bridge.observe(&snapshot).unwrap().events.is_empty());
+
+        // Resolution followed by a higher revision on the same id reopens it.
+        snapshot.revision = 4;
+        snapshot.gate.as_mut().unwrap().revision = 7;
+        snapshot.gate.as_mut().unwrap().status = GjcSdkGateStatus::Resolved;
+        assert!(bridge.observe(&snapshot).unwrap().events.is_empty());
+        snapshot.revision = 5;
+        snapshot.gate.as_mut().unwrap().revision = 8;
+        snapshot.gate.as_mut().unwrap().status = GjcSdkGateStatus::Open;
+        let reopened = bridge.observe(&snapshot).unwrap().events;
+        assert_eq!(kinds(&reopened), vec!["workflow.gate"]);
+        assert_eq!(reopened[0].payload["gate_revision"], Value::from(8));
+    }
+
+    #[test]
+    fn plural_ready_gates_are_rejected_before_event_mapping() {
+        let gate = |id: &str| crate::gjc::model::WorkflowGate {
+            gate_id: id.to_string(),
+            kind: None,
+            workflow_id: None,
+            state: crate::gjc::model::WorkflowGateState::Ready,
+            title: Some("Approve merge".to_string()),
+            options: Vec::new(),
+            raised_at: Some("2026-08-23T10:00:00Z".to_string()),
+        };
+        let mut query = control_query(crate::gjc::model::GjcPromptStatus::Running);
+        query.workflow_gates = Some(vec![gate("gate-1"), gate("gate-2")]);
+        let snapshot = snapshot_from_session_query("sess-9", 1, &query, &identity());
+        assert_eq!(
+            GjcEventBridge::new().observe(&snapshot).unwrap_err(),
+            "gjc_bridge_ambiguous_workflow_gates"
+        );
+    }
+
+    #[test]
+    fn malformed_gate_identity_or_revision_is_rejected() {
+        let mut bridge = GjcEventBridge::new();
+        let mut snapshot = base_snapshot("gate-invalid", 1);
+        snapshot.gate = Some(GjcSdkGate {
+            id: "gate invalid".to_string(),
+            kind: GjcSdkGateKind::Workflow,
+            revision: 1,
+            status: GjcSdkGateStatus::Open,
+            summary: None,
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
+        });
+        assert_eq!(
+            bridge.observe(&snapshot).unwrap_err(),
+            "gjc_bridge_invalid_gate_id"
+        );
+        snapshot.gate.as_mut().unwrap().id = "gate-1".to_string();
+        snapshot.gate.as_mut().unwrap().revision = 0;
+        assert_eq!(
+            bridge.observe(&snapshot).unwrap_err(),
+            "gjc_bridge_invalid_gate_revision"
+        );
+    }
+
+    #[test]
+    fn gate_summaries_redact_credential_aliases() {
+        for value in [
+            "authorization=secret",
+            "apikey: secret",
+            "api-key secret",
+            "private_key=secret",
+            "credential secret",
+            "passwd secret",
+            "auth: secret",
+        ] {
+            assert_eq!(public_text(value), "details redacted");
+        }
+    }
+
+    #[test]
+    fn contradictory_prompt_acceptance_fails_closed() {
+        let error = snapshot_from_response_payload(&json!({
+            "session_id": "sess-1",
+            "revision": 1,
+            "turn": {
+                "id": "turn-1",
+                "state": "active",
+                "prompt_accepted": true
+            },
+            "prompt": {"command_id": "turn-1", "status": "progressing"}
+        }))
+        .unwrap_err();
+        assert_eq!(error, "gjc_bridge_contradictory_prompt_acceptance");
+    }
+
     fn control_query(
         status: crate::gjc::model::GjcPromptStatus,
     ) -> crate::gjc::model::SessionQuery {
         crate::gjc::model::SessionQuery {
+            revision: None,
             metadata: Some(crate::gjc::model::SessionMetadata {
                 session_id: "sess-9".to_string(),
                 title: Some("issue 324 lane".to_string()),
@@ -1368,6 +1879,8 @@ mod tests {
                 provider_metadata: Default::default(),
             }),
             stats: None,
+            workflow_gates_present: false,
+            turn_present: true,
             model_profile: Some(crate::gjc::model::SessionModelProfile {
                 model: "model-a".to_string(),
                 profile: Some("profile-x".to_string()),
@@ -1376,6 +1889,7 @@ mod tests {
             turn: Some(crate::gjc::model::SessionTurn {
                 turn_id: "t1".to_string(),
                 status,
+                prompt_accepted: true,
                 started_at: None,
                 finished_at: None,
                 outcome: Some(crate::gjc::model::SessionTurnOutcome {
@@ -1458,10 +1972,11 @@ mod tests {
          -> crate::gjc::model::WorkflowGate {
             crate::gjc::model::WorkflowGate {
                 gate_id: "gate-1".to_string(),
-                workflow_id: None,
+                kind: Some("ask".to_string()),
+                workflow_id: Some("workflow-1".to_string()),
                 state,
                 title: Some("Approve merge".to_string()),
-                options: Vec::new(),
+                options: vec!["approve".to_string(), "reject".to_string()],
                 raised_at: Some(raised_at.to_string()),
             }
         };
@@ -1476,23 +1991,24 @@ mod tests {
         let open = snapshot_from_session_query("sess-9", 10, &query, &identity());
         let gate_state = open.gate.as_ref().unwrap();
         assert_eq!(gate_state.status, GjcSdkGateStatus::Open);
-        assert_eq!(gate_state.revision, 1787479200);
+        assert_eq!(gate_state.revision, 1_787_479_200_000_000_000);
         let events = bridge.observe(&open).unwrap().events;
         assert!(
-            kinds(&events).contains(&"workflow.gate".to_string()),
+            kinds(&events)
+                .iter()
+                .any(|kind| kind == "workflow.question"),
             "{:?}",
             kinds(&events)
         );
         let gate_event = events
             .iter()
-            .find(|event| event.kind == "workflow.gate")
+            .find(|event| event.kind == "workflow.question")
             .unwrap();
         // The adapter maps the #323 WorkflowGate concept onto the workflow gate
         // route key; ask-style questions arrive through the ask surface.
-        assert_eq!(
-            gate_event.payload["question"]["kind"],
-            Value::from("workflow")
-        );
+        assert_eq!(gate_event.payload["question"]["kind"], Value::from("ask"));
+        assert_eq!(gate_event.payload["question"]["workflow_id"], "workflow-1");
+        assert_eq!(gate_event.payload["question"]["options"][0], "approve");
 
         // Same revision again: quiet.
         assert!(bridge.observe(&open).unwrap().events.is_empty());
@@ -1517,13 +2033,15 @@ mod tests {
         let reopened = snapshot_from_session_query("sess-9", 12, &query, &identity());
         let events = bridge.observe(&reopened).unwrap().events;
         assert!(
-            kinds(&events).contains(&"workflow.gate".to_string()),
+            kinds(&events)
+                .iter()
+                .any(|kind| kind == "workflow.question"),
             "{:?}",
             kinds(&events)
         );
         assert_eq!(
             events[0].payload["gate_revision"],
-            Value::from(1787484600u64)
+            Value::from(1_787_484_600_000_000_000u64)
         );
     }
 
@@ -1642,6 +2160,9 @@ mod tests {
             revision: 2,
             status: GjcSdkGateStatus::Open,
             summary: Some("Ship it?".to_string()),
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
         });
         let outcome = bridge.observe(&snapshot).unwrap();
         let event = &outcome.events[0];
@@ -1673,6 +2194,9 @@ mod tests {
             revision: 1,
             status: GjcSdkGateStatus::Open,
             summary: None,
+            workflow_id: None,
+            title: None,
+            options: Vec::new(),
         });
         let outcome = bridge.observe(&snapshot).unwrap();
         assert_eq!(kinds(&outcome.events), vec!["workflow.gate".to_string()]);
@@ -1723,6 +2247,7 @@ mod tests {
             id: "t1".to_string(),
             state: GjcSdkTurnPhase::Failed,
             attempt: 0,
+            prompt_accepted: true,
             error_summary: Some("boom".to_string()),
         });
         let failed = &bridge.observe(&snapshot).unwrap().events[0];
@@ -1731,6 +2256,6 @@ mod tests {
             .render(failed, &MessageFormat::Alert)
             .unwrap();
         assert!(content.contains("gjc sess-1 failed"), "{content}");
-        assert!(content.contains("error=boom"), "{content}");
+        assert!(content.contains("error=provider turn failed"), "{content}");
     }
 }

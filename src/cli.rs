@@ -844,6 +844,8 @@ pub enum GjcCommands {
     },
     /// Replay the receipt of an accepted command by idempotency key.
     Receipt {
+        /// GJC session id bound to the receipt.
+        session: String,
         /// Idempotency key used when the command was accepted.
         #[arg(long)]
         idempotency_key: String,

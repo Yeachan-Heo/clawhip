@@ -159,6 +159,20 @@ impl EndpointMetadata {
         self.stale
     }
 
+    /// Stable opaque generation fingerprint for durable consumers. It never
+    /// exposes the URL or token, but changes whenever endpoint metadata does.
+    pub fn generation(&self) -> u64 {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(
+            format!(
+                "{}\0{}\0{:?}\0{}",
+                self.url, self.token, self.pid, self.stale
+            )
+            .as_bytes(),
+        );
+        u64::from_be_bytes(digest[..8].try_into().expect("fixed digest length"))
+    }
+
     /// Authenticated websocket URL with the token applied as a query param.
     fn authenticated_url(&self) -> Result<Url> {
         let mut url = Url::parse(&self.url).map_err(|_| SdkTransportError::EndpointMalformed)?;
@@ -493,6 +507,43 @@ pub fn discover(root: &StateRoot) -> Result<Discovery> {
         return Ok(Discovery::Malformed);
     }
     Ok(Discovery::NoMetadata)
+}
+
+/// Discover every live native SDK endpoint under one trusted worktree.
+/// Unlike [`discover`], this is the enrollment surface and never chooses a
+/// single "best" session; each filename remains the authoritative identity.
+pub fn discover_all(root: &StateRoot) -> Result<Vec<EndpointMetadata>> {
+    let sdk_dir = match root.validate_components() {
+        Ok(sdk_dir) => sdk_dir,
+        Err(error)
+            if error
+                .downcast_ref::<SdkTransportError>()
+                .is_some_and(|e| *e == SdkTransportError::EndpointUnavailable) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut live = Vec::new();
+    for entry in std::fs::read_dir(sdk_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json")
+            || validate_metadata_file(&path).is_err()
+        {
+            continue;
+        }
+        let Ok(contents) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(metadata) = parse_metadata_file(&path, &contents) else {
+            continue;
+        };
+        if !metadata.stale() && metadata.pid().is_none_or(process_alive) {
+            live.push(metadata);
+        }
+    }
+    live.sort_by(|left, right| left.session_id().cmp(right.session_id()));
+    Ok(live)
 }
 
 /// Bounded transport configuration.
@@ -903,6 +954,9 @@ impl SdkClient {
                     let connection_lost = error
                         .downcast_ref::<SdkTransportError>()
                         .is_some_and(|e| *e == SdkTransportError::ConnectionClosed);
+                    if connection_lost && request.frame_type == "control_request" {
+                        return Err(SdkTransportError::ConnectionClosed.into());
+                    }
                     if !(connection_lost && attempts <= self.limits.max_reconnect_attempts) {
                         if connection_lost {
                             return Err(SdkTransportError::RetryExhausted.into());
@@ -948,6 +1002,10 @@ async fn exchange(
             return Err(SdkTransportError::FrameRejected.into());
         };
         let response = parse_response(&text, limits)?;
+
+        if response.frame_type == "notification" {
+            continue;
+        }
         match response.id.as_deref() {
             Some(id) if id == request.correlation_id() => {
                 if response.frame_type != request.response_frame_type() {
