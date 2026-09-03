@@ -951,11 +951,51 @@ curl -s localhost:25294/health | jq .build
 
 Compare `build.commit` against the revision you expect to have deployed to
 confirm a rollout landed instead of inferring it from a green repository state.
+When `[update].repo_root` is configured the daemon makes that comparison
+itself — see [Deployment drift alerts](#deployment-drift-alerts).
 `commit_source` is `git` for checkout builds, `environment` when a packaging
 pipeline supplies `CLAWHIP_BUILD_COMMIT` (or CI supplies `GITHUB_SHA`), and
 `unavailable` when no revision could be determined. Only the commit object
 name, a dirty flag, and that source are exposed — no branches, paths, or
 hostnames. A build without `git` or outside a checkout still succeeds.
+
+## Deployment drift alerts
+
+Knowing the build revision only helps if somebody compares it. When
+`[update].repo_root` points at the source checkout, the daemon does that
+comparison itself every 5 minutes and alerts once per newly observed drift
+pair:
+
+```
+clawhip deployment drift: running binary was built from c4774562c6b0,
+but the source checkout is at dd1494cc0f4d.
+The running service is not the code in the checkout; rebuild and restart to deploy it.
+```
+
+The alert is delivered like any other custom event (`[update].channel` selects
+the target), and the latest observation is always readable:
+
+```bash
+curl -s localhost:25294/health | jq .deployment
+# { "state": "drift", "binary_commit": "c4774562...", "source_commit": "dd1494cc...", "reason": null }
+```
+
+`state` is one of:
+
+| state | meaning |
+| --- | --- |
+| `match` | the running binary was built from the checkout's current `HEAD` |
+| `drift` | the binary was built from a different revision; **alerts** |
+| `unknown` | not comparable; never alerts, and `reason` says why |
+
+`unknown` is deliberate rather than a silent pass. It is reported when no
+checkout is configured, when `HEAD` is unreadable (missing directory, not a
+repository), when the binary carries no stamped revision (e.g. a crates.io or
+tarball build), or when the binary was built from a modified tree — a `-dirty`
+build provably is not exactly its commit, so it is never called a match.
+
+Only commit object names are exposed; the checkout path never appears in an
+event payload or on the health surface.
 
 ## Live verification runbook
 

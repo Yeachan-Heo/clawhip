@@ -279,6 +279,17 @@ pub async fn run(
             update::run_checker(config, tx, pending).await;
         });
     }
+    {
+        // Detect a running binary that no longer matches its source checkout,
+        // so a merged-but-undeployed fix reports itself instead of waiting for
+        // an operator to compare revisions by hand.
+        let config = config.clone();
+        let tx = tx.clone();
+        let report = crate::deployment::shared_drift_report();
+        tokio::spawn(async move {
+            crate::deployment::run_checker(config, tx, report).await;
+        });
+    }
     let gjc_registry = crate::gjc::control::new_shared_command_registry();
     let gjc_control = match std::env::current_dir() {
         Ok(cwd) => Arc::new(crate::gjc::control::GjcControlPlane::for_worktree(
@@ -810,6 +821,11 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let git_monitors = snapshot_git_monitor_diagnostics(&state.git_monitor_diagnostics);
     let github_monitor_auth =
         snapshot_github_monitor_auth_status(&new_shared_github_monitor_auth_status());
+    let deployment = crate::deployment::shared_drift_report()
+        .read()
+        .await
+        .as_ref()
+        .map(crate::deployment::DriftReport::payload);
     let mut payload = health_payload(
         state.config.as_ref(),
         state.port,
@@ -824,6 +840,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "github_monitor_auth".to_string(),
             json!(github_monitor_auth),
         );
+        if let Some(deployment) = deployment {
+            object.insert("deployment".to_string(), deployment);
+        }
     }
     Json(payload)
 }
