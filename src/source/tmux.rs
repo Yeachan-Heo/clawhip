@@ -4533,32 +4533,45 @@ error: failed";
 
     #[test]
     fn stale_minutes_zero_disables_stale_detection() {
+        // Advance the observation instant instead of rewinding `Instant::now()`:
+        // `Instant` is monotonic-since-boot, so subtracting an hour panics on a
+        // host that booted less than an hour ago.
+        let last_change = Instant::now();
         let pane = TmuxPaneState {
             session: "test".into(),
             pane_name: "0.0".into(),
             snapshot: String::new(),
             content_hash: 0,
-            last_change: Instant::now() - Duration::from_secs(3600),
+            last_change,
             last_stale_notification: None,
             pane_dead: false,
         };
         // stale_minutes=0 should never emit, even after 1 hour idle
-        assert!(!should_emit_stale(&pane, Instant::now(), 0));
+        assert!(!should_emit_stale(
+            &pane,
+            last_change + Duration::from_secs(3600),
+            0
+        ));
     }
 
     #[test]
     fn stale_minutes_nonzero_still_emits() {
+        let last_change = Instant::now();
         let pane = TmuxPaneState {
             session: "test".into(),
             pane_name: "0.0".into(),
             snapshot: String::new(),
             content_hash: 0,
-            last_change: Instant::now() - Duration::from_secs(3600),
+            last_change,
             last_stale_notification: None,
             pane_dead: false,
         };
         // stale_minutes=1 should emit after 1 hour idle
-        assert!(should_emit_stale(&pane, Instant::now(), 1));
+        assert!(should_emit_stale(
+            &pane,
+            last_change + Duration::from_secs(3600),
+            1
+        ));
     }
 
     #[test]
@@ -4574,17 +4587,22 @@ error: failed";
 
     #[test]
     fn pane_dead_suppresses_stale_alert() {
+        let last_change = Instant::now();
         let pane = TmuxPaneState {
             session: "test".into(),
             pane_name: "0.0".into(),
             snapshot: String::new(),
             content_hash: 0,
-            last_change: Instant::now() - Duration::from_secs(3600),
+            last_change,
             last_stale_notification: None,
             pane_dead: true,
         };
         // Dead pane should never emit stale, even after 1 hour idle
-        assert!(!should_emit_stale(&pane, Instant::now(), 1));
+        assert!(!should_emit_stale(
+            &pane,
+            last_change + Duration::from_secs(3600),
+            1
+        ));
     }
 
     #[tokio::test]
