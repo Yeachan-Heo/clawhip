@@ -1,7 +1,7 @@
 use std::fmt;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -737,6 +737,19 @@ impl DiscordClient {
         })
     }
 
+    /// Borrow the shared Discord delivery state, tolerating lock poisoning.
+    ///
+    /// A panic inside one Discord critical section must not permanently brick
+    /// delivery for the rest of the daemon's lifetime. The guarded state is a
+    /// rate limiter, per-target circuit breakers, and the DLQ buffer: all
+    /// individually recoverable, so recovering the poisoned guard degrades to
+    /// possibly-stale counters instead of an unrecoverable panic loop on every
+    /// later send. This matches the poison-tolerant locking already used by
+    /// the daemon, dispatch, lane, and subscription paths.
+    fn state(&self) -> MutexGuard<'_, DiscordState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn allow_request(
         &self,
         key: &str,
@@ -744,7 +757,7 @@ impl DiscordClient {
         bool,
         Option<crate::core::circuit_breaker::CircuitTransition>,
     ) {
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state
             .circuits
             .entry(key.to_string())
@@ -758,12 +771,12 @@ impl DiscordClient {
     }
 
     fn rate_limit_delay(&self, key: &str) -> Duration {
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state.limiter.delay_for(key)
     }
 
     fn record_success(&self, key: &str) -> Option<crate::core::circuit_breaker::CircuitTransition> {
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state
             .circuits
             .entry(key.to_string())
@@ -777,7 +790,7 @@ impl DiscordClient {
     }
 
     fn record_failure(&self, key: &str) -> Option<crate::core::circuit_breaker::CircuitTransition> {
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state
             .circuits
             .entry(key.to_string())
@@ -842,7 +855,7 @@ impl DiscordClient {
                 .unwrap_or_else(|_| "{\"error\":\"dlq serialize failed\"}".to_string())
         );
 
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state.dlq.push(entry);
     }
 
@@ -876,12 +889,17 @@ impl DiscordClient {
 
     #[cfg(test)]
     fn dlq_entries(&self) -> Vec<DlqEntry> {
-        self.state
-            .lock()
-            .expect("discord state lock")
-            .dlq
-            .entries()
-            .to_vec()
+        self.state().dlq.entries().to_vec()
+    }
+
+    #[cfg(test)]
+    fn poison_state_for_tests(&self) {
+        let state = Arc::clone(&self.state);
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+            panic!("poison discord state");
+        })
+        .join();
     }
 }
 
@@ -1579,6 +1597,35 @@ mod tests {
         );
         assert!(!error.to_string().contains(sentinel));
         assert!(!format!("{error:?}").contains(sentinel));
+    }
+
+    #[test]
+    fn poisoned_delivery_state_still_serves_limiter_circuit_and_dlq() {
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", "http://127.0.0.1:1".to_string())
+                .unwrap();
+
+        // Baseline: a healthy client admits requests and holds an empty DLQ.
+        let (allowed, _) = client.allow_request("channel:poison");
+        assert!(allowed);
+
+        client.poison_state_for_tests();
+
+        // After poisoning, every state-touching path must keep working instead
+        // of panicking for the rest of the daemon's lifetime.
+        let (allowed_after, _) = client.allow_request("channel:poison");
+        assert!(allowed_after);
+        assert_eq!(client.rate_limit_delay("channel:poison"), Duration::ZERO);
+        assert!(client.record_success("channel:poison").is_none());
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            client.record_failure("channel:poison");
+        }
+        let (allowed_open, _) = client.allow_request("channel:poison");
+        assert!(
+            !allowed_open,
+            "circuit must still open on a recovered poisoned state"
+        );
+        assert!(client.dlq_entries().is_empty());
     }
 
     #[tokio::test]
