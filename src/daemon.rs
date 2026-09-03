@@ -156,11 +156,16 @@ pub async fn run(
 ) -> Result<()> {
     config.validate()?;
     let token_source = config.discord_token_source();
-    println!("clawhip v{VERSION} starting (token_source: {token_source})");
+    let build = crate::build_info::stamp();
+    println!(
+        "clawhip v{} starting (token_source: {token_source})",
+        build.describe()
+    );
     telemetry::emit(daemon_record(
         telemetry::reason::DAEMON_STARTUP,
         json!({
             "version": VERSION,
+            "build": build.payload(),
             "token_source": token_source,
             "http_routes_configured": config.has_http_routes(),
         }),
@@ -851,6 +856,11 @@ fn health_payload(
     json!({
         "ok": !subscription_degraded && !git_degraded,
         "version": VERSION,
+        // Build provenance of the running binary. `version` alone cannot
+        // distinguish a freshly deployed daemon from one still running a
+        // binary built several merges ago, which is how deployment drift
+        // stayed invisible behind a green repository backlog.
+        "build": crate::build_info::stamp().payload(),
         "token_source": config.discord_token_source(),
         "token_precedence_warning": config.discord_token_env_shadow().map(discord_token_shadow_warning),
         "github_monitor_auth": {
@@ -3864,6 +3874,31 @@ mod tests {
         assert_eq!(payload["token_precedence_warning"], Value::Null);
         assert_eq!(payload["http_routes_configured"], Value::Bool(false));
         assert_eq!(payload["expected_discord_bot_id"], Value::Null);
+
+        // Deployment drift is only detectable if the running binary reports
+        // which revision it was built from, not just the crate version.
+        let build = &payload["build"];
+        assert_eq!(build["version"], Value::String(VERSION.to_string()));
+        assert!(build["dirty"].is_boolean());
+        assert!(
+            matches!(
+                build["commit_source"].as_str(),
+                Some("git" | "environment" | "unavailable")
+            ),
+            "unexpected build commit source: {build}"
+        );
+        assert_eq!(
+            build["commit"].is_null(),
+            build["short_commit"].is_null(),
+            "build revision fields must agree: {build}"
+        );
+        if let Some(commit) = build["commit"].as_str() {
+            assert!(commit.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(commit.starts_with(build["short_commit"].as_str().unwrap()));
+        }
+        // The stamp must stay public-safe: no paths, branches, or hostnames.
+        let rendered = build.to_string();
+        assert!(!rendered.contains('/'), "build stamp leaked a path");
     }
 
     #[test]

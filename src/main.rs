@@ -1,4 +1,5 @@
 mod binding_verify;
+mod build_info;
 mod cli;
 mod client;
 mod config;
