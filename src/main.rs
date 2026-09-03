@@ -6,6 +6,7 @@ mod config;
 mod core;
 mod cron;
 mod daemon;
+mod deployment;
 mod discord;
 mod discord_watch;
 mod dispatch;
