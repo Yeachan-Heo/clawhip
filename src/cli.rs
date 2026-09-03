@@ -14,7 +14,10 @@ pub const DEFAULT_DELIVER_MAX_ENTERS: u32 = crate::hooks::prompt_deliver::DEFAUL
 #[derive(Debug, Parser)]
 #[command(
     name = "clawhip",
-    version,
+    // Stamp the build revision, not just the crate version: the version only
+    // moves on release, so it cannot distinguish a freshly deployed binary
+    // from one built several merges earlier.
+    version = crate::build_info::version_line(),
     about = "Daemon-first event gateway for Discord"
 )]
 pub struct Cli {

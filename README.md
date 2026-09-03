@@ -931,6 +931,32 @@ Expected install path:
 - `systemctl daemon-reload`
 - `systemctl enable --now clawhip`
 
+## Deployed build identity
+
+The crate version only changes on release, so `clawhip 0.6.11` cannot tell a
+freshly deployed daemon apart from one still running a binary built several
+merges earlier. Every build therefore stamps the source revision it was built
+from, and both the CLI and the daemon report it:
+
+```bash
+clawhip --version
+# clawhip 0.6.11 (7bad9d24df18)          built from that commit
+# clawhip 0.6.11 (7bad9d24df18-dirty)   build tree had uncommitted changes
+# clawhip 0.6.11                        revision unavailable (e.g. source tarball)
+
+curl -s localhost:25294/health | jq .build
+# { "version": "0.6.11", "commit": "7bad9d24df18...", "short_commit": "7bad9d24df18",
+#   "dirty": false, "commit_source": "git" }
+```
+
+Compare `build.commit` against the revision you expect to have deployed to
+confirm a rollout landed instead of inferring it from a green repository state.
+`commit_source` is `git` for checkout builds, `environment` when a packaging
+pipeline supplies `CLAWHIP_BUILD_COMMIT` (or CI supplies `GITHUB_SHA`), and
+`unavailable` when no revision could be determined. Only the commit object
+name, a dirty flag, and that source are exposed — no branches, paths, or
+hostnames. A build without `git` or outside a checkout still succeeds.
+
 ## Live verification runbook
 
 Use:
@@ -957,6 +983,7 @@ Required live sign-off presets:
 
 ```bash
 clawhip                 # start daemon
+clawhip --version       # crate version + build revision of this binary
 clawhip status          # daemon health
 clawhip config          # bounded preset editor / config inspection
 clawhip config verify-gateway-allowlist  # check Clawdbot gateway allowlist coverage
