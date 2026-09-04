@@ -485,7 +485,7 @@ async fn real_main(cli: Cli) -> Result<()> {
         },
         Commands::Plugin { command } => match command {
             PluginCommands::List => {
-                let plugins_dir = plugins::default_plugins_dir()?;
+                let plugins_dir = plugins::default_plugins_dir(&config_path)?;
                 let discovered = plugins::load_plugins(&plugins_dir)?;
 
                 if discovered.is_empty() {

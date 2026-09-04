@@ -40,6 +40,7 @@ pub fn load(config_path: &Path) -> Result<Option<String>> {
         return Err(error.into());
     }
     platform::with_state_dir(config_path, false, |state_dir| {
+        let _lock = platform::lock_shared(state_dir)?;
         let records = platform::records(state_dir)?;
         let mut latest = None;
         for record in records {
@@ -61,13 +62,6 @@ where
     platform::with_state_dir(config_path, true, |state_dir| {
         let _lock = platform::lock(state_dir)?;
         let records = platform::record_names(state_dir)?;
-        let generation = records
-            .iter()
-            .filter_map(|record| record_generation(record))
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("managed source checkout generation overflow")?;
         let mut valid_records = Vec::with_capacity(records.len());
         for record in records {
             if managed_record_is_valid(state_dir, &record) {
@@ -76,6 +70,13 @@ where
                 platform::cleanup_records(state_dir, &[record], 0)?;
             }
         }
+        let generation = valid_records
+            .iter()
+            .filter_map(|record| record_generation(record))
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("managed source checkout generation overflow")?;
         let state = SourceCheckoutState {
             generation,
             repo_root: path_string(&canonical)?,
@@ -153,7 +154,7 @@ pub(crate) fn validate_checkout(path: &Path) -> Result<PathBuf> {
     {
         return Err("managed repo_root Cargo package is not clawhip".into());
     }
-    let output = Command::new("git")
+    let output = isolated_git_command()
         .arg("-C")
         .arg(&canonical)
         .args(["rev-parse", "--show-toplevel"])
@@ -161,11 +162,27 @@ pub(crate) fn validate_checkout(path: &Path) -> Result<PathBuf> {
     if !output.status.success() {
         return Err("managed repo_root is not a git worktree".into());
     }
-    let git_root = fs::canonicalize(String::from_utf8(output.stdout)?.trim())?;
+    let git_output = String::from_utf8(output.stdout)?;
+    let git_root = fs::canonicalize(git_output.trim_end_matches(['\r', '\n']))?;
     if git_root != canonical {
         return Err("managed repo_root must be the git worktree root".into());
     }
     Ok(canonical)
+}
+
+pub(crate) fn isolated_git_command() -> Command {
+    let mut command = Command::new("git");
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(variable);
+    }
+    command
 }
 
 fn path_string(path: &Path) -> Result<String> {
@@ -267,33 +284,57 @@ mod platform {
     }
 
     pub fn lock(dir: &StateDir) -> Result<StateLock> {
+        lock_file(dir, true, true)
+    }
+
+    pub fn lock_shared(dir: &StateDir) -> Result<StateLock> {
+        lock_file(dir, false, false)
+    }
+
+    fn lock_file(dir: &StateDir, create: bool, exclusive: bool) -> Result<StateLock> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let file = linux::open_lock(dir, LOCK_NAME)?;
+        let file = linux::open_lock(dir, LOCK_NAME, create)?;
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         let file = {
             use std::os::unix::fs::OpenOptionsExt;
 
-            OpenOptions::new()
+            let mut options = OpenOptions::new();
+            options
                 .read(true)
                 .write(true)
-                .create(true)
                 .truncate(false)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(dir.path.join(LOCK_NAME))?
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            options.create(create).open(dir.path.join(LOCK_NAME))?
         };
         #[cfg(windows)]
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.path.join(LOCK_NAME))?;
+        let file = {
+            let path = dir.path.join(LOCK_NAME);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err("managed source checkout lock is not a regular file".into());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {}
+                Err(error) => return Err(error.into()),
+            }
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .create(create);
+            options.open(path)?
+        };
         if !file.metadata()?.is_file() {
             return Err("managed source checkout lock is not a regular file".into());
         }
         validate_private_file(&file.metadata()?, "lock")?;
-        file.lock_exclusive()?;
+        if exclusive {
+            file.lock_exclusive()?;
+        } else {
+            FileExt::lock_shared(&file)?;
+        }
         Ok(StateLock(file))
     }
 
@@ -342,9 +383,6 @@ mod platform {
         ));
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let read_path = dir.path.clone();
-        if !read_path.exists() {
-            return Ok(Vec::new());
-        }
         let mut records = Vec::new();
         for entry in fs::read_dir(read_path)? {
             let entry = entry?;
@@ -373,7 +411,14 @@ mod platform {
                 .open(dir.path.join(name))?
         };
         #[cfg(windows)]
-        let mut file = OpenOptions::new().read(true).open(dir.path.join(name))?;
+        let mut file = {
+            let path = dir.path.join(name);
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("managed source checkout record has invalid size or type".into());
+            }
+            OpenOptions::new().read(true).open(path)?
+        };
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let metadata = file.metadata()?;
@@ -426,13 +471,24 @@ mod platform {
         }
         #[cfg(windows)]
         {
-            let path = dir.path.join(name);
-            let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+            let temp_path = dir
+                .path
+                .join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
             file.write_all(bytes)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
-            before_publish()?;
-            File::open(&dir.path)?.sync_all()?;
+            if let Err(error) = before_publish() {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+            if let Err(error) = fs::rename(&temp_path, dir.path.join(name)) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error.into());
+            }
             Ok(())
         }
     }
@@ -494,13 +550,14 @@ mod platform {
             Ok(unsafe { File::from_raw_fd(fd) })
         }
 
-        pub fn open_lock(dir: &StateDir, name: &str) -> Result<File> {
+        pub fn open_lock(dir: &StateDir, name: &str, create: bool) -> Result<File> {
+            let create_flag = if create { libc::O_CREAT } else { 0 };
             let fd = unsafe {
                 libc::openat(
                     dir.file.as_raw_fd(),
                     c_name(name)?.as_ptr(),
                     libc::O_RDWR
-                        | libc::O_CREAT
+                        | create_flag
                         | libc::O_NONBLOCK
                         | libc::O_NOFOLLOW
                         | libc::O_CLOEXEC,
@@ -570,7 +627,13 @@ mod platform {
                 )
             };
             if fd < 0 {
-                return Err(std::io::Error::last_os_error().into());
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error().is_some_and(|code| {
+                    [libc::EOPNOTSUPP, libc::EINVAL, libc::EISDIR, libc::ENOSYS].contains(&code)
+                }) {
+                    return publish_named_temp(dir, name, bytes, before_publish);
+                }
+                return Err(error.into());
             }
             let mut file = unsafe { File::from_raw_fd(fd) };
             file.write_all(bytes)?;
@@ -601,6 +664,61 @@ mod platform {
                 {
                     return Err(std::io::Error::last_os_error().into());
                 }
+            }
+            dir.file.sync_all()?;
+            Ok(())
+        }
+
+        fn publish_named_temp<F>(
+            dir: &StateDir,
+            name: &str,
+            bytes: &[u8],
+            before_publish: &mut F,
+        ) -> Result<()>
+        where
+            F: FnMut() -> Result<()>,
+        {
+            let temp_name = format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple());
+            let temp = c_name(&temp_name)?;
+            let fd = unsafe {
+                libc::openat(
+                    dir.file.as_raw_fd(),
+                    temp.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let operation = (|| -> Result<()> {
+                file.write_all(bytes)?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                before_publish()?;
+                if unsafe {
+                    libc::linkat(
+                        dir.file.as_raw_fd(),
+                        temp.as_ptr(),
+                        dir.file.as_raw_fd(),
+                        c_name(name)?.as_ptr(),
+                        0,
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                Ok(())
+            })();
+            let cleanup = unsafe { libc::unlinkat(dir.file.as_raw_fd(), temp.as_ptr(), 0) };
+            operation?;
+            if cleanup != 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
             dir.file.sync_all()?;
             Ok(())
@@ -813,6 +931,28 @@ mod tests {
                 .effective_update_repo_root(),
             checkout_path.to_str()
         );
+    }
+
+    #[test]
+    fn malformed_max_generation_record_can_be_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout_path = dir.path().join("checkout");
+        checkout(&checkout_path);
+        let config_path = dir.path().join("config.toml");
+        create_managed_state_dir(&config_path);
+        fs::write(
+            state_dir_for_config(&config_path).join(format!(
+                "state-{:020}-00000000000000000000000000000001.json",
+                u64::MAX
+            )),
+            "not json",
+        )
+        .unwrap();
+
+        persist(&config_path, &checkout_path).unwrap();
+        let records = platform::with_state_dir(&config_path, false, platform::records).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(record_generation(&records[0]), Some(1));
     }
 
     #[test]

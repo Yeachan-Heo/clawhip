@@ -58,6 +58,54 @@ star_prompt_disabled() {
   is_truthy "${CLAWHIP_SKIP_STAR_PROMPT:-}" || is_truthy "${SKIP_STAR_PROMPT:-}"
 }
 
+selected_config_path() {
+  local config_path="${CLAWHIP_CONFIG:-}"
+  if [[ -z "$config_path" ]]; then
+    config_path="$HOME/.clawhip/config.toml"
+  elif [[ "$config_path" != /* ]]; then
+    config_path="$INVOCATION_CWD/$config_path"
+  fi
+  printf '%s\n' "$config_path"
+}
+
+validate_source_checkout() {
+  if [[ -L "$REPO_ROOT/Cargo.toml" || ! -f "$REPO_ROOT/Cargo.toml" ]]; then
+    log "source checkout Cargo.toml is missing or is a symlink"
+    return 1
+  fi
+  if [[ -L "$REPO_ROOT/src" || ! -d "$REPO_ROOT/src" ]]; then
+    log "source checkout src marker is missing or is a symlink"
+    return 1
+  fi
+
+  local git_root
+  git_root="$(
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+      -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+      git -C "$REPO_ROOT" rev-parse --show-toplevel
+  )" || {
+    log "source checkout is not a git worktree"
+    return 1
+  }
+  if [[ "$git_root" != "$REPO_ROOT" ]]; then
+    log "source checkout is not the git worktree root"
+    return 1
+  fi
+
+  local package_id
+  package_id="$(cargo pkgid --manifest-path "$REPO_ROOT/Cargo.toml")" || {
+    log "unable to inspect source checkout Cargo package"
+    return 1
+  }
+  case "$package_id" in
+    *'#clawhip@'*) ;;
+    *)
+      log "source checkout Cargo package is not clawhip"
+      return 1
+      ;;
+  esac
+}
+
 is_interactive_install() {
   [[ -t 0 && -t 1 ]]
 }
@@ -148,6 +196,7 @@ MSG
     exit 1
   fi
 
+  validate_source_checkout
   log "building from source with cargo install --path . --force"
   cd "$REPO_ROOT"
   cargo install --path . --force
@@ -163,23 +212,17 @@ record_source_checkout() {
     return 1
   }
   log "recording validated source checkout"
-  config_path="${CLAWHIP_CONFIG:-}"
-  if [[ -n "$config_path" && "$config_path" != /* ]]; then
-    config_path="$INVOCATION_CWD/$config_path"
-  fi
+  config_path="$(selected_config_path)"
   (
     cd "$REPO_ROOT"
-    if [[ -n "$config_path" ]]; then
-      "$binary_path" --config "$config_path" install --record-source-checkout-only
-    else
-      "$binary_path" install --record-source-checkout-only
-    fi
+    "$binary_path" --config "$config_path" install --record-source-checkout-only
   )
 }
 
 sync_plugins() {
   local source_dir="$REPO_ROOT/plugins"
-  local target_dir="$HOME/.clawhip/plugins"
+  local target_dir
+  target_dir="$(dirname "$(selected_config_path)")/plugins"
 
   if [[ ! -d "$source_dir" ]]; then
     return 0
@@ -209,7 +252,8 @@ setup_quick_start() {
   local binary_path
   binary_path="$(installed_binary_path)" || return 0
 
-  local config_path="$HOME/.clawhip/config.toml"
+  local config_path
+  config_path="$(selected_config_path)"
   if [[ -f "$config_path" ]]; then
     log "existing config found at $config_path; skipping quick-start scaffold"
     return 0
@@ -223,7 +267,7 @@ setup_quick_start() {
 
   if [[ -n "${webhook_url// }" ]]; then
     log "scaffolding webhook quick-start config"
-    "$binary_path" setup --webhook "$webhook_url"
+    "$binary_path" --config "$config_path" setup --webhook "$webhook_url"
     log "webhook config scaffolded at $config_path"
   else
     log "recommended quick start: clawhip setup --webhook 'https://discord.com/api/webhooks/...'"
@@ -254,8 +298,10 @@ main() {
     install_from_source
   fi
 
-  mkdir -p "$HOME/.clawhip"
-  log "ensured config dir $HOME/.clawhip"
+  local config_path
+  config_path="$(selected_config_path)"
+  mkdir -p "$(dirname "$config_path")"
+  log "ensured config dir $(dirname "$config_path")"
   sync_plugins
   log "next: read SKILL.md and attach the skill surface"
   setup_quick_start

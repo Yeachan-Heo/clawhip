@@ -17,9 +17,9 @@ pub fn install(systemd: bool, skip_star_prompt: bool, config_path: &Path) -> Res
         .arg("install")
         .arg("--path")
         .arg(&repo_root))?;
-    ensure_config_dir()?;
-    plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
+    let config_parent = ensure_selected_config_parent(config_path)?;
     source_checkout::persist(config_path, &repo_root)?;
+    plugins::install_bundled_plugins(&config_parent.join("plugins"))?;
     if systemd {
         install_systemd(&repo_root)?;
     }
@@ -30,23 +30,7 @@ pub fn install(systemd: bool, skip_star_prompt: bool, config_path: &Path) -> Res
 
 pub fn record_source_checkout(config_path: &Path) -> Result<()> {
     let repo_root = current_repo_root()?;
-    let config_parent = config_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(config_parent).with_context(|| {
-        format!(
-            "failed to create selected config directory {}",
-            config_parent.display()
-        )
-    })?;
-    if !fs::metadata(config_parent)?.is_dir() {
-        return Err(anyhow!(
-            "selected config parent is not a directory: {}",
-            config_parent.display()
-        )
-        .into());
-    }
+    ensure_selected_config_parent(config_path)?;
     source_checkout::persist(config_path, &repo_root)?;
     println!("Recorded source checkout {}", repo_root.display());
     Ok(())
@@ -78,19 +62,20 @@ fn resolve_update_repo_root(explicit_root: Option<&str>) -> Result<PathBuf> {
 }
 
 fn update_repo(repo_root: &Path, restart: bool, config_path: &Path) -> Result<()> {
-    run(Command::new("git")
+    run(source_checkout::isolated_git_command()
         .arg("-C")
         .arg(repo_root)
         .arg("pull")
         .arg("--ff-only"))?;
+    let repo_root = canonical_checkout(repo_root, "updated repo_root")?;
     run(Command::new("cargo")
         .arg("install")
         .arg("--path")
-        .arg(repo_root)
+        .arg(&repo_root)
         .arg("--force"))?;
-    ensure_config_dir()?;
-    plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
-    source_checkout::persist(config_path, repo_root)?;
+    let config_parent = ensure_selected_config_parent(config_path)?;
+    source_checkout::persist(config_path, &repo_root)?;
+    plugins::install_bundled_plugins(&config_parent.join("plugins"))?;
     if restart {
         restart_systemd_if_present()?;
     }
@@ -161,11 +146,26 @@ fn canonical_checkout(path: &Path, description: &str) -> Result<PathBuf> {
     })
 }
 
-fn ensure_config_dir() -> Result<()> {
-    let dir = config_dir();
-    fs::create_dir_all(&dir)?;
-    println!("Ensured config dir {}", dir.display());
-    Ok(())
+fn ensure_selected_config_parent(config_path: &Path) -> Result<PathBuf> {
+    let parent = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create selected config directory {}",
+            parent.display()
+        )
+    })?;
+    if !fs::metadata(parent)?.is_dir() {
+        return Err(anyhow!(
+            "selected config parent is not a directory: {}",
+            parent.display()
+        )
+        .into());
+    }
+    println!("Ensured config dir {}", parent.display());
+    Ok(parent.to_path_buf())
 }
 
 fn config_dir() -> PathBuf {

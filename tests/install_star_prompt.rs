@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,30 @@ fn install_test_binary(temp: &TempDir) {
     fs::create_dir_all(&cargo_bin).expect("create cargo bin");
     fs::copy(env!("CARGO_BIN_EXE_clawhip"), cargo_bin.join("clawhip"))
         .expect("copy clawhip binary");
+}
+
+fn run_direct_install(temp: &TempDir, config_path: &Path, home: &Path) -> Output {
+    let bin_dir = temp.path().join("direct-install-bin");
+    fs::create_dir_all(&bin_dir).expect("create direct install bin");
+    write_executable(
+        &bin_dir.join("cargo"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\n",
+    );
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    Command::new(env!("CARGO_BIN_EXE_clawhip"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "install",
+            "--skip-star-prompt",
+        ])
+        .current_dir(repo_root())
+        .env("PATH", format!("{}:{existing_path}", bin_dir.display()))
+        .env("HOME", home)
+        .env("CARGO_HOME", temp.path().join("cargo"))
+        .env("CARGO_LOG", temp.path().join("cargo.log"))
+        .output()
+        .expect("run direct clawhip install")
 }
 
 fn fake_gh_script() -> &'static str {
@@ -267,12 +293,108 @@ fn source_installer_creates_nested_selected_config_parent() {
 }
 
 #[test]
+fn full_source_script_flow_uses_only_selected_custom_config_dir() {
+    let temp = TempDir::new().expect("tempdir");
+    let unavailable_home = temp.path().join("unavailable-home");
+    fs::write(&unavailable_home, "not a directory").expect("write unavailable home");
+    let config_path = temp.path().join("full/custom/config.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let original = b"# operator-owned\n[update]\nrepo_root = \"/operator/explicit\"\n";
+    fs::write(&config_path, original).unwrap();
+    install_test_binary(&temp);
+
+    let output = run_shell(
+        &temp,
+        r#"
+install_prebuilt_binary() {
+  return 1
+}
+install_from_source() {
+  record_source_checkout
+}
+main --skip-star-prompt
+"#,
+        &[
+            ("CLAWHIP_CONFIG", "full/custom/config.toml"),
+            ("HOME", unavailable_home.to_str().unwrap()),
+        ],
+    );
+
+    assert!(output.status.success(), "script failed: {output:?}");
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+    assert!(
+        config_path
+            .parent()
+            .unwrap()
+            .join("source-checkout.d")
+            .is_dir()
+    );
+    assert!(config_path.parent().unwrap().join("plugins").is_dir());
+    assert_eq!(
+        fs::read_to_string(&unavailable_home).unwrap(),
+        "not a directory"
+    );
+}
+
+#[test]
+fn direct_install_creates_nested_custom_parent_without_default_home() {
+    let temp = TempDir::new().expect("tempdir");
+    let unavailable_home = temp.path().join("unavailable-home");
+    fs::write(&unavailable_home, "not a directory").expect("write unavailable home");
+    let config_path = temp.path().join("direct/fresh/nested/config.toml");
+
+    let output = run_direct_install(&temp, &config_path, &unavailable_home);
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert!(!config_path.exists(), "operator config must not be created");
+    assert!(
+        config_path
+            .parent()
+            .unwrap()
+            .join("source-checkout.d")
+            .is_dir()
+    );
+    assert_eq!(
+        fs::read_to_string(&unavailable_home).unwrap(),
+        "not a directory"
+    );
+}
+
+#[test]
+fn direct_install_preserves_custom_config_bytes_and_update_defaults() {
+    let temp = TempDir::new().expect("tempdir");
+    let unavailable_home = temp.path().join("unavailable-home");
+    fs::write(&unavailable_home, "not a directory").expect("write unavailable home");
+    let config_path = temp.path().join("direct/existing/config.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let original = b"# operator-owned\n[update]\nrepo_root = \"/operator/explicit\"\n";
+    fs::write(&config_path, original).unwrap();
+
+    let output = run_direct_install(&temp, &config_path, &unavailable_home);
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+    assert!(
+        config_path
+            .parent()
+            .unwrap()
+            .join("source-checkout.d")
+            .is_dir()
+    );
+    let config = String::from_utf8(original.to_vec()).unwrap();
+    assert!(!config.contains("enabled"));
+    assert!(!config.contains("channel"));
+}
+
+#[test]
 fn source_install_flow_records_checkout_after_cargo_install() {
     let temp = TempDir::new().expect("tempdir");
     let output = run_shell(
         &temp,
         r#"
 cargo() {
+  if [[ "${1:-}" == "pkgid" ]]; then
+    printf 'path+file:///checkout#clawhip@0.0.0\n'
+    return 0
+  fi
   printf 'cargo\n' >> "$HOME/flow.log"
 }
 record_source_checkout() {
@@ -298,6 +420,10 @@ fn source_install_flow_stops_when_checkout_persistence_fails() {
         &temp,
         r#"
 cargo() {
+  if [[ "${1:-}" == "pkgid" ]]; then
+    printf 'path+file:///checkout#clawhip@0.0.0\n'
+    return 0
+  fi
   return 0
 }
 record_source_checkout() {
@@ -311,4 +437,27 @@ echo unsafe-continuation > "$HOME/continued"
 
     assert!(!output.status.success(), "script unexpectedly succeeded");
     assert!(!temp.path().join("home/continued").exists());
+}
+
+#[test]
+fn source_install_rejects_wrong_package_before_cargo_install() {
+    let temp = TempDir::new().expect("tempdir");
+    let output = run_shell(
+        &temp,
+        r#"
+cargo() {
+  if [[ "${1:-}" == "pkgid" ]]; then
+    printf 'path+file:///checkout#not-clawhip@0.0.0\n'
+    return 0
+  fi
+  echo invoked > "$HOME/cargo-install-called"
+}
+mkdir -p "$HOME"
+install_from_source
+"#,
+        &[],
+    );
+
+    assert!(!output.status.success(), "script unexpectedly succeeded");
+    assert!(!temp.path().join("home/cargo-install-called").exists());
 }
