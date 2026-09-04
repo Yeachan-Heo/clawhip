@@ -1296,7 +1296,7 @@ async fn feed_gjc_bridge_from_query(
     let Some(query_revision) = query.revision else {
         return false;
     };
-    let (candidate, mut events, snapshot) = {
+    let (candidate, mut events) = {
         let Ok(bridge) = gjc_bridge_slot().lock() else {
             return false;
         };
@@ -1312,10 +1312,14 @@ async fn feed_gjc_bridge_from_query(
         let Ok(outcome) = candidate.observe(&snapshot) else {
             return false;
         };
-        (candidate, outcome.events, snapshot)
+        (candidate, outcome.events)
     };
-    let staged_failure = events.iter().any(|event| event.kind == "session.failed");
-    if staged_failure {
+    let failure_event = events
+        .iter()
+        .find(|event| event.kind == "session.failed")
+        .cloned();
+    let staged_failure = failure_event.is_some();
+    if let Some(failure_event) = failure_event.as_ref() {
         let Some(current) = store.record(&lane_id) else {
             return false;
         };
@@ -1323,7 +1327,7 @@ async fn feed_gjc_bridge_from_query(
             .stage_bridge_failure(
                 &lane_id,
                 current.revision,
-                &snapshot,
+                failure_event,
                 &crate::gjc_lane::now_rfc3339(),
             )
             .is_err()
@@ -1832,16 +1836,17 @@ async fn post_gjc_bridge(
     };
 
     let mut events = outcome.events;
-    let staged_event = events
+    let failure_event = events
         .iter()
         .find(|event| event.kind == "session.failed")
-        .map(|event| {
-            json!({
-                "type": event.kind,
-                "event_id": event.payload.get("event_id").and_then(Value::as_str).unwrap_or_default(),
-                "staged": true,
-            })
-        });
+        .cloned();
+    let staged_event = failure_event.as_ref().map(|event| {
+        json!({
+            "type": event.kind,
+            "event_id": event.payload.get("event_id").and_then(Value::as_str).unwrap_or_default(),
+            "staged": true,
+        })
+    });
     let has_failure = staged_event.is_some();
     let staged_failure = if has_failure && let Some(lane_id) = push_lane_id.as_deref() {
         let Some(store) = state.gjc_store.as_ref() else {
@@ -1862,7 +1867,7 @@ async fn post_gjc_bridge(
             .stage_bridge_failure(
                 lane_id,
                 current.revision,
-                &snapshot,
+                failure_event.as_ref().expect("failure event checked"),
                 &crate::gjc_lane::now_rfc3339(),
             )
             .is_err()

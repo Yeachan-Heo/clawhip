@@ -343,6 +343,11 @@ impl GjcEventBridge {
                                 .filter(|value| !value.is_empty())
                                 .unwrap_or_else(|| "provider turn failed".to_string())
                         });
+                        let command_fields = track
+                            .prompt_command
+                            .as_ref()
+                            .map(|command_id| vec![("command_id", Value::from(command_id.clone()))])
+                            .unwrap_or_default();
                         events.push(lifecycle_event(
                             &context,
                             kind,
@@ -355,7 +360,7 @@ impl GjcEventBridge {
                             },
                             error,
                             &[if failed { "failed" } else { "complete" }],
-                            &[],
+                            &command_fields,
                         ));
                         track.terminal_emitted_turn = Some(turn_id);
                     }

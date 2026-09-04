@@ -859,27 +859,47 @@ fn migrate_lane_ids(state: &mut GjcLaneStateFile) -> Result<bool> {
 fn migrate_failure_causality(state: &mut GjcLaneStateFile) -> bool {
     let mut migrated = false;
     for record in state.lanes.values_mut() {
-        let Some(turn) = record
-            .last_turn
-            .as_ref()
+        let legacy_count = record
+            .pending_alerts
+            .iter()
+            .filter(|alert| alert.kind == "session.failed" && alert.turn_failure.is_none())
+            .count();
+        let fallback = (legacy_count == 1)
+            .then_some(record.last_turn.as_ref())
+            .flatten()
             .filter(|turn| turn.state == GjcTurnState::Failed)
-        else {
-            continue;
-        };
-        let Some(turn_id) = turn.turn_id.clone() else {
-            continue;
-        };
-        for alert in &mut record.pending_alerts {
-            if alert.kind == "session.failed" && alert.turn_failure.is_none() {
-                alert.turn_failure = Some(GjcTurnFailureCausality {
+            .and_then(|turn| {
+                Some(GjcTurnFailureCausality {
                     session_id: record.sdk_session_id.clone(),
                     sdk_revision: record.sdk_revision,
-                    turn_id: turn_id.clone(),
+                    turn_id: turn.turn_id.clone()?,
                     command_id: turn.command_id.clone(),
                     model: turn.model.clone(),
                     profile: turn.profile.clone(),
-                });
-                migrated = true;
+                })
+            });
+        for alert in &mut record.pending_alerts {
+            if alert.kind == "session.failed" && alert.turn_failure.is_none() {
+                let payload = &alert.payload;
+                let derived = payload["session_id"]
+                    .as_str()
+                    .zip(payload["turn_id"].as_str())
+                    .zip(payload["sdk_revision"].as_u64())
+                    .map(
+                        |((session_id, turn_id), sdk_revision)| GjcTurnFailureCausality {
+                            session_id: session_id.to_string(),
+                            sdk_revision,
+                            turn_id: turn_id.to_string(),
+                            command_id: payload["command_id"].as_str().map(str::to_string),
+                            model: payload["model"].as_str().map(public_selection_label),
+                            profile: payload["profile"].as_str().map(public_selection_label),
+                        },
+                    )
+                    .or_else(|| fallback.clone());
+                if derived.is_some() {
+                    alert.turn_failure = derived;
+                    migrated = true;
+                }
             }
         }
     }
@@ -980,6 +1000,7 @@ fn observation_snapshot(
         profile: observation.profile.clone(),
         endpoint,
         repo_name: record.pr.as_ref().map(|pr| pr.repo.clone()),
+        repo_path: record.worktree.clone(),
         worktree_path: record.worktree.clone(),
         branch: record.branch.clone(),
         observed_at: Some(now.to_string()),
@@ -1248,33 +1269,36 @@ impl GjcLaneStore {
         &self,
         lane_id: &str,
         expected_revision: u64,
-        snapshot: &GjcSdkStateSnapshot,
+        failure: &IncomingEvent,
         now: &str,
     ) -> Result<GjcLaneRecord> {
-        let turn = snapshot
-            .turn
-            .as_ref()
-            .filter(|turn| turn.state == GjcSdkTurnPhase::Failed && turn.prompt_accepted)
-            .ok_or_else(|| anyhow!("bridge failure snapshot lacks an accepted failed turn"))?;
+        if failure.kind != "session.failed" {
+            bail!("bridge failure event kind is not session.failed");
+        }
+        let session_id = failure.payload["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("bridge failure lacks session identity"))?;
+        let turn_id = failure.payload["turn_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("bridge failure lacks turn identity"))?;
         let record = self
             .record(lane_id)
             .ok_or_else(|| anyhow!("lane not found: {lane_id}"))?;
         let observation = GjcSdkObservation {
-            session_id: snapshot.session_id.clone(),
+            session_id: session_id.to_string(),
             worktree: record.worktree.clone(),
             branch: record.branch.clone(),
             branch_observed: false,
             endpoint_generation: record.endpoint_generation,
-            revision: snapshot.revision,
+            revision: failure.payload["sdk_revision"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("bridge failure lacks sdk revision"))?,
             turn_state: GjcTurnState::Failed,
-            turn_id: Some(turn.id.clone()),
-            command_id: snapshot
-                .prompt
-                .as_ref()
-                .map(|prompt| prompt.command_id.clone()),
+            turn_id: Some(turn_id.to_string()),
+            command_id: failure.payload["command_id"].as_str().map(str::to_string),
             prompt_accepted: true,
-            model: snapshot.model.clone(),
-            profile: snapshot.profile.clone(),
+            model: failure.payload["model"].as_str().map(str::to_string),
+            profile: failure.payload["profile"].as_str().map(str::to_string),
             gate_state: None,
             gate_section_present: false,
             gate_id: None,
@@ -1284,7 +1308,10 @@ impl GjcLaneStore {
             gate_title: None,
             gate_options: Vec::new(),
             disposition: GjcSessionDisposition::Live,
-            error_summary: turn.error_summary.clone(),
+            error_summary: failure.payload["error_message"]
+                .as_str()
+                .or_else(|| failure.payload["summary"].as_str())
+                .map(str::to_string),
         };
         self.apply_observation(lane_id, expected_revision, &observation, now)
             .map(|(record, _)| record)
@@ -4167,18 +4194,77 @@ mod tests {
     }
 
     #[test]
+    fn legacy_multi_failure_migration_preserves_each_alert_identity() {
+        let (dir, store, lane_id) = store_with_lane("legacy-multi-failure");
+        let record = store.record(&lane_id).expect("record");
+        let mut first = observation(GjcTurnState::Failed, GjcSessionDisposition::Live);
+        first.revision = 10;
+        first.turn_id = Some("turn-first".to_string());
+        first.command_id = Some("command-first".to_string());
+        let (record, _) = store
+            .apply_observation(&lane_id, record.revision, &first, &ts(1_200))
+            .expect("first failure");
+        let mut second = first;
+        second.revision = 11;
+        second.turn_id = Some("turn-second".to_string());
+        second.command_id = Some("command-second".to_string());
+        let (record, _) = store
+            .apply_observation(&lane_id, record.revision, &second, &ts(1_300))
+            .expect("second failure");
+        assert_eq!(record.pending_alerts.len(), 2);
+        drop(store);
+
+        let path = dir.path().join("gjc-lane-state.json");
+        let mut persisted: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read state")).expect("json");
+        for alert in persisted["lanes"][&lane_id]["pending_alerts"]
+            .as_array_mut()
+            .expect("pending alerts")
+        {
+            alert
+                .as_object_mut()
+                .expect("pending alert")
+                .remove("turn_failure");
+        }
+        std::fs::write(&path, serde_json::to_vec(&persisted).expect("serialize")).expect("write");
+
+        let reopened = GjcLaneStore::open(&path).expect("reopen");
+        let migrated = reopened.record(&lane_id).expect("record");
+        let identities = migrated
+            .pending_alerts
+            .iter()
+            .map(|alert| {
+                let causality = alert.turn_failure.as_ref().expect("causality");
+                (
+                    causality.turn_id.as_str(),
+                    causality.command_id.as_deref(),
+                    causality.sdk_revision,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                ("turn-first", Some("command-first"), 10),
+                ("turn-second", Some("command-second"), 11),
+            ]
+        );
+    }
+
+    #[test]
     fn bridge_failure_is_staged_in_the_durable_authority_queue() {
         let (_dir, store, lane_id) = store_with_lane("bridge-failure");
         let record = store.record(&lane_id).expect("record");
-        let snapshot = GjcSdkStateSnapshot {
+        let mut bridge = GjcEventBridge::new();
+        let accepted = GjcSdkStateSnapshot {
             session_id: record.sdk_session_id.clone(),
-            revision: 10,
+            revision: 9,
             turn: Some(GjcSdkTurn {
                 id: "bridge-turn".to_string(),
-                state: GjcSdkTurnPhase::Failed,
+                state: GjcSdkTurnPhase::Active,
                 prompt_accepted: true,
                 attempt: 0,
-                error_summary: Some("Prompt submission failed".to_string()),
+                error_summary: None,
             }),
             prompt: Some(GjcSdkPrompt {
                 command_id: "bridge-command".to_string(),
@@ -4186,12 +4272,34 @@ mod tests {
             }),
             model: Some("gpt-5.6-sol".to_string()),
             profile: Some("gpt-heavy".to_string()),
+            repo_path: record.worktree.clone(),
+            worktree_path: record.worktree.clone(),
             ..GjcSdkStateSnapshot::default()
         };
+        bridge.observe(&accepted).expect("accepted prompt");
+        let mut failed = accepted;
+        failed.revision = 10;
+        failed.prompt = None;
+        failed.turn.as_mut().expect("turn").state = GjcSdkTurnPhase::Failed;
+        failed.turn.as_mut().expect("turn").prompt_accepted = false;
+        failed.turn.as_mut().expect("turn").error_summary =
+            Some("Prompt submission failed".to_string());
+        let failure = bridge
+            .observe(&failed)
+            .expect("failed turn")
+            .events
+            .into_iter()
+            .find(|event| event.kind == "session.failed")
+            .expect("reducer-proven failure");
+        let direct_event_id = failure.payload["event_id"]
+            .as_str()
+            .expect("event id")
+            .to_string();
         let staged = store
-            .stage_bridge_failure(&lane_id, record.revision, &snapshot, &ts(1_200))
+            .stage_bridge_failure(&lane_id, record.revision, &failure, &ts(1_200))
             .expect("stage");
         assert_eq!(staged.pending_alerts.len(), 1);
+        assert_eq!(staged.pending_alerts[0].event_id, direct_event_id);
         let causality = staged.pending_alerts[0]
             .turn_failure
             .as_ref()
