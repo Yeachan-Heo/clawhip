@@ -988,7 +988,14 @@ pub fn persist_update_repo_root_if_absent(path: &Path, repo_root: &Path) -> Resu
     let updated = document.to_string();
     let _: AppConfig = toml::from_str(&updated)?;
     let mut before_publish = || Ok(());
-    save_config_bytes_with_backup_locked(path, updated.as_bytes(), &active, &mut before_publish)?;
+    let mut before_link = || Ok(());
+    save_config_bytes_with_backup_locked(
+        path,
+        updated.as_bytes(),
+        &active,
+        &mut before_publish,
+        &mut before_link,
+    )?;
     Ok(true)
 }
 
@@ -1429,6 +1436,7 @@ impl AppConfig {
         }
 
         revalidate_config_parent_dir(&parent_dir)?;
+        let mut before_link = || Ok(());
         commit_config_bytes_via_temp(
             &parent_dir,
             path,
@@ -1437,6 +1445,7 @@ impl AppConfig {
             &active,
             false,
             before_rename,
+            &mut before_link,
         )?;
 
         revalidate_config_parent_dir(&parent_dir).map_err(|error| {
@@ -3400,7 +3409,7 @@ fn readat_regular(dir: &BoundDir, name: &str) -> std::result::Result<Vec<u8>, io
         libc::openat(
             dir.fd(),
             c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )
     };
@@ -3431,14 +3440,16 @@ fn unlinkat_name(dir: &BoundDir, name: &str) -> std::result::Result<(), io::Erro
     Ok(())
 }
 
-fn save_config_bytes_with_backup_locked<G>(
+fn save_config_bytes_with_backup_locked<G, H>(
     path: &Path,
     new_bytes: &[u8],
     active: &ActiveConfigState,
     before_publish: &mut G,
+    before_link: &mut H,
 ) -> Result<()>
 where
     G: FnMut() -> Result<()>,
+    H: FnMut() -> Result<()>,
 {
     let parent = path
         .parent()
@@ -3478,6 +3489,7 @@ where
         active,
         true,
         before_publish,
+        before_link,
     )?;
 
     let current_identity = current_active_config_identity(path).map_err(|error| {
@@ -3514,7 +3526,8 @@ where
     .map_err(Into::into)
 }
 
-fn commit_config_bytes_via_temp<G>(
+#[allow(clippy::too_many_arguments)]
+fn commit_config_bytes_via_temp<G, H>(
     parent_dir: &ConfigParentDir,
     path: &Path,
     filename: &str,
@@ -3522,9 +3535,11 @@ fn commit_config_bytes_via_temp<G>(
     active: &ActiveConfigState,
     no_clobber: bool,
     before_rename: &mut G,
+    before_link: &mut H,
 ) -> Result<()>
 where
     G: FnMut() -> Result<()>,
+    H: FnMut() -> Result<()>,
 {
     let temp_name = format!(".{filename}.tmp.{}", std::process::id());
 
@@ -3610,7 +3625,9 @@ where
                     }
                     let guarded = readat_regular(&dir, &guard_name);
                     if !guarded.as_deref().is_ok_and(|guarded| guarded == bytes) {
-                        let _ = renameat_names(&dir, &guard_name, filename);
+                        if linkat_names(&dir, &guard_name, filename).is_ok() {
+                            let _ = unlinkat_name(&dir, &guard_name);
+                        }
                         let _ = unlinkat_name(&dir, &temp_name);
                         return Err(
                             "active config changed at final publication; config was not saved"
@@ -3619,9 +3636,37 @@ where
                     }
                 }
             }
+            before_link().inspect_err(|_| {
+                let _ = unlinkat_name(&dir, &temp_name);
+                if matches!(active, ActiveConfigState::Present { .. })
+                    && linkat_names(&dir, &guard_name, filename).is_ok()
+                {
+                    let _ = unlinkat_name(&dir, &guard_name);
+                }
+            })?;
+            let temp_is_original = matches!(
+                fstatat_regular_identity(&dir, &temp_name),
+                Ok(Some((identity, _))) if identity == temp_identity
+            ) && readat_regular(&dir, &temp_name)
+                .as_deref()
+                .is_ok_and(|bytes| bytes == new_bytes);
+            if !temp_is_original {
+                let _ = unlinkat_name(&dir, &temp_name);
+                if matches!(active, ActiveConfigState::Present { .. })
+                    && linkat_names(&dir, &guard_name, filename).is_ok()
+                {
+                    let _ = unlinkat_name(&dir, &guard_name);
+                }
+                return Err(
+                    "config temp changed at final publication; config was not saved".into(),
+                );
+            }
             if let Err(error) = linkat_names(&dir, &temp_name, filename) {
-                if matches!(active, ActiveConfigState::Present { .. }) {
-                    let _ = renameat_names(&dir, &guard_name, filename);
+                if matches!(active, ActiveConfigState::Present { .. })
+                    && (error.kind() == io::ErrorKind::AlreadyExists
+                        || linkat_names(&dir, &guard_name, filename).is_ok())
+                {
+                    let _ = unlinkat_name(&dir, &guard_name);
                 }
                 let _ = unlinkat_name(&dir, &temp_name);
                 return Err(format!(
@@ -3708,20 +3753,56 @@ where
                 .join(format!(".{filename}.guard.{}", std::process::id()));
             if let ActiveConfigState::Present { bytes, .. } = active {
                 fs::rename(path, &guard_path)?;
-                if !fs::read(&guard_path)
-                    .as_deref()
-                    .is_ok_and(|guarded| guarded == bytes)
-                {
-                    let _ = fs::rename(&guard_path, path);
+                let guard_metadata = fs::symlink_metadata(&guard_path);
+                let guard_is_expected = guard_metadata
+                    .as_ref()
+                    .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+                    && fs::read(&guard_path)
+                        .as_deref()
+                        .is_ok_and(|guarded| guarded == bytes);
+                if !guard_is_expected {
+                    if fs::hard_link(&guard_path, path).is_ok() {
+                        let _ = fs::remove_file(&guard_path);
+                    }
                     let _ = fs::remove_file(&temp_path);
                     return Err(
                         "active config changed at final publication; config was not saved".into(),
                     );
                 }
             }
+            before_link().inspect_err(|_| {
+                let _ = fs::remove_file(&temp_path);
+                if matches!(active, ActiveConfigState::Present { .. })
+                    && fs::hard_link(&guard_path, path).is_ok()
+                {
+                    let _ = fs::remove_file(&guard_path);
+                }
+            })?;
+            let temp_metadata = fs::symlink_metadata(&temp_path);
+            let temp_is_original = temp_metadata
+                .as_ref()
+                .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+                && fs::read(&temp_path)
+                    .as_deref()
+                    .is_ok_and(|bytes| bytes == new_bytes);
+            if !temp_is_original {
+                let _ = fs::remove_file(&temp_path);
+                if matches!(active, ActiveConfigState::Present { .. })
+                    && fs::hard_link(&guard_path, path).is_ok()
+                {
+                    let _ = fs::remove_file(&guard_path);
+                }
+                return Err(
+                    "config temp changed at final publication; config was not saved".into(),
+                );
+            }
             fs::hard_link(&temp_path, path).map_err(|error| {
                 if matches!(active, ActiveConfigState::Present { .. }) {
-                    let _ = fs::rename(&guard_path, path);
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        let _ = fs::remove_file(&guard_path);
+                    } else if fs::hard_link(&guard_path, path).is_ok() {
+                        let _ = fs::remove_file(&guard_path);
+                    }
                 }
                 let _ = fs::remove_file(&temp_path);
                 format!(
@@ -4590,11 +4671,13 @@ mod tests {
         fs::write(&config_path, operator).unwrap();
 
         let mut before_publish = || Ok(());
+        let mut before_link = || Ok(());
         let error = save_config_bytes_with_backup_locked(
             &config_path,
             candidate.as_bytes(),
             &active,
             &mut before_publish,
+            &mut before_link,
         )
         .expect_err("stale absent decision must not overwrite operator config");
         assert!(
@@ -4619,17 +4702,132 @@ mod tests {
             fs::write(&replacement_path, operator)?;
             Ok(())
         };
+        let mut before_link = || Ok(());
 
         let error = save_config_bytes_with_backup_locked(
             &config_path,
             candidate.as_bytes(),
             &active,
             &mut before_publish,
+            &mut before_link,
         )
         .expect_err("final publication must not overwrite operator config");
 
         assert!(error.to_string().contains("final publication"));
         assert_eq!(fs::read_to_string(&config_path).unwrap(), operator);
+    }
+
+    #[test]
+    fn repo_root_write_preserves_target_recreated_before_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "# initial\n").unwrap();
+        let _lock = ConfigWriteLock::acquire(&config_path).unwrap();
+        let active = read_active_config_no_follow(&config_path).unwrap();
+        let candidate = "# initial\n[update]\nrepo_root = \"/automatic\"\n";
+        let operator = "# operator recreated\n[update]\nrepo_root = \"/explicit\"\n";
+        let replacement_path = config_path.clone();
+        let mut before_publish = || Ok(());
+        let mut before_link = || {
+            fs::write(&replacement_path, operator)?;
+            Ok(())
+        };
+
+        let error = save_config_bytes_with_backup_locked(
+            &config_path,
+            candidate.as_bytes(),
+            &active,
+            &mut before_publish,
+            &mut before_link,
+        )
+        .expect_err("recreated target must win without overwrite");
+
+        assert!(error.to_string().contains("target appeared"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), operator);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_root_write_rejects_fifo_replacement_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "# initial\n").unwrap();
+        let _lock = ConfigWriteLock::acquire(&config_path).unwrap();
+        let active = read_active_config_no_follow(&config_path).unwrap();
+        let replacement_path = config_path.clone();
+        let mut before_publish = || {
+            fs::remove_file(&replacement_path)?;
+            let path = CString::new(replacement_path.as_os_str().as_bytes()).unwrap();
+            if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            Ok(())
+        };
+        let mut before_link = || Ok(());
+
+        let error = save_config_bytes_with_backup_locked(
+            &config_path,
+            b"[update]\nrepo_root = \"/automatic\"\n",
+            &active,
+            &mut before_publish,
+            &mut before_link,
+        )
+        .expect_err("FIFO replacement must fail without blocking");
+
+        assert!(error.to_string().contains("final publication"));
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_root_write_cleans_temp_swap_before_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "# initial\n").unwrap();
+        let _lock = ConfigWriteLock::acquire(&config_path).unwrap();
+        let active = read_active_config_no_follow(&config_path).unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, "sentinel").unwrap();
+        let temp_path = dir
+            .path()
+            .join(format!(".config.toml.tmp.{}", std::process::id()));
+        let swap_path = temp_path.clone();
+        let outside_target = outside.clone();
+        let mut before_publish = || Ok(());
+        let mut before_link = || {
+            fs::remove_file(&swap_path)?;
+            symlink(&outside_target, &swap_path)?;
+            Ok(())
+        };
+
+        let error = save_config_bytes_with_backup_locked(
+            &config_path,
+            b"[update]\nrepo_root = \"/automatic\"\n",
+            &active,
+            &mut before_publish,
+            &mut before_link,
+        )
+        .expect_err("swapped temp must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("temp changed at final publication")
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), "# initial\n");
+        assert_eq!(fs::read_to_string(outside).unwrap(), "sentinel");
+        assert!(!temp_path.exists());
     }
 
     #[test]
