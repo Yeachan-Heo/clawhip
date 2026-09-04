@@ -128,7 +128,14 @@ fn load_config_for_cli(config_path: &std::path::Path) -> Result<Arc<AppConfig>> 
 
 async fn real_main(cli: Cli) -> Result<()> {
     let config_path = cli.config_path();
-    let config = load_config_for_cli(&config_path)?;
+    let repairs_managed_state = command_repairs_managed_state(cli.command.as_ref());
+    let config = if repairs_managed_state {
+        AppConfig::load_or_default_without_managed(&config_path)
+            .map(Arc::new)
+            .map_err(|_| "config_invalid")?
+    } else {
+        load_config_for_cli(&config_path)?
+    };
     let cron_state_path = crate::cron::default_state_path(&config_path);
 
     match cli.command.unwrap_or(Commands::Start {
@@ -610,6 +617,13 @@ async fn real_main(cli: Cli) -> Result<()> {
         },
         Commands::Gjc { command } => crate::gjc::cli::run(config.clone(), command).await,
     }
+}
+
+fn command_repairs_managed_state(command: Option<&Commands>) -> bool {
+    matches!(
+        command,
+        Some(Commands::Install { .. }) | Some(Commands::Update { command: None, .. })
+    )
 }
 
 async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Result<()> {
@@ -1214,13 +1228,28 @@ fn tmux_empty_list_detail(health: Option<&serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_tmux_list, load_config_for_cli, parse_bind_checkout_overrides, parse_bind_overrides,
-        parse_expect_name_overrides, validate_bind_checkout_repos, verify_bindings_json,
+        command_repairs_managed_state, format_tmux_list, load_config_for_cli,
+        parse_bind_checkout_overrides, parse_bind_overrides, parse_expect_name_overrides,
+        validate_bind_checkout_repos, verify_bindings_json,
     };
     use crate::binding_verify::{BindingAudit, BindingDriftAudit};
+    use crate::cli::Commands;
     use crate::events::RoutingMetadata;
     use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
     use std::fs;
+
+    #[test]
+    fn install_and_direct_update_bypass_managed_enrichment_for_repair() {
+        assert!(command_repairs_managed_state(Some(&Commands::Install {
+            systemd: false,
+            skip_star_prompt: true,
+        })));
+        assert!(command_repairs_managed_state(Some(&Commands::Update {
+            command: None,
+            restart: false,
+        })));
+        assert!(!command_repairs_managed_state(None));
+    }
 
     #[test]
     fn cli_config_errors_are_bounded_without_source_content() {

@@ -2,9 +2,11 @@
   "schemaVersion": 1,
   "kind": "api-package-test-report",
   "issue": 360,
-  "contract": "Persist a canonical source checkout in clawhip-owned managed state; explicit update.repo_root wins, operator config is never mutated, and deployment health can use the managed fallback alone.",
+  "contract": "Persist canonical source checkout in clawhip-owned immutable managed state; explicit nonblank update.repo_root wins, operator config is never mutated, and deployment health can use the managed fallback alone.",
   "results": [
-    {"surface":"managed sidecar","command":"cargo test source_checkout::tests","status":"passed","evidence":"Fresh canonical round-trip, explicit override, byte-stable operator config, malformed/nonregular/symlink/FIFO rejection, interrupted-write preservation, and invalid checkout rejection passed (7 tests)."},
-    {"surface":"deployment health","command":"cargo test repo_root_alone_is_sufficient_for_health_comparison","status":"passed","evidence":"Managed sidecar alone supplies a readable source commit while update.enabled remains false and channel remains absent."}
+    {"surface":"managed state","command":"cargo test source_checkout::tests","status":"passed","evidence":"12 tests cover immutable checked-fd records, explicit and blank precedence, byte-stable operator config, malformed/symlink/FIFO rejection, interrupted publication preserving the last valid record, bound-directory parent swap, cleanup isolation and record bounds, repair loading, and canonical git/package validation."},
+    {"surface":"repair dispatch","command":"cargo test install_and_direct_update_bypass_managed_enrichment_for_repair","status":"passed","evidence":"Install and direct update select config loading that skips malformed managed enrichment so lifecycle persistence can repair state; normal commands remain fail-closed."},
+    {"surface":"deployment health","command":"cargo test repo_root_alone_is_sufficient_for_health_comparison","status":"passed","evidence":"Managed state alone supplies a readable source commit while update.enabled remains false and channel remains absent."},
+    {"surface":"repository gates","command":"cargo fmt --all -- --check; cargo check; cargo clippy -- -D warnings; cargo test -- --test-threads=1; cargo build --release; git diff --check","status":"passed","evidence":"All local gates passed; the full serial suite reported 1240 tests passing."}
   ]
 }

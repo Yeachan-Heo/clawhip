@@ -1168,12 +1168,22 @@ where
 
 impl AppConfig {
     pub fn load_or_default(path: &Path) -> Result<Self> {
+        Self::load_or_default_with_managed(path, true)
+    }
+
+    pub fn load_or_default_without_managed(path: &Path) -> Result<Self> {
+        Self::load_or_default_with_managed(path, false)
+    }
+
+    fn load_or_default_with_managed(path: &Path, load_managed: bool) -> Result<Self> {
         if !path.exists() {
             let mut config = Self {
                 config_path: path.to_path_buf(),
                 ..Self::default()
             };
-            config.managed_repo_root = crate::source_checkout::load(path)?;
+            if load_managed {
+                config.managed_repo_root = crate::source_checkout::load(path)?;
+            }
             return Ok(config);
         }
         let raw = fs::read_to_string(path)?;
@@ -1185,7 +1195,14 @@ impl AppConfig {
             config.defaults.channel = config.discord_default_channel();
         }
         config.config_path = path.to_path_buf();
-        if config.update.repo_root.is_none() {
+        if load_managed
+            && config
+                .update
+                .repo_root
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        {
             config.managed_repo_root = crate::source_checkout::load(path)?;
         }
         Ok(config)
