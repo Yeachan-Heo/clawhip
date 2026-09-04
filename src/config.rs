@@ -989,12 +989,14 @@ pub fn persist_update_repo_root_if_absent(path: &Path, repo_root: &Path) -> Resu
     let _: AppConfig = toml::from_str(&updated)?;
     let mut before_publish = || Ok(());
     let mut before_link = || Ok(());
+    let mut after_temp_check = || Ok(());
     save_config_bytes_with_backup_locked(
         path,
         updated.as_bytes(),
         &active,
         &mut before_publish,
         &mut before_link,
+        &mut after_temp_check,
     )?;
     Ok(true)
 }
@@ -1437,6 +1439,7 @@ impl AppConfig {
 
         revalidate_config_parent_dir(&parent_dir)?;
         let mut before_link = || Ok(());
+        let mut after_temp_check = || Ok(());
         commit_config_bytes_via_temp(
             &parent_dir,
             path,
@@ -1446,6 +1449,7 @@ impl AppConfig {
             false,
             before_rename,
             &mut before_link,
+            &mut after_temp_check,
         )?;
 
         revalidate_config_parent_dir(&parent_dir).map_err(|error| {
@@ -3397,6 +3401,56 @@ fn linkat_names(dir: &BoundDir, old: &str, new: &str) -> std::result::Result<(),
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn link_fd_at(temp: &File, dir: &BoundDir, new: &str) -> std::result::Result<(), io::Error> {
+    let empty = CString::new("").unwrap();
+    let c_new = CString::new(new).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let rc = unsafe {
+        libc::linkat(
+            temp.as_raw_fd(),
+            empty.as_ptr(),
+            dir.fd(),
+            c_new.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let first_error = io::Error::last_os_error();
+    let proc_path = CString::new(format!("/proc/self/fd/{}", temp.as_raw_fd())).unwrap();
+    let rc = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            proc_path.as_ptr(),
+            dir.fd(),
+            c_new.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(if first_error.kind() == io::ErrorKind::NotFound {
+            io::Error::last_os_error()
+        } else {
+            first_error
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn link_fd_at(_temp: &File, _dir: &BoundDir, _new: &str) -> std::result::Result<(), io::Error> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic checked-file publication is unsupported on this platform",
+    ))
+}
+
 #[cfg(unix)]
 fn readat_regular(dir: &BoundDir, name: &str) -> std::result::Result<Vec<u8>, io::Error> {
     let c_name = CString::new(name).map_err(|_| {
@@ -3440,16 +3494,18 @@ fn unlinkat_name(dir: &BoundDir, name: &str) -> std::result::Result<(), io::Erro
     Ok(())
 }
 
-fn save_config_bytes_with_backup_locked<G, H>(
+fn save_config_bytes_with_backup_locked<G, H, I>(
     path: &Path,
     new_bytes: &[u8],
     active: &ActiveConfigState,
     before_publish: &mut G,
     before_link: &mut H,
+    after_temp_check: &mut I,
 ) -> Result<()>
 where
     G: FnMut() -> Result<()>,
     H: FnMut() -> Result<()>,
+    I: FnMut() -> Result<()>,
 {
     let parent = path
         .parent()
@@ -3490,6 +3546,7 @@ where
         true,
         before_publish,
         before_link,
+        after_temp_check,
     )?;
 
     let current_identity = current_active_config_identity(path).map_err(|error| {
@@ -3526,8 +3583,123 @@ where
     .map_err(Into::into)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(clippy::too_many_arguments)]
-fn commit_config_bytes_via_temp<G, H>(
+fn commit_config_bytes_no_clobber_unix<G, H, I>(
+    parent_dir: &ConfigParentDir,
+    path: &Path,
+    filename: &str,
+    new_bytes: &[u8],
+    active: &ActiveConfigState,
+    hostile_temp_name: &str,
+    before_publish: &mut G,
+    before_link: &mut H,
+    after_temp_check: &mut I,
+) -> Result<()>
+where
+    G: FnMut() -> Result<()>,
+    H: FnMut() -> Result<()>,
+    I: FnMut() -> Result<()>,
+{
+    let dir = BoundDir::open_verified(&parent_dir.path, parent_dir.identity)?;
+    let dot = CString::new(".").unwrap();
+    let fd = unsafe {
+        libc::openat(
+            dir.fd(),
+            dot.as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "failed to create unnamed config temp; config was not saved: {}",
+            io::Error::last_os_error()
+        )
+        .into());
+    }
+    let mut temp = unsafe { File::from_raw_fd(fd) };
+    temp.write_all(new_bytes)?;
+    temp.sync_all()?;
+    let temp_identity = metadata_identity(&temp.metadata()?)
+        .ok_or_else(|| "unnamed config temp identity unavailable".to_string())?;
+
+    dir.revalidate(parent_dir.identity)?;
+    revalidate_active_config(path, active)?;
+    before_publish()?;
+
+    let guard_name = format!(".{filename}.guard.{}", std::process::id());
+    if let ActiveConfigState::Present { bytes, .. } = active {
+        renameat_names(&dir, filename, &guard_name)?;
+        let guarded = readat_regular(&dir, &guard_name);
+        if !guarded.as_deref().is_ok_and(|guarded| guarded == bytes) {
+            if linkat_names(&dir, &guard_name, filename).is_ok() {
+                let _ = unlinkat_name(&dir, &guard_name);
+            }
+            return Err("active config changed at final publication; config was not saved".into());
+        }
+    }
+
+    before_link()?;
+    if metadata_identity(&temp.metadata()?) != Some(temp_identity) {
+        return Err("unnamed config temp changed before publication".into());
+    }
+    after_temp_check()?;
+    // A hostile path created under the historical temp name is never the
+    // publication source and is removed before returning.
+    let _ = unlinkat_name(&dir, hostile_temp_name);
+
+    if let Err(error) = link_fd_at(&temp, &dir, filename) {
+        if matches!(active, ActiveConfigState::Present { .. })
+            && (error.kind() == io::ErrorKind::AlreadyExists
+                || linkat_names(&dir, &guard_name, filename).is_ok())
+        {
+            let _ = unlinkat_name(&dir, &guard_name);
+        }
+        return Err(format!(
+            "config target appeared at final publication; config was not saved: {error}"
+        )
+        .into());
+    }
+    if matches!(active, ActiveConfigState::Present { .. }) {
+        let _ = unlinkat_name(&dir, &guard_name);
+    }
+    match fstatat_regular_identity(&dir, filename) {
+        Ok(Some((identity, _))) if identity == temp_identity => Ok(()),
+        _ => {
+            let _ = unlinkat_name(&dir, filename);
+            Err(format!(
+                "config commit identity mismatch at {}; unsafe target was removed",
+                path.display()
+            )
+            .into())
+        }
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[allow(clippy::too_many_arguments)]
+fn commit_config_bytes_no_clobber_unix<G, H, I>(
+    _parent_dir: &ConfigParentDir,
+    _path: &Path,
+    _filename: &str,
+    _new_bytes: &[u8],
+    _active: &ActiveConfigState,
+    _hostile_temp_name: &str,
+    _before_publish: &mut G,
+    _before_link: &mut H,
+    _after_temp_check: &mut I,
+) -> Result<()>
+where
+    G: FnMut() -> Result<()>,
+    H: FnMut() -> Result<()>,
+    I: FnMut() -> Result<()>,
+{
+    Err("atomic no-clobber config publication is unsupported on this platform".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_config_bytes_via_temp<G, H, I>(
     parent_dir: &ConfigParentDir,
     path: &Path,
     filename: &str,
@@ -3536,15 +3708,30 @@ fn commit_config_bytes_via_temp<G, H>(
     no_clobber: bool,
     before_rename: &mut G,
     before_link: &mut H,
+    after_temp_check: &mut I,
 ) -> Result<()>
 where
     G: FnMut() -> Result<()>,
     H: FnMut() -> Result<()>,
+    I: FnMut() -> Result<()>,
 {
     let temp_name = format!(".{filename}.tmp.{}", std::process::id());
 
     #[cfg(unix)]
     {
+        if no_clobber {
+            return commit_config_bytes_no_clobber_unix(
+                parent_dir,
+                path,
+                filename,
+                new_bytes,
+                active,
+                &temp_name,
+                before_rename,
+                before_link,
+                after_temp_check,
+            );
+        }
         let dir = BoundDir::open_verified(&parent_dir.path, parent_dir.identity)?;
         let mut temp = match openat_exclusive_write(&dir, &temp_name) {
             Ok(temp) => temp,
@@ -3661,7 +3848,15 @@ where
                     "config temp changed at final publication; config was not saved".into(),
                 );
             }
-            if let Err(error) = linkat_names(&dir, &temp_name, filename) {
+            after_temp_check().inspect_err(|_| {
+                let _ = unlinkat_name(&dir, &temp_name);
+                if matches!(active, ActiveConfigState::Present { .. })
+                    && linkat_names(&dir, &guard_name, filename).is_ok()
+                {
+                    let _ = unlinkat_name(&dir, &guard_name);
+                }
+            })?;
+            if let Err(error) = link_fd_at(&temp, &dir, filename) {
                 if matches!(active, ActiveConfigState::Present { .. })
                     && (error.kind() == io::ErrorKind::AlreadyExists
                         || linkat_names(&dir, &guard_name, filename).is_ok())
@@ -3687,11 +3882,16 @@ where
         }
         match fstatat_regular_identity(&dir, filename) {
             Ok(Some((identity, _))) if identity == temp_identity => Ok(()),
-            Ok(_) => Err(format!(
-                "config commit identity mismatch at {}; config path may be unsafe",
-                path.display()
-            )
-            .into()),
+            Ok(_) => {
+                if no_clobber {
+                    let _ = unlinkat_name(&dir, filename);
+                }
+                Err(format!(
+                    "config commit identity mismatch at {}; unsafe target was removed",
+                    path.display()
+                )
+                .into())
+            }
             Err(error) => Err(format!(
                 "failed to verify committed config at {}; config path may be unsafe: {error}",
                 path.display()
@@ -3796,6 +3996,14 @@ where
                     "config temp changed at final publication; config was not saved".into(),
                 );
             }
+            after_temp_check().inspect_err(|_| {
+                let _ = fs::remove_file(&temp_path);
+                if matches!(active, ActiveConfigState::Present { .. })
+                    && fs::hard_link(&guard_path, path).is_ok()
+                {
+                    let _ = fs::remove_file(&guard_path);
+                }
+            })?;
             fs::hard_link(&temp_path, path).map_err(|error| {
                 if matches!(active, ActiveConfigState::Present { .. }) {
                     if error.kind() == io::ErrorKind::AlreadyExists {
@@ -4672,12 +4880,14 @@ mod tests {
 
         let mut before_publish = || Ok(());
         let mut before_link = || Ok(());
+        let mut after_temp_check = || Ok(());
         let error = save_config_bytes_with_backup_locked(
             &config_path,
             candidate.as_bytes(),
             &active,
             &mut before_publish,
             &mut before_link,
+            &mut after_temp_check,
         )
         .expect_err("stale absent decision must not overwrite operator config");
         assert!(
@@ -4703,6 +4913,7 @@ mod tests {
             Ok(())
         };
         let mut before_link = || Ok(());
+        let mut after_temp_check = || Ok(());
 
         let error = save_config_bytes_with_backup_locked(
             &config_path,
@@ -4710,6 +4921,7 @@ mod tests {
             &active,
             &mut before_publish,
             &mut before_link,
+            &mut after_temp_check,
         )
         .expect_err("final publication must not overwrite operator config");
 
@@ -4732,6 +4944,7 @@ mod tests {
             fs::write(&replacement_path, operator)?;
             Ok(())
         };
+        let mut after_temp_check = || Ok(());
 
         let error = save_config_bytes_with_backup_locked(
             &config_path,
@@ -4739,6 +4952,7 @@ mod tests {
             &active,
             &mut before_publish,
             &mut before_link,
+            &mut after_temp_check,
         )
         .expect_err("recreated target must win without overwrite");
 
@@ -4768,6 +4982,7 @@ mod tests {
             Ok(())
         };
         let mut before_link = || Ok(());
+        let mut after_temp_check = || Ok(());
 
         let error = save_config_bytes_with_backup_locked(
             &config_path,
@@ -4775,6 +4990,7 @@ mod tests {
             &active,
             &mut before_publish,
             &mut before_link,
+            &mut after_temp_check,
         )
         .expect_err("FIFO replacement must fail without blocking");
 
@@ -4789,7 +5005,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn repo_root_write_cleans_temp_swap_before_link() {
+    fn repo_root_write_publishes_checked_fd_after_temp_name_swap() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4805,27 +5021,31 @@ mod tests {
         let swap_path = temp_path.clone();
         let outside_target = outside.clone();
         let mut before_publish = || Ok(());
-        let mut before_link = || {
-            fs::remove_file(&swap_path)?;
+        let mut before_link = || Ok(());
+        let mut after_temp_check = || {
+            if let Err(error) = fs::remove_file(&swap_path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(error.into());
+            }
             symlink(&outside_target, &swap_path)?;
             Ok(())
         };
 
-        let error = save_config_bytes_with_backup_locked(
+        save_config_bytes_with_backup_locked(
             &config_path,
             b"[update]\nrepo_root = \"/automatic\"\n",
             &active,
             &mut before_publish,
             &mut before_link,
+            &mut after_temp_check,
         )
-        .expect_err("swapped temp must fail closed");
+        .expect("publication must use the checked open file, not the swapped path");
 
-        assert!(
-            error
-                .to_string()
-                .contains("temp changed at final publication")
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "[update]\nrepo_root = \"/automatic\"\n"
         );
-        assert_eq!(fs::read_to_string(&config_path).unwrap(), "# initial\n");
         assert_eq!(fs::read_to_string(outside).unwrap(), "sentinel");
         assert!(!temp_path.exists());
     }
