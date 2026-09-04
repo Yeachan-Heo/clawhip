@@ -6634,21 +6634,31 @@ mod tests {
     }
 
     #[test]
-    fn issue_359_baseline_lock_waits_for_slow_windows_file_flush() {
+    fn issue_317_issue_359_baseline_lock_waits_for_slow_windows_file_flush() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("github-ci-baseline.json");
         let held_lock = acquire_baseline_lock(&path).unwrap();
-        let start = Arc::new(Barrier::new(2));
+        let (contended_tx, contended_rx) = std::sync::mpsc::sync_channel(0);
 
         std::thread::scope(|scope| {
-            let waiter_start = start.clone();
             let waiter_path = path.clone();
             let waiter = scope.spawn(move || {
-                waiter_start.wait();
+                let lock_path = waiter_path.with_extension("json.lock");
+                let probe = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)
+                    .unwrap();
+                assert!(
+                    !try_lock_baseline_file(&probe),
+                    "waiter probe must be excluded by the live lock owner"
+                );
+                contended_tx.send(()).unwrap();
+                drop(probe);
                 acquire_baseline_lock(&waiter_path)
             });
 
-            start.wait();
+            contended_rx.recv().unwrap();
             std::thread::sleep(Duration::from_secs(1));
             drop(held_lock);
             assert!(
