@@ -856,17 +856,18 @@ fn migrate_lane_ids(state: &mut GjcLaneStateFile) -> Result<bool> {
     Ok(migrated)
 }
 
-fn migrate_failure_causality(state: &mut GjcLaneStateFile) -> bool {
+fn migrate_failure_causality(state: &mut GjcLaneStateFile) -> Result<bool> {
     let mut migrated = false;
+    let mut audit = Vec::new();
     for record in state.lanes.values_mut() {
         let legacy_count = record
             .pending_alerts
             .iter()
             .filter(|alert| alert.kind == "session.failed" && alert.turn_failure.is_none())
             .count();
-        let fallback = (legacy_count == 1)
-            .then_some(record.last_turn.as_ref())
-            .flatten()
+        let current_causality = record
+            .last_turn
+            .as_ref()
             .filter(|turn| turn.state == GjcTurnState::Failed)
             .and_then(|turn| {
                 Some(GjcTurnFailureCausality {
@@ -878,7 +879,12 @@ fn migrate_failure_causality(state: &mut GjcLaneStateFile) -> bool {
                     profile: turn.profile.clone(),
                 })
             });
-        for alert in &mut record.pending_alerts {
+        let fallback = (legacy_count == 1)
+            .then(|| current_causality.clone())
+            .flatten();
+        let current_event_id = legacy_current_failure_event_id(record);
+        let mut retained = Vec::with_capacity(record.pending_alerts.len());
+        for mut alert in std::mem::take(&mut record.pending_alerts) {
             if alert.kind == "session.failed" && alert.turn_failure.is_none() {
                 let payload = &alert.payload;
                 let derived = payload["session_id"]
@@ -895,15 +901,73 @@ fn migrate_failure_causality(state: &mut GjcLaneStateFile) -> bool {
                             profile: payload["profile"].as_str().map(public_selection_label),
                         },
                     )
-                    .or_else(|| fallback.clone());
+                    .or_else(|| {
+                        (current_event_id.as_deref() == Some(alert.event_id.as_str()))
+                            .then(|| current_causality.clone())
+                            .flatten()
+                    })
+                    .or_else(|| fallback.clone().filter(|_| legacy_count == 1));
                 if derived.is_some() {
                     alert.turn_failure = derived;
                     migrated = true;
+                } else if current_event_id.is_some() {
+                    migrated = true;
+                    audit.push(GjcReconcileAuditEntry {
+                        at: record.updated_at.clone(),
+                        lane_id: record.lane_id.clone(),
+                        kind: GjcAuditKind::HistoricalFailureSuppressed,
+                        detail: format!(
+                            "legacy historical failure suppressed during causality migration: event={}",
+                            bounded_identity(Some(alert.event_id.as_str()))
+                        ),
+                    });
+                    continue;
                 }
             }
+            retained.push(alert);
         }
+        record.pending_alerts = retained;
     }
-    migrated
+    for entry in audit {
+        state.push_audit(entry);
+    }
+    Ok(migrated)
+}
+
+fn legacy_current_failure_event_id(record: &GjcLaneRecord) -> Option<String> {
+    let turn = record
+        .last_turn
+        .as_ref()
+        .filter(|turn| turn.state == GjcTurnState::Failed)?;
+    let turn_id = turn.turn_id.clone()?;
+    let snapshot = GjcSdkStateSnapshot {
+        session_id: record.sdk_session_id.clone(),
+        revision: record.sdk_revision,
+        turn: Some(GjcSdkTurn {
+            id: turn_id,
+            state: GjcSdkTurnPhase::Failed,
+            prompt_accepted: true,
+            attempt: 0,
+            error_summary: None,
+        }),
+        prompt: turn.command_id.clone().map(|command_id| GjcSdkPrompt {
+            command_id,
+            status: GjcSdkPromptStatus::Accepted,
+        }),
+        model: turn.model.clone(),
+        profile: turn.profile.clone(),
+        repo_name: record.pr.as_ref().map(|pr| pr.repo.clone()),
+        worktree_path: record.worktree.clone(),
+        branch: record.branch.clone(),
+        ..GjcSdkStateSnapshot::default()
+    };
+    bridge_alerts(None, &snapshot)
+        .ok()?
+        .into_iter()
+        .find(|event| event.kind == "session.failed")?
+        .payload["event_id"]
+        .as_str()
+        .map(str::to_string)
 }
 
 fn current_git_branch(worktree: &str) -> Result<Option<String>> {
@@ -1186,7 +1250,9 @@ impl GjcLaneStore {
                 return Err(error).context(format!("failed to read {}", path.display()));
             }
         };
-        let migrated = migrate_lane_ids(&mut state)? | migrate_failure_causality(&mut state);
+        let lane_ids_migrated = migrate_lane_ids(&mut state)?;
+        let failures_migrated = migrate_failure_causality(&mut state)?;
+        let migrated = lane_ids_migrated || failures_migrated;
         let store = Self {
             path: path.to_path_buf(),
             state: Mutex::new(state),
@@ -4194,7 +4260,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_multi_failure_migration_preserves_each_alert_identity() {
+    fn legacy_multi_failure_migration_keeps_only_latest_authoritative_failure() {
         let (dir, store, lane_id) = store_with_lane("legacy-multi-failure");
         let record = store.record(&lane_id).expect("record");
         let mut first = observation(GjcTurnState::Failed, GjcSessionDisposition::Live);
@@ -4212,43 +4278,86 @@ mod tests {
             .apply_observation(&lane_id, record.revision, &second, &ts(1_300))
             .expect("second failure");
         assert_eq!(record.pending_alerts.len(), 2);
+        let legacy_event_id = |turn_id: &str, command_id: &str, revision: u64| {
+            let snapshot = GjcSdkStateSnapshot {
+                session_id: record.sdk_session_id.clone(),
+                revision,
+                turn: Some(GjcSdkTurn {
+                    id: turn_id.to_string(),
+                    state: GjcSdkTurnPhase::Failed,
+                    prompt_accepted: true,
+                    attempt: 0,
+                    error_summary: None,
+                }),
+                prompt: Some(GjcSdkPrompt {
+                    command_id: command_id.to_string(),
+                    status: GjcSdkPromptStatus::Accepted,
+                }),
+                model: Some("test-model".to_string()),
+                profile: Some("test-profile".to_string()),
+                worktree_path: record.worktree.clone(),
+                branch: record.branch.clone(),
+                ..GjcSdkStateSnapshot::default()
+            };
+            GjcEventBridge::new()
+                .observe(&snapshot)
+                .expect("legacy event")
+                .events[0]
+                .payload["event_id"]
+                .as_str()
+                .expect("event id")
+                .to_string()
+        };
+        let legacy_ids = [
+            legacy_event_id("turn-first", "command-first", 10),
+            legacy_event_id("turn-second", "command-second", 11),
+        ];
         drop(store);
 
         let path = dir.path().join("gjc-lane-state.json");
         let mut persisted: Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read state")).expect("json");
-        for alert in persisted["lanes"][&lane_id]["pending_alerts"]
+        for (index, alert) in persisted["lanes"][&lane_id]["pending_alerts"]
             .as_array_mut()
             .expect("pending alerts")
+            .iter_mut()
+            .enumerate()
         {
-            alert
-                .as_object_mut()
-                .expect("pending alert")
-                .remove("turn_failure");
+            let alert = alert.as_object_mut().expect("pending alert");
+            alert.remove("turn_failure");
+            alert.insert(
+                "event_id".to_string(),
+                Value::from(legacy_ids[index].clone()),
+            );
+            let payload = alert["payload"].as_object_mut().expect("payload");
+            for field in ["turn_id", "command_id", "sdk_revision", "model", "profile"] {
+                payload.remove(field);
+            }
+            payload.insert(
+                "event_id".to_string(),
+                Value::from(legacy_ids[index].clone()),
+            );
+            payload.insert(
+                "idempotency_key".to_string(),
+                Value::from(legacy_ids[index].clone()),
+            );
         }
         std::fs::write(&path, serde_json::to_vec(&persisted).expect("serialize")).expect("write");
 
         let reopened = GjcLaneStore::open(&path).expect("reopen");
         let migrated = reopened.record(&lane_id).expect("record");
-        let identities = migrated
-            .pending_alerts
-            .iter()
-            .map(|alert| {
-                let causality = alert.turn_failure.as_ref().expect("causality");
-                (
-                    causality.turn_id.as_str(),
-                    causality.command_id.as_deref(),
-                    causality.sdk_revision,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            identities,
-            vec![
-                ("turn-first", Some("command-first"), 10),
-                ("turn-second", Some("command-second"), 11),
-            ]
-        );
+        assert_eq!(migrated.pending_alerts.len(), 1);
+        let causality = migrated.pending_alerts[0]
+            .turn_failure
+            .as_ref()
+            .expect("causality");
+        assert_eq!(causality.turn_id, "turn-second");
+        assert_eq!(causality.command_id.as_deref(), Some("command-second"));
+        assert_eq!(causality.sdk_revision, 11);
+        assert!(reopened.audit().iter().any(|entry| {
+            entry.kind == GjcAuditKind::HistoricalFailureSuppressed
+                && entry.detail.contains(&legacy_ids[0])
+        }));
     }
 
     #[test]
