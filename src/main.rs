@@ -329,7 +329,14 @@ async fn real_main(cli: Cli) -> Result<()> {
         Commands::Install {
             systemd,
             skip_star_prompt,
-        } => lifecycle::install(systemd, skip_star_prompt, &config_path),
+            record_source_checkout_only,
+        } => {
+            if record_source_checkout_only {
+                lifecycle::record_source_checkout(&config_path)
+            } else {
+                lifecycle::install(systemd, skip_star_prompt, &config_path)
+            }
+        }
         Commands::Update { command, restart } => match command {
             None => lifecycle::update(restart, &config_path),
             Some(UpdateCommands::Check) => {
@@ -1243,6 +1250,7 @@ mod tests {
         assert!(command_repairs_managed_state(Some(&Commands::Install {
             systemd: false,
             skip_star_prompt: true,
+            record_source_checkout_only: false,
         })));
         assert!(command_repairs_managed_state(Some(&Commands::Update {
             command: None,

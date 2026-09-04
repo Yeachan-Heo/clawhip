@@ -150,6 +150,21 @@ MSG
   log "building from source with cargo install --path . --force"
   cd "$REPO_ROOT"
   cargo install --path . --force
+
+  record_source_checkout
+}
+
+record_source_checkout() {
+  local binary_path
+  binary_path="$(installed_binary_path)" || {
+    log "unable to find installed clawhip binary for source-checkout persistence"
+    return 1
+  }
+  log "recording validated source checkout"
+  (
+    cd "$REPO_ROOT"
+    "$binary_path" install --record-source-checkout-only
+  )
 }
 
 sync_plugins() {

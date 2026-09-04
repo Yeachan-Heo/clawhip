@@ -184,3 +184,90 @@ echo after-prompt
     );
     assert!(stdout.contains("after-prompt"), "stdout was: {stdout}");
 }
+
+#[test]
+fn source_installer_records_checkout_without_mutating_explicit_config() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let config_dir = home.join(".clawhip");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    let config_path = config_dir.join("config.toml");
+    let original = b"# operator-owned\n[update]\nrepo_root = \"/operator/explicit\"\n";
+    fs::write(&config_path, original).expect("write config");
+
+    let cargo_bin = temp.path().join("cargo/bin");
+    fs::create_dir_all(&cargo_bin).expect("create cargo bin");
+    fs::copy(env!("CARGO_BIN_EXE_clawhip"), cargo_bin.join("clawhip"))
+        .expect("copy clawhip binary");
+
+    let output = run_shell(&temp, "record_source_checkout", &[]);
+    assert!(output.status.success(), "script failed: {output:?}");
+    assert_eq!(fs::read(&config_path).expect("read config"), original);
+
+    let state_dir = config_dir.join("source-checkout.d");
+    let records = fs::read_dir(&state_dir)
+        .expect("read managed state")
+        .map(|entry| entry.expect("state entry"))
+        .filter(|entry| entry.file_name() != ".lock")
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(records[0].path()).expect("read managed checkout record"))
+            .expect("parse managed checkout record");
+    assert_eq!(
+        state["repo_root"].as_str(),
+        repo_root().canonicalize().unwrap().to_str()
+    );
+
+    let config = String::from_utf8(original.to_vec()).unwrap();
+    assert!(config.contains("repo_root = \"/operator/explicit\""));
+    assert!(!config.contains("enabled"));
+    assert!(!config.contains("channel"));
+}
+
+#[test]
+fn source_install_flow_records_checkout_after_cargo_install() {
+    let temp = TempDir::new().expect("tempdir");
+    let output = run_shell(
+        &temp,
+        r#"
+cargo() {
+  printf 'cargo\n' >> "$HOME/flow.log"
+}
+record_source_checkout() {
+  printf 'record\n' >> "$HOME/flow.log"
+}
+mkdir -p "$HOME"
+install_from_source
+"#,
+        &[],
+    );
+
+    assert!(output.status.success(), "script failed: {output:?}");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("home/flow.log")).unwrap(),
+        "cargo\nrecord\n"
+    );
+}
+
+#[test]
+fn source_install_flow_stops_when_checkout_persistence_fails() {
+    let temp = TempDir::new().expect("tempdir");
+    let output = run_shell(
+        &temp,
+        r#"
+cargo() {
+  return 0
+}
+record_source_checkout() {
+  return 23
+}
+install_from_source
+echo unsafe-continuation > "$HOME/continued"
+"#,
+        &[],
+    );
+
+    assert!(!output.status.success(), "script unexpectedly succeeded");
+    assert!(!temp.path().join("home/continued").exists());
+}

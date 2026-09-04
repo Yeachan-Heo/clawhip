@@ -28,6 +28,14 @@ pub fn install(systemd: bool, skip_star_prompt: bool, config_path: &Path) -> Res
     Ok(())
 }
 
+pub fn record_source_checkout(config_path: &Path) -> Result<()> {
+    let repo_root = current_repo_root()?;
+    ensure_config_dir()?;
+    source_checkout::persist(config_path, &repo_root)?;
+    println!("Recorded source checkout {}", repo_root.display());
+    Ok(())
+}
+
 pub fn update(restart: bool, config_path: &Path) -> Result<()> {
     let repo_root = current_repo_root()?;
     update_repo(&repo_root, restart, config_path)

@@ -121,11 +121,18 @@ pub enum Commands {
     /// Install clawhip from the current git clone.
     Install {
         /// Install and start the bundled systemd service.
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with = "record_source_checkout_only"
+        )]
         systemd: bool,
         /// Disable the optional post-install GitHub star prompt.
         #[arg(long, default_value_t = false)]
         skip_star_prompt: bool,
+        /// Only validate and persist the current source checkout for install.sh.
+        #[arg(long, default_value_t = false)]
+        record_source_checkout_only: bool,
     },
     /// Update clawhip from the current git clone.
     ///
@@ -2196,6 +2203,7 @@ mod tests {
         let Commands::Install {
             systemd,
             skip_star_prompt,
+            record_source_checkout_only,
         } = cli.command.expect("install command")
         else {
             panic!("expected install command");
@@ -2203,6 +2211,34 @@ mod tests {
 
         assert!(systemd);
         assert!(skip_star_prompt);
+        assert!(!record_source_checkout_only);
+    }
+
+    #[test]
+    fn parses_installer_checkout_recording_mode() {
+        let cli = Cli::parse_from(["clawhip", "install", "--record-source-checkout-only"]);
+
+        let Commands::Install {
+            systemd,
+            skip_star_prompt,
+            record_source_checkout_only,
+        } = cli.command.expect("install command")
+        else {
+            panic!("expected install command");
+        };
+
+        assert!(!systemd);
+        assert!(!skip_star_prompt);
+        assert!(record_source_checkout_only);
+        assert!(
+            Cli::try_parse_from([
+                "clawhip",
+                "install",
+                "--systemd",
+                "--record-source-checkout-only",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
