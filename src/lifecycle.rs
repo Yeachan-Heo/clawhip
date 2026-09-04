@@ -30,7 +30,23 @@ pub fn install(systemd: bool, skip_star_prompt: bool, config_path: &Path) -> Res
 
 pub fn record_source_checkout(config_path: &Path) -> Result<()> {
     let repo_root = current_repo_root()?;
-    ensure_config_dir()?;
+    let config_parent = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(config_parent).with_context(|| {
+        format!(
+            "failed to create selected config directory {}",
+            config_parent.display()
+        )
+    })?;
+    if !fs::metadata(config_parent)?.is_dir() {
+        return Err(anyhow!(
+            "selected config parent is not a directory: {}",
+            config_parent.display()
+        )
+        .into());
+    }
     source_checkout::persist(config_path, &repo_root)?;
     println!("Recorded source checkout {}", repo_root.display());
     Ok(())

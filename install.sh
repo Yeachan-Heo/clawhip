@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INVOCATION_CWD="$(pwd -P)"
 GITHUB_REPO="Yeachan-Heo/clawhip"
 INSTALLER_URL="${CLAWHIP_INSTALLER_URL:-https://github.com/${GITHUB_REPO}/releases/latest/download/clawhip-installer.sh}"
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
@@ -156,14 +157,23 @@ MSG
 
 record_source_checkout() {
   local binary_path
+  local config_path
   binary_path="$(installed_binary_path)" || {
     log "unable to find installed clawhip binary for source-checkout persistence"
     return 1
   }
   log "recording validated source checkout"
+  config_path="${CLAWHIP_CONFIG:-}"
+  if [[ -n "$config_path" && "$config_path" != /* ]]; then
+    config_path="$INVOCATION_CWD/$config_path"
+  fi
   (
     cd "$REPO_ROOT"
-    "$binary_path" install --record-source-checkout-only
+    if [[ -n "$config_path" ]]; then
+      "$binary_path" --config "$config_path" install --record-source-checkout-only
+    else
+      "$binary_path" install --record-source-checkout-only
+    fi
   )
 }
 

@@ -20,6 +20,13 @@ fn write_executable(path: &Path, contents: &str) {
     fs::set_permissions(path, perms).expect("chmod");
 }
 
+fn install_test_binary(temp: &TempDir) {
+    let cargo_bin = temp.path().join("cargo/bin");
+    fs::create_dir_all(&cargo_bin).expect("create cargo bin");
+    fs::copy(env!("CARGO_BIN_EXE_clawhip"), cargo_bin.join("clawhip"))
+        .expect("copy clawhip binary");
+}
+
 fn fake_gh_script() -> &'static str {
     r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -55,6 +62,7 @@ fn run_shell(temp: &TempDir, script_body: &str, extra_env: &[(&str, &str)]) -> O
     command.env("GH_LOG", temp.path().join("gh.log"));
     command.env("HOME", temp.path().join("home"));
     command.env("CARGO_HOME", temp.path().join("cargo"));
+    command.current_dir(temp.path());
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -186,21 +194,26 @@ echo after-prompt
 }
 
 #[test]
-fn source_installer_records_checkout_without_mutating_explicit_config() {
+fn source_installer_preserves_relative_custom_config_with_unavailable_home() {
     let temp = TempDir::new().expect("tempdir");
-    let home = temp.path().join("home");
-    let config_dir = home.join(".clawhip");
+    let config_dir = temp.path().join("custom/nested");
     fs::create_dir_all(&config_dir).expect("create config dir");
     let config_path = config_dir.join("config.toml");
     let original = b"# operator-owned\n[update]\nrepo_root = \"/operator/explicit\"\n";
     fs::write(&config_path, original).expect("write config");
+    let unavailable_home = temp.path().join("unavailable-home");
+    fs::write(&unavailable_home, "not a directory").expect("write unavailable home");
 
-    let cargo_bin = temp.path().join("cargo/bin");
-    fs::create_dir_all(&cargo_bin).expect("create cargo bin");
-    fs::copy(env!("CARGO_BIN_EXE_clawhip"), cargo_bin.join("clawhip"))
-        .expect("copy clawhip binary");
+    install_test_binary(&temp);
 
-    let output = run_shell(&temp, "record_source_checkout", &[]);
+    let output = run_shell(
+        &temp,
+        "record_source_checkout",
+        &[
+            ("CLAWHIP_CONFIG", "custom/nested/config.toml"),
+            ("HOME", unavailable_home.to_str().unwrap()),
+        ],
+    );
     assert!(output.status.success(), "script failed: {output:?}");
     assert_eq!(fs::read(&config_path).expect("read config"), original);
 
@@ -223,6 +236,34 @@ fn source_installer_records_checkout_without_mutating_explicit_config() {
     assert!(config.contains("repo_root = \"/operator/explicit\""));
     assert!(!config.contains("enabled"));
     assert!(!config.contains("channel"));
+}
+
+#[test]
+fn source_installer_creates_nested_selected_config_parent() {
+    let temp = TempDir::new().expect("tempdir");
+    let unavailable_home = temp.path().join("unavailable-home");
+    fs::write(&unavailable_home, "not a directory").expect("write unavailable home");
+    install_test_binary(&temp);
+
+    let output = run_shell(
+        &temp,
+        "record_source_checkout",
+        &[
+            ("CLAWHIP_CONFIG", "fresh/deep/config.toml"),
+            ("HOME", unavailable_home.to_str().unwrap()),
+        ],
+    );
+    assert!(output.status.success(), "script failed: {output:?}");
+
+    let config_path = temp.path().join("fresh/deep/config.toml");
+    assert!(!config_path.exists(), "operator config must not be created");
+    let state_dir = temp.path().join("fresh/deep/source-checkout.d");
+    let records = fs::read_dir(state_dir)
+        .expect("read managed state")
+        .map(|entry| entry.expect("state entry"))
+        .filter(|entry| entry.file_name() != ".lock")
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
 }
 
 #[test]
