@@ -36,6 +36,7 @@ mod sender_identity;
 mod sink;
 mod slack;
 mod source;
+mod source_checkout;
 mod telemetry;
 mod tmux_wrapper;
 

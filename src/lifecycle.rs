@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, anyhow};
 
-use crate::{Result, config, plugins};
+use crate::{Result, plugins, source_checkout};
 
 const GITHUB_REPO: &str = "Yeachan-Heo/clawhip";
 const SKIP_STAR_PROMPT_ENV: &str = "CLAWHIP_SKIP_STAR_PROMPT";
@@ -19,7 +19,7 @@ pub fn install(systemd: bool, skip_star_prompt: bool, config_path: &Path) -> Res
         .arg(&repo_root))?;
     ensure_config_dir()?;
     plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
-    config::persist_update_repo_root_if_absent(config_path, &repo_root)?;
+    source_checkout::persist(config_path, &repo_root)?;
     if systemd {
         install_systemd(&repo_root)?;
     }
@@ -61,7 +61,7 @@ fn update_repo(repo_root: &Path, restart: bool, config_path: &Path) -> Result<()
         .arg("--force"))?;
     ensure_config_dir()?;
     plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
-    config::persist_update_repo_root_if_absent(config_path, repo_root)?;
+    source_checkout::persist(config_path, repo_root)?;
     if restart {
         restart_systemd_if_present()?;
     }
