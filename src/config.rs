@@ -2762,6 +2762,11 @@ impl ConfigWriteLock {
             )
             .into());
         }
+        #[cfg(unix)]
+        {
+            let bound = BoundDir::open_verified(&parent_dir.path, parent_dir.identity)?;
+            recover_stale_config_guards(&bound, &parent_dir.path, filename)?;
+        }
         Ok(Self { file })
     }
 }
@@ -3453,6 +3458,14 @@ fn link_fd_at(_temp: &File, _dir: &BoundDir, _new: &str) -> std::result::Result<
 
 #[cfg(unix)]
 fn readat_regular(dir: &BoundDir, name: &str) -> std::result::Result<Vec<u8>, io::Error> {
+    let mut file = openat_regular_file(dir, name)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn openat_regular_file(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
     let c_name = CString::new(name).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3470,13 +3483,11 @@ fn readat_regular(dir: &BoundDir, name: &str) -> std::result::Result<Vec<u8>, io
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    let file = unsafe { File::from_raw_fd(fd) };
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("config guard is not a regular file"));
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -3485,7 +3496,11 @@ fn recover_stale_config_guards(dir: &BoundDir, parent: &Path, filename: &str) ->
     let mut guards = fs::read_dir(parent)?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with(&prefix))
+        .filter(|name| {
+            name.strip_prefix(&prefix).is_some_and(|suffix| {
+                suffix.len() == 32 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+            })
+        })
         .collect::<Vec<_>>();
     guards.sort();
     if guards.is_empty() {
@@ -3494,13 +3509,13 @@ fn recover_stale_config_guards(dir: &BoundDir, parent: &Path, filename: &str) ->
 
     let active_exists = fstatat_regular_identity(dir, filename)?.is_some();
     if !active_exists {
-        let guard = guards
+        let (_, guard) = guards
             .iter()
-            .find(|name| readat_regular(dir, name).is_ok())
+            .find_map(|name| openat_regular_file(dir, name).ok().map(|file| (name, file)))
             .ok_or_else(|| {
                 "stale config guards exist but none is a regular readable file".to_string()
             })?;
-        linkat_names(dir, guard, filename)?;
+        link_fd_at(&guard, dir, filename)?;
     }
     for guard in guards {
         let _ = unlinkat_name(dir, &guard);
@@ -3631,7 +3646,6 @@ where
     I: FnMut() -> Result<()>,
 {
     let dir = BoundDir::open_verified(&parent_dir.path, parent_dir.identity)?;
-    recover_stale_config_guards(&dir, &parent_dir.path, filename)?;
     let dot = CString::new(".").unwrap();
     let fd = unsafe {
         libc::openat(
@@ -3680,8 +3694,8 @@ where
 
     if let Err(error) = link_fd_at(&temp, &dir, filename) {
         if matches!(active, ActiveConfigState::Present { .. })
-            && (error.kind() == io::ErrorKind::AlreadyExists
-                || linkat_names(&dir, &guard_name, filename).is_ok())
+            && error.kind() != io::ErrorKind::AlreadyExists
+            && linkat_names(&dir, &guard_name, filename).is_ok()
         {
             let _ = unlinkat_name(&dir, &guard_name);
         }
@@ -3694,7 +3708,14 @@ where
         let _ = unlinkat_name(&dir, &guard_name);
     }
     match fstatat_regular_identity(&dir, filename) {
-        Ok(Some((identity, _))) if identity == temp_identity => Ok(()),
+        Ok(Some((identity, _)))
+            if identity == temp_identity
+                && readat_regular(&dir, filename)
+                    .as_deref()
+                    .is_ok_and(|bytes| bytes == new_bytes) =>
+        {
+            Ok(())
+        }
         Ok(Some(_)) => Err(format!(
             "config commit identity mismatch at {}; concurrent regular target was preserved",
             path.display()
@@ -5090,7 +5111,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         fs::write(&config_path, "operator config\n").unwrap();
-        let guard = dir.path().join(".config.toml.guard.crash");
+        let guard = dir
+            .path()
+            .join(".config.toml.guard.00000000000000000000000000000001");
         fs::hard_link(&config_path, &guard).unwrap();
         fs::remove_file(&config_path).unwrap();
         let parent = validate_config_parent_dir(dir.path(), false).unwrap();
@@ -5102,6 +5125,26 @@ mod tests {
             fs::read_to_string(&config_path).unwrap(),
             "operator config\n"
         );
+        assert!(!guard.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_root_persistence_recovers_interrupted_guard_then_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "# recovered\n[daemon]\nport = 25295\n").unwrap();
+        let guard = dir
+            .path()
+            .join(".config.toml.guard.00000000000000000000000000000002");
+        fs::hard_link(&config_path, &guard).unwrap();
+        fs::remove_file(&config_path).unwrap();
+
+        assert!(persist_update_repo_root_if_absent(&config_path, dir.path()).unwrap());
+
+        let persisted = fs::read_to_string(&config_path).unwrap();
+        assert!(persisted.contains("# recovered"));
+        assert!(persisted.contains("repo_root"));
         assert!(!guard.exists());
     }
 
