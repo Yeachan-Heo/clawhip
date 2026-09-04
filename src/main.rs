@@ -425,11 +425,7 @@ async fn real_main(cli: Cli) -> Result<()> {
             TmuxCommands::List => {
                 let client = DaemonClient::from_config(config.as_ref());
                 let registrations = client.list_tmux().await?;
-                let health = if registrations.is_empty() {
-                    client.health().await.ok()
-                } else {
-                    None
-                };
+                let health = client.health().await.ok();
                 render_tmux_list(&registrations, health.as_ref());
                 Ok(())
             }
@@ -1193,6 +1189,10 @@ fn format_tmux_list_with_health(
         ));
     }
 
+    if let Some(warning) = tmux_watch_coverage_warning(health) {
+        output.push_str(&format!("WARNING: {warning}\n"));
+    }
+
     output
 }
 
@@ -1219,25 +1219,51 @@ fn tmux_empty_list_detail(health: Option<&serde_json::Value>) -> String {
     {
         return format!("; live tmux probe failed: {error}");
     }
-    let live_count = tmux
-        .get("live_probe")
-        .and_then(|probe| probe.get("count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    if live_count > 0 {
-        return format!(
-            "; {live_count} live tmux session(s) exist but no clawhip watch routes are registered"
-        );
+    if let Some(warning) = tmux_watch_coverage_warning(health) {
+        return format!("; warning: {warning}");
     }
     String::new()
+}
+
+fn tmux_watch_coverage_warning(health: Option<&serde_json::Value>) -> Option<String> {
+    let coverage = health
+        .and_then(|health| health.get("tmux"))?
+        .get("watch_coverage")?;
+    let count = coverage.get("unregistered_live_lane_count")?.as_u64()?;
+    if count == 0 {
+        return None;
+    }
+
+    let sample = coverage
+        .get("unregistered_live_lane_sample")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    let omitted = count.saturating_sub(sample.len() as u64);
+    let sessions = if sample.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", sample.join(", "))
+    };
+    let remainder = if omitted == 0 {
+        String::new()
+    } else {
+        format!(" (+{omitted} more)")
+    };
+
+    Some(format!(
+        "{count} live GJC lane session(s) are not registered as clawhip watches{sessions}{remainder}"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        command_repairs_managed_state, format_tmux_list, load_config_for_cli,
-        parse_bind_checkout_overrides, parse_bind_overrides, parse_expect_name_overrides,
-        validate_bind_checkout_repos, verify_bindings_json,
+        command_repairs_managed_state, format_tmux_list, format_tmux_list_with_health,
+        load_config_for_cli, parse_bind_checkout_overrides, parse_bind_overrides,
+        parse_expect_name_overrides, validate_bind_checkout_repos, verify_bindings_json,
     };
     use crate::binding_verify::{BindingAudit, BindingDriftAudit};
     use crate::cli::Commands;
@@ -1486,5 +1512,75 @@ program = "/bin/true"
     #[test]
     fn format_tmux_list_handles_empty_registry() {
         assert_eq!(format_tmux_list(&[]), "No active tmux watches found\n");
+    }
+
+    #[test]
+    fn format_tmux_list_warns_about_partial_lane_coverage() {
+        let registration = RegisteredTmuxSession {
+            session: "gc-issue-367-lane".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            routing: RoutingMetadata::default(),
+            keywords: Vec::new(),
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-09-04T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: None,
+            registration_generation: 0,
+            active_wrapper_monitor: false,
+            lane: None,
+        };
+        let health = serde_json::json!({
+            "tmux": {
+                "watch_coverage": {
+                    "unregistered_live_lane_count": 3,
+                    "unregistered_live_lane_sample": ["gc-pr-5271-lane", "gc-pr-5280-lane"]
+                }
+            }
+        });
+
+        let output = format_tmux_list_with_health(&[registration], Some(&health));
+
+        assert!(output.contains(
+            "WARNING: 3 live GJC lane session(s) are not registered as clawhip watches: gc-pr-5271-lane, gc-pr-5280-lane (+1 more)\n"
+        ));
+    }
+
+    #[test]
+    fn format_tmux_list_warns_about_zero_registration_lane_coverage() {
+        let health = serde_json::json!({
+            "tmux": {
+                "live_probe": { "count": 2 },
+                "watch_coverage": {
+                    "unregistered_live_lane_count": 1,
+                    "unregistered_live_lane_sample": ["gc-issue-367-lane"]
+                }
+            }
+        });
+
+        assert_eq!(
+            format_tmux_list_with_health(&[], Some(&health)),
+            "No active tmux watches found; warning: 1 live GJC lane session(s) are not registered as clawhip watches: gc-issue-367-lane\n"
+        );
+    }
+
+    #[test]
+    fn format_tmux_list_does_not_warn_for_unrelated_live_sessions() {
+        let health = serde_json::json!({
+            "tmux": {
+                "live_probe": { "count": 2 },
+                "watch_coverage": {
+                    "unregistered_live_lane_count": 0,
+                    "unregistered_live_lane_sample": []
+                }
+            }
+        });
+
+        assert_eq!(
+            format_tmux_list_with_health(&[], Some(&health)),
+            "No active tmux watches found\n"
+        );
     }
 }
