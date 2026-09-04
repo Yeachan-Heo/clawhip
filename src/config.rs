@@ -4,7 +4,7 @@ use std::env;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -3380,39 +3380,6 @@ fn renameat_names(dir: &BoundDir, old: &str, new: &str) -> std::result::Result<(
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn renameat2_exchange(
-    dir: &BoundDir,
-    left: &str,
-    right: &str,
-) -> std::result::Result<(), io::Error> {
-    let left = CString::new(left).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "entry name contains interior NUL",
-        )
-    })?;
-    let right = CString::new(right).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "entry name contains interior NUL",
-        )
-    })?;
-    let rc = unsafe {
-        libc::renameat2(
-            dir.fd(),
-            left.as_ptr(),
-            dir.fd(),
-            right.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
 fn linkat_names(dir: &BoundDir, old: &str, new: &str) -> std::result::Result<(), io::Error> {
     let c_old = CString::new(old).map_err(|_| {
@@ -3514,6 +3481,32 @@ fn openat_regular_file(dir: &BoundDir, name: &str) -> std::result::Result<File, 
     let file = unsafe { File::from_raw_fd(fd) };
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("config guard is not a regular file"));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn openat_regular_file_write(dir: &BoundDir, name: &str) -> std::result::Result<File, io::Error> {
+    let c_name = CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let fd = unsafe {
+        libc::openat(
+            dir.fd(),
+            c_name.as_ptr(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("active config is not a regular file"));
     }
     Ok(file)
 }
@@ -3674,54 +3667,54 @@ where
     let _ = unlinkat_name(&dir, hostile_temp_name);
 
     match active {
-        ActiveConfigState::Absent => link_fd_at(&temp, &dir, filename).map_err(|error| {
-            format!("config target appeared at final publication; config was not saved: {error}")
-        })?,
+        ActiveConfigState::Absent => {
+            link_fd_at(&temp, &dir, filename).map_err(|error| {
+                format!(
+                    "config target appeared at final publication; config was not saved: {error}"
+                )
+            })?;
+            Ok(())
+        }
         ActiveConfigState::Present { identity, bytes } => {
-            let candidate_name = format!(".{filename}.candidate.{}", uuid::Uuid::new_v4().simple());
-            link_fd_at(&temp, &dir, &candidate_name)?;
-            renameat2_exchange(&dir, &candidate_name, filename)?;
-
-            let captured_matches = fstatat_regular_identity(&dir, &candidate_name)?
-                .is_some_and(|(captured, _)| Some(captured) == *identity)
-                && readat_regular(&dir, &candidate_name)
-                    .as_deref()
-                    .is_ok_and(|captured| captured == bytes);
-            if !captured_matches {
-                let active_is_candidate = fstatat_regular_identity(&dir, filename)?
-                    .is_some_and(|(current, _)| current == temp_identity);
-                if active_is_candidate {
-                    renameat2_exchange(&dir, &candidate_name, filename)?;
-                }
+            let mut observed = openat_regular_file_write(&dir, filename)?;
+            let observed_identity = metadata_identity(&observed.metadata()?);
+            let mut observed_bytes = Vec::new();
+            observed.read_to_end(&mut observed_bytes)?;
+            if observed_identity != *identity || observed_bytes != *bytes {
                 return Err(
-                    "active config changed during atomic exchange; operator config was preserved"
+                    "active config changed before inode-bound update; config was not saved".into(),
+                );
+            }
+            if !fstatat_regular_identity(&dir, filename)?
+                .is_some_and(|(current, _)| Some(current) == *identity)
+            {
+                return Err(
+                    "active config pathname changed; newer operator config was preserved".into(),
+                );
+            }
+            observed.seek(SeekFrom::Start(0))?;
+            observed.write_all(new_bytes)?;
+            observed.set_len(new_bytes.len() as u64)?;
+            observed.sync_all()?;
+            if !fstatat_regular_identity(&dir, filename)?
+                .is_some_and(|(current, _)| Some(current) == *identity)
+            {
+                return Err(
+                    "observed config inode was updated, but a newer operator pathname now wins"
                         .into(),
                 );
             }
-            let _ = unlinkat_name(&dir, &candidate_name);
-        }
-    }
-    match fstatat_regular_identity(&dir, filename) {
-        Ok(Some((identity, _)))
-            if identity == temp_identity
-                && readat_regular(&dir, filename)
-                    .as_deref()
-                    .is_ok_and(|bytes| bytes == new_bytes) =>
-        {
+            observed.seek(SeekFrom::Start(0))?;
+            let mut committed = Vec::new();
+            observed.read_to_end(&mut committed)?;
+            if committed != new_bytes {
+                return Err(format!(
+                    "config commit content mismatch at {}; backup recovery may be required",
+                    path.display()
+                )
+                .into());
+            }
             Ok(())
-        }
-        Ok(Some(_)) => Err(format!(
-            "config commit identity mismatch at {}; concurrent regular target was preserved",
-            path.display()
-        )
-        .into()),
-        _ => {
-            let _ = unlinkat_name(&dir, filename);
-            Err(format!(
-                "config commit identity mismatch at {}; unsafe target was removed",
-                path.display()
-            )
-            .into())
         }
     }
 }
