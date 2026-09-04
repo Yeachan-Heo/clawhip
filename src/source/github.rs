@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK, USER_AGENT};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -22,6 +22,10 @@ use crate::telemetry;
 
 const GH_AUTH_TIMEOUT: Duration = Duration::from_secs(2);
 const GITHUB_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
+// MoveFileExW with write-through and the following file flush can exceed the
+// old 200 ms retry window on loaded Windows runners.
+const BASELINE_LOCK_MAX_WAIT: Duration = Duration::from_secs(5);
+const BASELINE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GitHubMonitorAuthStatus {
@@ -1479,11 +1483,16 @@ fn acquire_baseline_lock(path: &Path) -> Result<BaselineLock> {
         .write(true)
         .truncate(false)
         .open(&lock_path)?;
-    for _ in 0..40 {
+    let deadline = Instant::now() + BASELINE_LOCK_MAX_WAIT;
+    loop {
         if try_lock_baseline_file(&file) {
             return Ok(BaselineLock { file });
         }
-        std::thread::sleep(Duration::from_millis(5));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(BASELINE_LOCK_RETRY_DELAY));
     }
     Err("timed out waiting for GitHub CI baseline lock".into())
 }
@@ -6622,6 +6631,31 @@ mod tests {
         let repo = loaded.repos.get("repo:org/repo").unwrap();
         assert!(repo.contains_identity("run:1"));
         assert!(repo.contains_identity("run:2"));
+    }
+
+    #[test]
+    fn issue_359_baseline_lock_waits_for_slow_windows_file_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-ci-baseline.json");
+        let held_lock = acquire_baseline_lock(&path).unwrap();
+        let start = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let waiter_start = start.clone();
+            let waiter_path = path.clone();
+            let waiter = scope.spawn(move || {
+                waiter_start.wait();
+                acquire_baseline_lock(&waiter_path)
+            });
+
+            start.wait();
+            std::thread::sleep(Duration::from_secs(1));
+            drop(held_lock);
+            assert!(
+                waiter.join().unwrap().is_ok(),
+                "baseline lock waiter must tolerate a slow Windows replace-and-flush"
+            );
+        });
     }
 
     #[tokio::test]
