@@ -63,22 +63,27 @@ where
         let _lock = platform::lock(state_dir)?;
         let records = platform::record_names(state_dir)?;
         let mut valid_records = Vec::with_capacity(records.len());
+        let mut exhausted_records = Vec::new();
         for record in records {
-            if record_generation(&record) != Some(u64::MAX)
-                && managed_record_is_valid(state_dir, &record)
-            {
+            if record_generation(&record) == Some(u64::MAX) {
+                exhausted_records.push(record);
+            } else if managed_record_is_valid(state_dir, &record) {
                 valid_records.push(record);
             } else {
                 platform::cleanup_records(state_dir, &[record], 0)?;
             }
         }
-        let generation = valid_records
-            .iter()
-            .filter_map(|record| record_generation(record))
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("managed source checkout generation overflow")?;
+        let generation = if exhausted_records.is_empty() {
+            valid_records
+                .iter()
+                .filter_map(|record| record_generation(record))
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or("managed source checkout generation overflow")?
+        } else {
+            1
+        };
         let state = SourceCheckoutState {
             generation,
             repo_root: path_string(&canonical)?,
@@ -89,7 +94,12 @@ where
             uuid::Uuid::new_v4().simple()
         );
         platform::publish_record(state_dir, &name, &bytes, before_publish)?;
-        platform::cleanup_records(state_dir, &valid_records, MAX_RECORDS.saturating_sub(1))?;
+        if exhausted_records.is_empty() {
+            platform::cleanup_records(state_dir, &valid_records, MAX_RECORDS.saturating_sub(1))?;
+        } else {
+            platform::cleanup_records(state_dir, &valid_records, 0)?;
+            platform::cleanup_records(state_dir, &exhausted_records, 0)?;
+        }
         Ok(())
     })
 }
@@ -246,6 +256,8 @@ mod platform {
         validate_state_dir_trust(&path, &metadata)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let file = linux::open_directory(&path)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        validate_state_dir_trust(&path, &file.metadata()?)?;
         operation(&StateDir {
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             path,
@@ -1042,12 +1054,30 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         persist(&config_path, &checkout_path).unwrap();
         let records = platform::with_state_dir(&config_path, false, platform::records).unwrap();
+        let penultimate_name = format!(
+            "state-{:020}-00000000000000000000000000000001.json",
+            u64::MAX - 1
+        );
         let max_name = format!(
             "state-{:020}-00000000000000000000000000000002.json",
             u64::MAX
         );
         let state_dir = state_dir_for_config(&config_path);
-        fs::rename(state_dir.join(&records[0]), state_dir.join(&max_name)).unwrap();
+        fs::rename(
+            state_dir.join(&records[0]),
+            state_dir.join(&penultimate_name),
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join(&penultimate_name),
+            serde_json::to_vec_pretty(&SourceCheckoutState {
+                generation: u64::MAX - 1,
+                repo_root: path_string(&checkout_path.canonicalize().unwrap()).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::copy(state_dir.join(&penultimate_name), state_dir.join(&max_name)).unwrap();
         fs::write(
             state_dir.join(&max_name),
             serde_json::to_vec_pretty(&SourceCheckoutState {
