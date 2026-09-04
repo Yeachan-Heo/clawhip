@@ -4027,6 +4027,36 @@ mod tests {
     }
 
     #[test]
+    fn tmux_watch_coverage_diagnostics_do_not_degrade_daemon_health() {
+        let payload = health_payload(
+            &AppConfig::default(),
+            25294,
+            1,
+            snapshot_shared(&new_shared_native_hook_observability()),
+            json!({
+                "watch_coverage": {
+                    "live_lane_count": 2,
+                    "registered_live_lane_count": 1,
+                    "unregistered_live_lane_count": 1,
+                    "unregistered_live_lane_sample": ["gc-pr-5280-lane"]
+                }
+            }),
+            &[],
+            GitMonitorLifecycleCounts::default(),
+        );
+
+        assert_eq!(payload["ok"], Value::Bool(true));
+        assert_eq!(
+            payload["tmux"]["watch_coverage"]["unregistered_live_lane_count"],
+            Value::from(1)
+        );
+        assert_eq!(
+            payload["tmux"]["watch_coverage"]["unregistered_live_lane_sample"],
+            json!(["gc-pr-5280-lane"])
+        );
+    }
+
+    #[test]
     fn health_payload_surfaces_gjc_state_without_endpoints_or_tokens() {
         let mut config = AppConfig::default();
         config.gjc.enabled = true;

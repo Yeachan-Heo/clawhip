@@ -26,6 +26,7 @@ use crate::telemetry;
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
 static REGISTRY_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static NEXT_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+const MAX_TMUX_DIAGNOSTIC_SESSION_SAMPLE: usize = 5;
 
 /// Mint a process-wide monotonically increasing registration generation.
 /// Client-supplied values are always overwritten with the daemon-minted
@@ -62,6 +63,7 @@ pub struct TmuxRegistryDiagnostics {
     pub durable_runtime_count: usize,
     pub config_projected_count: usize,
     pub live_probe: TmuxLiveProbeDiagnostics,
+    pub watch_coverage: TmuxWatchCoverageDiagnostics,
     pub registry_state: TmuxRegistryStateDiagnostics,
 }
 
@@ -71,6 +73,14 @@ pub struct TmuxLiveProbeDiagnostics {
     pub count: usize,
     pub sample: Vec<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TmuxWatchCoverageDiagnostics {
+    pub live_lane_count: usize,
+    pub registered_live_lane_count: usize,
+    pub unregistered_live_lane_count: usize,
+    pub unregistered_live_lane_sample: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1932,31 +1942,42 @@ pub async fn tmux_registry_diagnostics(
     let registered_count = snapshot.len();
     let durable_runtime_count = durable_runtime_entries(&snapshot).len();
     let config_projected_count = registered_count.saturating_sub(durable_runtime_count);
+    let registered_sessions = snapshot.keys().cloned().collect::<HashSet<_>>();
     drop(snapshot);
 
-    let live_probe = match list_tmux_sessions().await {
+    let (live_probe, watch_coverage) = match list_tmux_sessions().await {
         Ok(TmuxSessionInventory::Sessions(sessions)) => {
-            let mut sample = sessions.iter().take(5).cloned().collect::<Vec<_>>();
+            let mut sample = sessions.iter().cloned().collect::<Vec<_>>();
             sample.sort();
+            sample.truncate(MAX_TMUX_DIAGNOSTIC_SESSION_SAMPLE);
+            (
+                TmuxLiveProbeDiagnostics {
+                    ok: true,
+                    count: sessions.len(),
+                    sample,
+                    error: None,
+                },
+                tmux_watch_coverage(&sessions, &registered_sessions),
+            )
+        }
+        Ok(TmuxSessionInventory::NoServer) => (
             TmuxLiveProbeDiagnostics {
                 ok: true,
-                count: sessions.len(),
-                sample,
+                count: 0,
+                sample: Vec::new(),
                 error: None,
-            }
-        }
-        Ok(TmuxSessionInventory::NoServer) => TmuxLiveProbeDiagnostics {
-            ok: true,
-            count: 0,
-            sample: Vec::new(),
-            error: None,
-        },
-        Err(error) => TmuxLiveProbeDiagnostics {
-            ok: false,
-            count: 0,
-            sample: Vec::new(),
-            error: Some(error.to_string()),
-        },
+            },
+            tmux_watch_coverage(&HashSet::new(), &registered_sessions),
+        ),
+        Err(error) => (
+            TmuxLiveProbeDiagnostics {
+                ok: false,
+                count: 0,
+                sample: Vec::new(),
+                error: Some(error.to_string()),
+            },
+            tmux_watch_coverage(&HashSet::new(), &registered_sessions),
+        ),
     };
 
     TmuxRegistryDiagnostics {
@@ -1964,8 +1985,49 @@ pub async fn tmux_registry_diagnostics(
         durable_runtime_count,
         config_projected_count,
         live_probe,
+        watch_coverage,
         registry_state,
     }
+}
+
+fn tmux_watch_coverage(
+    live_sessions: &HashSet<String>,
+    registered_sessions: &HashSet<String>,
+) -> TmuxWatchCoverageDiagnostics {
+    let mut live_lanes = live_sessions
+        .iter()
+        .filter(|session| is_gjc_lane_session(session))
+        .cloned()
+        .collect::<Vec<_>>();
+    live_lanes.sort();
+
+    let live_lane_count = live_lanes.len();
+    let registered_live_lane_count = live_lanes
+        .iter()
+        .filter(|session| registered_sessions.contains(*session))
+        .count();
+    let mut unregistered_live_lanes = live_lanes
+        .into_iter()
+        .filter(|session| !registered_sessions.contains(session))
+        .collect::<Vec<_>>();
+    let unregistered_live_lane_count = unregistered_live_lanes.len();
+    unregistered_live_lanes.truncate(MAX_TMUX_DIAGNOSTIC_SESSION_SAMPLE);
+
+    TmuxWatchCoverageDiagnostics {
+        live_lane_count,
+        registered_live_lane_count,
+        unregistered_live_lane_count,
+        unregistered_live_lane_sample: unregistered_live_lanes,
+    }
+}
+
+fn is_gjc_lane_session(session: &str) -> bool {
+    ["gc-issue-", "gc-pr-"].iter().any(|prefix| {
+        session
+            .strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_suffix("-lane"))
+            .is_some_and(|lane_id| !lane_id.is_empty())
+    })
 }
 
 pub async fn list_active_tmux_registrations(
@@ -3770,6 +3832,83 @@ PR created #7",
     fn default_registry_state_path_sits_beside_cron_state() {
         let path = default_registry_state_path(Path::new("/tmp/clawhip/cron-state.json"));
         assert_eq!(path, PathBuf::from("/tmp/clawhip/tmux-watch-registry.json"));
+    }
+
+    #[test]
+    fn watch_coverage_reports_sorted_bounded_partial_lane_gaps() {
+        let live = HashSet::from([
+            "gc-pr-9-lane".to_string(),
+            "gc-pr-8-lane".to_string(),
+            "gc-pr-7-lane".to_string(),
+            "gc-pr-6-lane".to_string(),
+            "gc-pr-5-lane".to_string(),
+            "gc-pr-4-lane".to_string(),
+            "gc-pr-3-lane".to_string(),
+            "gc-issue-3-lane".to_string(),
+        ]);
+        let registered = HashSet::from(["gc-issue-3-lane".to_string(), "gc-pr-9-lane".to_string()]);
+
+        let diagnostics = tmux_watch_coverage(&live, &registered);
+
+        assert_eq!(diagnostics.live_lane_count, 8);
+        assert_eq!(diagnostics.registered_live_lane_count, 2);
+        assert_eq!(diagnostics.unregistered_live_lane_count, 6);
+        assert_eq!(
+            diagnostics.unregistered_live_lane_sample,
+            [
+                "gc-pr-3-lane",
+                "gc-pr-4-lane",
+                "gc-pr-5-lane",
+                "gc-pr-6-lane",
+                "gc-pr-7-lane",
+            ]
+        );
+    }
+
+    #[test]
+    fn watch_coverage_reports_zero_registration_lane_gap() {
+        let live = HashSet::from(["gc-issue-367-lane".to_string()]);
+
+        let diagnostics = tmux_watch_coverage(&live, &HashSet::new());
+
+        assert_eq!(diagnostics.live_lane_count, 1);
+        assert_eq!(diagnostics.registered_live_lane_count, 0);
+        assert_eq!(diagnostics.unregistered_live_lane_count, 1);
+        assert_eq!(
+            diagnostics.unregistered_live_lane_sample,
+            ["gc-issue-367-lane"]
+        );
+    }
+
+    #[test]
+    fn watch_coverage_is_clean_for_fully_registered_lanes() {
+        let live = HashSet::from([
+            "gc-issue-367-lane".to_string(),
+            "gc-pr-5280-lane".to_string(),
+        ]);
+
+        let diagnostics = tmux_watch_coverage(&live, &live);
+
+        assert_eq!(diagnostics.live_lane_count, 2);
+        assert_eq!(diagnostics.registered_live_lane_count, 2);
+        assert_eq!(diagnostics.unregistered_live_lane_count, 0);
+        assert!(diagnostics.unregistered_live_lane_sample.is_empty());
+    }
+
+    #[test]
+    fn watch_coverage_ignores_unrelated_tmux_sessions() {
+        let live = HashSet::from([
+            "operator-shell".to_string(),
+            "gc-pr--lane".to_string(),
+            "gc-issue-367".to_string(),
+        ]);
+
+        let diagnostics = tmux_watch_coverage(&live, &HashSet::new());
+
+        assert_eq!(diagnostics.live_lane_count, 0);
+        assert_eq!(diagnostics.registered_live_lane_count, 0);
+        assert_eq!(diagnostics.unregistered_live_lane_count, 0);
+        assert!(diagnostics.unregistered_live_lane_sample.is_empty());
     }
 
     #[cfg(unix)]
