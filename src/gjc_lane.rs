@@ -3465,7 +3465,7 @@ fn failure_alert_authority(
         && current.prompt_accepted
         && matches!(
             current.turn_state,
-            GjcTurnState::Running | GjcTurnState::AwaitingInput
+            GjcTurnState::Running | GjcTurnState::AwaitingInput | GjcTurnState::Failed
         )
         && (!turn_matches || !command_matches)
     {
@@ -4463,6 +4463,59 @@ mod tests {
         assert!(rendered.contains("current turn failed"), "{rendered}");
         assert!(rendered.contains("command=command-current"), "{rendered}");
         assert!(rendered.contains("turn=turn-current"), "{rendered}");
+        assert!(
+            store
+                .record(&lane_id)
+                .expect("record")
+                .pending_alerts
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_failed_replacement_suppresses_old_and_alerts_only_current_turn() {
+        let (_dir, store, lane_id) = store_with_lane("failed-replacement");
+        let record = store.record(&lane_id).expect("record");
+        let mut old = observation(GjcTurnState::Failed, GjcSessionDisposition::Live);
+        old.revision = 10;
+        old.turn_id = Some("turn-old".to_string());
+        old.command_id = Some("command-old".to_string());
+        let (record, _) = store
+            .apply_observation(&lane_id, record.revision, &old, &ts(1_200))
+            .expect("old failure");
+        assert_eq!(record.pending_alerts.len(), 1);
+
+        let mut current = old;
+        current.revision = 11;
+        current.turn_id = Some("turn-current-failed".to_string());
+        current.command_id = Some("command-current-failed".to_string());
+        let plane = Arc::new(ScriptedPlane {
+            responses: Mutex::new(VecDeque::from(vec![Ok(current.clone()), Ok(current)])),
+        });
+        let (tx, sink, mut rx) = event_channel(8);
+        let callback_sink = sink.clone();
+        let callback = tokio::spawn(async move {
+            if let Some(event) = rx.recv().await {
+                callback_sink.lock().expect("sink").push(event.clone());
+                crate::dispatch::resolve_alert_acceptance_id(
+                    event.payload["event_id"].as_str().expect("event id"),
+                    true,
+                );
+            }
+        });
+        let reconciler =
+            GjcReconciler::new(plane, None, store.clone(), tx, GjcPollingPolicy::default());
+        reconciler.poll_once(fixed_now(40_000)).await.expect("poll");
+        callback.await.expect("callback");
+
+        let events = sink.lock().expect("sink");
+        let alerts = events
+            .iter()
+            .filter(|event| event.kind == "session.failed")
+            .collect::<Vec<_>>();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].payload["turn_id"], "turn-current-failed");
+        assert_eq!(alerts[0].payload["command_id"], "command-current-failed");
         assert!(
             store
                 .record(&lane_id)
