@@ -23,6 +23,10 @@ use crate::source::workspace::{default_workspace_debounce_ms, default_workspace_
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
+    #[serde(skip)]
+    pub(crate) config_path: PathBuf,
+    #[serde(skip)]
+    pub(crate) managed_repo_root: Option<String>,
     #[serde(default, skip_serializing_if = "DiscordConfig::is_empty")]
     pub discord: DiscordConfig,
     #[serde(default, skip_serializing_if = "ProvidersConfig::is_empty")]
@@ -1164,8 +1168,23 @@ where
 
 impl AppConfig {
     pub fn load_or_default(path: &Path) -> Result<Self> {
+        Self::load_or_default_with_managed(path, true)
+    }
+
+    pub fn load_or_default_without_managed(path: &Path) -> Result<Self> {
+        Self::load_or_default_with_managed(path, false)
+    }
+
+    fn load_or_default_with_managed(path: &Path, load_managed: bool) -> Result<Self> {
         if !path.exists() {
-            return Ok(Self::default());
+            let mut config = Self {
+                config_path: path.to_path_buf(),
+                ..Self::default()
+            };
+            if load_managed {
+                config.managed_repo_root = crate::source_checkout::load(path)?;
+            }
+            return Ok(config);
         }
         let raw = fs::read_to_string(path)?;
         let raw_toml: toml::Value = toml::from_str(&raw)?;
@@ -1175,7 +1194,35 @@ impl AppConfig {
         if config.defaults.channel.is_none() {
             config.defaults.channel = config.discord_default_channel();
         }
+        config.config_path = path.to_path_buf();
+        if load_managed
+            && config
+                .update
+                .repo_root
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        {
+            config.managed_repo_root = crate::source_checkout::load(path)?;
+        }
         Ok(config)
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        if self.config_path.as_os_str().is_empty() {
+            default_config_path()
+        } else {
+            self.config_path.clone()
+        }
+    }
+
+    pub fn effective_update_repo_root(&self) -> Option<&str> {
+        self.update
+            .repo_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .or(self.managed_repo_root.as_deref())
     }
 
     fn merge_legacy_discord(&mut self, raw_toml: &toml::Value) -> Result<()> {

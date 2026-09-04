@@ -220,14 +220,7 @@ pub async fn run_checker(
     tx: mpsc::Sender<IncomingEvent>,
     report: SharedDriftReport,
 ) {
-    let Some(repo_root) = config
-        .update
-        .repo_root
-        .as_deref()
-        .map(str::trim)
-        .filter(|root| !root.is_empty())
-        .map(PathBuf::from)
-    else {
+    let Some(repo_root) = config.effective_update_repo_root().map(PathBuf::from) else {
         // Nothing to compare against; record why and stay quiet.
         observe(None, &report).await;
         return;
@@ -392,6 +385,27 @@ mod tests {
         // The test binary's own stamp decides match/drift, so only assert the
         // parts that do not depend on how this test run was built.
         assert_ne!(observed.state, DriftState::Match);
+    }
+
+    #[tokio::test]
+    async fn repo_root_alone_is_sufficient_for_health_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        std::fs::create_dir(&root).unwrap();
+        checkout_at(&root, B);
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"clawhip\"\n").unwrap();
+        let config_path = dir.path().join("config.toml");
+        crate::source_checkout::persist(&config_path, &root).unwrap();
+        let config = AppConfig::load_or_default(&config_path).unwrap();
+        assert!(!config.update.enabled);
+        assert!(config.update.channel.is_none());
+
+        let report = new_shared_drift_report();
+        let observed = observe(config.effective_update_repo_root().map(Path::new), &report).await;
+
+        assert_eq!(observed.source_commit.as_deref(), Some(B));
+        assert_ne!(observed.reason, Some("no source checkout configured"));
     }
 
     #[tokio::test]
