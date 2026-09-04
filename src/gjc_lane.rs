@@ -886,8 +886,8 @@ fn migrate_failure_causality(state: &mut GjcLaneStateFile) -> Result<bool> {
         let mut retained = Vec::with_capacity(record.pending_alerts.len());
         for mut alert in std::mem::take(&mut record.pending_alerts) {
             if alert.kind == "session.failed" && alert.turn_failure.is_none() {
-                if !current_event_ids.is_empty()
-                    && !current_event_ids
+                if current_event_ids.is_empty()
+                    || !current_event_ids
                         .iter()
                         .any(|current| current == &alert.event_id)
                 {
@@ -4427,6 +4427,51 @@ mod tests {
                 .turn_id,
             "turn-rich-second"
         );
+    }
+
+    #[test]
+    fn legacy_failure_queue_is_cleared_when_no_failed_turn_is_current() {
+        let (dir, store, lane_id) = store_with_lane("legacy-no-current-failure");
+        let record = store.record(&lane_id).expect("record");
+        let mut failed = observation(GjcTurnState::Failed, GjcSessionDisposition::Live);
+        failed.session_id = record.sdk_session_id.clone();
+        let (record, _) = store
+            .apply_observation(&lane_id, record.revision, &failed, &ts(1_200))
+            .expect("failure");
+        let mut replacement = failed;
+        replacement.revision = 11;
+        replacement.turn_state = GjcTurnState::Running;
+        replacement.turn_id = Some("turn-replacement-current".to_string());
+        replacement.command_id = Some("command-replacement-current".to_string());
+        let (record, _) = store
+            .apply_observation(&lane_id, record.revision, &replacement, &ts(1_300))
+            .expect("replacement");
+        assert_eq!(record.pending_alerts.len(), 1);
+        drop(store);
+
+        let path = dir.path().join("gjc-lane-state.json");
+        let mut persisted: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read state")).expect("json");
+        persisted["lanes"][&lane_id]["pending_alerts"][0]
+            .as_object_mut()
+            .expect("pending alert")
+            .remove("turn_failure");
+        std::fs::write(&path, serde_json::to_vec(&persisted).expect("serialize")).expect("write");
+
+        let reopened = GjcLaneStore::open(&path).expect("reopen");
+        assert!(
+            reopened
+                .record(&lane_id)
+                .expect("record")
+                .pending_alerts
+                .is_empty()
+        );
+        assert!(reopened.audit().iter().any(|entry| {
+            entry.kind == GjcAuditKind::HistoricalFailureSuppressed
+                && entry
+                    .detail
+                    .contains("legacy historical failure suppressed")
+        }));
     }
 
     #[test]
