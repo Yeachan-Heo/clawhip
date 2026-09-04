@@ -1296,7 +1296,7 @@ async fn feed_gjc_bridge_from_query(
     let Some(query_revision) = query.revision else {
         return false;
     };
-    let (candidate, events) = {
+    let (candidate, mut events, snapshot) = {
         let Ok(bridge) = gjc_bridge_slot().lock() else {
             return false;
         };
@@ -1312,8 +1312,26 @@ async fn feed_gjc_bridge_from_query(
         let Ok(outcome) = candidate.observe(&snapshot) else {
             return false;
         };
-        (candidate, outcome.events)
+        (candidate, outcome.events, snapshot)
     };
+    let staged_failure = events.iter().any(|event| event.kind == "session.failed");
+    if staged_failure {
+        let Some(current) = store.record(&lane_id) else {
+            return false;
+        };
+        if store
+            .stage_bridge_failure(
+                &lane_id,
+                current.revision,
+                &snapshot,
+                &crate::gjc_lane::now_rfc3339(),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        events.retain(|event| event.kind != "session.failed");
+    }
     for event in &events {
         if enqueue_event(&state.tx, normalize_event(event.clone()))
             .await
@@ -1322,19 +1340,21 @@ async fn feed_gjc_bridge_from_query(
             return false;
         }
     }
-    let Some(current) = store.record(&lane_id) else {
-        return false;
-    };
-    if store
-        .set_sdk_revision_if(
-            &lane_id,
-            current.sdk_revision,
-            query_revision,
-            &crate::gjc_lane::now_rfc3339(),
-        )
-        .is_err()
-    {
-        return false;
+    if !staged_failure {
+        let Some(current) = store.record(&lane_id) else {
+            return false;
+        };
+        if store
+            .set_sdk_revision_if(
+                &lane_id,
+                current.sdk_revision,
+                query_revision,
+                &crate::gjc_lane::now_rfc3339(),
+            )
+            .is_err()
+        {
+            return false;
+        }
     }
     let Ok(mut bridge) = gjc_bridge_slot().lock() else {
         return false;
@@ -1811,9 +1831,58 @@ async fn post_gjc_bridge(
         }
     };
 
-    let mut emitted = Vec::new();
+    let mut events = outcome.events;
+    let staged_event = events
+        .iter()
+        .find(|event| event.kind == "session.failed")
+        .map(|event| {
+            json!({
+                "type": event.kind,
+                "event_id": event.payload.get("event_id").and_then(Value::as_str).unwrap_or_default(),
+                "staged": true,
+            })
+        });
+    let has_failure = staged_event.is_some();
+    let staged_failure = if has_failure && let Some(lane_id) = push_lane_id.as_deref() {
+        let Some(store) = state.gjc_store.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc lane store unavailable"})),
+            )
+                .into_response();
+        };
+        let Some(current) = store.record(lane_id) else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc lane record unavailable"})),
+            )
+                .into_response();
+        };
+        if store
+            .stage_bridge_failure(
+                lane_id,
+                current.revision,
+                &snapshot,
+                &crate::gjc_lane::now_rfc3339(),
+            )
+            .is_err()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc failure staging unavailable"})),
+            )
+                .into_response();
+        }
+        true
+    } else {
+        false
+    };
+    if staged_failure {
+        events.retain(|event| event.kind != "session.failed");
+    }
+    let mut emitted = staged_event.into_iter().collect::<Vec<_>>();
     let mut rejected = Vec::new();
-    for event in outcome.events {
+    for event in events {
         let kind = event.kind.clone();
         let event_id = event
             .payload
@@ -1851,7 +1920,8 @@ async fn post_gjc_bridge(
     telemetry::emit(record);
 
     let response_status = if rejected.is_empty() {
-        if let Some(lane_id) = push_lane_id.as_deref()
+        if !staged_failure
+            && let Some(lane_id) = push_lane_id.as_deref()
             && let Some(store) = &state.gjc_store
             && let Some(current) = store.record(lane_id)
             && store
