@@ -64,7 +64,9 @@ where
         let records = platform::record_names(state_dir)?;
         let mut valid_records = Vec::with_capacity(records.len());
         for record in records {
-            if managed_record_is_valid(state_dir, &record) {
+            if record_generation(&record) != Some(u64::MAX)
+                && managed_record_is_valid(state_dir, &record)
+            {
                 valid_records.push(record);
             } else {
                 platform::cleanup_records(state_dir, &[record], 0)?;
@@ -179,6 +181,16 @@ pub(crate) fn isolated_git_command() -> Command {
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_EXEC_PATH",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "GIT_PROXY_COMMAND",
     ] {
         command.env_remove(variable);
     }
@@ -377,25 +389,25 @@ mod platform {
 
     pub fn record_names(dir: &StateDir) -> Result<Vec<String>> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let read_path = PathBuf::from(format!(
-            "/proc/self/fd/{}",
-            std::os::fd::AsRawFd::as_raw_fd(&dir.file)
-        ));
+        return linux::record_names(dir);
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let read_path = dir.path.clone();
-        let mut records = Vec::new();
-        for entry in fs::read_dir(read_path)? {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if record_generation(&name).is_none() {
-                continue;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let mut records = Vec::new();
+            for entry in fs::read_dir(read_path)? {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if record_generation(&name).is_none() {
+                    continue;
+                }
+                records.push(name);
             }
-            records.push(name);
+            records.sort();
+            Ok(records)
         }
-        records.sort();
-        Ok(records)
     }
 
     pub fn read_record(dir: &StateDir, name: &str) -> Result<Vec<u8>> {
@@ -601,6 +613,70 @@ mod platform {
             open_record(dir, name).map(|_| ())
         }
 
+        pub fn record_names(dir: &StateDir) -> Result<Vec<String>> {
+            use std::ffi::CStr;
+
+            let dot = CString::new(".")?;
+            let fd = unsafe {
+                libc::openat(
+                    dir.file.as_raw_fd(),
+                    dot.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let stream = unsafe { libc::fdopendir(fd) };
+            if stream.is_null() {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(error.into());
+            }
+            let mut records = Vec::new();
+            loop {
+                set_errno(0);
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    let error = errno();
+                    unsafe { libc::closedir(stream) };
+                    if error != 0 {
+                        return Err(std::io::Error::from_raw_os_error(error).into());
+                    }
+                    break;
+                }
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+                let Ok(name) = name.to_str() else {
+                    continue;
+                };
+                if record_generation(name).is_some() {
+                    records.push(name.to_owned());
+                }
+            }
+            records.sort();
+            Ok(records)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn errno() -> i32 {
+            unsafe { *libc::__errno_location() }
+        }
+
+        #[cfg(target_os = "linux")]
+        fn set_errno(value: i32) {
+            unsafe { *libc::__errno_location() = value };
+        }
+
+        #[cfg(target_os = "android")]
+        fn errno() -> i32 {
+            unsafe { *libc::__errno() }
+        }
+
+        #[cfg(target_os = "android")]
+        fn set_errno(value: i32) {
+            unsafe { *libc::__errno() = value };
+        }
+
         pub fn read_record(dir: &StateDir, name: &str) -> Result<Vec<u8>> {
             let mut file = open_record(dir, name)?;
             let mut bytes = Vec::new();
@@ -631,7 +707,7 @@ mod platform {
                 if error.raw_os_error().is_some_and(|code| {
                     [libc::EOPNOTSUPP, libc::EINVAL, libc::EISDIR, libc::ENOSYS].contains(&code)
                 }) {
-                    return publish_named_temp(dir, name, bytes, before_publish);
+                    return publish_named_temp(dir, name, bytes, before_publish, true);
                 }
                 return Err(error.into());
             }
@@ -662,7 +738,7 @@ mod platform {
                     )
                 } != 0
                 {
-                    return Err(std::io::Error::last_os_error().into());
+                    return publish_named_temp(dir, name, bytes, before_publish, false);
                 }
             }
             dir.file.sync_all()?;
@@ -674,6 +750,7 @@ mod platform {
             name: &str,
             bytes: &[u8],
             before_publish: &mut F,
+            run_hook: bool,
         ) -> Result<()>
         where
             F: FnMut() -> Result<()>,
@@ -700,7 +777,9 @@ mod platform {
                 file.write_all(bytes)?;
                 file.write_all(b"\n")?;
                 file.sync_all()?;
-                before_publish()?;
+                if run_hook {
+                    before_publish()?;
+                }
                 if unsafe {
                     libc::linkat(
                         dir.file.as_raw_fd(),
@@ -949,6 +1028,40 @@ mod tests {
         )
         .unwrap();
 
+        persist(&config_path, &checkout_path).unwrap();
+        let records = platform::with_state_dir(&config_path, false, platform::records).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(record_generation(&records[0]), Some(1));
+    }
+
+    #[test]
+    fn valid_max_generation_record_can_be_rebased_by_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout_path = dir.path().join("checkout");
+        checkout(&checkout_path);
+        let config_path = dir.path().join("config.toml");
+        persist(&config_path, &checkout_path).unwrap();
+        let records = platform::with_state_dir(&config_path, false, platform::records).unwrap();
+        let max_name = format!(
+            "state-{:020}-00000000000000000000000000000002.json",
+            u64::MAX
+        );
+        let state_dir = state_dir_for_config(&config_path);
+        fs::rename(state_dir.join(&records[0]), state_dir.join(&max_name)).unwrap();
+        fs::write(
+            state_dir.join(&max_name),
+            serde_json::to_vec_pretty(&SourceCheckoutState {
+                generation: u64::MAX,
+                repo_root: path_string(&checkout_path.canonicalize().unwrap()).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            load(&config_path).unwrap().as_deref(),
+            checkout_path.to_str()
+        );
         persist(&config_path, &checkout_path).unwrap();
         let records = platform::with_state_dir(&config_path, false, platform::records).unwrap();
         assert_eq!(records.len(), 1);

@@ -82,6 +82,9 @@ validate_source_checkout() {
   git_root="$(
     env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
       -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+      -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
+      -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_EXEC_PATH \
+      -u GIT_SSH -u GIT_SSH_COMMAND -u GIT_ASKPASS -u GIT_PROXY_COMMAND \
       git -C "$REPO_ROOT" rev-parse --show-toplevel
   )" || {
     log "source checkout is not a git worktree"
