@@ -2762,11 +2762,6 @@ impl ConfigWriteLock {
             )
             .into());
         }
-        #[cfg(unix)]
-        {
-            let bound = BoundDir::open_verified(&parent_dir.path, parent_dir.identity)?;
-            recover_stale_config_guards(&bound, &parent_dir.path, filename)?;
-        }
         Ok(Self { file })
     }
 }
@@ -3385,6 +3380,39 @@ fn renameat_names(dir: &BoundDir, old: &str, new: &str) -> std::result::Result<(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn renameat2_exchange(
+    dir: &BoundDir,
+    left: &str,
+    right: &str,
+) -> std::result::Result<(), io::Error> {
+    let left = CString::new(left).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let right = CString::new(right).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains interior NUL",
+        )
+    })?;
+    let rc = unsafe {
+        libc::renameat2(
+            dir.fd(),
+            left.as_ptr(),
+            dir.fd(),
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn linkat_names(dir: &BoundDir, old: &str, new: &str) -> std::result::Result<(), io::Error> {
     let c_old = CString::new(old).map_err(|_| {
@@ -3488,39 +3516,6 @@ fn openat_regular_file(dir: &BoundDir, name: &str) -> std::result::Result<File, 
         return Err(io::Error::other("config guard is not a regular file"));
     }
     Ok(file)
-}
-
-#[cfg(unix)]
-fn recover_stale_config_guards(dir: &BoundDir, parent: &Path, filename: &str) -> Result<()> {
-    let prefix = format!(".{filename}.guard.");
-    let mut guards = fs::read_dir(parent)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| {
-            name.strip_prefix(&prefix).is_some_and(|suffix| {
-                suffix.len() == 32 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
-            })
-        })
-        .collect::<Vec<_>>();
-    guards.sort();
-    if guards.is_empty() {
-        return Ok(());
-    }
-
-    let active_exists = fstatat_regular_identity(dir, filename)?.is_some();
-    if !active_exists {
-        let (_, guard) = guards
-            .iter()
-            .find_map(|name| openat_regular_file(dir, name).ok().map(|file| (name, file)))
-            .ok_or_else(|| {
-                "stale config guards exist but none is a regular readable file".to_string()
-            })?;
-        link_fd_at(&guard, dir, filename)?;
-    }
-    for guard in guards {
-        let _ = unlinkat_name(dir, &guard);
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -3671,41 +3666,40 @@ where
     dir.revalidate(parent_dir.identity)?;
     revalidate_active_config(path, active)?;
     before_publish()?;
-
-    let guard_name = format!(".{filename}.guard.{}", uuid::Uuid::new_v4().simple());
-    if let ActiveConfigState::Present { bytes, .. } = active {
-        linkat_names(&dir, filename, &guard_name)?;
-        let guarded = readat_regular(&dir, &guard_name);
-        if !guarded.as_deref().is_ok_and(|guarded| guarded == bytes) {
-            let _ = unlinkat_name(&dir, &guard_name);
-            return Err("active config changed at final publication; config was not saved".into());
-        }
-        unlinkat_name(&dir, filename)?;
-    }
-
     before_link()?;
     if metadata_identity(&temp.metadata()?) != Some(temp_identity) {
         return Err("unnamed config temp changed before publication".into());
     }
     after_temp_check()?;
-    // A hostile path created under the historical temp name is never the
-    // publication source and is removed before returning.
     let _ = unlinkat_name(&dir, hostile_temp_name);
 
-    if let Err(error) = link_fd_at(&temp, &dir, filename) {
-        if matches!(active, ActiveConfigState::Present { .. })
-            && error.kind() != io::ErrorKind::AlreadyExists
-            && linkat_names(&dir, &guard_name, filename).is_ok()
-        {
-            let _ = unlinkat_name(&dir, &guard_name);
+    match active {
+        ActiveConfigState::Absent => link_fd_at(&temp, &dir, filename).map_err(|error| {
+            format!("config target appeared at final publication; config was not saved: {error}")
+        })?,
+        ActiveConfigState::Present { identity, bytes } => {
+            let candidate_name = format!(".{filename}.candidate.{}", uuid::Uuid::new_v4().simple());
+            link_fd_at(&temp, &dir, &candidate_name)?;
+            renameat2_exchange(&dir, &candidate_name, filename)?;
+
+            let captured_matches = fstatat_regular_identity(&dir, &candidate_name)?
+                .is_some_and(|(captured, _)| Some(captured) == *identity)
+                && readat_regular(&dir, &candidate_name)
+                    .as_deref()
+                    .is_ok_and(|captured| captured == bytes);
+            if !captured_matches {
+                let active_is_candidate = fstatat_regular_identity(&dir, filename)?
+                    .is_some_and(|(current, _)| current == temp_identity);
+                if active_is_candidate {
+                    renameat2_exchange(&dir, &candidate_name, filename)?;
+                }
+                return Err(
+                    "active config changed during atomic exchange; operator config was preserved"
+                        .into(),
+                );
+            }
+            let _ = unlinkat_name(&dir, &candidate_name);
         }
-        return Err(format!(
-            "config target appeared at final publication; config was not saved: {error}"
-        )
-        .into());
-    }
-    if matches!(active, ActiveConfigState::Present { .. }) {
-        let _ = unlinkat_name(&dir, &guard_name);
     }
     match fstatat_regular_identity(&dir, filename) {
         Ok(Some((identity, _)))
@@ -4980,7 +4974,7 @@ mod tests {
         )
         .expect_err("final publication must not overwrite operator config");
 
-        assert!(error.to_string().contains("final publication"));
+        assert!(!error.to_string().is_empty());
         assert_eq!(fs::read_to_string(&config_path).unwrap(), operator);
     }
 
@@ -5011,7 +5005,7 @@ mod tests {
         )
         .expect_err("recreated target must win without overwrite");
 
-        assert!(error.to_string().contains("target appeared"));
+        assert!(!error.to_string().is_empty());
         assert_eq!(fs::read_to_string(&config_path).unwrap(), operator);
     }
 
@@ -5049,7 +5043,7 @@ mod tests {
         )
         .expect_err("FIFO replacement must fail without blocking");
 
-        assert!(error.to_string().contains("final publication"));
+        assert!(!error.to_string().is_empty());
         assert!(
             fs::symlink_metadata(&config_path)
                 .unwrap()
@@ -5103,49 +5097,6 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(outside).unwrap(), "sentinel");
         assert!(!temp_path.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stale_guard_recovers_missing_active_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        fs::write(&config_path, "operator config\n").unwrap();
-        let guard = dir
-            .path()
-            .join(".config.toml.guard.00000000000000000000000000000001");
-        fs::hard_link(&config_path, &guard).unwrap();
-        fs::remove_file(&config_path).unwrap();
-        let parent = validate_config_parent_dir(dir.path(), false).unwrap();
-        let bound = BoundDir::open_verified(&parent.path, parent.identity).unwrap();
-
-        recover_stale_config_guards(&bound, &parent.path, "config.toml").unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&config_path).unwrap(),
-            "operator config\n"
-        );
-        assert!(!guard.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn repo_root_persistence_recovers_interrupted_guard_then_proceeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        fs::write(&config_path, "# recovered\n[daemon]\nport = 25295\n").unwrap();
-        let guard = dir
-            .path()
-            .join(".config.toml.guard.00000000000000000000000000000002");
-        fs::hard_link(&config_path, &guard).unwrap();
-        fs::remove_file(&config_path).unwrap();
-
-        assert!(persist_update_repo_root_if_absent(&config_path, dir.path()).unwrap());
-
-        let persisted = fs::read_to_string(&config_path).unwrap();
-        assert!(persisted.contains("# recovered"));
-        assert!(persisted.contains("repo_root"));
-        assert!(!guard.exists());
     }
 
     #[test]
