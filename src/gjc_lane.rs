@@ -3447,27 +3447,27 @@ fn failure_alert_authority(
         return FailureAlertAuthority::Unknown;
     };
     let turn_matches = causality.turn_id == current_turn_id;
-    let command_matches = match (
+    let command_conflicts = match (
         causality.command_id.as_deref(),
         current.command_id.as_deref(),
     ) {
-        (Some(alert), Some(current)) => alert == current,
-        (None, _) => true,
-        (Some(_), None) => false,
+        (Some(alert), Some(current)) => alert != current,
+        _ => false,
     };
-    if current.prompt_accepted
-        && current.turn_state == GjcTurnState::Failed
+    if current.turn_state == GjcTurnState::Failed
+        && current.revision >= causality.sdk_revision
         && turn_matches
-        && command_matches
+        && !command_conflicts
     {
         FailureAlertAuthority::Current
     } else if current.revision > causality.sdk_revision
-        && current.prompt_accepted
-        && matches!(
-            current.turn_state,
-            GjcTurnState::Running | GjcTurnState::AwaitingInput | GjcTurnState::Failed
-        )
-        && (!turn_matches || !command_matches)
+        && ((current.prompt_accepted
+            && matches!(
+                current.turn_state,
+                GjcTurnState::Running | GjcTurnState::AwaitingInput
+            )
+            && (!turn_matches || command_conflicts))
+            || (current.turn_state == GjcTurnState::Failed && (!turn_matches || command_conflicts)))
     {
         FailureAlertAuthority::Superseded
     } else {
@@ -4426,8 +4426,11 @@ mod tests {
         let mut failed = observation(GjcTurnState::Failed, GjcSessionDisposition::Live);
         failed.command_id = Some("command-current".to_string());
         failed.turn_id = Some("turn-current".to_string());
+        let mut terminal_readback = failed.clone();
+        terminal_readback.prompt_accepted = false;
+        terminal_readback.command_id = None;
         let plane = Arc::new(ScriptedPlane {
-            responses: Mutex::new(VecDeque::from(vec![Ok(failed.clone()), Ok(failed)])),
+            responses: Mutex::new(VecDeque::from(vec![Ok(failed), Ok(terminal_readback)])),
         });
         let (tx, sink, mut rx) = event_channel(8);
         let callback_sink = sink.clone();
