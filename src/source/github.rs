@@ -137,9 +137,9 @@ struct GitHubRequestBackoff {
     reported: bool,
 }
 
-fn github_request_backoff() -> &'static Mutex<GitHubRequestBackoff> {
-    static BACKOFF: OnceLock<Mutex<GitHubRequestBackoff>> = OnceLock::new();
-    BACKOFF.get_or_init(|| Mutex::new(GitHubRequestBackoff::default()))
+struct GitHubClient {
+    http: reqwest::Client,
+    backoff: Mutex<GitHubRequestBackoff>,
 }
 
 thread_local! {
@@ -2051,7 +2051,7 @@ impl GitHubCISnapshot {
 
 async fn run_github_poll_cycle(
     config: &AppConfig,
-    github_client: Option<&reqwest::Client>,
+    github_client: Option<&GitHubClient>,
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut HashMap<String, GitHubRepoState>,
     ci_baseline: &mut CIBaseline,
@@ -2104,7 +2104,7 @@ async fn snapshot_github_repo(repo: &GitRepoMonitor) -> Result<GitSnapshot> {
 
 async fn poll_github(
     config: &AppConfig,
-    github_client: Option<&reqwest::Client>,
+    github_client: Option<&GitHubClient>,
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut HashMap<String, GitHubRepoState>,
     ci_baseline: &mut CIBaseline,
@@ -2317,7 +2317,7 @@ async fn poll_github(
 
 async fn poll_issues(
     config: &AppConfig,
-    github_client: Option<&reqwest::Client>,
+    github_client: Option<&GitHubClient>,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
@@ -2362,7 +2362,7 @@ async fn poll_issues(
 
 async fn poll_pull_requests(
     config: &AppConfig,
-    github_client: Option<&reqwest::Client>,
+    github_client: Option<&GitHubClient>,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
@@ -2429,7 +2429,7 @@ async fn poll_pull_requests(
 #[allow(clippy::too_many_arguments)]
 async fn poll_ci_statuses(
     config: &AppConfig,
-    github_client: Option<&reqwest::Client>,
+    github_client: Option<&GitHubClient>,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
@@ -2602,13 +2602,13 @@ async fn send_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -> R
 }
 
 async fn github_get(
-    client: &reqwest::Client,
+    client: &GitHubClient,
     api_base: &str,
     path: &str,
     query: &[(&str, &str)],
     context: &str,
 ) -> Result<reqwest::Response> {
-    if let Ok(backoff) = github_request_backoff().lock()
+    if let Ok(backoff) = client.backoff.lock()
         && backoff
             .until
             .is_some_and(|until| until > std::time::Instant::now())
@@ -2622,13 +2622,13 @@ async fn github_get(
     );
     eprintln!("clawhip source github: GET ({context})");
 
-    let response = client.get(&url).query(query).send().await?;
+    let response = client.http.get(&url).query(query).send().await?;
     let status = response.status();
 
     if !status.is_success() {
         let rate_limited = status == reqwest::StatusCode::FORBIDDEN
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-        if rate_limited && let Ok(mut backoff) = github_request_backoff().lock() {
+        if rate_limited && let Ok(mut backoff) = client.backoff.lock() {
             backoff.until = Some(std::time::Instant::now() + GITHUB_RATE_LIMIT_BACKOFF);
             if !backoff.reported {
                 eprintln!(
@@ -2640,7 +2640,7 @@ async fn github_get(
         return Err(github_api_error(status).into());
     }
 
-    if let Ok(mut backoff) = github_request_backoff().lock() {
+    if let Ok(mut backoff) = client.backoff.lock() {
         backoff.until = None;
         backoff.reported = false;
     }
@@ -2812,7 +2812,7 @@ fn collect_ci_events(
 }
 
 async fn fetch_issues(
-    client: &reqwest::Client,
+    client: &GitHubClient,
     api_base: &str,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
@@ -2847,7 +2847,7 @@ async fn fetch_issues(
 }
 
 async fn fetch_pull_requests(
-    client: &reqwest::Client,
+    client: &GitHubClient,
     api_base: &str,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
@@ -2917,7 +2917,7 @@ async fn fetch_pull_requests(
 }
 
 async fn fetch_ci_statuses(
-    client: &reqwest::Client,
+    client: &GitHubClient,
     api_base: &str,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
@@ -3059,7 +3059,7 @@ fn pagination_page_key(url: &str) -> String {
 }
 
 async fn fetch_check_runs(
-    client: &reqwest::Client,
+    client: &GitHubClient,
     api_base: &str,
     github_repo: &str,
     pr_number: u64,
@@ -3149,7 +3149,7 @@ fn summarize_workflow_runs(check_runs: &[GitHubCheckRun]) -> HashMap<String, (us
 }
 
 async fn fetch_direct_workflow_runs(
-    client: &reqwest::Client,
+    client: &GitHubClient,
     api_base: &str,
     github_repo: &str,
     snapshot: &GitSnapshot,
@@ -3234,7 +3234,7 @@ async fn fetch_direct_workflow_runs(
 }
 
 async fn fetch_workflow_attempts_by_head_sha(
-    client: &reqwest::Client,
+    client: &GitHubClient,
     api_base: &str,
     github_repo: &str,
     head_sha: &str,
@@ -3318,7 +3318,7 @@ fn apply_workflow_run_attempts(
     }
 }
 
-fn build_github_client(token: Option<String>) -> Result<reqwest::Client> {
+fn build_github_client(token: Option<String>) -> Result<GitHubClient> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("clawhip/0.1"));
     headers.insert(
@@ -3331,9 +3331,12 @@ fn build_github_client(token: Option<String>) -> Result<reqwest::Client> {
             HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
     }
-    Ok(reqwest::Client::builder()
-        .default_headers(headers)
-        .build()?)
+    Ok(GitHubClient {
+        http: reqwest::Client::builder()
+            .default_headers(headers)
+            .build()?,
+        backoff: Mutex::new(GitHubRequestBackoff::default()),
+    })
 }
 
 #[derive(Deserialize)]
@@ -3482,19 +3485,70 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_rate_limit_requests_are_backed_off() {
-        if let Ok(mut backoff) = github_request_backoff().lock() {
-            backoff.until = Some(std::time::Instant::now() + Duration::from_secs(60));
-        }
-        let client = reqwest::Client::new();
+        let client = build_github_client(None).unwrap();
+        client.backoff.lock().unwrap().until =
+            Some(std::time::Instant::now() + Duration::from_secs(60));
         let error = github_get(&client, "http://127.0.0.1:1", "rate-limit", &[], "test")
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("rate limit backoff is active"));
-        if let Ok(mut backoff) = github_request_backoff().lock() {
-            backoff.until = None;
-            backoff.reported = false;
-        }
+    }
+
+    #[tokio::test]
+    async fn successful_request_on_another_client_does_not_clear_rate_limit_backoff() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_started_tx, request_started_rx) = oneshot::channel();
+        let (send_response_tx, send_response_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _request_len = stream.read(&mut request).await.unwrap();
+            request_started_tx.send(()).unwrap();
+            send_response_rx.await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n[]",
+                )
+                .await
+                .unwrap();
+        });
+
+        let successful_client = build_github_client(None).unwrap();
+        let successful_request = tokio::spawn(async move {
+            github_get(
+                &successful_client,
+                &format!("http://{addr}"),
+                "success",
+                &[],
+                "contaminating success",
+            )
+            .await
+        });
+        request_started_rx.await.unwrap();
+
+        let backed_off_client = build_github_client(None).unwrap();
+        backed_off_client.backoff.lock().unwrap().until =
+            Some(std::time::Instant::now() + Duration::from_secs(60));
+        send_response_tx.send(()).unwrap();
+        successful_request.await.unwrap().unwrap();
+        server.await.unwrap();
+
+        let error = github_get(
+            &backed_off_client,
+            "http://127.0.0.1:1",
+            "rate-limit",
+            &[],
+            "test",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("rate limit backoff is active"));
     }
     use crate::config::{DefaultsConfig, RouteRule};
     use crate::events::MessageFormat;
@@ -3654,7 +3708,7 @@ mod tests {
     /// state -> record terminal identities into the shared baseline.
     async fn poll_once_with_baseline(
         config: &AppConfig,
-        client: &reqwest::Client,
+        client: &GitHubClient,
         state: &mut HashMap<String, GitHubRepoState>,
         ci_baseline: &mut CIBaseline,
         ci_baseline_path: Option<&Path>,
@@ -7228,6 +7282,7 @@ mod tests {
 
         let client = build_github_client(Some("secret-token".into())).unwrap();
         let _ = client
+            .http
             .get(format!("http://{}/repos/x/y/pulls", addr))
             .send()
             .await
