@@ -13,6 +13,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use time::{Date, Duration as TimeDuration, OffsetDateTime, PrimitiveDateTime, format_description};
 use toml_edit::{DocumentMut, value};
@@ -957,6 +958,7 @@ pub fn default_config_path() -> PathBuf {
 /// Returns `true` when the config changed and `false` when an explicit
 /// `update.repo_root` was already present.
 pub fn persist_update_repo_root_if_absent(path: &Path, repo_root: &Path) -> Result<bool> {
+    let _lock = ConfigWriteLock::acquire(path)?;
     let repo_root = repo_root
         .to_str()
         .ok_or_else(|| "source checkout path must be valid UTF-8".to_string())?;
@@ -985,7 +987,7 @@ pub fn persist_update_repo_root_if_absent(path: &Path, repo_root: &Path) -> Resu
     document["update"]["repo_root"] = value(repo_root);
     let updated = document.to_string();
     let _: AppConfig = toml::from_str(&updated)?;
-    save_config_bytes_with_backup(path, updated.as_bytes(), &active)?;
+    save_config_bytes_with_backup_locked(path, updated.as_bytes(), &active)?;
     Ok(true)
 }
 
@@ -1363,6 +1365,7 @@ impl AppConfig {
         P: FnMut(&BackupCandidate) -> Result<()>,
         A: FnMut(&BackupCandidate) -> Result<()>,
     {
+        let _lock = ConfigWriteLock::acquire(path)?;
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -2685,6 +2688,75 @@ impl ActiveConfigState {
     }
 }
 
+struct ConfigWriteLock {
+    file: File,
+}
+
+impl ConfigWriteLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "config path must have a UTF-8 filename".to_string())?;
+        let parent_dir = validate_config_parent_dir(parent, true)?;
+        revalidate_config_parent_dir(&parent_dir)?;
+        let lock_path = parent_dir.path.join(format!(".{filename}.lock"));
+
+        if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(format!(
+                "config lock path must be a regular non-symlink file: {}",
+                lock_path.display()
+            )
+            .into());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        let opened = file.metadata()?;
+        let current = fs::symlink_metadata(&lock_path)?;
+        if !opened.is_file()
+            || current.file_type().is_symlink()
+            || !current.is_file()
+            || metadata_identity(&opened) != metadata_identity(&current)
+        {
+            return Err(format!(
+                "config lock path changed while it was being opened: {}",
+                lock_path.display()
+            )
+            .into());
+        }
+        file.lock_exclusive()?;
+        revalidate_config_parent_dir(&parent_dir)?;
+        let locked = fs::symlink_metadata(&lock_path)?;
+        if locked.file_type().is_symlink()
+            || !locked.is_file()
+            || metadata_identity(&opened) != metadata_identity(&locked)
+        {
+            return Err(format!(
+                "config lock path changed after locking: {}",
+                lock_path.display()
+            )
+            .into());
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ConfigWriteLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct FileIdentity {
     #[cfg(unix)]
@@ -3308,7 +3380,7 @@ fn unlinkat_name(dir: &BoundDir, name: &str) -> std::result::Result<(), io::Erro
     Ok(())
 }
 
-fn save_config_bytes_with_backup(
+fn save_config_bytes_with_backup_locked(
     path: &Path,
     new_bytes: &[u8],
     active: &ActiveConfigState,
@@ -4378,8 +4450,9 @@ mod tests {
         let operator = "# operator won\n[update]\nrepo_root = \"/explicit\"\n";
         fs::write(&config_path, operator).unwrap();
 
-        let error = save_config_bytes_with_backup(&config_path, candidate.as_bytes(), &active)
-            .expect_err("stale absent decision must not overwrite operator config");
+        let error =
+            save_config_bytes_with_backup_locked(&config_path, candidate.as_bytes(), &active)
+                .expect_err("stale absent decision must not overwrite operator config");
         assert!(
             error
                 .to_string()
@@ -4397,6 +4470,21 @@ mod tests {
         let loaded = AppConfig::load_or_default(&config_path).unwrap();
 
         assert_eq!(loaded.config_path(), config_path);
+    }
+
+    #[test]
+    fn config_write_lock_excludes_concurrent_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _lock = ConfigWriteLock::acquire(&config_path).unwrap();
+        let lock_path = dir.path().join(".config.toml.lock");
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+
+        assert!(contender.try_lock_exclusive().is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
