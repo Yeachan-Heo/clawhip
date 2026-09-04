@@ -248,6 +248,8 @@ impl GjcEventBridge {
             }
         }
         if let Some(prompt) = &snapshot.prompt {
+            crate::gjc::model::CommandId::new(prompt.command_id.clone())
+                .map_err(|_| "gjc_bridge_invalid_prompt_id".to_string())?;
             let prompt_id = sanitize(&prompt.command_id);
             if prompt_id.is_empty() || prompt_id.chars().count() > MAX_ID_CHARS {
                 return Err("gjc_bridge_invalid_prompt_id".to_string());
@@ -276,6 +278,8 @@ impl GjcEventBridge {
         let context = SnapshotContext::new(&session_id, snapshot);
 
         if let Some(turn) = &snapshot.turn {
+            crate::gjc::model::TurnId::new(turn.id.clone())
+                .map_err(|_| "gjc_bridge_invalid_turn_id".to_string())?;
             let turn_id = sanitize(&turn.id);
             if turn_id.is_empty() || turn_id.chars().count() > MAX_ID_CHARS {
                 return Err("gjc_bridge_invalid_turn_id".to_string());
@@ -949,6 +953,10 @@ fn base_object(
         object.insert("status".to_string(), Value::from(status));
     }
     object.insert("session_id".to_string(), Value::from(context.session_id));
+    object.insert(
+        "sdk_revision".to_string(),
+        Value::from(context.snapshot.revision),
+    );
     for (key, value) in [
         ("repo_name", &context.snapshot.repo_name),
         ("repo_path", &context.snapshot.repo_path),
@@ -974,6 +982,26 @@ fn base_object(
         .as_ref()
         .map(|turn| sanitize(&turn.id))
         .unwrap_or_default();
+    if !turn.is_empty() {
+        object.insert("turn_id".to_string(), Value::from(turn.clone()));
+    }
+    let command = context
+        .snapshot
+        .prompt
+        .as_ref()
+        .map(|prompt| sanitize(&prompt.command_id))
+        .unwrap_or_default();
+    if !command.is_empty() {
+        object.insert("command_id".to_string(), Value::from(command.clone()));
+    }
+    for (key, value) in [
+        ("model", context.snapshot.model.as_deref()),
+        ("profile", context.snapshot.profile.as_deref()),
+    ] {
+        if let Some(value) = value.map(public_text).filter(|value| !value.is_empty()) {
+            object.insert(key.to_string(), Value::from(value));
+        }
+    }
     let gate = context.snapshot.gate.as_ref();
     let gate_component = gate
         .map(|gate| format!("{}|{}", sanitize(&gate.id), gate.revision))
@@ -1517,6 +1545,25 @@ mod tests {
         assert_eq!(right.len(), 1);
         assert_eq!(left[0].payload["event_id"], right[0].payload["event_id"]);
 
+        let mut annotated = second.clone();
+        annotated.prompt = Some(GjcSdkPrompt {
+            command_id: "command-correlated".to_string(),
+            status: GjcSdkPromptStatus::Accepted,
+        });
+        let annotated = GjcEventBridge::new().observe(&annotated).unwrap().events;
+        let annotated_failure = annotated
+            .iter()
+            .find(|event| event.kind == "session.failed")
+            .expect("failure event");
+        assert_eq!(
+            left[0].payload["event_id"],
+            annotated_failure.payload["event_id"]
+        );
+        assert_eq!(
+            annotated_failure.payload["command_id"],
+            "command-correlated"
+        );
+
         let mut prompt_a = base_snapshot("stable-prompt", 1);
         prompt_a.turn = Some(turn("turn-1", GjcSdkTurnPhase::Active, 0));
         prompt_a.prompt = Some(GjcSdkPrompt {
@@ -1604,6 +1651,7 @@ mod tests {
             "attempt",
             "command_id",
             "turn_id",
+            "sdk_revision",
             "question",
             "question_id",
             "question_summary",

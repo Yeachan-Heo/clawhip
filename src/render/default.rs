@@ -528,6 +528,11 @@ fn session_subject(payload: &Value) -> String {
 }
 
 fn session_status_label(kind: &str, payload: &Value) -> String {
+    if kind == "session.failed"
+        && payload.get("authority_scope").and_then(Value::as_str) == Some("current-session")
+    {
+        return "current turn failed".to_string();
+    }
     match kind {
         "session.started"
         | "session.blocked"
@@ -561,6 +566,12 @@ fn session_detail_suffix(payload: &Value) -> String {
     }
     if let Some(branch) = optional_string_field(payload, "branch") {
         parts.push(format!("branch={branch}"));
+    }
+    if let Some(command_id) = optional_string_field(payload, "command_id") {
+        parts.push(format!("command={command_id}"));
+    }
+    if let Some(turn_id) = optional_string_field(payload, "turn_id") {
+        parts.push(format!("turn={turn_id}"));
     }
     if let Some(test_runner) = optional_string_field(payload, "test_runner") {
         parts.push(format!("runner={test_runner}"));
