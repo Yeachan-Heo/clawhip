@@ -41,11 +41,16 @@ pub fn update_from_repo(
     restart: bool,
     config_path: &Path,
 ) -> Result<()> {
-    let repo_root = match explicit_root {
+    let repo_root = resolve_update_repo_root(explicit_root)?;
+    update_repo(&repo_root, restart, config_path)
+}
+
+fn resolve_update_repo_root(explicit_root: Option<&str>) -> Result<PathBuf> {
+    let repo_root = match explicit_root.map(str::trim).filter(|path| !path.is_empty()) {
         Some(path) => canonical_checkout(Path::new(path), "configured repo_root")?,
         None => find_repo_root()?,
     };
-    update_repo(&repo_root, restart, config_path)
+    Ok(repo_root)
 }
 
 fn update_repo(repo_root: &Path, restart: bool, config_path: &Path) -> Result<()> {
@@ -85,9 +90,7 @@ fn find_repo_root() -> Result<PathBuf> {
         .and_then(|o| String::from_utf8(o.stdout).ok());
     if let Some(path) = output {
         let manifest = PathBuf::from(path.trim());
-        if let Some(parent) = manifest.parent()
-            && parent.join("src").exists()
-        {
+        if let Some(parent) = manifest.parent() {
             return canonical_checkout(parent, "discovered repo root");
         }
     }
@@ -125,20 +128,13 @@ fn current_repo_root() -> Result<PathBuf> {
 }
 
 fn canonical_checkout(path: &Path, description: &str) -> Result<PathBuf> {
-    let canonical = fs::canonicalize(path).map_err(|error| {
+    source_checkout::validate_checkout(path).map_err(|error| {
         anyhow!(
-            "{description} '{}' is not a readable clawhip checkout: {error}",
+            "{description} '{}' is not a valid clawhip git checkout: {error}",
             path.display()
         )
-    })?;
-    if !canonical.join("Cargo.toml").is_file() || !canonical.join("src").is_dir() {
-        return Err(anyhow!(
-            "{description} '{}' does not contain a clawhip checkout",
-            canonical.display()
-        )
-        .into());
-    }
-    Ok(canonical)
+        .into()
+    })
 }
 
 fn ensure_config_dir() -> Result<()> {
@@ -486,6 +482,14 @@ mod tests {
             error
                 .to_string()
                 .contains("does not contain a clawhip checkout")
+        );
+    }
+
+    #[test]
+    fn blank_explicit_update_root_uses_discovery_fallback() {
+        assert_eq!(
+            resolve_update_repo_root(Some("  ")).unwrap(),
+            find_repo_root().unwrap()
         );
     }
 
