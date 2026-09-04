@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use time::{Date, Duration as TimeDuration, OffsetDateTime, PrimitiveDateTime, format_description};
+use toml_edit::{DocumentMut, value};
 
 use crate::Result;
 use crate::discord::is_discord_snowflake;
@@ -23,6 +24,8 @@ use crate::source::workspace::{default_workspace_debounce_ms, default_workspace_
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
+    #[serde(skip)]
+    pub(crate) config_path: PathBuf,
     #[serde(default, skip_serializing_if = "DiscordConfig::is_empty")]
     pub discord: DiscordConfig,
     #[serde(default, skip_serializing_if = "ProvidersConfig::is_empty")]
@@ -948,6 +951,44 @@ pub fn default_config_path() -> PathBuf {
     PathBuf::from(home).join(".clawhip").join("config.toml")
 }
 
+/// Persist the source checkout used by install/update without changing any
+/// operator-owned update settings or reformatting the rest of the config.
+///
+/// Returns `true` when the config changed and `false` when an explicit
+/// `update.repo_root` was already present.
+pub fn persist_update_repo_root_if_absent(path: &Path, repo_root: &Path) -> Result<bool> {
+    let repo_root = repo_root
+        .to_str()
+        .ok_or_else(|| "source checkout path must be valid UTF-8".to_string())?;
+    let active = read_active_config_no_follow(path)?;
+    let raw = match active.bytes() {
+        Some(bytes) => std::str::from_utf8(bytes)
+            .map_err(|_| "config must be valid UTF-8".to_string())?
+            .to_string(),
+        None => String::new(),
+    };
+
+    // Validate the existing application config before touching it. A broken
+    // operator file must remain byte-for-byte intact on failure.
+    if !raw.is_empty() {
+        let _: AppConfig = toml::from_str(&raw)?;
+    }
+    let mut document = raw.parse::<DocumentMut>()?;
+    if document
+        .get("update")
+        .and_then(|update| update.get("repo_root"))
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    document["update"]["repo_root"] = value(repo_root);
+    let updated = document.to_string();
+    let _: AppConfig = toml::from_str(&updated)?;
+    save_config_bytes_with_backup(path, updated.as_bytes(), &active)?;
+    Ok(true)
+}
+
 fn default_bind_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -1165,7 +1206,10 @@ where
 impl AppConfig {
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self {
+                config_path: path.to_path_buf(),
+                ..Self::default()
+            });
         }
         let raw = fs::read_to_string(path)?;
         let raw_toml: toml::Value = toml::from_str(&raw)?;
@@ -1175,7 +1219,16 @@ impl AppConfig {
         if config.defaults.channel.is_none() {
             config.defaults.channel = config.discord_default_channel();
         }
+        config.config_path = path.to_path_buf();
         Ok(config)
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        if self.config_path.as_os_str().is_empty() {
+            default_config_path()
+        } else {
+            self.config_path.clone()
+        }
     }
 
     fn merge_legacy_discord(&mut self, raw_toml: &toml::Value) -> Result<()> {
@@ -3255,6 +3308,85 @@ fn unlinkat_name(dir: &BoundDir, name: &str) -> std::result::Result<(), io::Erro
     Ok(())
 }
 
+fn save_config_bytes_with_backup(
+    path: &Path,
+    new_bytes: &[u8],
+    active: &ActiveConfigState,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "config path must have a UTF-8 filename".to_string())?;
+    let parent_dir = validate_config_parent_dir(parent, true)?;
+    revalidate_config_parent_dir(&parent_dir)?;
+    if active.bytes() == Some(new_bytes) {
+        return Ok(());
+    }
+
+    let managed_dir = validate_managed_backup_dir(&parent_dir.path, active.bytes().is_some())?;
+    if let Some(old_bytes) = active.bytes() {
+        let managed_dir = managed_dir
+            .as_ref()
+            .ok_or_else(|| "managed config backup directory was not created".to_string())?;
+        let mut before_snapshot = || Ok(());
+        create_managed_snapshot_create_new(
+            managed_dir,
+            filename,
+            old_bytes,
+            OffsetDateTime::now_utc(),
+            &mut before_snapshot,
+        )?;
+    }
+
+    revalidate_config_parent_dir(&parent_dir)?;
+    let mut before_rename = || Ok(());
+    commit_config_bytes_via_temp(
+        &parent_dir,
+        path,
+        filename,
+        new_bytes,
+        active,
+        &mut before_rename,
+    )?;
+
+    let current_identity = current_active_config_identity(path).map_err(|error| {
+        io::Error::other(format!(
+            "config was saved; backup retention cleanup remains incomplete: {error}"
+        ))
+    })?;
+    let mut protected_identities = active.identity().into_iter().collect::<Vec<_>>();
+    if let Some(current_identity) = current_identity
+        && !protected_identities.contains(&current_identity)
+    {
+        protected_identities.push(current_identity);
+    }
+    let mut before_delete = |_: &BackupCandidate| Ok(());
+    let mut after_preflight = |_: &BackupCandidate| Ok(());
+    let mut after_check = |_: &BackupCandidate| Ok(());
+    cleanup_config_backups_with_hooks(
+        &parent_dir.path,
+        parent_dir.identity,
+        filename,
+        managed_dir.as_ref(),
+        &protected_identities,
+        OffsetDateTime::now_utc(),
+        &mut before_delete,
+        &mut after_preflight,
+        &mut after_check,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        io::Error::other(format!(
+            "config was saved; backup retention cleanup remains incomplete: {error}"
+        ))
+    })
+    .map_err(Into::into)
+}
+
 fn commit_config_bytes_via_temp<G>(
     parent_dir: &ConfigParentDir,
     path: &Path,
@@ -3486,12 +3618,16 @@ fn revalidate_active_config(path: &Path, active: &ActiveConfigState) -> Result<(
             .into()),
             Err(error) => Err(error.into()),
         },
-        ActiveConfigState::Present { identity, .. } => {
-            let metadata = fs::symlink_metadata(path)?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || identity.is_some_and(|identity| metadata_identity(&metadata) != Some(identity))
-            {
+        ActiveConfigState::Present { identity, bytes } => {
+            let current = read_active_config_no_follow(path)?;
+            let unchanged = matches!(
+                current,
+                ActiveConfigState::Present {
+                    identity: current_identity,
+                    bytes: current_bytes,
+                } if current_identity == *identity && current_bytes == *bytes
+            );
+            if !unchanged {
                 return Err(format!(
                     "active config changed before replacement; config was not saved: {}",
                     path.display()
@@ -4158,6 +4294,110 @@ fn normalize_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_root_persistence_creates_fresh_minimal_update_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let checkout = dir.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+
+        assert!(persist_update_repo_root_if_absent(&config_path, &checkout).unwrap());
+
+        let loaded = AppConfig::load_or_default(&config_path).unwrap();
+        assert_eq!(loaded.update.repo_root.as_deref(), checkout.to_str());
+        assert!(!loaded.update.enabled);
+        assert!(loaded.update.channel.is_none());
+    }
+
+    #[test]
+    fn repo_root_persistence_preserves_unrelated_config_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let checkout = dir.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        fs::write(
+            &config_path,
+            "# operator note\n[daemon]\nport = 25295 # keep this\n",
+        )
+        .unwrap();
+
+        assert!(persist_update_repo_root_if_absent(&config_path, &checkout).unwrap());
+
+        let persisted = fs::read_to_string(&config_path).unwrap();
+        assert!(persisted.contains("# operator note"));
+        assert!(persisted.contains("port = 25295 # keep this"));
+        let loaded = AppConfig::load_or_default(&config_path).unwrap();
+        assert_eq!(loaded.update.repo_root.as_deref(), checkout.to_str());
+        assert!(!loaded.update.enabled);
+        assert!(loaded.update.channel.is_none());
+    }
+
+    #[test]
+    fn repo_root_persistence_keeps_explicit_value_byte_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let original =
+            "# owned\n[update]\nrepo_root = \"/operator/checkout\" # explicit\nenabled = false\n";
+        fs::write(&config_path, original).unwrap();
+
+        assert!(!persist_update_repo_root_if_absent(&config_path, dir.path()).unwrap());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn repo_root_persistence_leaves_malformed_config_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let malformed = "[update\nrepo_root = nope\n";
+        fs::write(&config_path, malformed).unwrap();
+
+        assert!(persist_update_repo_root_if_absent(&config_path, dir.path()).is_err());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn repo_root_persistence_reports_unsafe_write_path_without_creating_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_file = dir.path().join("not-a-directory");
+        fs::write(&parent_file, "occupied").unwrap();
+        let config_path = parent_file.join("config.toml");
+
+        assert!(persist_update_repo_root_if_absent(&config_path, dir.path()).is_err());
+        assert_eq!(fs::read_to_string(&parent_file).unwrap(), "occupied");
+    }
+
+    #[test]
+    fn repo_root_write_rejects_concurrent_explicit_config_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "# initial\n").unwrap();
+        let active = read_active_config_no_follow(&config_path).unwrap();
+        let candidate = "# initial\n[update]\nrepo_root = \"/automatic\"\n";
+
+        let operator = "# operator won\n[update]\nrepo_root = \"/explicit\"\n";
+        fs::write(&config_path, operator).unwrap();
+
+        let error = save_config_bytes_with_backup(&config_path, candidate.as_bytes(), &active)
+            .expect_err("stale absent decision must not overwrite operator config");
+        assert!(
+            error
+                .to_string()
+                .contains("active config changed before replacement")
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), operator);
+    }
+
+    #[test]
+    fn loaded_config_remembers_non_default_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("custom.toml");
+        fs::write(&config_path, "[update]\nenabled = false\n").unwrap();
+
+        let loaded = AppConfig::load_or_default(&config_path).unwrap();
+
+        assert_eq!(loaded.config_path(), config_path);
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_bounded_test_child(

@@ -321,9 +321,9 @@ async fn real_main(cli: Cli) -> Result<()> {
         Commands::Install {
             systemd,
             skip_star_prompt,
-        } => lifecycle::install(systemd, skip_star_prompt),
+        } => lifecycle::install(systemd, skip_star_prompt, &config_path),
         Commands::Update { command, restart } => match command {
-            None => lifecycle::update(restart),
+            None => lifecycle::update(restart, &config_path),
             Some(UpdateCommands::Check) => {
                 let http = reqwest::Client::builder()
                     .user_agent(format!("clawhip/{VERSION}"))

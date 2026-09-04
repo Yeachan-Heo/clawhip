@@ -395,6 +395,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repo_root_alone_is_sufficient_for_health_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        std::fs::create_dir(&root).unwrap();
+        checkout_at(&root, B);
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[update]\nrepo_root = {:?}\n", root.to_string_lossy()),
+        )
+        .unwrap();
+        let config = AppConfig::load_or_default(&config_path).unwrap();
+        assert!(!config.update.enabled);
+        assert!(config.update.channel.is_none());
+
+        let report = new_shared_drift_report();
+        let observed = observe(config.update.repo_root.as_deref().map(Path::new), &report).await;
+
+        assert_eq!(observed.source_commit.as_deref(), Some(B));
+        assert_ne!(observed.reason, Some("no source checkout configured"));
+    }
+
+    #[tokio::test]
     async fn unreadable_checkout_is_unknown_not_drift() {
         let dir = tempfile::tempdir().unwrap();
         let not_a_repo = dir.path().join("nope");

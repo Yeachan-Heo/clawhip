@@ -6,12 +6,12 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, anyhow};
 
-use crate::{Result, plugins};
+use crate::{Result, config, plugins};
 
 const GITHUB_REPO: &str = "Yeachan-Heo/clawhip";
 const SKIP_STAR_PROMPT_ENV: &str = "CLAWHIP_SKIP_STAR_PROMPT";
 
-pub fn install(systemd: bool, skip_star_prompt: bool) -> Result<()> {
+pub fn install(systemd: bool, skip_star_prompt: bool, config_path: &Path) -> Result<()> {
     let repo_root = current_repo_root()?;
     run(Command::new("cargo")
         .arg("install")
@@ -19,6 +19,7 @@ pub fn install(systemd: bool, skip_star_prompt: bool) -> Result<()> {
         .arg(&repo_root))?;
     ensure_config_dir()?;
     plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
+    config::persist_update_repo_root_if_absent(config_path, &repo_root)?;
     if systemd {
         install_systemd(&repo_root)?;
     }
@@ -27,33 +28,27 @@ pub fn install(systemd: bool, skip_star_prompt: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn update(restart: bool) -> Result<()> {
+pub fn update(restart: bool, config_path: &Path) -> Result<()> {
     let repo_root = current_repo_root()?;
-    update_repo(&repo_root, restart)
+    update_repo(&repo_root, restart, config_path)
 }
 
 /// Perform a self-update using an explicit repo root (from config) or by
 /// attempting automatic discovery. Prefer passing an explicit path for
 /// deterministic behavior in daemon/systemd contexts.
-pub fn update_from_repo(explicit_root: Option<&str>, restart: bool) -> Result<()> {
+pub fn update_from_repo(
+    explicit_root: Option<&str>,
+    restart: bool,
+    config_path: &Path,
+) -> Result<()> {
     let repo_root = match explicit_root {
-        Some(path) => {
-            let root = PathBuf::from(path);
-            if !root.join("Cargo.toml").exists() || !root.join("src").exists() {
-                return Err(anyhow!(
-                    "configured repo_root '{}' does not contain a clawhip checkout",
-                    root.display()
-                )
-                .into());
-            }
-            root
-        }
+        Some(path) => canonical_checkout(Path::new(path), "configured repo_root")?,
         None => find_repo_root()?,
     };
-    update_repo(&repo_root, restart)
+    update_repo(&repo_root, restart, config_path)
 }
 
-fn update_repo(repo_root: &Path, restart: bool) -> Result<()> {
+fn update_repo(repo_root: &Path, restart: bool, config_path: &Path) -> Result<()> {
     run(Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -66,6 +61,7 @@ fn update_repo(repo_root: &Path, restart: bool) -> Result<()> {
         .arg("--force"))?;
     ensure_config_dir()?;
     plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
+    config::persist_update_repo_root_if_absent(config_path, repo_root)?;
     if restart {
         restart_systemd_if_present()?;
     }
@@ -92,7 +88,7 @@ fn find_repo_root() -> Result<PathBuf> {
         if let Some(parent) = manifest.parent()
             && parent.join("src").exists()
         {
-            return Ok(parent.to_path_buf());
+            return canonical_checkout(parent, "discovered repo root");
         }
     }
     Err(anyhow!(
@@ -124,11 +120,25 @@ pub fn uninstall(remove_systemd: bool, remove_config: bool) -> Result<()> {
 
 fn current_repo_root() -> Result<PathBuf> {
     let dir = env::current_dir()?;
-    if dir.join("Cargo.toml").exists() && dir.join("src").exists() {
-        Ok(dir)
-    } else {
-        Err(anyhow!("run this command from the clawhip git clone root").into())
+    canonical_checkout(&dir, "current directory")
+        .map_err(|_| anyhow!("run this command from the clawhip git clone root").into())
+}
+
+fn canonical_checkout(path: &Path, description: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        anyhow!(
+            "{description} '{}' is not a readable clawhip checkout: {error}",
+            path.display()
+        )
+    })?;
+    if !canonical.join("Cargo.toml").is_file() || !canonical.join("src").is_dir() {
+        return Err(anyhow!(
+            "{description} '{}' does not contain a clawhip checkout",
+            canonical.display()
+        )
+        .into());
     }
+    Ok(canonical)
 }
 
 fn ensure_config_dir() -> Result<()> {
@@ -443,8 +453,12 @@ mod tests {
         let bad_path = dir.path().join("not-a-checkout");
         std::fs::create_dir_all(&bad_path).expect("mkdir");
 
-        let error = update_from_repo(Some(bad_path.to_str().unwrap()), false)
-            .expect_err("should reject missing Cargo.toml");
+        let error = update_from_repo(
+            Some(bad_path.to_str().unwrap()),
+            false,
+            &dir.path().join("config.toml"),
+        )
+        .expect_err("should reject missing Cargo.toml");
 
         assert!(
             error
@@ -461,8 +475,12 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"clawhip\"")
             .expect("write Cargo.toml");
 
-        let error = update_from_repo(Some(root.to_str().unwrap()), false)
-            .expect_err("should reject missing src/");
+        let error = update_from_repo(
+            Some(root.to_str().unwrap()),
+            false,
+            &dir.path().join("config.toml"),
+        )
+        .expect_err("should reject missing src/");
 
         assert!(
             error

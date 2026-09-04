@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "issue": 360,
+  "contract": "Persist canonical update.repo_root only when absent during source install/update, preserving operator config and enabling deployment comparison without auto-update settings.",
+  "results": [
+    {"surface":"config persistence","command":"cargo test --locked --bin clawhip config::tests::repo_root_","status":"passed","evidence":"Fresh config, comments/unrelated values, explicit value, malformed config, unsafe path, and concurrent explicit-write protection passed."},
+    {"surface":"custom config path","command":"cargo test --locked --bin clawhip config::tests::loaded_config_remembers_non_default_source_path","status":"passed","evidence":"Loaded AppConfig retained its selected non-default path for daemon-approved updates."},
+    {"surface":"lifecycle validation","command":"cargo test --locked --bin clawhip lifecycle::tests::update_from_repo_","status":"passed","evidence":"Malformed source checkout paths were rejected before update execution."},
+    {"surface":"deployment health","command":"cargo test --locked --bin clawhip deployment::tests::repo_root_alone_is_sufficient_for_health_comparison","status":"passed","evidence":"repo_root alone supplied a readable source commit while enabled remained false and channel remained absent."},
+    {"surface":"repository gates","command":"cargo check; cargo clippy -- -D warnings; cargo fmt --all -- --check; cargo test; cargo build --release","status":"passed","evidence":"Full local gates passed; cargo test reported 1234 passing tests."}
+  ]
+}
