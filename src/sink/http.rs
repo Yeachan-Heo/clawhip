@@ -477,7 +477,8 @@ fn public_text(value: &str, max_chars: usize, state: &mut NormalizationState) ->
     }
 
     let redacted_urls = redact_urls_in_text(collapsed.trim(), state);
-    let redacted_secrets = redact_secret_assignments(&redacted_urls, state);
+    let redacted_json = redact_json_secrets(&redacted_urls, state);
+    let redacted_secrets = redact_secret_assignments(&redacted_json, state);
     if redacted_secrets.chars().count() > max_chars {
         state.truncated = true;
     }
@@ -515,6 +516,119 @@ fn redact_urls_in_text(value: &str, state: &mut NormalizationState) -> String {
     }
 
     output
+}
+
+fn redact_json_secrets(value: &str, state: &mut NormalizationState) -> String {
+    // Redact JSON-shaped secrets like {"token":"value"} or "token": "value"
+    let mut result = value.to_string();
+
+    let sensitive_keys = [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "api_key",
+        "api-key",
+        "apikey",
+    ];
+
+    for key in &sensitive_keys {
+        let pattern = format!("\"{}\"", key);
+        let mut search_from = 0;
+
+        loop {
+            if search_from >= result.len() {
+                break;
+            }
+
+            let lower_result = result[search_from..].to_ascii_lowercase();
+            let lower_pattern = pattern.to_ascii_lowercase();
+
+            let Some(offset) = lower_result.find(&lower_pattern) else {
+                break; // No more occurrences
+            };
+
+            let key_pos = search_from + offset;
+
+            let after_key = key_pos + pattern.len();
+            let result_len = result.len();
+            if after_key >= result_len {
+                break;
+            }
+
+            // Compute all positions first
+            let result_bytes = result.as_bytes();
+            let mut pos = after_key;
+
+            // Look for colon
+            while pos < result_len && result_bytes[pos] != b':' {
+                pos += 1;
+            }
+
+            if pos >= result_len {
+                break;
+            }
+
+            pos += 1; // Skip the colon
+
+            // Skip whitespace
+            while pos < result_len && result_bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+
+            if pos >= result_len {
+                break;
+            }
+
+            // Check for opening quote
+            let quote_byte = result_bytes[pos];
+            if quote_byte != b'"' && quote_byte != b'\'' {
+                // Move past this key and continue searching
+                search_from = key_pos + pattern.len();
+                continue;
+            }
+
+            let mut value_end = pos + 1;
+            let mut found_closing_quote = false;
+
+            // Find closing quote
+            while value_end < result_len {
+                if result_bytes[value_end] == quote_byte {
+                    // Check if escaped
+                    let mut num_backslashes = 0;
+                    let mut check = value_end;
+                    while check > 0 && result_bytes[check - 1] == b'\\' {
+                        num_backslashes += 1;
+                        check -= 1;
+                    }
+                    if num_backslashes % 2 == 0 {
+                        // Not escaped, found the closing quote
+                        found_closing_quote = true;
+                        break;
+                    }
+                }
+                value_end += 1;
+            }
+
+            // Now process the replacement outside of the borrow
+            if found_closing_quote {
+                state.redacted = true;
+                // Copy the parts before reassigning result
+                let before = result[..pos + 1].to_string();
+                let after = result[value_end..].to_string();
+                // Now we can reassign result
+                result = format!("{}[redacted]{}", before, after);
+                // Move search position past the key we just processed to avoid re-matching it
+                search_from = key_pos + pattern.len();
+            } else {
+                // Couldn't find closing quote, move past this key and continue
+                search_from = key_pos + pattern.len();
+            }
+        }
+    }
+
+    result
 }
 
 fn redact_secret_assignments(value: &str, state: &mut NormalizationState) -> String {
@@ -1009,6 +1123,27 @@ mod tests {
         unsafe { std::env::remove_var(name) };
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn json_shaped_secrets_are_redacted() {
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        // JSON-shaped secrets should be redacted just like token= forms
+        message.content = r#"API response: {"token":"secret-value","password":"my-pass"}"#.into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body.clone()).unwrap();
+
+        // The secret values should not leak into the summary
+        assert!(
+            !rendered.contains("secret-value"),
+            "JSON token value leaked into summary"
+        );
+        assert!(
+            !rendered.contains("my-pass"),
+            "JSON password value leaked into summary"
+        );
     }
 
     #[test]
