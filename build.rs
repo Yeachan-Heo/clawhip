@@ -96,7 +96,8 @@ fn resolve_gitdir() -> Option<PathBuf> {
     for line in contents.lines() {
         if let Some(gitdir) = line.strip_prefix("gitdir:") {
             let gitdir = gitdir.trim();
-            let path = if gitdir.starts_with('/') {
+            let path = if Path::new(gitdir).is_absolute() {
+                // Handle Unix absolute paths (/...), Windows drive-qualified (C:/...), and UNC paths (\\...)
                 PathBuf::from(gitdir)
             } else {
                 // Relative paths are relative to the .git file location
