@@ -29,6 +29,7 @@ pub use tmux::{
 pub use workspace::WorkspaceSource;
 
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Source: Send + Sync {
     fn name(&self) -> &str;
 

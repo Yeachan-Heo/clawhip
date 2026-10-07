@@ -43,6 +43,7 @@ pub struct SinkTelemetry {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Sink: Send + Sync {
     async fn send(&self, target: &SinkTarget, message: &SinkMessage) -> Result<()>;
 }

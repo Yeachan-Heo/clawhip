@@ -252,6 +252,7 @@ pub struct GjcResponse {
 /// - return [`GjcError::Timeout`] instead of an unbounded wait;
 /// - never surface endpoint metadata or tokens in errors.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait GjcTransport: Send + Sync {
     async fn round_trip(&self, request: GjcRequest) -> std::result::Result<GjcResponse, GjcError>;
 
