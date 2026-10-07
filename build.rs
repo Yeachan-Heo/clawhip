@@ -11,8 +11,8 @@
 //! crates.io build, or a machine without `git` still builds, and simply
 //! reports an unknown revision instead of breaking the build.
 
-use std::path::Path;
-use std::process::Command;
+#[path = "build/gitdir.rs"]
+mod gitdir;
 
 fn main() {
     let (commit, source) = detect_commit();
@@ -27,9 +27,77 @@ fn main() {
 
     // Rebuild when HEAD moves so a stamped binary can never claim an older
     // revision than the tree it was built from.
-    for path in [".git/HEAD", ".git/index"] {
-        if Path::new(path).exists() {
-            println!("cargo:rerun-if-changed={path}");
+    // In a linked worktree, .git is a file containing a gitdir pointer,
+    // so we need to resolve the actual gitdir location.
+    if let Some(gitdir) = gitdir::resolve_gitdir() {
+        // Watch HEAD itself for detached HEAD changes
+        if let Ok(head_path) = gitdir.join("HEAD").canonicalize() {
+            println!(
+                "cargo:rerun-if-changed={}",
+                gitdir::rerun_path_safe(&head_path)
+            );
+        }
+
+        // If on a branch, also watch the branch ref file for commits without index changes.
+        // Register the loose ref path even when it does not yet exist; a subsequent commit
+        // can create refs/heads/<branch> without changing other watched files.
+        if let Some(head_bytes) = gitdir::read_head_bytes(&gitdir)
+            && let Some(ref_path_bytes) = gitdir::parse_head_symref(&head_bytes)
+            && let Some(common_dir) = gitdir::resolve_common_dir(&gitdir)
+        {
+            // ref_path_bytes is like b"refs/heads/main"
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let ref_osstr = std::ffi::OsStr::from_bytes(&ref_path_bytes);
+                let ref_full = common_dir.join(ref_osstr);
+                // Try to canonicalize if it exists; otherwise use the path as-is.
+                let watch_path = if ref_full.exists() {
+                    ref_full.canonicalize().ok()
+                } else {
+                    Some(ref_full)
+                };
+                if let Some(path) = watch_path {
+                    println!("cargo:rerun-if-changed={}", gitdir::rerun_path_safe(&path));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Ok(ref_path_str) = std::str::from_utf8(&ref_path_bytes) {
+                    let ref_full = common_dir.join(ref_path_str);
+                    // Try to canonicalize if it exists; otherwise use the path as-is.
+                    let watch_path = if ref_full.exists() {
+                        ref_full.canonicalize().ok()
+                    } else {
+                        Some(ref_full)
+                    };
+                    if let Some(path) = watch_path {
+                        println!("cargo:rerun-if-changed={}", gitdir::rerun_path_safe(&path));
+                    }
+                }
+            }
+        }
+
+        // Watch packed-refs for efficiency (batch ref updates).
+        // Register even if it does not yet exist (it might be created on first gc).
+        if let Some(common_dir) = gitdir::resolve_common_dir(&gitdir) {
+            let packed_refs = common_dir.join("packed-refs");
+            let watch_path = if packed_refs.exists() {
+                packed_refs.canonicalize().ok()
+            } else {
+                Some(packed_refs)
+            };
+            if let Some(path) = watch_path {
+                println!("cargo:rerun-if-changed={}", gitdir::rerun_path_safe(&path));
+            }
+        }
+
+        // Watch the index for working tree changes
+        if let Ok(index_path) = gitdir.join("index").canonicalize() {
+            println!(
+                "cargo:rerun-if-changed={}",
+                gitdir::rerun_path_safe(&index_path)
+            );
         }
     }
     println!("cargo:rerun-if-env-changed=CLAWHIP_BUILD_COMMIT");
@@ -55,7 +123,7 @@ fn detect_dirty() -> bool {
     if sanitized_env("CLAWHIP_BUILD_COMMIT").is_some() {
         return false;
     }
-    git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|out| !out.is_empty())
+    gitdir::detect_dirty_status().unwrap_or(false)
 }
 
 fn sanitized_env(key: &str) -> Option<String> {
@@ -73,9 +141,5 @@ fn is_hex_commit(value: &str) -> bool {
 }
 
 fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
+    gitdir::run_git(args)
 }
