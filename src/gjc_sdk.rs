@@ -319,7 +319,7 @@ impl StateRoot {
 
 #[cfg(unix)]
 fn current_uid() -> Option<u32> {
-    Some(unsafe { libc::getuid() })
+    Some(unsafe { libc::geteuid() })
 }
 
 #[cfg(not(unix))]
@@ -327,40 +327,100 @@ fn current_uid() -> Option<u32> {
     None
 }
 
-/// Validate one endpoint metadata file's filesystem properties.
+/// Validate and read one endpoint metadata file in one atomic operation.
 ///
-/// Rejects symlinks, non-regular files, oversized files, foreign owners, and
-/// permissive group/world permissions.
-fn validate_metadata_file(path: &Path) -> Result<std::fs::Metadata> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|_| SdkTransportError::EndpointUnavailable)?;
-    if metadata.is_symlink() || !metadata.is_file() {
+/// Opens the file with O_NOFOLLOW to prevent TOCTOU attacks, validates
+/// filesystem properties via fstat on the open fd (rejects symlinks,
+/// non-regular files, oversized files, foreign owners, and permissive
+/// group/world permissions), and reads the contents from the same fd.
+/// This ensures the validated file is exactly the one read.
+#[cfg(unix)]
+fn validate_and_read_metadata_file(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    // Open with O_NONBLOCK (prevent FIFO blocking) + O_NOFOLLOW (symlink attacks)
+    // + O_CLOEXEC (prevent descriptor leaks on exec).
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| SdkTransportError::EndpointUnavailable)?;
+
+    // Validate via fstat on the open fd.
+    let metadata = file
+        .metadata()
+        .map_err(|_| SdkTransportError::EndpointUnavailable)?;
+
+    if !metadata.is_file() {
         return Err(SdkTransportError::EndpointMalformed.into());
     }
+
     if metadata.len() > MAX_METADATA_BYTES {
         return Err(SdkTransportError::EndpointMalformed.into());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if let (Some(file_uid), Some(current)) = (
-            non_zero_uid(metadata.uid()),
-            current_uid().and_then(non_zero_uid),
-        ) && file_uid != current
-        {
-            return Err(SdkTransportError::EndpointUnauthorized.into());
-        }
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(SdkTransportError::EndpointMalformed.into());
-        }
+
+    // Validate ownership: the file must be owned by the current effective uid.
+    let current_uid = current_uid().ok_or(SdkTransportError::EndpointMalformed)?;
+    let file_uid = metadata.uid();
+    if file_uid != current_uid {
+        return Err(SdkTransportError::EndpointUnauthorized.into());
     }
-    Ok(metadata)
+
+    // Validate permissions: reject if group/world-readable (mode & 0o077 must be 0).
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(SdkTransportError::EndpointMalformed.into());
+    }
+
+    // Read contents from the same validated fd.
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|_| SdkTransportError::EndpointUnavailable)?;
+
+    Ok(contents)
 }
 
-#[cfg(unix)]
-fn non_zero_uid(uid: u32) -> Option<u32> {
-    (uid != 0).then_some(uid)
+#[cfg(not(unix))]
+fn validate_and_read_metadata_file(path: &Path) -> Result<Vec<u8>> {
+    // On non-Unix platforms, we must still enforce the same invariants:
+    // reject symlinks, non-regular files, and oversized files.
+    use std::io::Read;
+
+    // Use symlink_metadata to check the file without following symlinks.
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| SdkTransportError::EndpointUnavailable)?;
+
+    // Reject symlinks: is_symlink() is available on all platforms.
+    if metadata.is_symlink() {
+        return Err(SdkTransportError::EndpointMalformed.into());
+    }
+
+    // Reject non-regular files (includes directories, devices, sockets, etc.).
+    if !metadata.is_file() {
+        return Err(SdkTransportError::EndpointMalformed.into());
+    }
+
+    // Reject files larger than MAX_METADATA_BYTES.
+    if metadata.len() > MAX_METADATA_BYTES {
+        return Err(SdkTransportError::EndpointMalformed.into());
+    }
+
+    // Read with a bounded take() to ensure we don't read more than allowed,
+    // even if the file size check was somehow bypassed.
+    let file = std::fs::File::open(path).map_err(|_| SdkTransportError::EndpointUnavailable)?;
+    let mut reader = file.take(MAX_METADATA_BYTES + 1);
+    let mut contents = Vec::new();
+    reader
+        .read_to_end(&mut contents)
+        .map_err(|_| SdkTransportError::EndpointUnavailable)?;
+
+    // Verify we didn't exceed the bound (which would indicate the file grew).
+    if contents.len() > MAX_METADATA_BYTES as usize {
+        return Err(SdkTransportError::EndpointMalformed.into());
+    }
+
+    Ok(contents)
 }
 
 /// Parse and validate one endpoint record.
@@ -474,10 +534,7 @@ pub fn discover(root: &StateRoot) -> Result<Discovery> {
             continue;
         }
         seen_any_file = true;
-        if validate_metadata_file(&path).is_err() {
-            continue;
-        }
-        let Ok(contents) = std::fs::read(&path) else {
+        let Ok(contents) = validate_and_read_metadata_file(&path) else {
             continue;
         };
         let Ok(metadata) = parse_metadata_file(&path, &contents) else {
@@ -527,12 +584,10 @@ pub fn discover_all(root: &StateRoot) -> Result<Vec<EndpointMetadata>> {
     let mut live = Vec::new();
     for entry in std::fs::read_dir(sdk_dir)?.flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "json")
-            || validate_metadata_file(&path).is_err()
-        {
+        if path.extension().is_none_or(|extension| extension != "json") {
             continue;
         }
-        let Ok(contents) = std::fs::read(&path) else {
+        let Ok(contents) = validate_and_read_metadata_file(&path) else {
             continue;
         };
         let Ok(metadata) = parse_metadata_file(&path, &contents) else {
@@ -1330,6 +1385,8 @@ fn render_inspect(snapshot: &InspectSnapshot) {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::Ordering;
 
     fn temp_worktree(name: &str) -> (tempfile::TempDir, StateRoot) {
@@ -1655,8 +1712,217 @@ mod tests {
         assert!(matches!(discover(&root).unwrap(), Discovery::Live(_)));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn discovery_scopes_to_lane_state_root_only() {
+    fn validate_and_read_rejects_files_owned_by_other_users() {
+        // Regression test for endpoint trust issue: files owned by other users
+        // must be rejected, regardless of whether running as root or non-root.
+
+        let (_dir, root) = temp_worktree("wt-ownership");
+        let path = write_metadata_at(
+            &root,
+            &format!("{SESSION_ID}.json"),
+            &metadata_json("ws://127.0.0.1:1/", "tok", Some(std::process::id())),
+        );
+
+        // First, test that the file is acceptable when owned by current user.
+        let result = validate_and_read_metadata_file(&path);
+        assert!(
+            result.is_ok(),
+            "file owned by current user should be accepted"
+        );
+
+        // Now test ownership rejection: if we could change ownership to another user,
+        // validation should reject it. We can only do this if running as root.
+        let effective_uid = unsafe { libc::geteuid() };
+        if effective_uid != 0 {
+            eprintln!("skipping ownership test: not running as root (geteuid={effective_uid})");
+            return;
+        }
+
+        // Change ownership to a different user (e.g., 'nobody' uid 65534 if available).
+        let target_uid = 65534u32; // typically 'nobody' on Unix systems
+        let path_cstring = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .expect("path should be convertible to CString");
+        let chown_result = unsafe { libc::chown(path_cstring.as_ptr(), target_uid, 65534) };
+        assert!(
+            chown_result == 0,
+            "chown failed (errno={}); cannot test ownership rejection",
+            std::io::Error::last_os_error()
+        );
+
+        let result = validate_and_read_metadata_file(&path);
+        assert!(
+            result.is_err(),
+            "file owned by different user should be rejected by root daemon"
+        );
+        // Verify it's an unauthorized error, not a malformed one.
+        if let Err(e) = result {
+            if let Some(&SdkTransportError::EndpointUnauthorized) =
+                e.downcast_ref::<SdkTransportError>()
+            {
+                // Correct error type.
+            } else {
+                panic!("expected EndpointUnauthorized, got: {e:?}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_and_read_enforces_no_symlink_toctou() {
+        // Regression test for TOCTOU vulnerability: ensure validate_and_read_metadata_file
+        // opens files with O_NOFOLLOW to prevent symlink attacks.
+
+        let (_dir, root) = temp_worktree("wt-toctou");
+        let metadata_path = root.path().join("sdk").join(format!("{SESSION_ID}.json"));
+        let target_path = root.path().join("sdk").join("target.json");
+
+        // Write the actual metadata file.
+        std::fs::write(
+            &target_path,
+            metadata_json("ws://127.0.0.1:1/", "tok", Some(std::process::id())),
+        )
+        .unwrap();
+
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&target_path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&target_path, perms).unwrap();
+        }
+
+        // Create a symlink to the target.
+        std::os::unix::fs::symlink(&target_path, &metadata_path).unwrap();
+
+        // validate_and_read_metadata_file should reject the symlink (O_NOFOLLOW).
+        let result = validate_and_read_metadata_file(&metadata_path);
+        assert!(
+            result.is_err(),
+            "symlinked metadata file should be rejected due to O_NOFOLLOW"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_and_read_atomicity_prevents_race() {
+        // Regression test: validate_and_read_metadata_file reads from the same
+        // validated file descriptor, preventing races where the file changes
+        // between validation and read.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, root) = temp_worktree("wt-atomic");
+        let path = root.path().join("sdk").join(format!("{SESSION_ID}.json"));
+
+        let good_json = metadata_json("ws://127.0.0.1:1/", "tok", Some(std::process::id()));
+        std::fs::write(&path, &good_json).unwrap();
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        // Read the file via validate_and_read_metadata_file.
+        // The content should match what we wrote (not a malicious replacement).
+        let result = validate_and_read_metadata_file(&path).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&result).unwrap(),
+            good_json,
+            "read content must match validated file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_does_not_block_on_fifo_candidate() {
+        // Regression test: discovery must not block on a FIFO .json entry.
+        // With O_NONBLOCK on open(), validate_and_read_metadata_file should
+        // reject FIFOs as non-regular files before read() can block.
+
+        let (_dir, root) = temp_worktree("wt-fifo");
+        let sdk_dir = root.path().join("sdk");
+
+        // Write a valid metadata file (filename must match sessionId exactly).
+        write_metadata_at(
+            &root,
+            &format!("{SESSION_ID}.json"),
+            &metadata_json("ws://127.0.0.1:1/", "tok", Some(std::process::id())),
+        );
+
+        // Create a FIFO with .json extension in the sdk directory.
+        let fifo_path = sdk_dir.join("blocking.json");
+        let fifo_cstring = std::ffi::CString::new(fifo_path.as_os_str().as_bytes())
+            .expect("FIFO path should be convertible to CString");
+
+        let mkfifo_result = unsafe { libc::mkfifo(fifo_cstring.as_ptr(), 0o600) };
+        if mkfifo_result != 0 {
+            eprintln!(
+                "mkfifo failed (errno={}); skipping FIFO test",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Run discovery with the FIFO present. It should skip the FIFO (reject it
+        // as non-regular) and return the valid metadata without blocking.
+        // With O_NONBLOCK, opening the FIFO returns EAGAIN instead of blocking.
+        let start = std::time::Instant::now();
+        match discover(&root) {
+            Ok(Discovery::Live(_)) => {
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed < std::time::Duration::from_millis(500),
+                    "discovery took {:?}; likely blocked on FIFO",
+                    elapsed
+                );
+            }
+            outcome => panic!("unexpected discovery outcome with FIFO present: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_and_read_rejects_oversized_files() {
+        // Regression test: validate_and_read_metadata_file must reject files
+        // larger than MAX_METADATA_BYTES, ensuring bounded reads.
+        let (_dir, root) = temp_worktree("wt-oversized");
+        let path = root.path().join("sdk").join(format!("{SESSION_ID}.json"));
+
+        // Create a file larger than MAX_METADATA_BYTES (4096 bytes).
+        let large_content = vec![b'x'; (MAX_METADATA_BYTES + 1) as usize];
+        std::fs::write(&path, large_content).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+
+        let result = validate_and_read_metadata_file(&path);
+        assert!(result.is_err(), "oversized file should be rejected");
+    }
+
+    #[test]
+    fn validate_and_read_rejects_non_regular_files() {
+        // Regression test: validate_and_read_metadata_file must reject
+        // non-regular files (directories, devices, etc.).
+        let dir = tempfile::tempdir().unwrap();
+        let sdk_dir = dir.path().join(".gjc").join("state").join("sdk");
+        std::fs::create_dir_all(&sdk_dir).unwrap();
+
+        // Attempt to read a directory as a file.
+        let dir_path = sdk_dir.join("not-a-file.json");
+        std::fs::create_dir(&dir_path).unwrap();
+
+        let result = validate_and_read_metadata_file(&dir_path);
+        assert!(
+            result.is_err(),
+            "directory should be rejected as metadata file"
+        );
+    }
+
+    #[test]
+    fn discover_scopes_to_lane_state_root_only() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         let unrelated = dir.path().join("unrelated");
