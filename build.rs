@@ -30,11 +30,69 @@ fn main() {
     // In a linked worktree, .git is a file containing a gitdir pointer,
     // so we need to resolve the actual gitdir location.
     if let Some(gitdir) = gitdir::resolve_gitdir() {
+        // Watch HEAD itself for detached HEAD changes
         if let Ok(head_path) = gitdir.join("HEAD").canonicalize() {
-            println!("cargo:rerun-if-changed={}", head_path.display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                gitdir::rerun_path_safe(&head_path)
+            );
         }
+
+        // If on a branch, also watch the branch ref file for commits without index changes
+        if let Some(head_bytes) = gitdir::read_head_bytes(&gitdir)
+            && let Some(ref_path_bytes) = gitdir::parse_head_symref(&head_bytes)
+            && let Some(common_dir) = gitdir::resolve_common_dir(&gitdir)
+        {
+            // ref_path_bytes is like b"refs/heads/main"
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let ref_osstr = std::ffi::OsStr::from_bytes(&ref_path_bytes);
+                let ref_full = common_dir.join(ref_osstr);
+                if ref_full.exists()
+                    && let Ok(canonical) = ref_full.canonicalize()
+                {
+                    println!(
+                        "cargo:rerun-if-changed={}",
+                        gitdir::rerun_path_safe(&canonical)
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Ok(ref_path_str) = std::str::from_utf8(&ref_path_bytes) {
+                    let ref_full = common_dir.join(ref_path_str);
+                    if ref_full.exists()
+                        && let Ok(canonical) = ref_full.canonicalize()
+                    {
+                        println!(
+                            "cargo:rerun-if-changed={}",
+                            gitdir::rerun_path_safe(&canonical)
+                        );
+                    }
+                }
+            }
+        }
+
+        // Watch packed-refs for efficiency (batch ref updates)
+        if let Some(common_dir) = gitdir::resolve_common_dir(&gitdir) {
+            let packed_refs = common_dir.join("packed-refs");
+            if packed_refs.exists()
+                && let Ok(canonical) = packed_refs.canonicalize()
+            {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    gitdir::rerun_path_safe(&canonical)
+                );
+            }
+        }
+
+        // Watch the index for working tree changes
         if let Ok(index_path) = gitdir.join("index").canonicalize() {
-            println!("cargo:rerun-if-changed={}", index_path.display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                gitdir::rerun_path_safe(&index_path)
+            );
         }
     }
     println!("cargo:rerun-if-env-changed=CLAWHIP_BUILD_COMMIT");

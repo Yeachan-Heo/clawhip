@@ -117,3 +117,88 @@ pub fn run_git(args: &[&str]) -> Option<String> {
 pub fn detect_dirty_status() -> Option<bool> {
     run_git(&["status", "--porcelain", "--untracked-files=no"]).map(|output| !output.is_empty())
 }
+
+/// Resolve the common git directory for a worktree.
+/// For regular repos, returns the gitdir itself.
+/// For linked worktrees, returns the common directory that holds refs/heads, packed-refs, etc.
+#[allow(dead_code)]
+pub fn resolve_common_dir(gitdir: &Path) -> Option<PathBuf> {
+    // The commondir file, if it exists, points to the shared git directory.
+    let common_dir_file = gitdir.join("commondir");
+    if let Ok(contents) = fs::read_to_string(&common_dir_file) {
+        let path_str = contents.trim();
+        if !path_str.is_empty() {
+            let path = if Path::new(path_str).is_absolute() {
+                PathBuf::from(path_str)
+            } else {
+                gitdir.join(path_str)
+            };
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+    // If no commondir file, return the gitdir itself (regular repo).
+    Some(gitdir.to_path_buf())
+}
+
+/// Read HEAD file as bytes to preserve non-UTF-8 encoding.
+/// Returns the full content including the newline if present.
+#[allow(dead_code)]
+pub fn read_head_bytes(gitdir: &Path) -> Option<Vec<u8>> {
+    let head_path = gitdir.join("HEAD");
+    fs::read(&head_path).ok()
+}
+
+/// Parse HEAD content to get the symbolic ref if on a branch.
+/// HEAD content is like "ref: refs/heads/main\n" for branches,
+/// or a commit hash for detached HEAD.
+/// Returns the path to the branch ref (e.g., "refs/heads/main") if on a branch.
+#[allow(dead_code)]
+pub fn parse_head_symref(head_bytes: &[u8]) -> Option<Vec<u8>> {
+    const REF_PREFIX: &[u8] = b"ref: ";
+
+    if !head_bytes.starts_with(REF_PREFIX) {
+        return None; // Detached HEAD
+    }
+
+    // Skip "ref: " prefix and trim trailing whitespace/newline
+    let ref_path = &head_bytes[REF_PREFIX.len()..];
+    let ref_path = ref_path.trim_ascii();
+
+    if ref_path.is_empty() {
+        return None;
+    }
+
+    Some(ref_path.to_vec())
+}
+
+/// Construct a safe rerun-if-changed directive for a path.
+/// If the path is valid UTF-8, use the display form.
+/// If it contains non-UTF-8 bytes, emit a warning and use a coarser watch.
+#[allow(dead_code)]
+pub fn rerun_path_safe(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        match String::from_utf8(bytes.to_vec()) {
+            Ok(s) => s,
+            Err(_) => {
+                // Path contains non-UTF-8 bytes; watch the parent directory instead.
+                // This is a safe coarser watch.
+                eprintln!(
+                    "warning: path contains non-UTF-8 bytes, watching parent directory instead: {:?}",
+                    path.parent()
+                );
+                path.parent()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| ".".to_string())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        path.display().to_string()
+    }
+}

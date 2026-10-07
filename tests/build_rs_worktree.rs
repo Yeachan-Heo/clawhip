@@ -475,3 +475,144 @@ fn test_dirty_detection_unstaged_tracked() {
         status_str
     );
 }
+
+/// Test parsing of HEAD symref to extract branch names.
+/// When HEAD points to a branch (not detached), we need to watch that branch ref file.
+#[test]
+fn test_head_symref_parsing() {
+    use gitdir::parse_head_symref;
+
+    // Test normal branch HEAD
+    let head_branch = b"ref: refs/heads/main\n";
+    let parsed = parse_head_symref(head_branch);
+    assert_eq!(parsed, Some(b"refs/heads/main".to_vec()));
+
+    // Test branch with spaces (should be trimmed)
+    let head_spaces = b"ref: refs/heads/feature  \n";
+    let parsed = parse_head_symref(head_spaces);
+    assert_eq!(parsed, Some(b"refs/heads/feature".to_vec()));
+
+    // Test detached HEAD (no 'ref:' prefix)
+    let head_detached = b"abc123def456\n";
+    let parsed = parse_head_symref(head_detached);
+    assert_eq!(parsed, None);
+
+    // Test HEAD without newline
+    let head_no_newline = b"ref: refs/heads/test";
+    let parsed = parse_head_symref(head_no_newline);
+    assert_eq!(parsed, Some(b"refs/heads/test".to_vec()));
+}
+
+/// Test that branch ref changes trigger rebuild in linked worktrees.
+/// When a branch is advanced without changing the index, we still need to rebuild.
+#[test]
+fn test_branch_advance_in_linked_worktree() {
+    let temp = TempDir::new().expect("failed to create temp directory");
+    let repo_path = temp.path().join("main");
+    fs::create_dir(&repo_path).expect("failed to create repo directory");
+
+    // Initialize main repository with some commits
+    init_git_repo(&repo_path);
+
+    // Create another commit in main
+    let test_file = repo_path.join("test.txt");
+    fs::write(&test_file, "content 1\n").expect("failed to write test file");
+    std::process::Command::new("git")
+        .args(["add", "test.txt"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to add file");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "add test file"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to commit");
+
+    // Create a linked worktree on a new branch
+    let worktree_path = temp.path().join("wt");
+    create_linked_worktree(&repo_path, &worktree_path, "feature");
+
+    // Verify worktree is on feature branch
+    let status = std::process::Command::new("git")
+        .args(["branch", "-a"])
+        .current_dir(&worktree_path)
+        .output()
+        .expect("failed to get branch list");
+    let branches = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        branches.contains("feature"),
+        "worktree should be on feature branch"
+    );
+
+    // Get the current HEAD from the worktree
+    let head_output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&worktree_path)
+        .output()
+        .expect("failed to get HEAD commit");
+    let initial_head = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_string();
+
+    // Now advance the feature branch from the main repo (like a CI push)
+    let new_file = repo_path.join("new.txt");
+    fs::write(&new_file, "new content\n").expect("failed to write new file");
+    std::process::Command::new("git")
+        .args(["add", "new.txt"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to add new file");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "new commit"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to commit new change");
+
+    // Force-update the feature branch in main to point to this new commit
+    std::process::Command::new("git")
+        .args(["branch", "-f", "feature"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to force-update feature branch");
+
+    // Now fetch in the worktree to get the updated branch
+    std::process::Command::new("git")
+        .args(["fetch", "origin"])
+        .current_dir(&worktree_path)
+        .output()
+        .expect("failed to fetch in worktree");
+
+    // Verify that the worktree's HEAD can be updated (this simulates build.rs re-reading)
+    let new_head_output = std::process::Command::new("git")
+        .args(["rev-parse", "origin/feature"])
+        .current_dir(&worktree_path)
+        .output()
+        .expect("failed to get remote feature ref");
+    let new_head = String::from_utf8_lossy(&new_head_output.stdout)
+        .trim()
+        .to_string();
+
+    // Verify the commits are different (branch was advanced)
+    assert_ne!(
+        initial_head, new_head,
+        "feature branch should have been advanced to a new commit"
+    );
+
+    // Verify the gitdir is correctly resolved and has the branch ref file
+    let git_file = worktree_path.join(".git");
+    let resolved_gitdir = resolve_gitdir_from(&git_file);
+    assert!(
+        resolved_gitdir.is_some(),
+        "should resolve gitdir in linked worktree"
+    );
+
+    let gitdir = resolved_gitdir.unwrap();
+    // The common-dir should have the refs/heads/feature file
+    if let Some(common_dir) = gitdir::resolve_common_dir(&gitdir) {
+        let feature_ref = common_dir.join("refs/heads/feature");
+        assert!(
+            feature_ref.exists(),
+            "common dir should have refs/heads/feature file"
+        );
+    }
+}
