@@ -31,6 +31,7 @@ async fn connect_authenticated(server: &FakeGjcServer) -> WsStream {
     stream
 }
 
+#[allow(clippy::result_large_err)]
 async fn connect_with(
     url: &str,
     bearer: Option<&str>,

@@ -201,6 +201,7 @@ impl fmt::Display for GjcSdkQueryError {
 /// seam lets #325's reconciler observe sessions without duplicating sibling
 /// transport or control surfaces.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait GjcSdkControlPlane: Send + Sync {
     async fn query_lane(
         &self,
@@ -471,6 +472,7 @@ pub struct GjcPrState {
 
 /// PR resolution seam. Returns `Ok(None)` when the PR is not open anymore.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait GjcLanePrResolver: Send + Sync {
     async fn resolve_pr(&self, repo: &str, number: u64) -> Result<Option<GjcPrState>>;
 }
