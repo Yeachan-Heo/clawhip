@@ -38,7 +38,9 @@ fn main() {
             );
         }
 
-        // If on a branch, also watch the branch ref file for commits without index changes
+        // If on a branch, also watch the branch ref file for commits without index changes.
+        // Register the loose ref path even when it does not yet exist; a subsequent commit
+        // can create refs/heads/<branch> without changing other watched files.
         if let Some(head_bytes) = gitdir::read_head_bytes(&gitdir)
             && let Some(ref_path_bytes) = gitdir::parse_head_symref(&head_bytes)
             && let Some(common_dir) = gitdir::resolve_common_dir(&gitdir)
@@ -49,12 +51,16 @@ fn main() {
                 use std::os::unix::ffi::OsStrExt;
                 let ref_osstr = std::ffi::OsStr::from_bytes(&ref_path_bytes);
                 let ref_full = common_dir.join(ref_osstr);
-                if ref_full.exists()
-                    && let Ok(canonical) = ref_full.canonicalize()
-                {
+                // Try to canonicalize if it exists; otherwise use the path as-is.
+                let watch_path = if ref_full.exists() {
+                    ref_full.canonicalize().ok()
+                } else {
+                    Some(ref_full)
+                };
+                if let Some(path) = watch_path {
                     println!(
                         "cargo:rerun-if-changed={}",
-                        gitdir::rerun_path_safe(&canonical)
+                        gitdir::rerun_path_safe(&path)
                     );
                 }
             }
@@ -62,27 +68,35 @@ fn main() {
             {
                 if let Ok(ref_path_str) = std::str::from_utf8(&ref_path_bytes) {
                     let ref_full = common_dir.join(ref_path_str);
-                    if ref_full.exists()
-                        && let Ok(canonical) = ref_full.canonicalize()
-                    {
+                    // Try to canonicalize if it exists; otherwise use the path as-is.
+                    let watch_path = if ref_full.exists() {
+                        ref_full.canonicalize().ok()
+                    } else {
+                        Some(ref_full)
+                    };
+                    if let Some(path) = watch_path {
                         println!(
                             "cargo:rerun-if-changed={}",
-                            gitdir::rerun_path_safe(&canonical)
+                            gitdir::rerun_path_safe(&path)
                         );
                     }
                 }
             }
         }
 
-        // Watch packed-refs for efficiency (batch ref updates)
+        // Watch packed-refs for efficiency (batch ref updates).
+        // Register even if it does not yet exist (it might be created on first gc).
         if let Some(common_dir) = gitdir::resolve_common_dir(&gitdir) {
             let packed_refs = common_dir.join("packed-refs");
-            if packed_refs.exists()
-                && let Ok(canonical) = packed_refs.canonicalize()
-            {
+            let watch_path = if packed_refs.exists() {
+                packed_refs.canonicalize().ok()
+            } else {
+                Some(packed_refs)
+            };
+            if let Some(path) = watch_path {
                 println!(
                     "cargo:rerun-if-changed={}",
-                    gitdir::rerun_path_safe(&canonical)
+                    gitdir::rerun_path_safe(&path)
                 );
             }
         }

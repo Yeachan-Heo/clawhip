@@ -616,3 +616,81 @@ fn test_branch_advance_in_linked_worktree() {
         );
     }
 }
+
+/// Test that loose ref paths are registered even when packed.
+/// Regression test for PR #374: when a branch is packed at build time,
+/// the old code skipped registering the loose ref path via exists() guard.
+/// A subsequent empty commit creates refs/heads/<branch> without changing
+/// packed-refs, so Cargo should still rerun the build when the loose ref is created.
+#[test]
+fn test_packed_branch_loose_ref_registration() {
+    let temp = TempDir::new().expect("failed to create temp directory");
+    let repo_path = temp.path().join("main");
+    fs::create_dir(&repo_path).expect("failed to create repo directory");
+
+    // Initialize main repository
+    init_git_repo(&repo_path);
+
+    // Create a linked worktree
+    let worktree_path = temp.path().join("wt");
+    create_linked_worktree(&repo_path, &worktree_path, "packed-test");
+
+    // Get the gitdir and common_dir
+    let git_file = worktree_path.join(".git");
+    let resolved_gitdir = resolve_gitdir_from(&git_file);
+    assert!(
+        resolved_gitdir.is_some(),
+        "should resolve gitdir in linked worktree"
+    );
+
+    let gitdir = resolved_gitdir.unwrap();
+    let common_dir = gitdir::resolve_common_dir(&gitdir)
+        .expect("should resolve common dir");
+
+    // Verify the loose ref exists before packing
+    let loose_ref = common_dir.join("refs/heads/packed-test");
+    assert!(
+        loose_ref.exists(),
+        "loose ref should exist before packing"
+    );
+
+    // Pack refs by running git gc in the main repo
+    let gc_status = std::process::Command::new("git")
+        .args(["gc", "--aggressive"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to run git gc");
+    assert!(gc_status.status.success(), "git gc should succeed");
+
+    // Verify packed-refs exists
+    let packed_refs = common_dir.join("packed-refs");
+    assert!(packed_refs.exists(), "packed-refs should exist after gc");
+
+    // Verify the loose ref no longer exists (it's now in packed-refs)
+    assert!(
+        !loose_ref.exists(),
+        "loose ref should not exist after packing"
+    );
+
+    // The critical part: HEAD should still point to the packed-test branch
+    let head_bytes = gitdir::read_head_bytes(&gitdir)
+        .expect("should read HEAD");
+    let ref_path_bytes = gitdir::parse_head_symref(&head_bytes)
+        .expect("HEAD should point to a branch");
+
+    // The ref path should be refs/heads/packed-test even though the loose ref doesn't exist
+    assert_eq!(
+        ref_path_bytes,
+        b"refs/heads/packed-test",
+        "HEAD should still point to packed-test branch"
+    );
+
+    // This test verifies that build.rs correctly:
+    // 1. Reads HEAD and finds the branch ref path
+    // 2. Constructs the loose ref path
+    // 3. Registers it for watching EVEN IF IT DOESN'T EXIST
+    //
+    // Without the fix, the exists() guard would skip registering the loose ref,
+    // leaving only packed-refs watched. When an empty commit creates the loose ref,
+    // Cargo would not rerun, and the binary would have stale commit metadata.
+}
