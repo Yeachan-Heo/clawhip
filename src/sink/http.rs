@@ -477,8 +477,7 @@ fn public_text(value: &str, max_chars: usize, state: &mut NormalizationState) ->
     }
 
     let redacted_urls = redact_urls_in_text(collapsed.trim(), state);
-    let redacted_json = redact_json_secrets(&redacted_urls, state);
-    let redacted_secrets = redact_secret_assignments(&redacted_json, state);
+    let redacted_secrets = redact_secret_assignments(&redacted_urls, state);
     if redacted_secrets.chars().count() > max_chars {
         state.truncated = true;
     }
@@ -518,164 +517,11 @@ fn redact_urls_in_text(value: &str, state: &mut NormalizationState) -> String {
     output
 }
 
-fn is_json_secret_key(key: &str) -> bool {
-    // P2: Avoid full lowercase allocation; check patterns byte-wise
-    let patterns = [
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "authorization",
-        "credential",
-        "api",
-        "access",
-    ];
-    patterns
-        .iter()
-        .any(|pattern| contains_case_insensitive(key, pattern))
-}
-
-fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    let haystack_bytes = haystack.as_bytes();
-    let needle_bytes = needle.as_bytes();
-    'outer: for i in 0..=haystack_bytes.len().saturating_sub(needle_bytes.len()) {
-        for (j, &needle_byte) in needle_bytes.iter().enumerate() {
-            let h_byte = haystack_bytes[i + j];
-            // ASCII-safe comparison: convert both to lowercase (byte-level, no full allocation)
-            #[allow(clippy::manual_ignore_case_cmp)]
-            if h_byte.to_ascii_lowercase() != needle_byte.to_ascii_lowercase() {
-                continue 'outer;
-            }
-        }
-        return true;
-    }
-    false
-}
-
-fn redact_json_secrets(value: &str, state: &mut NormalizationState) -> String {
-    // Redact JSON-shaped secrets like {"token":"value"} or "token": "value"
-    // Strategy: search for `":` pattern, extract the key, and redact if it's sensitive
-    let mut result = value.to_string();
-    let mut search_from = 0;
-
-    loop {
-        if search_from >= result.len() {
-            break;
-        }
-
-        let result_bytes = result.as_bytes();
-        let lower_result = result[search_from..].to_ascii_lowercase();
-
-        // Look for the pattern ": (quote-colon) which marks the end of a JSON key
-        let pattern = "\":".to_ascii_lowercase();
-        let Some(offset) = lower_result.find(&pattern) else {
-            break; // No more key-value patterns found
-        };
-
-        let key_close_quote_pos = search_from + offset;
-        let colon_pos = key_close_quote_pos + 1;
-        let result_len = result.len();
-
-        if colon_pos >= result_len {
-            break;
-        }
-
-        // Now find the opening quote of this key by searching backwards
-        let mut key_open_quote_pos = key_close_quote_pos;
-        while key_open_quote_pos > 0 {
-            key_open_quote_pos -= 1;
-            if result_bytes[key_open_quote_pos] == b'"' {
-                // Check if escaped
-                let mut num_backslashes = 0;
-                let mut check = key_open_quote_pos;
-                while check > 0 && result_bytes[check - 1] == b'\\' {
-                    num_backslashes += 1;
-                    check -= 1;
-                }
-                if num_backslashes % 2 == 0 {
-                    // Not escaped, found the opening quote
-                    break;
-                }
-            }
-        }
-
-        // Extract key name
-        let key_name = &result[key_open_quote_pos + 1..key_close_quote_pos];
-        if !is_json_secret_key(key_name) {
-            // Not a secret key, continue searching after this key-value pair
-            search_from = colon_pos + 1;
-            continue;
-        }
-
-        // This is a secret key, now find and redact its value
-        let mut pos = colon_pos + 1;
-
-        // Skip whitespace after colon
-        while pos < result_len && result_bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-
-        if pos >= result_len {
-            break;
-        }
-
-        // Check for opening quote of value
-        let quote_byte = result_bytes[pos];
-        if quote_byte != b'"' && quote_byte != b'\'' {
-            // Value is not quoted, skip this entry
-            search_from = colon_pos + 1;
-            continue;
-        }
-
-        let mut value_end = pos + 1;
-        let mut found_closing_quote = false;
-
-        // Find closing quote of value
-        while value_end < result_len {
-            if result_bytes[value_end] == quote_byte {
-                // Check if escaped
-                let mut num_backslashes = 0;
-                let mut check = value_end;
-                while check > 0 && result_bytes[check - 1] == b'\\' {
-                    num_backslashes += 1;
-                    check -= 1;
-                }
-                if num_backslashes % 2 == 0 {
-                    // Not escaped, found the closing quote
-                    found_closing_quote = true;
-                    break;
-                }
-            }
-            value_end += 1;
-        }
-
-        // Process the replacement
-        state.redacted = true;
-        let before = result[..pos + 1].to_string();
-        if found_closing_quote {
-            // Normal case: found closing quote
-            let after = result[value_end..].to_string();
-            result = format!("{}[redacted]{}", before, after);
-            // Continue searching after this redaction
-            search_from = before.len() + "[redacted]".len();
-        } else {
-            // Unterminated value: redact through EOF
-            result = format!("{}[redacted]", before);
-            break; // End of string, nothing more to redact
-        }
-    }
-
-    result
-}
-
 fn redact_secret_assignments(value: &str, state: &mut NormalizationState) -> String {
     value
         .split(' ')
         .map(|word| {
-            let word_lower = word.to_ascii_lowercase();
+            let lower = word.to_ascii_lowercase();
             for marker in [
                 "authorization:",
                 "authorization=",
@@ -684,7 +530,7 @@ fn redact_secret_assignments(value: &str, state: &mut NormalizationState) -> Str
                 "secret=",
                 "token=",
             ] {
-                if let Some(index) = word_lower.find(marker) {
+                if let Some(index) = lower.find(marker) {
                     state.redacted = true;
                     return format!(
                         "{}{}[redacted]",
@@ -1166,27 +1012,6 @@ mod tests {
     }
 
     #[test]
-    fn json_shaped_secrets_are_redacted() {
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        // JSON-shaped secrets should be redacted just like token= forms
-        message.content = r#"API response: {"token":"secret-value","password":"my-pass"}"#.into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body.clone()).unwrap();
-
-        // The secret values should not leak into the summary
-        assert!(
-            !rendered.contains("secret-value"),
-            "JSON token value leaked into summary"
-        );
-        assert!(
-            !rendered.contains("my-pass"),
-            "JSON password value leaked into summary"
-        );
-    }
-
-    #[test]
     #[serial]
     fn from_config_reports_missing_secret_without_exposing_endpoint() {
         let name = "CLAWHIP_TEST_MISSING_HTTP_HMAC_SECRET";
@@ -1206,92 +1031,5 @@ mod tests {
         assert!(!error.contains(endpoint));
         assert!(!error.contains("controller.example"));
         assert!(!error.contains("endpoint-secret"));
-    }
-
-    #[test]
-    fn p1_redacts_unterminated_json_secret_through_eof() {
-        // P1 regression: when a JSON secret starts before the summary limit but
-        // its closing quote falls after truncation, the prefix must be redacted
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        // Craft content where a secret value extends past the truncation point
-        let long_secret = "x".repeat(2000);
-        message.content = format!(r#"API response: {{"access_token":"{}"}}"#, long_secret);
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body).unwrap();
-
-        // The truncated secret prefix must be redacted, not exposed
-        assert!(
-            !rendered.contains(&long_secret[..100]),
-            "Unterminated secret prefix leaked"
-        );
-        assert!(
-            rendered.contains("[redacted]"),
-            "Unterminated secret was not redacted"
-        );
-    }
-
-    #[test]
-    fn p1_matches_compound_secret_key_names() {
-        // P1 regression: compound names like access_token, refresh_token, client_secret
-        // must be redacted, not just simple 'token' and 'secret'
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        message.content = r#"{
-            "access_token": "secret-access",
-            "refresh_token": "secret-refresh",
-            "client_secret": "secret-client",
-            "api_key": "secret-api",
-            "authorization": "Bearer secret-bearer"
-        }"#
-        .into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body).unwrap();
-
-        // All compound secret names should be redacted
-        assert!(
-            !rendered.contains("secret-access"),
-            "access_token value leaked"
-        );
-        assert!(
-            !rendered.contains("secret-refresh"),
-            "refresh_token value leaked"
-        );
-        assert!(
-            !rendered.contains("secret-client"),
-            "client_secret value leaked"
-        );
-        assert!(!rendered.contains("secret-api"), "api_key value leaked");
-        assert!(
-            !rendered.contains("secret-bearer"),
-            "authorization value leaked"
-        );
-    }
-
-    #[test]
-    fn p2_avoids_excessive_lowercase_allocations_in_redaction() {
-        // P2 regression: redaction should not allocate lowercase copies
-        // for every word/key check when no secrets are present.
-        // This test verifies that the function completes efficiently (no panic)
-        // and produces valid output for normal text.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        // Content with many words that could potentially trigger allocation issues
-        message.content = "Session update: status running commits authored reviewed merged pending awaited and more text here and here and everywhere".into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let parsed: Value = serde_json::from_slice(&body).unwrap();
-
-        // Verify it completes without panic and produces valid JSON
-        assert!(!body.is_empty(), "Body should not be empty");
-        assert_eq!(parsed["schema"], EVENT_SCHEMA, "Schema should be correct");
-        assert_eq!(
-            parsed["request_id"], "request-123",
-            "Request ID should match"
-        );
-        // Verify summary is present (but may contain redactions if any `:` patterns are found)
-        assert!(parsed["summary"].is_string(), "Summary should be a string");
     }
 }
