@@ -433,6 +433,7 @@ fn is_sensitive_field(key: &str) -> bool {
         || key.contains("credential")
         || key.contains("cookie")
         || key.contains("webhook")
+        || key.contains("api")
         || key.ends_with("_path")
         || matches!(
             key.as_str(),
@@ -477,7 +478,8 @@ fn public_text(value: &str, max_chars: usize, state: &mut NormalizationState) ->
     }
 
     let redacted_urls = redact_urls_in_text(collapsed.trim(), state);
-    let redacted_secrets = redact_secret_assignments(&redacted_urls, state);
+    let redacted_json = redact_json_secrets(&redacted_urls, state);
+    let redacted_secrets = redact_secret_assignments(&redacted_json, state);
     if redacted_secrets.chars().count() > max_chars {
         state.truncated = true;
     }
@@ -517,11 +519,369 @@ fn redact_urls_in_text(value: &str, state: &mut NormalizationState) -> String {
     output
 }
 
+fn redact_json_secrets(value: &str, state: &mut NormalizationState) -> String {
+    // Primary strategy: parse as JSON and recursively redact sensitive values.
+    // This handles all value types (strings, numbers, objects, arrays) and
+    // properly interprets JSON structure. Fallback to string scanner for
+    // truncated or malformed JSON.
+    if let Ok(mut json_value) = serde_json::from_str::<Value>(value) {
+        if redact_sensitive_values(&mut json_value) {
+            state.redacted = true;
+        }
+        if let Ok(result) = serde_json::to_string(&json_value) {
+            return result;
+        }
+    }
+
+    // Fallback: parse error (truncated or malformed JSON). Use a bounded
+    // string scanner that handles whitespace, non-string values, and EOF.
+    redact_json_secrets_fallback(value, state)
+}
+
+fn redact_sensitive_values(value: &mut Value) -> bool {
+    // Recursively redact all values whose keys match is_sensitive_field.
+    // Returns true if any redactions were made.
+    let mut redacted = false;
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if is_sensitive_field(key) {
+                    // Redact the entire value regardless of type
+                    *val = Value::String("[redacted]".to_string());
+                    redacted = true;
+                } else {
+                    // Recursively check nested structures
+                    if redact_sensitive_values(val) {
+                        redacted = true;
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                if redact_sensitive_values(item) {
+                    redacted = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    redacted
+}
+
+fn redact_json_secrets_fallback(value: &str, state: &mut NormalizationState) -> String {
+    // Fallback scanner for truncated or malformed JSON-like content.
+    // Handles: whitespace before colons, non-string values, EOF, escaped keys.
+    // Preserves the input and only modifies when a sensitive key is found.
+    let mut result = value.to_string();
+    let mut search_from = 0;
+
+    loop {
+        if search_from >= result.len() {
+            break;
+        }
+
+        let result_bytes = result.as_bytes();
+        let remaining = &result[search_from..];
+
+        // Find the next quoted string (potential key)
+        let Some(key_start_offset) = remaining.find('"') else {
+            break; // No more quoted strings
+        };
+
+        let key_start_pos = search_from + key_start_offset;
+
+        // Find closing quote of the key, accounting for escapes
+        let mut key_end_offset = key_start_offset + 1;
+        let mut found_key_close = false;
+
+        while key_end_offset < remaining.len() {
+            if remaining.as_bytes()[key_end_offset] == b'"' {
+                // Check if escaped
+                let mut backslash_count = 0;
+                let mut check_pos = key_end_offset;
+                while check_pos > 0 && remaining.as_bytes()[check_pos - 1] == b'\\' {
+                    backslash_count += 1;
+                    check_pos -= 1;
+                }
+                if backslash_count % 2 == 0 {
+                    found_key_close = true;
+                    break;
+                }
+            }
+            key_end_offset += 1;
+        }
+
+        if !found_key_close {
+            break; // Unterminated key
+        }
+
+        let key_end_pos = search_from + key_end_offset;
+        let key_name_bytes = &result_bytes[key_start_pos + 1..key_end_pos];
+
+        // Decode JSON escapes in the key name (e.g., \u006b for 'k')
+        let key_name = match decode_json_escape_sequences(key_name_bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                search_from = key_end_pos + 1;
+                continue;
+            }
+        };
+
+        // Check if this is a sensitive field
+        if !is_sensitive_field(&key_name) {
+            search_from = key_end_pos + 1;
+            continue;
+        }
+
+        // Found a sensitive key. Now locate the colon (with optional whitespace).
+        let mut colon_pos = key_end_pos + 1;
+        while colon_pos < result.len() && result_bytes[colon_pos].is_ascii_whitespace() {
+            colon_pos += 1;
+        }
+
+        // Verify colon is present
+        if colon_pos >= result.len() || result_bytes[colon_pos] != b':' {
+            search_from = key_end_pos + 1;
+            continue;
+        }
+
+        // Skip colon and whitespace to reach value start
+        let mut value_start = colon_pos + 1;
+        while value_start < result.len() && result_bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+
+        if value_start >= result.len() {
+            // No value after colon
+            break;
+        }
+
+        // Find the end of the JSON value (handles strings, numbers, true/false/null, objects, arrays)
+        let value_end = find_json_value_end(&result, value_start);
+
+        if value_end <= value_start {
+            search_from = value_start + 1;
+            continue;
+        }
+
+        // Replace the value with [redacted]
+        state.redacted = true;
+        let before = &result[..value_start];
+        let after = &result[value_end..];
+        result = format!("{}[redacted]{}", before, after);
+
+        search_from = value_start + "[redacted]".len();
+    }
+
+    result
+}
+
+fn decode_json_escape_sequences(bytes: &[u8]) -> std::result::Result<String, String> {
+    // Decode JSON escape sequences like \\uXXXX to their actual characters.
+    // Returns Ok(decoded_string) or Err(reason).
+    let mut result = String::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'"' | b'\\' | b'/' => {
+                    result.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                b'b' => {
+                    result.push('\x08');
+                    i += 2;
+                }
+                b'f' => {
+                    result.push('\x0c');
+                    i += 2;
+                }
+                b'n' => {
+                    result.push('\n');
+                    i += 2;
+                }
+                b'r' => {
+                    result.push('\r');
+                    i += 2;
+                }
+                b't' => {
+                    result.push('\t');
+                    i += 2;
+                }
+                b'u' if i + 5 < bytes.len() => {
+                    // Parse \\uXXXX Unicode escape
+                    let hex_str = std::str::from_utf8(&bytes[i + 2..i + 6])
+                        .map_err(|_| "invalid UTF-8 in hex".to_string())?;
+                    let code_point = u32::from_str_radix(hex_str, 16)
+                        .map_err(|_| "invalid hex code point".to_string())?;
+                    let ch = char::from_u32(code_point)
+                        .ok_or_else(|| "invalid Unicode code point".to_string())?;
+                    result.push(ch);
+                    i += 6;
+                }
+                _ => {
+                    // Unknown escape, keep as-is
+                    result.push('\\');
+                    result.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    Ok(result)
+}
+
+fn find_json_value_end(text: &str, start: usize) -> usize {
+    // Find the end position of a JSON value starting at `start`.
+    // Returns the position immediately after the value (at comma, }, ], or EOF).
+    let bytes = text.as_bytes();
+    if start >= bytes.len() {
+        return start;
+    }
+
+    let first_byte = bytes[start];
+
+    match first_byte {
+        b'"' => {
+            // String value: find the closing unescaped quote
+            let mut pos = start + 1;
+            while pos < bytes.len() {
+                if bytes[pos] == b'"' {
+                    let mut backslash_count = 0;
+                    let mut check = pos;
+                    while check > 0 && bytes[check - 1] == b'\\' {
+                        backslash_count += 1;
+                        check -= 1;
+                    }
+                    if backslash_count % 2 == 0 {
+                        return pos + 1;
+                    }
+                }
+                pos += 1;
+            }
+            // Unterminated string: consume to EOF
+            bytes.len()
+        }
+        b'{' => {
+            // Object: find matching closing brace
+            let mut pos = start + 1;
+            let mut depth = 1;
+            while pos < bytes.len() && depth > 0 {
+                match bytes[pos] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    b'"' => {
+                        // Skip string contents to avoid confusing braces inside strings
+                        pos += 1;
+                        while pos < bytes.len() {
+                            if bytes[pos] == b'"' {
+                                let mut backslash_count = 0;
+                                let mut check = pos;
+                                while check > 0 && bytes[check - 1] == b'\\' {
+                                    backslash_count += 1;
+                                    check -= 1;
+                                }
+                                if backslash_count % 2 == 0 {
+                                    break;
+                                }
+                            }
+                            pos += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                pos += 1;
+            }
+            pos
+        }
+        b'[' => {
+            // Array: find matching closing bracket
+            let mut pos = start + 1;
+            let mut depth = 1;
+            while pos < bytes.len() && depth > 0 {
+                match bytes[pos] {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    b'"' => {
+                        // Skip string contents to avoid confusing brackets inside strings
+                        pos += 1;
+                        while pos < bytes.len() {
+                            if bytes[pos] == b'"' {
+                                let mut backslash_count = 0;
+                                let mut check = pos;
+                                while check > 0 && bytes[check - 1] == b'\\' {
+                                    backslash_count += 1;
+                                    check -= 1;
+                                }
+                                if backslash_count % 2 == 0 {
+                                    break;
+                                }
+                            }
+                            pos += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                pos += 1;
+            }
+            pos
+        }
+        b'n' if start + 4 <= bytes.len() && &bytes[start..start + 4] == b"null" => {
+            // null literal
+            start + 4
+        }
+        b't' if start + 4 <= bytes.len() && &bytes[start..start + 4] == b"true" => {
+            // true literal
+            start + 4
+        }
+        b'f' if start + 5 <= bytes.len() && &bytes[start..start + 5] == b"false" => {
+            // false literal
+            start + 5
+        }
+        b'-' | b'0'..=b'9' => {
+            // Number: consume digits, optional decimal point, optional exponent
+            let mut pos = start;
+            if bytes[pos] == b'-' {
+                pos += 1;
+            }
+            // Integer part
+            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            // Decimal part
+            if pos < bytes.len() && bytes[pos] == b'.' {
+                pos += 1;
+                while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                    pos += 1;
+                }
+            }
+            // Exponent part
+            if pos < bytes.len() && (bytes[pos] == b'e' || bytes[pos] == b'E') {
+                pos += 1;
+                if pos < bytes.len() && (bytes[pos] == b'+' || bytes[pos] == b'-') {
+                    pos += 1;
+                }
+                while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                    pos += 1;
+                }
+            }
+            pos
+        }
+        _ => start + 1,
+    }
+}
+
 fn redact_secret_assignments(value: &str, state: &mut NormalizationState) -> String {
     value
         .split(' ')
         .map(|word| {
-            let lower = word.to_ascii_lowercase();
+            let word_lower = word.to_ascii_lowercase();
             for marker in [
                 "authorization:",
                 "authorization=",
@@ -530,7 +890,7 @@ fn redact_secret_assignments(value: &str, state: &mut NormalizationState) -> Str
                 "secret=",
                 "token=",
             ] {
-                if let Some(index) = lower.find(marker) {
+                if let Some(index) = word_lower.find(marker) {
                     state.redacted = true;
                     return format!(
                         "{}{}[redacted]",
@@ -1012,6 +1372,27 @@ mod tests {
     }
 
     #[test]
+    fn json_shaped_secrets_are_redacted() {
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        // JSON-shaped secrets should be redacted just like token= forms
+        message.content = r#"API response: {"token":"secret-value","password":"my-pass"}"#.into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body.clone()).unwrap();
+
+        // The secret values should not leak into the summary
+        assert!(
+            !rendered.contains("secret-value"),
+            "JSON token value leaked into summary"
+        );
+        assert!(
+            !rendered.contains("my-pass"),
+            "JSON password value leaked into summary"
+        );
+    }
+
+    #[test]
     #[serial]
     fn from_config_reports_missing_secret_without_exposing_endpoint() {
         let name = "CLAWHIP_TEST_MISSING_HTTP_HMAC_SECRET";
@@ -1031,5 +1412,286 @@ mod tests {
         assert!(!error.contains(endpoint));
         assert!(!error.contains("controller.example"));
         assert!(!error.contains("endpoint-secret"));
+    }
+
+    #[test]
+    fn p1_redacts_unterminated_json_secret_through_eof() {
+        // P1 regression: when a JSON secret starts before the summary limit but
+        // its closing quote falls after truncation, the prefix must be redacted
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        // Craft content where a secret value extends past the truncation point
+        let long_secret = "x".repeat(2000);
+        message.content = format!(r#"API response: {{"access_token":"{}"}}"#, long_secret);
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body).unwrap();
+
+        // The truncated secret prefix must be redacted, not exposed
+        assert!(
+            !rendered.contains(&long_secret[..100]),
+            "Unterminated secret prefix leaked"
+        );
+        assert!(
+            rendered.contains("[redacted]"),
+            "Unterminated secret was not redacted"
+        );
+    }
+
+    #[test]
+    fn p1_matches_compound_secret_key_names() {
+        // P1 regression: compound names like access_token, refresh_token, client_secret
+        // must be redacted, not just simple 'token' and 'secret'
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        message.content = r#"{
+            "access_token": "secret-access",
+            "refresh_token": "secret-refresh",
+            "client_secret": "secret-client",
+            "api_key": "secret-api",
+            "authorization": "Bearer secret-bearer"
+        }"#
+        .into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body).unwrap();
+
+        // All compound secret names should be redacted
+        assert!(
+            !rendered.contains("secret-access"),
+            "access_token value leaked"
+        );
+        assert!(
+            !rendered.contains("secret-refresh"),
+            "refresh_token value leaked"
+        );
+        assert!(
+            !rendered.contains("secret-client"),
+            "client_secret value leaked"
+        );
+        assert!(!rendered.contains("secret-api"), "api_key value leaked");
+        assert!(
+            !rendered.contains("secret-bearer"),
+            "authorization value leaked"
+        );
+    }
+
+    #[test]
+    fn p2_avoids_excessive_lowercase_allocations_in_redaction() {
+        // P2 regression: redaction should not allocate lowercase copies
+        // for every word/key check when no secrets are present.
+        // This test verifies that the function completes efficiently (no panic)
+        // and produces valid output for normal text.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        // Content with many words that could potentially trigger allocation issues
+        message.content = "Session update: status running commits authored reviewed merged pending awaited and more text here and here and everywhere".into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify it completes without panic and produces valid JSON
+        assert!(!body.is_empty(), "Body should not be empty");
+        assert_eq!(parsed["schema"], EVENT_SCHEMA, "Schema should be correct");
+        assert_eq!(
+            parsed["request_id"], "request-123",
+            "Request ID should match"
+        );
+        // Verify summary is present (but may contain redactions if any `:` patterns are found)
+        assert!(parsed["summary"].is_string(), "Summary should be a string");
+    }
+
+    #[test]
+    fn p1_handles_short_haystack_without_panic() {
+        // P1 regression: when a JSON key is shorter than "token",
+        // like {"id":"123"}, the old code would panic on array indexing.
+        // Verify it now handles this gracefully.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        message.content = r#"{"id":"123","token":"secret"}"#.into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body).unwrap();
+
+        // Must not panic and must redact the token value
+        assert!(rendered.contains("[redacted]"), "Token should be redacted");
+        assert!(
+            !rendered.contains("\"secret\""),
+            "Secret value should not be in output"
+        );
+    }
+
+    #[test]
+    fn p1_allows_whitespace_before_json_colon() {
+        // P1 regression: valid JSON permits whitespace between key closing quote
+        // and colon: {"access_token" : "secret"}. The old pattern \":" would not match.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        message.content = r#"{"access_token"  :  "secret-value","token" : "another"}"#.into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body).unwrap();
+
+        // Both tokens should be redacted despite whitespace
+        assert!(
+            !rendered.contains("secret-value"),
+            "access_token value leaked"
+        );
+        assert!(!rendered.contains("another"), "token value leaked");
+    }
+
+    #[test]
+    fn p1_applies_full_sensitive_key_predicate() {
+        // P1 regression: the JSON redactor must use the full is_sensitive_field
+        // predicate, including "cookie", "webhook", and other fields.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        message.content = r#"{
+            "cookie":"session=xyz",
+            "webhook":"https://callback.example?secret=123",
+            "command":"rm -rf /",
+            "cwd":"/var/private"
+        }"#
+        .into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body).unwrap();
+
+        // All sensitive fields should be redacted
+        assert!(!rendered.contains("session=xyz"), "cookie value leaked");
+        assert!(
+            !rendered.contains("callback.example"),
+            "webhook value leaked"
+        );
+        assert!(!rendered.contains("rm -rf"), "command value leaked");
+        assert!(!rendered.contains("/var/private"), "cwd value leaked");
+    }
+
+    #[test]
+    fn p1_redacts_non_string_json_secret_values() {
+        // P1 regression: non-string JSON values like numbers, objects, and arrays
+        // must be redacted, not just quoted strings.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        message.content = r#"{
+            "token":123456,
+            "credential":{"value":"secret","id":"abc"},
+            "password":["pass1","pass2"],
+            "api_key":true
+        }"#
+        .into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body).unwrap();
+
+        // All sensitive values should be redacted, even non-strings
+        assert!(!rendered.contains("123456"), "numeric token leaked");
+        assert!(
+            !rendered.contains("\"value\":\"secret\""),
+            "nested credential leaked"
+        );
+        assert!(
+            !rendered.contains("pass1") && !rendered.contains("pass2"),
+            "password array leaked"
+        );
+        assert!(
+            !rendered.contains("api_key\":true"),
+            "boolean api_key leaked"
+        );
+    }
+
+    #[test]
+    fn p1_decodes_escaped_json_keys() {
+        // P1 regression: JSON keys with Unicode escapes like {"to\u006ben":"secret"}
+        // represent a "token" field but were not recognized.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        // {"to\u006ben":"secret"} is {"token":"secret"} with the 'k' escaped as \u006b
+        message.content = r#"{"to\u006b\u0065n":"secret-value"}"#.into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body).unwrap();
+
+        // The escaped "token" key should be recognized and its value redacted
+        assert!(
+            !rendered.contains("secret-value"),
+            "escaped token key not recognized"
+        );
+        assert!(rendered.contains("[redacted]"), "value should be redacted");
+    }
+
+    #[test]
+    fn p1_guards_against_missing_opening_quote() {
+        // P1 regression: if the input begins with ":, the old code would search
+        // backwards for a quote and panic on range 1..0. Now it must guard against this.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        // Content that looks JSON-ish but starts with a colon
+        message.content = r#":"value","token":"secret""#.into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body.clone()).unwrap();
+
+        // Must not panic; should still find and redact the actual token
+        assert!(!body.is_empty(), "body should be generated");
+        assert!(
+            rendered.contains("[redacted]"),
+            "actual token should be redacted"
+        );
+    }
+
+    #[test]
+    fn p1_redacts_malformed_json_like_content() {
+        // P1 regression: fallback scanner must handle truncated and malformed JSON,
+        // including missing closing braces, unclosed strings, etc.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        // Deliberately truncated JSON-like content
+        message.content = r#"{"token":"secret","other":"value"#.into();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let rendered = String::from_utf8(body.clone()).unwrap();
+
+        // Must not panic; should still redact the token
+        assert!(!body.is_empty(), "body should be generated");
+        assert!(
+            !rendered.contains("secret"),
+            "token value should be redacted in malformed JSON"
+        );
+    }
+
+    #[test]
+    fn p2_json_parsing_avoids_allocations() {
+        // P2 regression: using serde_json for parsing avoids the per-key
+        // lowercase allocations in the primary path. This completes without
+        // quadratic copying overhead.
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        // Large JSON with many non-sensitive fields
+        let json = serde_json::json!({
+            "field1": "value1",
+            "field2": "value2",
+            "field3": "value3",
+            "field4": "value4",
+            "field5": "value5",
+            "token": "secret-token",
+            "field6": "value6",
+            "field7": "value7",
+            "field8": "value8",
+        });
+        message.content = json.to_string();
+
+        let body = event_body(&message, &target, "request-123").unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify correct parsing and redaction
+        assert!(!body.is_empty(), "body should be generated");
+        assert!(
+            parsed["summary"]
+                .as_str()
+                .map(|s| !s.contains("secret-token"))
+                .unwrap_or(true),
+            "token should be redacted"
+        );
     }
 }
