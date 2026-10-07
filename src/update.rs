@@ -158,12 +158,13 @@ pub async fn approve_update(
         .ok_or("no pending update to approve")?;
 
     let auto_restart = config.update.auto_restart;
-    let repo_root = config.update.repo_root.clone();
+    let repo_root = config.effective_update_repo_root().map(str::to_owned);
+    let config_path = config.config_path();
     let channel = config.update.channel.clone();
     let result_version = update.latest_version.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        crate::lifecycle::update_from_repo(repo_root.as_deref(), auto_restart)
+        crate::lifecycle::update_from_repo(repo_root.as_deref(), auto_restart, &config_path)
     })
     .await
     .map_err(|error| format!("update task panicked: {error}"))?;

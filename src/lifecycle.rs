@@ -6,19 +6,20 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, anyhow};
 
-use crate::{Result, plugins};
+use crate::{Result, plugins, source_checkout};
 
 const GITHUB_REPO: &str = "Yeachan-Heo/clawhip";
 const SKIP_STAR_PROMPT_ENV: &str = "CLAWHIP_SKIP_STAR_PROMPT";
 
-pub fn install(systemd: bool, skip_star_prompt: bool) -> Result<()> {
+pub fn install(systemd: bool, skip_star_prompt: bool, config_path: &Path) -> Result<()> {
     let repo_root = current_repo_root()?;
     run(Command::new("cargo")
         .arg("install")
         .arg("--path")
         .arg(&repo_root))?;
-    ensure_config_dir()?;
-    plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
+    let config_parent = ensure_selected_config_parent(config_path)?;
+    source_checkout::persist(config_path, &repo_root)?;
+    plugins::install_bundled_plugins(&config_parent.join("plugins"))?;
     if systemd {
         install_systemd(&repo_root)?;
     }
@@ -27,45 +28,54 @@ pub fn install(systemd: bool, skip_star_prompt: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn update(restart: bool) -> Result<()> {
+pub fn record_source_checkout(config_path: &Path) -> Result<()> {
     let repo_root = current_repo_root()?;
-    update_repo(&repo_root, restart)
+    ensure_selected_config_parent(config_path)?;
+    source_checkout::persist(config_path, &repo_root)?;
+    println!("Recorded source checkout {}", repo_root.display());
+    Ok(())
+}
+
+pub fn update(restart: bool, config_path: &Path) -> Result<()> {
+    let repo_root = current_repo_root()?;
+    update_repo(&repo_root, restart, config_path)
 }
 
 /// Perform a self-update using an explicit repo root (from config) or by
 /// attempting automatic discovery. Prefer passing an explicit path for
 /// deterministic behavior in daemon/systemd contexts.
-pub fn update_from_repo(explicit_root: Option<&str>, restart: bool) -> Result<()> {
-    let repo_root = match explicit_root {
-        Some(path) => {
-            let root = PathBuf::from(path);
-            if !root.join("Cargo.toml").exists() || !root.join("src").exists() {
-                return Err(anyhow!(
-                    "configured repo_root '{}' does not contain a clawhip checkout",
-                    root.display()
-                )
-                .into());
-            }
-            root
-        }
-        None => find_repo_root()?,
-    };
-    update_repo(&repo_root, restart)
+pub fn update_from_repo(
+    explicit_root: Option<&str>,
+    restart: bool,
+    config_path: &Path,
+) -> Result<()> {
+    let repo_root = resolve_update_repo_root(explicit_root)?;
+    update_repo(&repo_root, restart, config_path)
 }
 
-fn update_repo(repo_root: &Path, restart: bool) -> Result<()> {
-    run(Command::new("git")
+fn resolve_update_repo_root(explicit_root: Option<&str>) -> Result<PathBuf> {
+    let repo_root = match explicit_root.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => canonical_checkout(Path::new(path), "configured repo_root")?,
+        None => find_repo_root()?,
+    };
+    Ok(repo_root)
+}
+
+fn update_repo(repo_root: &Path, restart: bool, config_path: &Path) -> Result<()> {
+    run(source_checkout::isolated_git_command()
         .arg("-C")
         .arg(repo_root)
         .arg("pull")
         .arg("--ff-only"))?;
+    let repo_root = canonical_checkout(repo_root, "updated repo_root")?;
     run(Command::new("cargo")
         .arg("install")
         .arg("--path")
-        .arg(repo_root)
+        .arg(&repo_root)
         .arg("--force"))?;
-    ensure_config_dir()?;
-    plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
+    let config_parent = ensure_selected_config_parent(config_path)?;
+    source_checkout::persist(config_path, &repo_root)?;
+    plugins::install_bundled_plugins(&config_parent.join("plugins"))?;
     if restart {
         restart_systemd_if_present()?;
     }
@@ -89,10 +99,8 @@ fn find_repo_root() -> Result<PathBuf> {
         .and_then(|o| String::from_utf8(o.stdout).ok());
     if let Some(path) = output {
         let manifest = PathBuf::from(path.trim());
-        if let Some(parent) = manifest.parent()
-            && parent.join("src").exists()
-        {
-            return Ok(parent.to_path_buf());
+        if let Some(parent) = manifest.parent() {
+            return canonical_checkout(parent, "discovered repo root");
         }
     }
     Err(anyhow!(
@@ -124,18 +132,40 @@ pub fn uninstall(remove_systemd: bool, remove_config: bool) -> Result<()> {
 
 fn current_repo_root() -> Result<PathBuf> {
     let dir = env::current_dir()?;
-    if dir.join("Cargo.toml").exists() && dir.join("src").exists() {
-        Ok(dir)
-    } else {
-        Err(anyhow!("run this command from the clawhip git clone root").into())
-    }
+    canonical_checkout(&dir, "current directory")
+        .map_err(|_| anyhow!("run this command from the clawhip git clone root").into())
 }
 
-fn ensure_config_dir() -> Result<()> {
-    let dir = config_dir();
-    fs::create_dir_all(&dir)?;
-    println!("Ensured config dir {}", dir.display());
-    Ok(())
+fn canonical_checkout(path: &Path, description: &str) -> Result<PathBuf> {
+    source_checkout::validate_checkout(path).map_err(|error| {
+        anyhow!(
+            "{description} '{}' is not a valid clawhip git checkout: {error}",
+            path.display()
+        )
+        .into()
+    })
+}
+
+fn ensure_selected_config_parent(config_path: &Path) -> Result<PathBuf> {
+    let parent = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create selected config directory {}",
+            parent.display()
+        )
+    })?;
+    if !fs::metadata(parent)?.is_dir() {
+        return Err(anyhow!(
+            "selected config parent is not a directory: {}",
+            parent.display()
+        )
+        .into());
+    }
+    println!("Ensured config dir {}", parent.display());
+    Ok(parent.to_path_buf())
 }
 
 fn config_dir() -> PathBuf {
@@ -443,8 +473,12 @@ mod tests {
         let bad_path = dir.path().join("not-a-checkout");
         std::fs::create_dir_all(&bad_path).expect("mkdir");
 
-        let error = update_from_repo(Some(bad_path.to_str().unwrap()), false)
-            .expect_err("should reject missing Cargo.toml");
+        let error = update_from_repo(
+            Some(bad_path.to_str().unwrap()),
+            false,
+            &dir.path().join("config.toml"),
+        )
+        .expect_err("should reject missing Cargo.toml");
 
         assert!(
             error
@@ -461,13 +495,25 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"clawhip\"")
             .expect("write Cargo.toml");
 
-        let error = update_from_repo(Some(root.to_str().unwrap()), false)
-            .expect_err("should reject missing src/");
+        let error = update_from_repo(
+            Some(root.to_str().unwrap()),
+            false,
+            &dir.path().join("config.toml"),
+        )
+        .expect_err("should reject missing src/");
 
         assert!(
             error
                 .to_string()
                 .contains("does not contain a clawhip checkout")
+        );
+    }
+
+    #[test]
+    fn blank_explicit_update_root_uses_discovery_fallback() {
+        assert_eq!(
+            resolve_update_repo_root(Some("  ")).unwrap(),
+            find_repo_root().unwrap()
         );
     }
 

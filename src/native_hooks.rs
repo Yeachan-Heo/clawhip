@@ -1461,6 +1461,7 @@ mod tests {
         assert!(!script.contains("??"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_hook_script_e2e_surfaces_bridge_stderr_and_exit_code() {
         use std::io::Write;
@@ -1659,6 +1660,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_hook_script_e2e_emits_canonical_repo_metadata_from_event_cwd() {
         use std::io::Write;

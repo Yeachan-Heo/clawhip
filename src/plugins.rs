@@ -44,8 +44,8 @@ impl Plugin {
     }
 }
 
-pub fn default_plugins_dir() -> Result<PathBuf> {
-    Ok(resolve_plugins_dir().unwrap_or_else(app_plugins_dir))
+pub fn default_plugins_dir(config_path: &Path) -> Result<PathBuf> {
+    Ok(resolve_plugins_dir(config_path).unwrap_or_else(|| app_plugins_dir(config_path)))
 }
 
 pub fn load_plugins(root: &Path) -> Result<Vec<Plugin>> {
@@ -84,13 +84,13 @@ pub fn install_bundled_plugins(destination_root: &Path) -> Result<()> {
     copy_dir_all(&source_root, destination_root)
 }
 
-fn resolve_plugins_dir() -> Option<PathBuf> {
-    plugin_dir_candidates()
+fn resolve_plugins_dir(config_path: &Path) -> Option<PathBuf> {
+    plugin_dir_candidates(config_path)
         .into_iter()
         .find(|path| path.is_dir())
 }
 
-fn plugin_dir_candidates() -> Vec<PathBuf> {
+fn plugin_dir_candidates(config_path: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Some(dir) = env::var_os(PLUGIN_DIR_ENV)
@@ -100,7 +100,7 @@ fn plugin_dir_candidates() -> Vec<PathBuf> {
         candidates.push(dir);
     }
 
-    candidates.push(app_plugins_dir());
+    candidates.push(app_plugins_dir(config_path));
     candidates.push(bundled_plugins_dir());
 
     if let Ok(exe) = env::current_exe()
@@ -119,9 +119,11 @@ fn bundled_plugins_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins")
 }
 
-fn app_plugins_dir() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-        .join(".clawhip")
+fn app_plugins_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
         .join("plugins")
 }
 
@@ -163,6 +165,18 @@ fn default_bridge() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_plugins_follow_selected_config_parent() {
+        assert_eq!(
+            app_plugins_dir(Path::new("/srv/clawhip/custom.toml")),
+            PathBuf::from("/srv/clawhip/plugins")
+        );
+        assert_eq!(
+            app_plugins_dir(Path::new("custom.toml")),
+            PathBuf::from("./plugins")
+        );
+    }
 
     #[test]
     fn loads_plugins_from_plugin_toml_files() {

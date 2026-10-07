@@ -14,17 +14,22 @@ pub use git::{
     GitMonitorLifecycleCounts, GitSource, SharedGitMonitorDiagnostics,
     new_shared_git_monitor_diagnostics, snapshot_git_monitor_diagnostics,
 };
-pub use github::GitHubSource;
+pub use github::{
+    GitHubSource, default_github_ci_baseline_path, new_shared_github_monitor_auth_status,
+    snapshot_github_monitor_auth_status,
+};
 pub use github_status::GitHubStatusSource;
 pub use subscription::{SubscriptionSnapshot, SubscriptionState, SubscriptionWorker};
 pub use tmux::{
     RegisteredTmuxSession, SharedTmuxRegistry, TmuxSource, default_registry_state_path,
     inspect_tmux_registry_state, list_active_tmux_registrations, load_tmux_registry_state,
-    register_runtime_tmux_registration, tmux_registry_diagnostics,
+    reconcile_restored_tmux_registry, register_runtime_tmux_registration,
+    tmux_registry_diagnostics,
 };
 pub use workspace::WorkspaceSource;
 
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Source: Send + Sync {
     fn name(&self) -> &str;
 

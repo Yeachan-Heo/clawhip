@@ -801,6 +801,11 @@ impl IncomingEvent {
         self
     }
 
+    pub fn with_template(mut self, template: Option<String>) -> Self {
+        self.template = template;
+        self
+    }
+
     pub fn with_repo_context(
         mut self,
         repo_path: Option<String>,

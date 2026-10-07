@@ -1,5 +1,11 @@
 # clawhip
 
+Clawhip is a GJC-first event router. It automatically discovers and binds live
+native GJC SDK sessions, routes authoritative lifecycle, question, gate, and
+failure events through the normal ledger/router/sink pipeline, and preserves
+loopback-only credentials and public-safe projections. GJC remains the process
+owner; Clawhip observes and controls only through the SDK contract.
+
 <p align="center">
   <img src="assets/clawhip-mascot.jpg" width="400" alt="clawhip mascot" />
 </p>
@@ -385,6 +391,48 @@ webhook = "https://hooks.slack.com/services/T.../B.../yyy"
 format = "alert"
 ```
 
+## Signed HTTP webhook setup
+
+The generic `http` sink delivers a normalized, bounded, public-safe JSON event directly to a
+local controller such as Hermes. Discord is optional when every event you intend to deliver is
+covered by HTTP, Slack, local-file, or Discord-webhook routes.
+
+Keep the HMAC secret outside the TOML file and reference its environment-variable name:
+
+```bash
+export HERMES_CLAWHIP_HMAC_SECRET="replace-with-a-random-shared-secret"
+```
+
+```toml
+[providers.http]
+endpoint = "http://127.0.0.1:8644/webhooks/clawhip-controller"
+hmac_secret_env = "HERMES_CLAWHIP_HMAC_SECRET"
+
+[[routes]]
+event = "*"
+sink = "http"
+```
+
+The sink signs the exact transmitted bytes with HMAC-SHA256 and sends the result as
+`X-Hub-Signature-256: sha256=<hex>`. `X-Request-ID` is stable for the normalized event and is
+also present in the body. Plain HTTP is accepted only for loopback endpoints (`127.0.0.0/8`,
+`::1`, or `localhost`); non-loopback endpoints must use HTTPS. Redirects are disabled, response
+bodies and endpoint paths are not copied into errors or telemetry, and raw event payloads,
+credentials, local paths, and webhook URLs are excluded or redacted from the outbound body.
+
+HTTP and Discord can fan out from the same event by adding a second matching route:
+
+```toml
+[[routes]]
+event = "github.*"
+sink = "http"
+
+[[routes]]
+event = "github.*"
+sink = "discord"
+channel = "PROJECT_CHANNEL_ID"
+```
+
 ## System model
 
 ```text
@@ -392,8 +440,8 @@ format = "alert"
               -> [sources]
               -> [mpsc queue]
               -> [dispatcher]
-              -> [router -> renderer -> Discord/Slack sink]
-              -> [Discord REST / Slack webhook delivery]
+              -> [router -> renderer -> Discord/Slack/HTTP sink]
+              -> [Discord REST / Slack webhook / signed HTTP delivery]
 ```
 
 Input sources in v0.3.0:
@@ -796,7 +844,7 @@ non-zero when any destination is missing or not explicitly allowed.
 
 Output is public-safe by design: text and JSON reports include counts, clawhip
 source labels, and channel IDs only. They do not dump gateway tokens, webhook
-URLs, raw config payloads, or unrelated gateway fields. Webhooks, Slack routes,
+URLs, raw config payloads, or unrelated gateway fields. Discord/Slack webhooks, HTTP routes,
 localfile routes, and thread-only targets are outside this allowlist check.
 
 ## Dynamic token contract
@@ -853,7 +901,7 @@ Release artifacts are generated for these Rust target triples: `x86_64-unknown-l
 ./install.sh --systemd
 ```
 
-`install.sh` now tries the latest prebuilt release first and falls back to `cargo install --path . --force` when a matching release asset is unavailable. If Cargo is needed for the fallback path but not installed, the script prints Rustup setup instructions. When `--systemd` is used, the installed binary is also copied to `/usr/local/bin/clawhip` so the bundled service unit can start it.
+`install.sh` now tries the latest prebuilt release first and falls back to `cargo install --path . --force` when a matching release asset is unavailable. After a source fallback, it invokes the installed binary to validate the exact clawhip git checkout and persist the managed deployment-health sidecar without modifying operator config; the install fails if that recording step cannot complete. A relative `CLAWHIP_CONFIG` is resolved from the directory that invoked the script. Both the script recording path and regular `clawhip install --config ...` prepare only the selected config parent hierarchy, so custom installs do not depend on or mutate the default `$HOME/.clawhip`. If Cargo is needed for the fallback path but not installed, the script prints Rustup setup instructions. When `--systemd` is used, the installed binary is also copied to `/usr/local/bin/clawhip` so the bundled service unit can start it.
 
 In interactive terminals, both the repo-local installer and `clawhip install` may offer an optional post-install GitHub star prompt via authenticated `gh api` access. It never runs automatically, is skipped when `gh` is missing or unauthenticated, and can be disabled with `./install.sh --skip-star-prompt`, `clawhip install --skip-star-prompt`, or `CLAWHIP_SKIP_STAR_PROMPT=1`.
 
@@ -883,6 +931,72 @@ Expected install path:
 - `systemctl daemon-reload`
 - `systemctl enable --now clawhip`
 
+## Deployed build identity
+
+The crate version only changes on release, so `clawhip 0.6.11` cannot tell a
+freshly deployed daemon apart from one still running a binary built several
+merges earlier. Every build therefore stamps the source revision it was built
+from, and both the CLI and the daemon report it:
+
+```bash
+clawhip --version
+# clawhip 0.6.11 (7bad9d24df18)          built from that commit
+# clawhip 0.6.11 (7bad9d24df18-dirty)   build tree had uncommitted changes
+# clawhip 0.6.11                        revision unavailable (e.g. source tarball)
+
+curl -s localhost:25294/health | jq .build
+# { "version": "0.6.11", "commit": "7bad9d24df18...", "short_commit": "7bad9d24df18",
+#   "dirty": false, "commit_source": "git" }
+```
+
+Compare `build.commit` against the revision you expect to have deployed to
+confirm a rollout landed instead of inferring it from a green repository state.
+When `[update].repo_root` is configured the daemon makes that comparison
+itself — see [Deployment drift alerts](#deployment-drift-alerts).
+`commit_source` is `git` for checkout builds, `environment` when a packaging
+pipeline supplies `CLAWHIP_BUILD_COMMIT` (or CI supplies `GITHUB_SHA`), and
+`unavailable` when no revision could be determined. Only the commit object
+name, a dirty flag, and that source are exposed — no branches, paths, or
+hostnames. A build without `git` or outside a checkout still succeeds.
+
+## Deployment drift alerts
+
+Knowing the build revision only helps if somebody compares it. When
+`[update].repo_root` points at the source checkout, the daemon does that
+comparison itself every 5 minutes and alerts once per newly observed drift
+pair:
+
+```
+clawhip deployment drift: running binary was built from c4774562c6b0,
+but the source checkout is at dd1494cc0f4d.
+The running service is not the code in the checkout; rebuild and restart to deploy it.
+```
+
+The alert is delivered like any other custom event (`[update].channel` selects
+the target), and the latest observation is always readable:
+
+```bash
+curl -s localhost:25294/health | jq .deployment
+# { "state": "drift", "binary_commit": "c4774562...", "source_commit": "dd1494cc...", "reason": null }
+```
+
+`state` is one of:
+
+| state | meaning |
+| --- | --- |
+| `match` | the running binary was built from the checkout's current `HEAD` |
+| `drift` | the binary was built from a different revision; **alerts** |
+| `unknown` | not comparable; never alerts, and `reason` says why |
+
+`unknown` is deliberate rather than a silent pass. It is reported when no
+checkout is configured, when `HEAD` is unreadable (missing directory, not a
+repository), when the binary carries no stamped revision (e.g. a crates.io or
+tarball build), or when the binary was built from a modified tree — a `-dirty`
+build provably is not exactly its commit, so it is never called a match.
+
+Only commit object names are exposed; the checkout path never appears in an
+event payload or on the health surface.
+
 ## Live verification runbook
 
 Use:
@@ -909,6 +1023,7 @@ Required live sign-off presets:
 
 ```bash
 clawhip                 # start daemon
+clawhip --version       # crate version + build revision of this binary
 clawhip status          # daemon health
 clawhip config          # bounded preset editor / config inspection
 clawhip config verify-gateway-allowlist  # check Clawdbot gateway allowlist coverage

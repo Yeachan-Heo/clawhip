@@ -14,7 +14,10 @@ pub const DEFAULT_DELIVER_MAX_ENTERS: u32 = crate::hooks::prompt_deliver::DEFAUL
 #[derive(Debug, Parser)]
 #[command(
     name = "clawhip",
-    version,
+    // Stamp the build revision, not just the crate version: the version only
+    // moves on release, so it cannot distinguish a freshly deployed binary
+    // from one built several merges earlier.
+    version = crate::build_info::version_line(),
     about = "Daemon-first event gateway for Discord"
 )]
 pub struct Cli {
@@ -118,11 +121,18 @@ pub enum Commands {
     /// Install clawhip from the current git clone.
     Install {
         /// Install and start the bundled systemd service.
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with = "record_source_checkout_only"
+        )]
         systemd: bool,
         /// Disable the optional post-install GitHub star prompt.
         #[arg(long, default_value_t = false)]
         skip_star_prompt: bool,
+        /// Only validate and persist the current source checkout for install.sh.
+        #[arg(long, default_value_t = false)]
+        record_source_checkout_only: bool,
     },
     /// Update clawhip from the current git clone.
     ///
@@ -178,6 +188,17 @@ pub enum Commands {
     Gajae {
         #[command(subcommand)]
         command: GajaeCommands,
+    },
+    /// Query and control GJC SDK sessions through the local daemon.
+    ///
+    /// Authoritative session queries (metadata, stats, model/profile, turn,
+    /// queue, workflow gates, goal/todo, capabilities) and mutation verbs
+    /// (prompt, steer, abort-and-prompt, workflow gate answer, ask answer,
+    /// model selection). All commands talk to the local daemon and fail
+    /// closed with typed error codes.
+    Gjc {
+        #[command(subcommand)]
+        command: GjcCommands,
     },
     /// Release consistency checks.
     Release {
@@ -280,6 +301,13 @@ pub struct SetupArgs {
     /// Use the configured default channel when no --question-channel is supplied.
     #[arg(long = "question-fallback", default_value_t = false)]
     pub question_fallback: bool,
+    /// Enable the loopback-safe GJC SDK integration with safe defaults.
+    ///
+    /// Marks [gjc] enabled and trusts only the loopback discovery root.
+    /// The SDK endpoint and auth token stay environment-driven; no secret is
+    /// ever written into the config file.
+    #[arg(long = "gjc-sdk", default_value_t = false)]
+    pub gjc_sdk: bool,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -301,6 +329,13 @@ pub struct VerifyGatewayAllowlistArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Default, Args)]
+pub struct VerifySenderIdentityArgs {
+    /// Emit machine-readable JSON instead of the human-readable text report.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 impl EmitArgs {
     pub fn into_event(self) -> crate::Result<crate::events::IncomingEvent> {
         let mut channel = None;
@@ -314,7 +349,7 @@ impl EmitArgs {
             return Err("emit fields must be provided as --key value pairs".into());
         }
 
-        for pair in self.fields.chunks_exact(2) {
+        for pair in self.fields.as_chunks::<2>().0 {
             let key = pair[0]
                 .strip_prefix("--")
                 .ok_or_else(|| format!("emit field names must start with --, got {}", pair[0]))?;
@@ -712,6 +747,196 @@ pub struct GajaeZeroBacklogCheckpointArgs {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+pub enum GjcCommands {
+    /// Inspect worktree-local GJC SDK endpoint metadata and transport readiness.
+    ///
+    /// Discovery only: reports the validated session endpoint for the target
+    /// worktree without exposing tokens or URLs.
+    Inspect(GjcInspectArgs),
+    /// Show capabilities advertised by the local daemon's control plane.
+    Capabilities {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Query authoritative session surfaces (metadata, stats, model, turn, queue, gates, goal/todo).
+    Session {
+        /// GJC session id.
+        session: String,
+        /// Comma-separated sections to fetch. Defaults to all.
+        #[arg(long)]
+        sections: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch the terminal outcome receipt for one turn.
+    TurnOutcome {
+        /// GJC session id.
+        session: String,
+        /// Turn id whose terminal outcome is requested.
+        turn_id: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a prompt into a session.
+    Prompt {
+        /// GJC session id.
+        session: String,
+        /// Prompt text to submit.
+        #[arg(long)]
+        prompt: String,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Steer an in-flight turn without aborting it.
+    Steer {
+        /// GJC session id.
+        session: String,
+        /// Steering message for the active turn.
+        #[arg(long)]
+        message: String,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Abort in-flight turns and immediately submit a replacement prompt.
+    AbortAndPrompt {
+        /// GJC session id.
+        session: String,
+        /// Replacement prompt submitted after the abort.
+        #[arg(long)]
+        prompt: String,
+        /// Restrict the abort to these turn ids (repeatable).
+        #[arg(long = "turn")]
+        turn_ids: Vec<String>,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Answer a raised workflow gate.
+    GateAnswer {
+        /// GJC session id.
+        session: String,
+        /// Workflow gate id being answered.
+        #[arg(long)]
+        gate_id: String,
+        /// Chosen option for the gate.
+        #[arg(long)]
+        option: String,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Answer an ask/question prompt.
+    AskAnswer {
+        /// GJC session id.
+        session: String,
+        /// Ask/question id being answered.
+        #[arg(long)]
+        ask_id: String,
+        /// Chosen option(s); repeatable for multi-select asks.
+        #[arg(long = "choice")]
+        choices: Vec<String>,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Select the model or profile for a session (exactly one of --model/--profile).
+    Select {
+        /// GJC session id.
+        session: String,
+        /// Model id to select.
+        #[arg(long)]
+        model: Option<String>,
+        /// Profile name to select.
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        mutation: GjcMutationArgs,
+    },
+    /// Replay the receipt of an accepted command by idempotency key.
+    Receipt {
+        /// GJC session id bound to the receipt.
+        session: String,
+        /// Idempotency key used when the command was accepted.
+        #[arg(long)]
+        idempotency_key: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show durable GJC SDK lane health and retained watch summary.
+    ///
+    /// Reads daemon-owned durable lane state only; never scrapes panes or
+    /// exposes endpoint tokens/URLs.
+    Status {
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Register an SDK-backed lane for durable ownership tracking.
+    Register(GjcLaneRegisterArgs),
+    /// Trigger one immediate reconciliation pass in the daemon.
+    Reconcile {
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Manually retire a retained lane watch (terminal disposition).
+    Retire {
+        /// Retained lane id (gjc-<fingerprint>) from `clawhip gjc status`.
+        #[arg(long)]
+        lane: String,
+        /// Bounded audit reason for the retirement.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct GjcLaneRegisterArgs {
+    /// Authoritative GJC SDK session identity to retain.
+    #[arg(long)]
+    pub session: String,
+    /// Worktree root the session runs in (trust boundary for discovery).
+    #[arg(long)]
+    pub worktree: Option<String>,
+    /// Claim ownership on behalf of this owner id.
+    #[arg(long)]
+    pub owner: Option<String>,
+    /// Repository (`owner/repo`) whose PR head/base invalidates stale evidence.
+    #[arg(long)]
+    pub pr_repo: Option<String>,
+    /// PR number bound to the lane.
+    #[arg(long)]
+    pub pr_number: Option<u64>,
+    /// PR head sha at binding time (7-64 hex chars).
+    #[arg(long)]
+    pub pr_head_sha: Option<String>,
+    /// PR base branch at binding time.
+    #[arg(long)]
+    pub pr_base: Option<String>,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct GjcInspectArgs {
+    /// Worktree root to inspect. Defaults to the current directory.
+    #[arg(long)]
+    pub worktree: Option<PathBuf>,
+    /// Open the discovered endpoint and issue one typed probe request.
+    #[arg(long, default_value_t = false)]
+    pub probe: bool,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
 pub enum ReleaseCommands {
     /// Verify version/Cargo.lock/CHANGELOG consistency before tagging a release.
     ///
@@ -733,6 +958,25 @@ pub enum CronCommands {
         /// Cron job id from [[cron.jobs]].id.
         id: String,
     },
+}
+
+/// Shared mutation flags for GJC control verbs.
+#[derive(Debug, Clone, Args)]
+pub struct GjcMutationArgs {
+    /// Client idempotency key (8..=128 bytes). Replays with the same key
+    /// return the recorded receipt instead of issuing a second command.
+    #[arg(long)]
+    pub idempotency_key: String,
+    /// Expected authoritative session id; the command fails closed on
+    /// mismatch when provided.
+    #[arg(long)]
+    pub expected_session: Option<String>,
+    /// Bounded peer exchange timeout in milliseconds (1..=60000).
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1088,6 +1332,17 @@ pub enum ConfigCommand {
     /// channel IDs plus clawhip source labels; never dumps gateway tokens,
     /// webhooks, payloads, or unrelated config fields.
     VerifyGatewayAllowlist(VerifyGatewayAllowlistArgs),
+    /// Verify the effective Discord bot token resolves to the expected bot
+    /// identity via the Discord /users/@me endpoint.
+    ///
+    /// Fail-closed sender-identity preflight: requires
+    /// providers.discord.expected_bot_id, queries Discord with the effective
+    /// token (non-mutating, bounded), compares the observed stable bot ID to
+    /// the expected one, and reports a public-safe verdict that never
+    /// contains the token. Exits non-zero on any non-verified outcome so a
+    /// wrong-but-valid token cannot pass a smoke test merely because
+    /// transport works.
+    VerifySenderIdentity(VerifySenderIdentityArgs),
 }
 
 #[cfg(test)]
@@ -1447,6 +1702,31 @@ mod tests {
             Some(std::path::Path::new("/tmp/clawdbot.json"))
         );
         assert!(args.json);
+    }
+    #[test]
+    fn parses_config_verify_sender_identity_json() {
+        let cli = Cli::parse_from(["clawhip", "config", "verify-sender-identity", "--json"]);
+
+        let Some(Commands::Config {
+            command: Some(ConfigCommand::VerifySenderIdentity(args)),
+        }) = cli.command
+        else {
+            panic!("expected verify-sender-identity");
+        };
+        assert!(args.json);
+    }
+
+    #[test]
+    fn parses_config_verify_sender_identity_text_default() {
+        let cli = Cli::parse_from(["clawhip", "config", "verify-sender-identity"]);
+
+        let Some(Commands::Config {
+            command: Some(ConfigCommand::VerifySenderIdentity(args)),
+        }) = cli.command
+        else {
+            panic!("expected verify-sender-identity");
+        };
+        assert!(!args.json);
     }
 
     #[test]
@@ -1923,6 +2203,7 @@ mod tests {
         let Commands::Install {
             systemd,
             skip_star_prompt,
+            record_source_checkout_only,
         } = cli.command.expect("install command")
         else {
             panic!("expected install command");
@@ -1930,6 +2211,34 @@ mod tests {
 
         assert!(systemd);
         assert!(skip_star_prompt);
+        assert!(!record_source_checkout_only);
+    }
+
+    #[test]
+    fn parses_installer_checkout_recording_mode() {
+        let cli = Cli::parse_from(["clawhip", "install", "--record-source-checkout-only"]);
+
+        let Commands::Install {
+            systemd,
+            skip_star_prompt,
+            record_source_checkout_only,
+        } = cli.command.expect("install command")
+        else {
+            panic!("expected install command");
+        };
+
+        assert!(!systemd);
+        assert!(!skip_star_prompt);
+        assert!(record_source_checkout_only);
+        assert!(
+            Cli::try_parse_from([
+                "clawhip",
+                "install",
+                "--systemd",
+                "--record-source-checkout-only",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
