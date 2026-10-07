@@ -292,7 +292,7 @@ fn create_linked_worktree(repo_path: &Path, worktree_path: &Path, branch_name: &
         .arg(branch_name)
         .arg(worktree_path)
         .current_dir(repo_path);
-    
+
     let status = cmd.output().expect("failed to run git worktree add");
 
     assert!(
