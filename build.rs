@@ -58,10 +58,7 @@ fn main() {
                     Some(ref_full)
                 };
                 if let Some(path) = watch_path {
-                    println!(
-                        "cargo:rerun-if-changed={}",
-                        gitdir::rerun_path_safe(&path)
-                    );
+                    println!("cargo:rerun-if-changed={}", gitdir::rerun_path_safe(&path));
                 }
             }
             #[cfg(not(unix))]
@@ -75,10 +72,7 @@ fn main() {
                         Some(ref_full)
                     };
                     if let Some(path) = watch_path {
-                        println!(
-                            "cargo:rerun-if-changed={}",
-                            gitdir::rerun_path_safe(&path)
-                        );
+                        println!("cargo:rerun-if-changed={}", gitdir::rerun_path_safe(&path));
                     }
                 }
             }
@@ -94,10 +88,7 @@ fn main() {
                 Some(packed_refs)
             };
             if let Some(path) = watch_path {
-                println!(
-                    "cargo:rerun-if-changed={}",
-                    gitdir::rerun_path_safe(&path)
-                );
+                println!("cargo:rerun-if-changed={}", gitdir::rerun_path_safe(&path));
             }
         }
 

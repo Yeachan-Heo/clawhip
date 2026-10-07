@@ -644,15 +644,11 @@ fn test_packed_branch_loose_ref_registration() {
     );
 
     let gitdir = resolved_gitdir.unwrap();
-    let common_dir = gitdir::resolve_common_dir(&gitdir)
-        .expect("should resolve common dir");
+    let common_dir = gitdir::resolve_common_dir(&gitdir).expect("should resolve common dir");
 
     // Verify the loose ref exists before packing
     let loose_ref = common_dir.join("refs/heads/packed-test");
-    assert!(
-        loose_ref.exists(),
-        "loose ref should exist before packing"
-    );
+    assert!(loose_ref.exists(), "loose ref should exist before packing");
 
     // Pack refs by running git gc in the main repo
     let gc_status = std::process::Command::new("git")
@@ -673,15 +669,13 @@ fn test_packed_branch_loose_ref_registration() {
     );
 
     // The critical part: HEAD should still point to the packed-test branch
-    let head_bytes = gitdir::read_head_bytes(&gitdir)
-        .expect("should read HEAD");
-    let ref_path_bytes = gitdir::parse_head_symref(&head_bytes)
-        .expect("HEAD should point to a branch");
+    let head_bytes = gitdir::read_head_bytes(&gitdir).expect("should read HEAD");
+    let ref_path_bytes =
+        gitdir::parse_head_symref(&head_bytes).expect("HEAD should point to a branch");
 
     // The ref path should be refs/heads/packed-test even though the loose ref doesn't exist
     assert_eq!(
-        ref_path_bytes,
-        b"refs/heads/packed-test",
+        ref_path_bytes, b"refs/heads/packed-test",
         "HEAD should still point to packed-test branch"
     );
 
