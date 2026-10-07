@@ -1,6 +1,10 @@
 //! Gitdir resolution for linked worktrees, shared by build.rs and its regression test.
 
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,22 +28,55 @@ pub fn resolve_gitdir_from(git_path: &Path) -> Option<PathBuf> {
     }
 
     // If .git is a file (linked worktree), read the gitdir pointer.
-    let contents = fs::read_to_string(git_path).ok()?;
-    for line in contents.lines() {
-        if let Some(gitdir) = line.strip_prefix("gitdir:") {
-            let gitdir = gitdir.trim();
-            let path = if Path::new(gitdir).is_absolute() {
-                // Handle Unix absolute paths (/...), Windows drive-qualified (C:/...), and UNC paths (\\...)
-                PathBuf::from(gitdir)
-            } else {
-                // Relative paths are relative to the .git file location
-                git_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(gitdir)
-            };
-            if path.is_dir() {
-                return Some(path);
+    // Read as bytes to avoid requiring UTF-8 encoding.
+    let contents = fs::read(git_path).ok()?;
+
+    // Process line by line, looking for the gitdir: pointer.
+    // We need to handle lines that might not be valid UTF-8 on Unix systems.
+    for line_bytes in contents.split(|&b| b == b'\n') {
+        if line_bytes.is_empty() {
+            continue;
+        }
+
+        // Try to find the "gitdir:" prefix (ASCII, safe to check in bytes)
+        if line_bytes.starts_with(b"gitdir:") {
+            // Extract the path part after "gitdir:" and strip whitespace
+            let path_bytes = &line_bytes[7..]; // Skip "gitdir:"
+            let path_bytes = path_bytes.trim_ascii();
+
+            #[cfg(unix)]
+            {
+                // On Unix, paths are arbitrary bytes; use OsStr
+                let path_osstr = OsStr::from_bytes(path_bytes);
+                let path = if Path::new(path_osstr).is_absolute() {
+                    PathBuf::from(path_osstr)
+                } else {
+                    git_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(path_osstr)
+                };
+                if path.is_dir() {
+                    return Some(path);
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                // On non-Unix (e.g., Windows), decode to string; paths should be UTF-8
+                if let Ok(path_str) = String::from_utf8(path_bytes.to_vec()) {
+                    let path = if Path::new(&path_str).is_absolute() {
+                        PathBuf::from(&path_str)
+                    } else {
+                        git_path
+                            .parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .join(&path_str)
+                    };
+                    if path.is_dir() {
+                        return Some(path);
+                    }
+                }
             }
         }
     }

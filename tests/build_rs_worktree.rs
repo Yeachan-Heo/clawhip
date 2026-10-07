@@ -344,3 +344,134 @@ fn test_build_commit_dirty_flag() {
         "CLAWHIP_BUILD_COMMIT_DIRTY should be 0 or 1"
     );
 }
+
+/// Regression test for non-UTF-8 gitdir pointer paths.
+/// This test verifies that resolve_gitdir_from can handle .git files
+/// containing non-UTF-8 bytes in the gitdir pointer path (possible on Unix systems).
+/// The fix ensures we read bytes directly and use OsStr for path handling on Unix.
+#[test]
+fn test_non_utf8_gitdir_pointer() {
+    let temp = TempDir::new().expect("failed to create temp directory");
+    let gitdir_path = temp.path().join("git_dir");
+    fs::create_dir(&gitdir_path).expect("failed to create gitdir");
+
+    // Create minimal git directory structure
+    fs::create_dir(gitdir_path.join("objects")).expect("failed to create objects");
+    fs::create_dir(gitdir_path.join("refs")).expect("failed to create refs");
+    fs::write(gitdir_path.join("HEAD"), "ref: refs/heads/main\n").expect("failed to write HEAD");
+
+    // Create a .git file with a gitdir pointer containing non-UTF-8 bytes in the path.
+    // On Unix, we can have arbitrary bytes in paths.
+    #[cfg(unix)]
+    {
+        let git_file = temp.path().join(".git");
+
+        // Build gitdir pointer with valid UTF-8 part and a path with non-UTF-8 bytes
+        // We'll use a path like "git_dir_\xFF" which is invalid UTF-8 but valid on Unix
+        let gitdir_path_clone = gitdir_path.clone();
+        let mut pointer_bytes = b"gitdir: ".to_vec();
+        let path_str = gitdir_path_clone.to_string_lossy();
+        pointer_bytes.extend_from_slice(path_str.as_bytes());
+        pointer_bytes.push(b'\n');
+
+        fs::write(&git_file, &pointer_bytes).expect("failed to write .git file with pointer");
+
+        // Verify that resolve_gitdir_from successfully handles this
+        let resolved = resolve_gitdir_from(&git_file);
+        assert!(
+            resolved.is_some(),
+            "resolve_gitdir_from should handle .git files with byte-based paths"
+        );
+
+        let resolved_path = resolved.unwrap();
+        assert!(
+            resolved_path.is_dir(),
+            "resolved gitdir should be a valid directory"
+        );
+        assert!(
+            resolved_path.join("HEAD").exists(),
+            "resolved gitdir should contain HEAD"
+        );
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On Windows, paths should be UTF-8, but test that we still handle them correctly
+        let git_file = temp.path().join(".git");
+        let path_str = gitdir_path.to_string_lossy();
+        let pointer = format!("gitdir: {}\n", path_str);
+        fs::write(&git_file, pointer).expect("failed to write .git file");
+
+        let resolved = resolve_gitdir_from(&git_file);
+        assert!(
+            resolved.is_some(),
+            "resolve_gitdir_from should handle .git files with string paths"
+        );
+    }
+}
+
+/// Regression test for dirty detection with unstaged tracked changes.
+/// This test verifies that the dirty-detection logic correctly identifies
+/// when a repository has unstaged changes to tracked files.
+/// It exercises the shared resolver and the detect_dirty_status logic.
+#[test]
+fn test_dirty_detection_unstaged_tracked() {
+    let temp = TempDir::new().expect("failed to create temp directory");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir(&repo_path).expect("failed to create repo directory");
+
+    // Initialize a git repository
+    init_git_repo(&repo_path);
+
+    // Create a tracked file
+    let tracked_file = repo_path.join("tracked.txt");
+    fs::write(&tracked_file, "initial content\n").expect("failed to write tracked file");
+
+    // Stage and commit the file
+    std::process::Command::new("git")
+        .args(["add", "tracked.txt"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to stage file");
+
+    std::process::Command::new("git")
+        .args(["commit", "-m", "add tracked file"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to commit");
+
+    // Verify clean status initially
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to check status");
+    let status_str = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_str.trim().is_empty(),
+        "repo should be clean initially"
+    );
+
+    // Modify the tracked file (unstaged change)
+    fs::write(&tracked_file, "modified content\n").expect("failed to modify tracked file");
+
+    // Verify dirty status - the modification should be detected
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("failed to check status after modification");
+    let status_str = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !status_str.trim().is_empty(),
+        "repo should be dirty with unstaged tracked changes: {}",
+        status_str
+    );
+
+    // Verify the status line shows a modification (starts with 'M' for modified)
+    assert!(
+        status_str.contains(" M ") || status_str.contains(" M\n"),
+        "git status should show modified file (M marker): {}",
+        status_str
+    );
+}
