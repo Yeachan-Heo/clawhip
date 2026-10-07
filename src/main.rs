@@ -1,10 +1,12 @@
 mod binding_verify;
+mod build_info;
 mod cli;
 mod client;
 mod config;
 mod core;
 mod cron;
 mod daemon;
+mod deployment;
 mod discord;
 mod discord_watch;
 mod dispatch;
@@ -13,6 +15,10 @@ mod event;
 mod events;
 mod gajae;
 mod gateway_allowlist;
+mod gjc;
+mod gjc_lane;
+mod gjc_sdk;
+mod gjc_sdk_events;
 mod hooks;
 mod keyword_window;
 mod lane;
@@ -26,9 +32,11 @@ mod provenance;
 mod release_preflight;
 mod render;
 mod router;
+mod sender_identity;
 mod sink;
 mod slack;
 mod source;
+mod source_checkout;
 mod telemetry;
 mod tmux_wrapper;
 
@@ -46,6 +54,7 @@ use crate::cli::{
     GajaeReceiptCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, LedgerCommands,
     MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, SubscribeCommands,
     TmuxCommands, UpdateCommands, VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
+    VerifySenderIdentityArgs,
 };
 
 use crate::client::DaemonClient;
@@ -119,7 +128,14 @@ fn load_config_for_cli(config_path: &std::path::Path) -> Result<Arc<AppConfig>> 
 
 async fn real_main(cli: Cli) -> Result<()> {
     let config_path = cli.config_path();
-    let config = load_config_for_cli(&config_path)?;
+    let repairs_managed_state = command_repairs_managed_state(cli.command.as_ref());
+    let config = if repairs_managed_state {
+        AppConfig::load_or_default_without_managed(&config_path)
+            .map(Arc::new)
+            .map_err(|_| "config_invalid")?
+    } else {
+        load_config_for_cli(&config_path)?
+    };
     let cron_state_path = crate::cron::default_state_path(&config_path);
 
     match cli.command.unwrap_or(Commands::Start {
@@ -313,9 +329,16 @@ async fn real_main(cli: Cli) -> Result<()> {
         Commands::Install {
             systemd,
             skip_star_prompt,
-        } => lifecycle::install(systemd, skip_star_prompt),
+            record_source_checkout_only,
+        } => {
+            if record_source_checkout_only {
+                lifecycle::record_source_checkout(&config_path)
+            } else {
+                lifecycle::install(systemd, skip_star_prompt, &config_path)
+            }
+        }
         Commands::Update { command, restart } => match command {
-            None => lifecycle::update(restart),
+            None => lifecycle::update(restart, &config_path),
             Some(UpdateCommands::Check) => {
                 let http = reqwest::Client::builder()
                     .user_agent(format!("clawhip/{VERSION}"))
@@ -402,11 +425,7 @@ async fn real_main(cli: Cli) -> Result<()> {
             TmuxCommands::List => {
                 let client = DaemonClient::from_config(config.as_ref());
                 let registrations = client.list_tmux().await?;
-                let health = if registrations.is_empty() {
-                    client.health().await.ok()
-                } else {
-                    None
-                };
+                let health = client.health().await.ok();
                 render_tmux_list(&registrations, health.as_ref());
                 Ok(())
             }
@@ -456,10 +475,13 @@ async fn real_main(cli: Cli) -> Result<()> {
             ConfigCommand::VerifyGatewayAllowlist(args) => {
                 run_verify_gateway_allowlist(config, args)
             }
+            ConfigCommand::VerifySenderIdentity(args) => {
+                run_verify_sender_identity(config, args).await
+            }
         },
         Commands::Plugin { command } => match command {
             PluginCommands::List => {
-                let plugins_dir = plugins::default_plugins_dir()?;
+                let plugins_dir = plugins::default_plugins_dir(&config_path)?;
                 let discovered = plugins::load_plugins(&plugins_dir)?;
 
                 if discovered.is_empty() {
@@ -596,7 +618,15 @@ async fn real_main(cli: Cli) -> Result<()> {
         Commands::Release { command } => match command {
             ReleaseCommands::Preflight { version, repo } => release_preflight::run(repo, version),
         },
+        Commands::Gjc { command } => crate::gjc::cli::run(config.clone(), command).await,
     }
+}
+
+fn command_repairs_managed_state(command: Option<&Commands>) -> bool {
+    matches!(
+        command,
+        Some(Commands::Install { .. }) | Some(Commands::Update { command: None, .. })
+    )
 }
 
 async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Result<()> {
@@ -838,6 +868,7 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
         && binds.is_empty()
         && !args.verify_bindings
         && !question_setup_requested
+        && !args.gjc_sdk
     {
         return Err("setup requires at least one non-empty setup flag".into());
     }
@@ -857,6 +888,9 @@ async fn run_setup(args: SetupArgs, config_path: &std::path::Path) -> Result<()>
             repo,
             adapter_program,
         )?;
+    }
+    if args.gjc_sdk {
+        editable.apply_gjc_sdk_setup();
     }
 
     // Process --bind entries: resolve each channel against Discord and write a
@@ -998,6 +1032,68 @@ async fn run_verify_bindings(config: Arc<AppConfig>, args: VerifyBindingsArgs) -
     Ok(())
 }
 
+async fn run_verify_sender_identity(
+    config: Arc<AppConfig>,
+    args: VerifySenderIdentityArgs,
+) -> Result<()> {
+    use crate::sender_identity::{sender_identity_expectation, verify_sender_identity};
+    config.validate()?;
+
+    let token_source = config.discord_token_source();
+    let expectation = sender_identity_expectation(config.expected_discord_bot_id().as_deref());
+    let client = DiscordClient::from_config(config.clone())?;
+    let verdict = verify_sender_identity(&client, &expectation).await;
+
+    if args.json {
+        let payload = sender_identity_json(&verdict, &expectation, token_source);
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_sender_identity_report(&verdict, token_source);
+    }
+
+    // Fail closed: every non-verified outcome — mismatch, absent expectation,
+    // invalid credential, rate limit, malformed response, transport failure —
+    // exits non-zero. Transport success alone never passes this preflight.
+    if !verdict.is_verified() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn sender_identity_json(
+    verdict: &crate::sender_identity::SenderIdentityVerdict,
+    expectation: &crate::sender_identity::SenderIdentityExpectation,
+    token_source: &str,
+) -> serde_json::Value {
+    use crate::sender_identity::SenderIdentityExpectation;
+    use serde_json::json;
+    let expected_bot_id = match expectation {
+        SenderIdentityExpectation::Expected { bot_id } => json!(bot_id),
+        SenderIdentityExpectation::Absent => serde_json::Value::Null,
+    };
+    let observed_bot_id = verdict
+        .observed_bot_id()
+        .map(|id| json!(id))
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "verified": verdict.is_verified(),
+        "reason_code": verdict.reason_code(),
+        "expected_bot_id": expected_bot_id,
+        "observed_bot_id": observed_bot_id,
+        "verdict": verdict.to_string(),
+        "token_source": token_source,
+    })
+}
+
+fn print_sender_identity_report(
+    verdict: &crate::sender_identity::SenderIdentityVerdict,
+    token_source: &str,
+) {
+    let status = if verdict.is_verified() { "ok" } else { "FAIL" };
+    println!("[{status:>4}] {verdict}");
+    println!("       token source: {token_source} (credential value never printed)");
+}
+
 fn run_verify_gateway_allowlist(
     config: Arc<AppConfig>,
     args: VerifyGatewayAllowlistArgs,
@@ -1093,6 +1189,10 @@ fn format_tmux_list_with_health(
         ));
     }
 
+    if let Some(warning) = tmux_watch_coverage_warning(health) {
+        output.push_str(&format!("WARNING: {warning}\n"));
+    }
+
     output
 }
 
@@ -1119,29 +1219,71 @@ fn tmux_empty_list_detail(health: Option<&serde_json::Value>) -> String {
     {
         return format!("; live tmux probe failed: {error}");
     }
-    let live_count = tmux
-        .get("live_probe")
-        .and_then(|probe| probe.get("count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    if live_count > 0 {
-        return format!(
-            "; {live_count} live tmux session(s) exist but no clawhip watch routes are registered"
-        );
+    if let Some(warning) = tmux_watch_coverage_warning(health) {
+        return format!("; warning: {warning}");
     }
     String::new()
+}
+
+fn tmux_watch_coverage_warning(health: Option<&serde_json::Value>) -> Option<String> {
+    let coverage = health
+        .and_then(|health| health.get("tmux"))?
+        .get("watch_coverage")?;
+    let count = coverage.get("unregistered_live_lane_count")?.as_u64()?;
+    if count == 0 {
+        return None;
+    }
+
+    let sample = coverage
+        .get("unregistered_live_lane_sample")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    let omitted = count.saturating_sub(sample.len() as u64);
+    let sessions = if sample.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", sample.join(", "))
+    };
+    let remainder = if omitted == 0 {
+        String::new()
+    } else {
+        format!(" (+{omitted} more)")
+    };
+
+    Some(format!(
+        "{count} live GJC lane session(s) are not registered as clawhip watches{sessions}{remainder}"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        format_tmux_list, load_config_for_cli, parse_bind_checkout_overrides, parse_bind_overrides,
+        command_repairs_managed_state, format_tmux_list, format_tmux_list_with_health,
+        load_config_for_cli, parse_bind_checkout_overrides, parse_bind_overrides,
         parse_expect_name_overrides, validate_bind_checkout_repos, verify_bindings_json,
     };
     use crate::binding_verify::{BindingAudit, BindingDriftAudit};
+    use crate::cli::Commands;
     use crate::events::RoutingMetadata;
     use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
     use std::fs;
+
+    #[test]
+    fn install_and_direct_update_bypass_managed_enrichment_for_repair() {
+        assert!(command_repairs_managed_state(Some(&Commands::Install {
+            systemd: false,
+            skip_star_prompt: true,
+            record_source_checkout_only: false,
+        })));
+        assert!(command_repairs_managed_state(Some(&Commands::Update {
+            command: None,
+            restart: false,
+        })));
+        assert!(!command_repairs_managed_state(None));
+    }
 
     #[test]
     fn cli_config_errors_are_bounded_without_source_content() {
@@ -1370,5 +1512,75 @@ program = "/bin/true"
     #[test]
     fn format_tmux_list_handles_empty_registry() {
         assert_eq!(format_tmux_list(&[]), "No active tmux watches found\n");
+    }
+
+    #[test]
+    fn format_tmux_list_warns_about_partial_lane_coverage() {
+        let registration = RegisteredTmuxSession {
+            session: "gc-issue-367-lane".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            routing: RoutingMetadata::default(),
+            keywords: Vec::new(),
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-09-04T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: None,
+            registration_generation: 0,
+            active_wrapper_monitor: false,
+            lane: None,
+        };
+        let health = serde_json::json!({
+            "tmux": {
+                "watch_coverage": {
+                    "unregistered_live_lane_count": 3,
+                    "unregistered_live_lane_sample": ["gc-pr-5271-lane", "gc-pr-5280-lane"]
+                }
+            }
+        });
+
+        let output = format_tmux_list_with_health(&[registration], Some(&health));
+
+        assert!(output.contains(
+            "WARNING: 3 live GJC lane session(s) are not registered as clawhip watches: gc-pr-5271-lane, gc-pr-5280-lane (+1 more)\n"
+        ));
+    }
+
+    #[test]
+    fn format_tmux_list_warns_about_zero_registration_lane_coverage() {
+        let health = serde_json::json!({
+            "tmux": {
+                "live_probe": { "count": 2 },
+                "watch_coverage": {
+                    "unregistered_live_lane_count": 1,
+                    "unregistered_live_lane_sample": ["gc-issue-367-lane"]
+                }
+            }
+        });
+
+        assert_eq!(
+            format_tmux_list_with_health(&[], Some(&health)),
+            "No active tmux watches found; warning: 1 live GJC lane session(s) are not registered as clawhip watches: gc-issue-367-lane\n"
+        );
+    }
+
+    #[test]
+    fn format_tmux_list_does_not_warn_for_unrelated_live_sessions() {
+        let health = serde_json::json!({
+            "tmux": {
+                "live_probe": { "count": 2 },
+                "watch_coverage": {
+                    "unregistered_live_lane_count": 0,
+                    "unregistered_live_lane_sample": []
+                }
+            }
+        });
+
+        assert_eq!(
+            format_tmux_list_with_health(&[], Some(&health)),
+            "No active tmux watches found\n"
+        );
     }
 }

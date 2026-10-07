@@ -150,3 +150,61 @@ On March 11, 2026, a real validation was run for the custom send path:
 - `cargo run -q -- send --message "🧪 clawhip live verification (...)"` exited successfully
 - guild-wide search confirmed actual Discord delivery by the `clawhip` webhook bot
 - delivery landed in the configured test channel, confirming the configured wildcard webhook route was active
+
+## Sender-identity acceptance smoke (bot-token deployments)
+
+Transport success (`discord_send_success`, `token_source=config`) proves the
+token is valid and delivery worked — it does **not** prove *which bot* sent the
+message. During the 2026-08-21 recovery, a wrong-but-valid token delivered
+messages as the wrong bot while every transport signal stayed green. The
+acceptance smoke for bot-token deployments therefore has two mandatory legs:
+
+1. **API identity equality** — `GET /users/@me` with the effective token must
+   resolve to exactly the operator-configured expected bot ID.
+2. **Channel author readback** — a delivered test message read back from the
+   channel must be authored by that same expected bot.
+
+### Setup
+
+Configure the expected stable bot ID (the dedicated Clawhip bot's application
+ID from the Discord Developer Portal — never a token):
+
+```toml
+[providers.discord]
+token = "<bot-token>"
+expected_bot_id = "<expected-discord-bot-id>"
+```
+
+### Leg 1 — API identity equality (fail-closed preflight)
+
+```bash
+clawhip config verify-sender-identity
+clawhip config verify-sender-identity --json
+```
+
+- exits `0` **only** when the observed stable bot ID equals `expected_bot_id`
+- prints expected and observed bot IDs on mismatch — never the token
+- exits non-zero for mismatch, absent expectation, no token, invalid
+  credential, rate limit, malformed response, or transport failure
+
+A wrong-but-valid token fails this leg with
+`sender_identity_mismatch` even though transport would succeed. That is the
+point.
+
+### Leg 2 — Channel author readback
+
+1. Deliver a uniquely-marked test message to the target channel.
+2. Read the message back from the channel (Discord client or
+   `GET /channels/<id>/messages`).
+3. Confirm the message **author** is the expected bot ID, not merely that the
+   message exists.
+
+A smoke that only confirms arrival is insufficient: a wrong-but-valid token
+arrives fine, authored by the wrong bot.
+
+### Acceptance
+
+The smoke passes only when both legs pass. Any other combination — identity
+verified but authored by another bot, or transport green but identity mismatch
+— is a failure state requiring the token to be corrected before the deployment
+is called healthy.
