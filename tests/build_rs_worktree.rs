@@ -8,7 +8,11 @@
 //! with both absolute and relative gitdir pointers, and that Path::is_absolute()
 //! correctly identifies Windows drive-qualified and UNC paths in addition to Unix paths.
 
-use clawhip::build_helper::resolve_gitdir_from;
+#[path = "../build/gitdir.rs"]
+#[allow(dead_code)]
+mod gitdir;
+
+use gitdir::resolve_gitdir_from;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;

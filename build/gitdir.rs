@@ -1,10 +1,11 @@
-//! Helpers for build.rs scripts — gitdir resolution for linked worktrees.
+//! Gitdir resolution for linked worktrees, shared by build.rs and its regression test.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Resolve the gitdir path, handling both regular git directories and linked
 /// worktrees where .git is a file containing a gitdir pointer.
+#[allow(dead_code)]
 pub fn resolve_gitdir() -> Option<PathBuf> {
     resolve_gitdir_from(Path::new(".git"))
 }
