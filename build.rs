@@ -11,7 +11,8 @@
 //! crates.io build, or a machine without `git` still builds, and simply
 //! reports an unknown revision instead of breaking the build.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -27,9 +28,14 @@ fn main() {
 
     // Rebuild when HEAD moves so a stamped binary can never claim an older
     // revision than the tree it was built from.
-    for path in [".git/HEAD", ".git/index"] {
-        if Path::new(path).exists() {
-            println!("cargo:rerun-if-changed={path}");
+    // In a linked worktree, .git is a file containing a gitdir pointer,
+    // so we need to resolve the actual gitdir location.
+    if let Some(gitdir) = resolve_gitdir() {
+        if let Ok(head_path) = gitdir.join("HEAD").canonicalize() {
+            println!("cargo:rerun-if-changed={}", head_path.display());
+        }
+        if let Ok(index_path) = gitdir.join("index").canonicalize() {
+            println!("cargo:rerun-if-changed={}", index_path.display());
         }
     }
     println!("cargo:rerun-if-env-changed=CLAWHIP_BUILD_COMMIT");
@@ -70,6 +76,41 @@ fn sanitized_env(key: &str) -> Option<String> {
 fn is_hex_commit(value: &str) -> bool {
     let len = value.len();
     (7..=40).contains(&len) && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Resolve the gitdir path, handling both regular git directories and linked
+/// worktrees where .git is a file containing a gitdir pointer.
+fn resolve_gitdir() -> Option<PathBuf> {
+    let git_path = Path::new(".git");
+    if !git_path.exists() {
+        return None;
+    }
+
+    // If .git is a directory, return it directly.
+    if git_path.is_dir() {
+        return Some(git_path.to_path_buf());
+    }
+
+    // If .git is a file (linked worktree), read the gitdir pointer.
+    let contents = fs::read_to_string(git_path).ok()?;
+    for line in contents.lines() {
+        if let Some(gitdir) = line.strip_prefix("gitdir:") {
+            let gitdir = gitdir.trim();
+            let path = if gitdir.starts_with('/') {
+                PathBuf::from(gitdir)
+            } else {
+                // Relative paths are relative to the .git file location
+                git_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(gitdir)
+            };
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn git(args: &[&str]) -> Option<String> {
