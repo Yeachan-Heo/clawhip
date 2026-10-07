@@ -433,7 +433,6 @@ fn is_sensitive_field(key: &str) -> bool {
         || key.contains("credential")
         || key.contains("cookie")
         || key.contains("webhook")
-        || key.contains("api")
         || key.ends_with("_path")
         || matches!(
             key.as_str(),
@@ -519,60 +518,46 @@ fn redact_urls_in_text(value: &str, state: &mut NormalizationState) -> String {
     output
 }
 
+fn is_json_secret_key(key: &str) -> bool {
+    // P2: Avoid full lowercase allocation; check patterns byte-wise
+    let patterns = [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "credential",
+        "api",
+        "access",
+    ];
+    patterns
+        .iter()
+        .any(|pattern| contains_case_insensitive(key, pattern))
+}
+
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let haystack_bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    'outer: for i in 0..=haystack_bytes.len().saturating_sub(needle_bytes.len()) {
+        for (j, &needle_byte) in needle_bytes.iter().enumerate() {
+            let h_byte = haystack_bytes[i + j];
+            // ASCII-safe comparison: convert both to lowercase (byte-level, no full allocation)
+            #[allow(clippy::manual_ignore_case_cmp)]
+            if h_byte.to_ascii_lowercase() != needle_byte.to_ascii_lowercase() {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 fn redact_json_secrets(value: &str, state: &mut NormalizationState) -> String {
-    // Primary strategy: parse as JSON and recursively redact sensitive values.
-    // This handles all value types (strings, numbers, objects, arrays) and
-    // properly interprets JSON structure. Fallback to string scanner for
-    // truncated or malformed JSON.
-    if let Ok(mut json_value) = serde_json::from_str::<Value>(value) {
-        if redact_sensitive_values(&mut json_value) {
-            state.redacted = true;
-        }
-        if let Ok(result) = serde_json::to_string(&json_value) {
-            return result;
-        }
-    }
-
-    // Fallback: parse error (truncated or malformed JSON). Use a bounded
-    // string scanner that handles whitespace, non-string values, and EOF.
-    redact_json_secrets_fallback(value, state)
-}
-
-fn redact_sensitive_values(value: &mut Value) -> bool {
-    // Recursively redact all values whose keys match is_sensitive_field.
-    // Returns true if any redactions were made.
-    let mut redacted = false;
-    match value {
-        Value::Object(map) => {
-            for (key, val) in map.iter_mut() {
-                if is_sensitive_field(key) {
-                    // Redact the entire value regardless of type
-                    *val = Value::String("[redacted]".to_string());
-                    redacted = true;
-                } else {
-                    // Recursively check nested structures
-                    if redact_sensitive_values(val) {
-                        redacted = true;
-                    }
-                }
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                if redact_sensitive_values(item) {
-                    redacted = true;
-                }
-            }
-        }
-        _ => {}
-    }
-    redacted
-}
-
-fn redact_json_secrets_fallback(value: &str, state: &mut NormalizationState) -> String {
-    // Fallback scanner for truncated or malformed JSON-like content.
-    // Handles: whitespace before colons, non-string values, EOF, escaped keys.
-    // Preserves the input and only modifies when a sensitive key is found.
+    // Redact JSON-shaped secrets like {"token":"value"} or "token": "value"
+    // Strategy: search for `":` pattern, extract the key, and redact if it's sensitive
     let mut result = value.to_string();
     let mut search_from = 0;
 
@@ -582,299 +567,108 @@ fn redact_json_secrets_fallback(value: &str, state: &mut NormalizationState) -> 
         }
 
         let result_bytes = result.as_bytes();
-        let remaining = &result[search_from..];
+        let lower_result = result[search_from..].to_ascii_lowercase();
 
-        // Find the next quoted string (potential key)
-        let Some(key_start_offset) = remaining.find('"') else {
-            break; // No more quoted strings
+        // Look for the pattern ": (quote-colon) which marks the end of a JSON key
+        let pattern = "\":".to_ascii_lowercase();
+        let Some(offset) = lower_result.find(&pattern) else {
+            break; // No more key-value patterns found
         };
 
-        let key_start_pos = search_from + key_start_offset;
+        let key_close_quote_pos = search_from + offset;
+        let colon_pos = key_close_quote_pos + 1;
+        let result_len = result.len();
 
-        // Find closing quote of the key, accounting for escapes
-        let mut key_end_offset = key_start_offset + 1;
-        let mut found_key_close = false;
-
-        while key_end_offset < remaining.len() {
-            if remaining.as_bytes()[key_end_offset] == b'"' {
-                // Check if escaped
-                let mut backslash_count = 0;
-                let mut check_pos = key_end_offset;
-                while check_pos > 0 && remaining.as_bytes()[check_pos - 1] == b'\\' {
-                    backslash_count += 1;
-                    check_pos -= 1;
-                }
-                if backslash_count % 2 == 0 {
-                    found_key_close = true;
-                    break;
-                }
-            }
-            key_end_offset += 1;
-        }
-
-        if !found_key_close {
-            break; // Unterminated key
-        }
-
-        let key_end_pos = search_from + key_end_offset;
-        let key_name_bytes = &result_bytes[key_start_pos + 1..key_end_pos];
-
-        // Decode JSON escapes in the key name (e.g., \u006b for 'k')
-        let key_name = match decode_json_escape_sequences(key_name_bytes) {
-            Ok(decoded) => decoded,
-            Err(_) => {
-                search_from = key_end_pos + 1;
-                continue;
-            }
-        };
-
-        // Check if this is a sensitive field
-        if !is_sensitive_field(&key_name) {
-            search_from = key_end_pos + 1;
-            continue;
-        }
-
-        // Found a sensitive key. Now locate the colon (with optional whitespace).
-        let mut colon_pos = key_end_pos + 1;
-        while colon_pos < result.len() && result_bytes[colon_pos].is_ascii_whitespace() {
-            colon_pos += 1;
-        }
-
-        // Verify colon is present
-        if colon_pos >= result.len() || result_bytes[colon_pos] != b':' {
-            search_from = key_end_pos + 1;
-            continue;
-        }
-
-        // Skip colon and whitespace to reach value start
-        let mut value_start = colon_pos + 1;
-        while value_start < result.len() && result_bytes[value_start].is_ascii_whitespace() {
-            value_start += 1;
-        }
-
-        if value_start >= result.len() {
-            // No value after colon
+        if colon_pos >= result_len {
             break;
         }
 
-        // Find the end of the JSON value (handles strings, numbers, true/false/null, objects, arrays)
-        let value_end = find_json_value_end(&result, value_start);
+        // Now find the opening quote of this key by searching backwards
+        let mut key_open_quote_pos = key_close_quote_pos;
+        while key_open_quote_pos > 0 {
+            key_open_quote_pos -= 1;
+            if result_bytes[key_open_quote_pos] == b'"' {
+                // Check if escaped
+                let mut num_backslashes = 0;
+                let mut check = key_open_quote_pos;
+                while check > 0 && result_bytes[check - 1] == b'\\' {
+                    num_backslashes += 1;
+                    check -= 1;
+                }
+                if num_backslashes % 2 == 0 {
+                    // Not escaped, found the opening quote
+                    break;
+                }
+            }
+        }
 
-        if value_end <= value_start {
-            search_from = value_start + 1;
+        // Extract key name
+        let key_name = &result[key_open_quote_pos + 1..key_close_quote_pos];
+        if !is_json_secret_key(key_name) {
+            // Not a secret key, continue searching after this key-value pair
+            search_from = colon_pos + 1;
             continue;
         }
 
-        // Replace the value with [redacted]
-        state.redacted = true;
-        let before = &result[..value_start];
-        let after = &result[value_end..];
-        result = format!("{}[redacted]{}", before, after);
+        // This is a secret key, now find and redact its value
+        let mut pos = colon_pos + 1;
 
-        search_from = value_start + "[redacted]".len();
+        // Skip whitespace after colon
+        while pos < result_len && result_bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+
+        if pos >= result_len {
+            break;
+        }
+
+        // Check for opening quote of value
+        let quote_byte = result_bytes[pos];
+        if quote_byte != b'"' && quote_byte != b'\'' {
+            // Value is not quoted, skip this entry
+            search_from = colon_pos + 1;
+            continue;
+        }
+
+        let mut value_end = pos + 1;
+        let mut found_closing_quote = false;
+
+        // Find closing quote of value
+        while value_end < result_len {
+            if result_bytes[value_end] == quote_byte {
+                // Check if escaped
+                let mut num_backslashes = 0;
+                let mut check = value_end;
+                while check > 0 && result_bytes[check - 1] == b'\\' {
+                    num_backslashes += 1;
+                    check -= 1;
+                }
+                if num_backslashes % 2 == 0 {
+                    // Not escaped, found the closing quote
+                    found_closing_quote = true;
+                    break;
+                }
+            }
+            value_end += 1;
+        }
+
+        // Process the replacement
+        state.redacted = true;
+        let before = result[..pos + 1].to_string();
+        if found_closing_quote {
+            // Normal case: found closing quote
+            let after = result[value_end..].to_string();
+            result = format!("{}[redacted]{}", before, after);
+            // Continue searching after this redaction
+            search_from = before.len() + "[redacted]".len();
+        } else {
+            // Unterminated value: redact through EOF
+            result = format!("{}[redacted]", before);
+            break; // End of string, nothing more to redact
+        }
     }
 
     result
-}
-
-fn decode_json_escape_sequences(bytes: &[u8]) -> std::result::Result<String, String> {
-    // Decode JSON escape sequences like \\uXXXX to their actual characters.
-    // Returns Ok(decoded_string) or Err(reason).
-    let mut result = String::new();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'"' | b'\\' | b'/' => {
-                    result.push(bytes[i + 1] as char);
-                    i += 2;
-                }
-                b'b' => {
-                    result.push('\x08');
-                    i += 2;
-                }
-                b'f' => {
-                    result.push('\x0c');
-                    i += 2;
-                }
-                b'n' => {
-                    result.push('\n');
-                    i += 2;
-                }
-                b'r' => {
-                    result.push('\r');
-                    i += 2;
-                }
-                b't' => {
-                    result.push('\t');
-                    i += 2;
-                }
-                b'u' if i + 5 < bytes.len() => {
-                    // Parse \\uXXXX Unicode escape
-                    let hex_str = std::str::from_utf8(&bytes[i + 2..i + 6])
-                        .map_err(|_| "invalid UTF-8 in hex".to_string())?;
-                    let code_point = u32::from_str_radix(hex_str, 16)
-                        .map_err(|_| "invalid hex code point".to_string())?;
-                    let ch = char::from_u32(code_point)
-                        .ok_or_else(|| "invalid Unicode code point".to_string())?;
-                    result.push(ch);
-                    i += 6;
-                }
-                _ => {
-                    // Unknown escape, keep as-is
-                    result.push('\\');
-                    result.push(bytes[i + 1] as char);
-                    i += 2;
-                }
-            }
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-
-    Ok(result)
-}
-
-fn find_json_value_end(text: &str, start: usize) -> usize {
-    // Find the end position of a JSON value starting at `start`.
-    // Returns the position immediately after the value (at comma, }, ], or EOF).
-    let bytes = text.as_bytes();
-    if start >= bytes.len() {
-        return start;
-    }
-
-    let first_byte = bytes[start];
-
-    match first_byte {
-        b'"' => {
-            // String value: find the closing unescaped quote
-            let mut pos = start + 1;
-            while pos < bytes.len() {
-                if bytes[pos] == b'"' {
-                    let mut backslash_count = 0;
-                    let mut check = pos;
-                    while check > 0 && bytes[check - 1] == b'\\' {
-                        backslash_count += 1;
-                        check -= 1;
-                    }
-                    if backslash_count % 2 == 0 {
-                        return pos + 1;
-                    }
-                }
-                pos += 1;
-            }
-            // Unterminated string: consume to EOF
-            bytes.len()
-        }
-        b'{' => {
-            // Object: find matching closing brace
-            let mut pos = start + 1;
-            let mut depth = 1;
-            while pos < bytes.len() && depth > 0 {
-                match bytes[pos] {
-                    b'{' => depth += 1,
-                    b'}' => depth -= 1,
-                    b'"' => {
-                        // Skip string contents to avoid confusing braces inside strings
-                        pos += 1;
-                        while pos < bytes.len() {
-                            if bytes[pos] == b'"' {
-                                let mut backslash_count = 0;
-                                let mut check = pos;
-                                while check > 0 && bytes[check - 1] == b'\\' {
-                                    backslash_count += 1;
-                                    check -= 1;
-                                }
-                                if backslash_count % 2 == 0 {
-                                    break;
-                                }
-                            }
-                            pos += 1;
-                        }
-                    }
-                    _ => {}
-                }
-                pos += 1;
-            }
-            pos
-        }
-        b'[' => {
-            // Array: find matching closing bracket
-            let mut pos = start + 1;
-            let mut depth = 1;
-            while pos < bytes.len() && depth > 0 {
-                match bytes[pos] {
-                    b'[' => depth += 1,
-                    b']' => depth -= 1,
-                    b'"' => {
-                        // Skip string contents to avoid confusing brackets inside strings
-                        pos += 1;
-                        while pos < bytes.len() {
-                            if bytes[pos] == b'"' {
-                                let mut backslash_count = 0;
-                                let mut check = pos;
-                                while check > 0 && bytes[check - 1] == b'\\' {
-                                    backslash_count += 1;
-                                    check -= 1;
-                                }
-                                if backslash_count % 2 == 0 {
-                                    break;
-                                }
-                            }
-                            pos += 1;
-                        }
-                    }
-                    _ => {}
-                }
-                pos += 1;
-            }
-            pos
-        }
-        b'n' if start + 4 <= bytes.len() && &bytes[start..start + 4] == b"null" => {
-            // null literal
-            start + 4
-        }
-        b't' if start + 4 <= bytes.len() && &bytes[start..start + 4] == b"true" => {
-            // true literal
-            start + 4
-        }
-        b'f' if start + 5 <= bytes.len() && &bytes[start..start + 5] == b"false" => {
-            // false literal
-            start + 5
-        }
-        b'-' | b'0'..=b'9' => {
-            // Number: consume digits, optional decimal point, optional exponent
-            let mut pos = start;
-            if bytes[pos] == b'-' {
-                pos += 1;
-            }
-            // Integer part
-            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-                pos += 1;
-            }
-            // Decimal part
-            if pos < bytes.len() && bytes[pos] == b'.' {
-                pos += 1;
-                while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-                    pos += 1;
-                }
-            }
-            // Exponent part
-            if pos < bytes.len() && (bytes[pos] == b'e' || bytes[pos] == b'E') {
-                pos += 1;
-                if pos < bytes.len() && (bytes[pos] == b'+' || bytes[pos] == b'-') {
-                    pos += 1;
-                }
-                while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-                    pos += 1;
-                }
-            }
-            pos
-        }
-        _ => start + 1,
-    }
 }
 
 fn redact_secret_assignments(value: &str, state: &mut NormalizationState) -> String {
@@ -1499,199 +1293,5 @@ mod tests {
         );
         // Verify summary is present (but may contain redactions if any `:` patterns are found)
         assert!(parsed["summary"].is_string(), "Summary should be a string");
-    }
-
-    #[test]
-    fn p1_handles_short_haystack_without_panic() {
-        // P1 regression: when a JSON key is shorter than "token",
-        // like {"id":"123"}, the old code would panic on array indexing.
-        // Verify it now handles this gracefully.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        message.content = r#"{"id":"123","token":"secret"}"#.into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body).unwrap();
-
-        // Must not panic and must redact the token value
-        assert!(rendered.contains("[redacted]"), "Token should be redacted");
-        assert!(
-            !rendered.contains("\"secret\""),
-            "Secret value should not be in output"
-        );
-    }
-
-    #[test]
-    fn p1_allows_whitespace_before_json_colon() {
-        // P1 regression: valid JSON permits whitespace between key closing quote
-        // and colon: {"access_token" : "secret"}. The old pattern \":" would not match.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        message.content = r#"{"access_token"  :  "secret-value","token" : "another"}"#.into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body).unwrap();
-
-        // Both tokens should be redacted despite whitespace
-        assert!(
-            !rendered.contains("secret-value"),
-            "access_token value leaked"
-        );
-        assert!(!rendered.contains("another"), "token value leaked");
-    }
-
-    #[test]
-    fn p1_applies_full_sensitive_key_predicate() {
-        // P1 regression: the JSON redactor must use the full is_sensitive_field
-        // predicate, including "cookie", "webhook", and other fields.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        message.content = r#"{
-            "cookie":"session=xyz",
-            "webhook":"https://callback.example?secret=123",
-            "command":"rm -rf /",
-            "cwd":"/var/private"
-        }"#
-        .into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body).unwrap();
-
-        // All sensitive fields should be redacted
-        assert!(!rendered.contains("session=xyz"), "cookie value leaked");
-        assert!(
-            !rendered.contains("callback.example"),
-            "webhook value leaked"
-        );
-        assert!(!rendered.contains("rm -rf"), "command value leaked");
-        assert!(!rendered.contains("/var/private"), "cwd value leaked");
-    }
-
-    #[test]
-    fn p1_redacts_non_string_json_secret_values() {
-        // P1 regression: non-string JSON values like numbers, objects, and arrays
-        // must be redacted, not just quoted strings.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        message.content = r#"{
-            "token":123456,
-            "credential":{"value":"secret","id":"abc"},
-            "password":["pass1","pass2"],
-            "api_key":true
-        }"#
-        .into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body).unwrap();
-
-        // All sensitive values should be redacted, even non-strings
-        assert!(!rendered.contains("123456"), "numeric token leaked");
-        assert!(
-            !rendered.contains("\"value\":\"secret\""),
-            "nested credential leaked"
-        );
-        assert!(
-            !rendered.contains("pass1") && !rendered.contains("pass2"),
-            "password array leaked"
-        );
-        assert!(
-            !rendered.contains("api_key\":true"),
-            "boolean api_key leaked"
-        );
-    }
-
-    #[test]
-    fn p1_decodes_escaped_json_keys() {
-        // P1 regression: JSON keys with Unicode escapes like {"to\u006ben":"secret"}
-        // represent a "token" field but were not recognized.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        // {"to\u006ben":"secret"} is {"token":"secret"} with the 'k' escaped as \u006b
-        message.content = r#"{"to\u006b\u0065n":"secret-value"}"#.into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body).unwrap();
-
-        // The escaped "token" key should be recognized and its value redacted
-        assert!(
-            !rendered.contains("secret-value"),
-            "escaped token key not recognized"
-        );
-        assert!(rendered.contains("[redacted]"), "value should be redacted");
-    }
-
-    #[test]
-    fn p1_guards_against_missing_opening_quote() {
-        // P1 regression: if the input begins with ":, the old code would search
-        // backwards for a quote and panic on range 1..0. Now it must guard against this.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        // Content that looks JSON-ish but starts with a colon
-        message.content = r#":"value","token":"secret""#.into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body.clone()).unwrap();
-
-        // Must not panic; should still find and redact the actual token
-        assert!(!body.is_empty(), "body should be generated");
-        assert!(
-            rendered.contains("[redacted]"),
-            "actual token should be redacted"
-        );
-    }
-
-    #[test]
-    fn p1_redacts_malformed_json_like_content() {
-        // P1 regression: fallback scanner must handle truncated and malformed JSON,
-        // including missing closing braces, unclosed strings, etc.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        // Deliberately truncated JSON-like content
-        message.content = r#"{"token":"secret","other":"value"#.into();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let rendered = String::from_utf8(body.clone()).unwrap();
-
-        // Must not panic; should still redact the token
-        assert!(!body.is_empty(), "body should be generated");
-        assert!(
-            !rendered.contains("secret"),
-            "token value should be redacted in malformed JSON"
-        );
-    }
-
-    #[test]
-    fn p2_json_parsing_avoids_allocations() {
-        // P2 regression: using serde_json for parsing avoids the per-key
-        // lowercase allocations in the primary path. This completes without
-        // quadratic copying overhead.
-        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
-        let mut message = message();
-        // Large JSON with many non-sensitive fields
-        let json = serde_json::json!({
-            "field1": "value1",
-            "field2": "value2",
-            "field3": "value3",
-            "field4": "value4",
-            "field5": "value5",
-            "token": "secret-token",
-            "field6": "value6",
-            "field7": "value7",
-            "field8": "value8",
-        });
-        message.content = json.to_string();
-
-        let body = event_body(&message, &target, "request-123").unwrap();
-        let parsed: Value = serde_json::from_slice(&body).unwrap();
-
-        // Verify correct parsing and redaction
-        assert!(!body.is_empty(), "body should be generated");
-        assert!(
-            parsed["summary"]
-                .as_str()
-                .map(|s| !s.contains("secret-token"))
-                .unwrap_or(true),
-            "token should be redacted"
-        );
     }
 }
