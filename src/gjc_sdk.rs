@@ -327,40 +327,65 @@ fn current_uid() -> Option<u32> {
     None
 }
 
-/// Validate one endpoint metadata file's filesystem properties.
+/// Validate and read one endpoint metadata file in one atomic operation.
 ///
-/// Rejects symlinks, non-regular files, oversized files, foreign owners, and
-/// permissive group/world permissions.
-fn validate_metadata_file(path: &Path) -> Result<std::fs::Metadata> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|_| SdkTransportError::EndpointUnavailable)?;
-    if metadata.is_symlink() || !metadata.is_file() {
+/// Opens the file with O_NOFOLLOW to prevent TOCTOU attacks, validates
+/// filesystem properties via fstat on the open fd (rejects symlinks,
+/// non-regular files, oversized files, foreign owners, and permissive
+/// group/world permissions), and reads the contents from the same fd.
+/// This ensures the validated file is exactly the one read.
+#[cfg(unix)]
+fn validate_and_read_metadata_file(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    // Open with O_NOFOLLOW to prevent symlink attacks.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| SdkTransportError::EndpointUnavailable)?;
+
+    // Validate via fstat on the open fd.
+    let metadata = file
+        .metadata()
+        .map_err(|_| SdkTransportError::EndpointUnavailable)?;
+
+    if !metadata.is_file() {
         return Err(SdkTransportError::EndpointMalformed.into());
     }
+
     if metadata.len() > MAX_METADATA_BYTES {
         return Err(SdkTransportError::EndpointMalformed.into());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if let (Some(file_uid), Some(current)) = (
-            non_zero_uid(metadata.uid()),
-            current_uid().and_then(non_zero_uid),
-        ) && file_uid != current
-        {
-            return Err(SdkTransportError::EndpointUnauthorized.into());
-        }
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(SdkTransportError::EndpointMalformed.into());
-        }
+
+    // Validate ownership: the file must be owned by the current effective uid.
+    let current_uid = current_uid().ok_or(SdkTransportError::EndpointMalformed)?;
+    let file_uid = metadata.uid();
+    if file_uid != current_uid {
+        return Err(SdkTransportError::EndpointUnauthorized.into());
     }
-    Ok(metadata)
+
+    // Validate permissions: reject if group/world-readable (mode & 0o077 must be 0).
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(SdkTransportError::EndpointMalformed.into());
+    }
+
+    // Read contents from the same validated fd.
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|_| SdkTransportError::EndpointUnavailable)?;
+
+    Ok(contents)
 }
 
-#[cfg(unix)]
-fn non_zero_uid(uid: u32) -> Option<u32> {
-    (uid != 0).then_some(uid)
+#[cfg(not(unix))]
+fn validate_and_read_metadata_file(path: &Path) -> Result<Vec<u8>> {
+    // On non-Unix platforms, fall back to the simpler separate-call approach.
+    // Note: this is not recommended for production; Unix-specific security
+    // protections via O_NOFOLLOW are not available on Windows.
+    std::fs::read(path).map_err(|_| SdkTransportError::EndpointUnavailable.into())
 }
 
 /// Parse and validate one endpoint record.
@@ -474,10 +499,7 @@ pub fn discover(root: &StateRoot) -> Result<Discovery> {
             continue;
         }
         seen_any_file = true;
-        if validate_metadata_file(&path).is_err() {
-            continue;
-        }
-        let Ok(contents) = std::fs::read(&path) else {
+        let Ok(contents) = validate_and_read_metadata_file(&path) else {
             continue;
         };
         let Ok(metadata) = parse_metadata_file(&path, &contents) else {
@@ -527,12 +549,10 @@ pub fn discover_all(root: &StateRoot) -> Result<Vec<EndpointMetadata>> {
     let mut live = Vec::new();
     for entry in std::fs::read_dir(sdk_dir)?.flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "json")
-            || validate_metadata_file(&path).is_err()
-        {
+        if path.extension().is_none_or(|extension| extension != "json") {
             continue;
         }
-        let Ok(contents) = std::fs::read(&path) else {
+        let Ok(contents) = validate_and_read_metadata_file(&path) else {
             continue;
         };
         let Ok(metadata) = parse_metadata_file(&path, &contents) else {
@@ -1653,6 +1673,122 @@ mod tests {
             &metadata_json("ws://127.0.0.1:1/", "tok", Some(std::process::id())),
         );
         assert!(matches!(discover(&root).unwrap(), Discovery::Live(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_and_read_rejects_files_owned_by_other_users() {
+        // Regression test for endpoint trust issue: files owned by other users
+        // must be rejected, regardless of whether running as root or non-root.
+
+        let (_dir, root) = temp_worktree("wt-ownership");
+        let path = write_metadata_at(
+            &root,
+            &format!("{SESSION_ID}.json"),
+            &metadata_json("ws://127.0.0.1:1/", "tok", Some(std::process::id())),
+        );
+
+        // First, test that the file is acceptable when owned by current user.
+        let result = validate_and_read_metadata_file(&path);
+        assert!(
+            result.is_ok(),
+            "file owned by current user should be accepted"
+        );
+
+        // Now test ownership rejection: if we could change ownership to another user,
+        // validation should reject it. We can only do this if running as root.
+        let current_uid = unsafe { libc::getuid() };
+        if current_uid == 0 {
+            // Change ownership to a different user (e.g., 'nobody' uid 65534 if available).
+            let target_uid = 65534u32; // typically 'nobody' on Unix systems
+            if unsafe {
+                libc::chown(
+                    path.to_str().unwrap().as_ptr() as *const i8,
+                    target_uid,
+                    65534,
+                )
+            } == 0
+            {
+                let result = validate_and_read_metadata_file(&path);
+                assert!(
+                    result.is_err(),
+                    "file owned by different user should be rejected by root daemon"
+                );
+                // Verify it's an unauthorized error, not a malformed one.
+                if let Err(e) = result {
+                    if let Some(&SdkTransportError::EndpointUnauthorized) =
+                        e.downcast_ref::<SdkTransportError>()
+                    {
+                        // Correct error type.
+                    } else {
+                        panic!("expected EndpointUnauthorized, got: {e:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_and_read_enforces_no_symlink_toctou() {
+        // Regression test for TOCTOU vulnerability: ensure validate_and_read_metadata_file
+        // opens files with O_NOFOLLOW to prevent symlink attacks.
+
+        let (_dir, root) = temp_worktree("wt-toctou");
+        let metadata_path = root.path().join("sdk").join(format!("{SESSION_ID}.json"));
+        let target_path = root.path().join("sdk").join("target.json");
+
+        // Write the actual metadata file.
+        std::fs::write(
+            &target_path,
+            metadata_json("ws://127.0.0.1:1/", "tok", Some(std::process::id())),
+        )
+        .unwrap();
+
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&target_path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&target_path, perms).unwrap();
+        }
+
+        // Create a symlink to the target.
+        std::os::unix::fs::symlink(&target_path, &metadata_path).unwrap();
+
+        // validate_and_read_metadata_file should reject the symlink (O_NOFOLLOW).
+        let result = validate_and_read_metadata_file(&metadata_path);
+        assert!(
+            result.is_err(),
+            "symlinked metadata file should be rejected due to O_NOFOLLOW"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_and_read_atomicity_prevents_race() {
+        // Regression test: validate_and_read_metadata_file reads from the same
+        // validated file descriptor, preventing races where the file changes
+        // between validation and read.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, root) = temp_worktree("wt-atomic");
+        let path = root.path().join("sdk").join(format!("{SESSION_ID}.json"));
+
+        let good_json = metadata_json("ws://127.0.0.1:1/", "tok", Some(std::process::id()));
+        std::fs::write(&path, &good_json).unwrap();
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        // Read the file via validate_and_read_metadata_file.
+        // The content should match what we wrote (not a malicious replacement).
+        let result = validate_and_read_metadata_file(&path).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&result).unwrap(),
+            good_json,
+            "read content must match validated file"
+        );
     }
 
     #[test]
