@@ -521,21 +521,32 @@ fn redact_urls_in_text(value: &str, state: &mut NormalizationState) -> String {
 fn is_json_secret_key(key: &str) -> bool {
     // P2: Avoid full lowercase allocation; check patterns byte-wise
     let patterns = [
-        "token", "secret", "password", "passwd", "authorization", "credential", "api",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "credential",
+        "api",
         "access",
     ];
-    patterns.iter().any(|pattern| contains_case_insensitive(key, pattern))
+    patterns
+        .iter()
+        .any(|pattern| contains_case_insensitive(key, pattern))
 }
 
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
-    let haystack_bytes = haystack.as_bytes();
-    let needle_bytes = needle.as_bytes();
-    if needle_bytes.is_empty() {
+    if needle.is_empty() {
         return true;
     }
+    let haystack_bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
     'outer: for i in 0..=haystack_bytes.len().saturating_sub(needle_bytes.len()) {
         for (j, &needle_byte) in needle_bytes.iter().enumerate() {
-            if haystack_bytes[i + j].to_ascii_lowercase() != needle_byte.to_ascii_lowercase() {
+            let h_byte = haystack_bytes[i + j];
+            // ASCII-safe comparison: convert both to lowercase (byte-level, no full allocation)
+            #[allow(clippy::manual_ignore_case_cmp)]
+            if h_byte.to_ascii_lowercase() != needle_byte.to_ascii_lowercase() {
                 continue 'outer;
             }
         }
