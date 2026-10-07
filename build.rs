@@ -11,8 +11,6 @@
 //! crates.io build, or a machine without `git` still builds, and simply
 //! reports an unknown revision instead of breaking the build.
 
-use std::process::Command;
-
 #[path = "build/gitdir.rs"]
 mod gitdir;
 
@@ -62,7 +60,7 @@ fn detect_dirty() -> bool {
     if sanitized_env("CLAWHIP_BUILD_COMMIT").is_some() {
         return false;
     }
-    git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|out| !out.is_empty())
+    gitdir::detect_dirty_status().unwrap_or(false)
 }
 
 fn sanitized_env(key: &str) -> Option<String> {
@@ -80,9 +78,5 @@ fn is_hex_commit(value: &str) -> bool {
 }
 
 fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
+    gitdir::run_git(args)
 }
