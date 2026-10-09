@@ -248,8 +248,9 @@ impl DiscordClient {
                 SinkTarget::DiscordChannel(channel_id) => {
                     self.send_message(channel_id, &message.content).await
                 }
-                SinkTarget::DiscordThread(thread_id) => {
-                    self.send_thread_message(thread_id, &message.content).await
+                SinkTarget::DiscordThread(thread_target) => {
+                    self.send_thread_message_with_fallback(thread_target, &message.content)
+                        .await
                 }
                 SinkTarget::DiscordWebhook(webhook_url) => {
                     self.send_webhook(webhook_url, &message.content).await
@@ -694,6 +695,27 @@ impl DiscordClient {
         .await
     }
 
+    async fn send_thread_message_with_fallback(
+        &self,
+        thread_target: &crate::sink::DiscordThreadTarget,
+        content: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
+        // Try sending to the thread first
+        let result = self
+            .send_thread_message(&thread_target.thread_id, content)
+            .await;
+
+        // If thread is not found (404) and we have a fallback channel, try that
+        if let Err(ref error) = result {
+            if error.status == Some(404) && thread_target.parent_channel_id.is_some() {
+                let fallback_channel = thread_target.parent_channel_id.as_ref().unwrap();
+                return self.send_message(fallback_channel, content).await;
+            }
+        }
+
+        result
+    }
+
     async fn send_webhook(
         &self,
         webhook_url: &str,
@@ -1063,7 +1085,9 @@ fn discord_thread_error_message(status: StatusCode) -> String {
 fn target_rate_limit_key(target: &SinkTarget) -> String {
     match target {
         SinkTarget::DiscordChannel(channel_id) => format!("discord:channel:{channel_id}"),
-        SinkTarget::DiscordThread(thread_id) => format!("discord:thread:{thread_id}"),
+        SinkTarget::DiscordThread(thread_target) => {
+            format!("discord:thread:{}", thread_target.thread_id)
+        }
         SinkTarget::DiscordWebhook(webhook_url) => format!("discord:webhook:{webhook_url}"),
         SinkTarget::SlackWebhook(webhook_url) => format!("slack:webhook:{webhook_url}"),
         SinkTarget::HttpEndpoint(endpoint) => format!("http:endpoint:{endpoint}"),
@@ -1258,7 +1282,13 @@ mod tests {
         };
 
         client
-            .send(&SinkTarget::DiscordThread("thread-123".into()), &message)
+            .send(
+                &SinkTarget::DiscordThread(crate::sink::DiscordThreadTarget {
+                    thread_id: "thread-123".into(),
+                    parent_channel_id: None,
+                }),
+                &message,
+            )
             .await
             .unwrap();
         let request = server.await.unwrap();
@@ -1290,7 +1320,13 @@ mod tests {
         };
 
         let error = client
-            .send(&SinkTarget::DiscordThread("thread-404".into()), &message)
+            .send(
+                &SinkTarget::DiscordThread(crate::sink::DiscordThreadTarget {
+                    thread_id: "thread-404".into(),
+                    parent_channel_id: None,
+                }),
+                &message,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1306,6 +1342,111 @@ mod tests {
                 .starts_with("discord:thread:redacted:")
         );
         assert!(!client.dlq_entries()[0].target.contains("thread-404"));
+    }
+
+    #[tokio::test]
+    async fn thread_404_falls_back_to_parent_channel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        
+        // First request to thread fails with 404, second request to channel succeeds
+        let server = tokio::spawn(async move {
+            let (mut stream1, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let _ = stream1.read(&mut buf).await.unwrap();
+            // Thread not found
+            stream1
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 62\r\n\r\n{\"message\":\"Unknown Channel\",\"code\":10003}",
+                )
+                .await
+                .unwrap();
+            stream1.shutdown().await.ok();
+
+            // Accept the fallback request to the parent channel
+            let (mut stream2, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let n = stream2.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Should be posted to the parent channel, not the thread
+            assert!(request.starts_with("POST /channels/parent-channel/messages "));
+            stream2
+                .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            stream2.shutdown().await.ok();
+        });
+
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}"))
+                .unwrap();
+        let message = SinkMessage {
+            event_kind: "session.finished".into(),
+            format: MessageFormat::Compact,
+            content: "done".into(),
+            payload: json!({"session_id":"sess-1"}),
+            telemetry: None,
+        };
+
+        // Send with thread ID and parent channel fallback
+        client
+            .send(
+                &SinkTarget::DiscordThread(crate::sink::DiscordThreadTarget {
+                    thread_id: "missing-thread".into(),
+                    parent_channel_id: Some("parent-channel".into()),
+                }),
+                &message,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        // Should succeed because it fell back to the parent channel
+        assert!(client.dlq_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_404_without_fallback_still_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once_capture(
+            listener,
+            "HTTP/1.1 404 Not Found",
+            r#"{"message":"Unknown Channel","code":10003}"#,
+        ));
+
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}"))
+                .unwrap();
+        let message = SinkMessage {
+            event_kind: "session.finished".into(),
+            format: MessageFormat::Compact,
+            content: "done".into(),
+            payload: json!({"session_id":"sess-1"}),
+            telemetry: None,
+        };
+
+        // Send to thread with no fallback
+        let error = client
+            .send(
+                &SinkTarget::DiscordThread(crate::sink::DiscordThreadTarget {
+                    thread_id: "missing-thread".into(),
+                    parent_channel_id: None,
+                }),
+                &message,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        let _ = server.await.unwrap();
+
+        // Should fail because thread is missing and no fallback provided
+        assert!(error.contains("missing") || error.contains("unreachable"));
+        assert_eq!(client.dlq_entries().len(), 1);
     }
 
     #[tokio::test]

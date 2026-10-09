@@ -15,9 +15,16 @@ pub use local_file::LocalFileSink;
 pub use slack::SlackSink;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DiscordThreadTarget {
+    pub thread_id: String,
+    /// Fallback parent channel ID to use if the thread no longer exists (404)
+    pub parent_channel_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SinkTarget {
     DiscordChannel(String),
-    DiscordThread(String),
+    DiscordThread(DiscordThreadTarget),
     DiscordWebhook(String),
     SlackWebhook(String),
     HttpEndpoint(String),

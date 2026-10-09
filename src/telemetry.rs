@@ -112,8 +112,11 @@ pub fn stable_correlation_id(event_kind: &str, payload: &Value) -> String {
 pub fn safe_target_id(target: &SinkTarget) -> String {
     match target {
         SinkTarget::DiscordChannel(channel_id) => format!("discord:channel:{channel_id}"),
-        SinkTarget::DiscordThread(thread_id) => {
-            format!("discord:thread:redacted:{:016x}", fingerprint(thread_id))
+        SinkTarget::DiscordThread(thread_target) => {
+            format!(
+                "discord:thread:redacted:{:016x}",
+                fingerprint(&thread_target.thread_id)
+            )
         }
         SinkTarget::DiscordWebhook(webhook_url) => {
             format!("discord:webhook:{}", redacted_url_fingerprint(webhook_url))
@@ -211,17 +214,32 @@ mod tests {
     #[test]
     fn thread_target_id_is_stable_and_redacted() {
         let raw_thread_id = "123456789012345678";
-        let safe = safe_target_id(&SinkTarget::DiscordThread(raw_thread_id.into()));
+        let safe = safe_target_id(&SinkTarget::DiscordThread(
+            crate::sink::DiscordThreadTarget {
+                thread_id: raw_thread_id.into(),
+                parent_channel_id: None,
+            },
+        ));
 
         assert!(safe.starts_with("discord:thread:redacted:"));
         assert!(!safe.contains(raw_thread_id));
         assert_eq!(
             safe,
-            safe_target_id(&SinkTarget::DiscordThread(raw_thread_id.into()))
+            safe_target_id(&SinkTarget::DiscordThread(
+                crate::sink::DiscordThreadTarget {
+                    thread_id: raw_thread_id.into(),
+                    parent_channel_id: None,
+                },
+            ))
         );
         assert_ne!(
             safe,
-            safe_target_id(&SinkTarget::DiscordThread("987654321098765432".into()))
+            safe_target_id(&SinkTarget::DiscordThread(
+                crate::sink::DiscordThreadTarget {
+                    thread_id: "987654321098765432".into(),
+                    parent_channel_id: None,
+                },
+            ))
         );
     }
 

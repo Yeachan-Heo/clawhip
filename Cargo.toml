@@ -1,3 +1,6 @@
+[workspace]
+resolver = "2"
+
 [package]
 name = "clawhip"
 version = "0.6.11"

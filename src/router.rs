@@ -387,7 +387,13 @@ impl Router {
                 }
 
                 if let Some(thread) = route.and_then(RouteRule::discord_thread_target) {
-                    return Ok(SinkTarget::DiscordThread(thread.to_string()));
+                    let parent_channel_id = route.and_then(|r| r.channel.clone());
+                    return Ok(SinkTarget::DiscordThread(
+                        crate::sink::DiscordThreadTarget {
+                            thread_id: thread.to_string(),
+                            parent_channel_id,
+                        },
+                    ));
                 }
 
                 let channel = route
@@ -1002,7 +1008,10 @@ mod tests {
 
         assert_eq!(
             delivery.target,
-            SinkTarget::DiscordThread("thread-123".into())
+            SinkTarget::DiscordThread(crate::sink::DiscordThreadTarget {
+                thread_id: "thread-123".into(),
+                parent_channel_id: None,
+            })
         );
         assert!(
             delivery

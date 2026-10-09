@@ -1339,7 +1339,9 @@ fn safe_target_for_log(target: &SinkTarget) -> String {
 fn sink_target_key(target: &SinkTarget) -> String {
     match target {
         SinkTarget::DiscordChannel(channel) => format!("discord-channel:{channel}"),
-        SinkTarget::DiscordThread(thread) => format!("discord-thread:{thread}"),
+        SinkTarget::DiscordThread(thread_target) => {
+            format!("discord-thread:{}", thread_target.thread_id)
+        }
         SinkTarget::DiscordWebhook(webhook) => format!("discord-webhook:{webhook}"),
         SinkTarget::SlackWebhook(webhook) => format!("slack-webhook:{webhook}"),
         SinkTarget::HttpEndpoint(endpoint) => format!("http-endpoint:{endpoint}"),
@@ -1452,7 +1454,12 @@ mod tests {
     #[test]
     fn dispatcher_log_target_redacts_thread_id() {
         let raw_thread_id = "123456789012345678";
-        let safe = safe_target_for_log(&SinkTarget::DiscordThread(raw_thread_id.into()));
+        let safe = safe_target_for_log(&SinkTarget::DiscordThread(
+            crate::sink::DiscordThreadTarget {
+                thread_id: raw_thread_id.into(),
+                parent_channel_id: None,
+            },
+        ));
 
         assert!(safe.starts_with("discord:thread:redacted:"));
         assert!(!safe.contains(raw_thread_id));

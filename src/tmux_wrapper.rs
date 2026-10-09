@@ -471,7 +471,10 @@ fn lane_result_json(
     });
     if let Some(thread) = thread {
         result["thread_id"] = serde_json::json!(telemetry::safe_target_id(
-            &SinkTarget::DiscordThread(thread.to_owned()),
+            &SinkTarget::DiscordThread(crate::sink::DiscordThreadTarget {
+                thread_id: thread.to_owned(),
+                parent_channel_id: None,
+            }),
         ));
         result["kickoff_message_id"] = serde_json::json!(snapshot.kickoff_message_id);
         result["kickoff_delivered_at"] = serde_json::json!(snapshot.kickoff_delivered_at);
@@ -2368,7 +2371,12 @@ mod tests {
 
         assert_eq!(
             result["thread_id"],
-            telemetry::safe_target_id(&SinkTarget::DiscordThread("1".into()))
+            telemetry::safe_target_id(&SinkTarget::DiscordThread(
+                crate::sink::DiscordThreadTarget {
+                    thread_id: "1".into(),
+                    parent_channel_id: None,
+                }
+            ))
         );
     }
 }
