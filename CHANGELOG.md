@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 0.6.13 - 2026-10-13
+
+### Highlights
+
+- add signed HTTP event sink for authenticated HTTP-based event delivery alongside the existing webhook sink
+- harden GitHub CI baseline durability against terminal-run replay on restart, review-blocker races, and incomplete window states
+- integrate persistent CI retry state management across merge events and daemon restarts so CI monitoring remains resilient to transient failures
+- document permanent Discord community invite for GJC operator coordination
+
+### Upgrade notes
+
+- crate version is now `0.6.13`
+- existing route/config schema remains compatible; no migration required
+
+### Added
+
+- add `http` sink with signed request delivery (digest authentication, optional webhook timestamp validation)
+- add GitHub source CI retry budget and terminal state durability across daemon restarts
+- add worktree-based build script checkout verification to prevent build script escapes
+
+### Fixed
+
+- harden GitHub CI baseline against review blocker races and incomplete baseline window states
+- suppress historical GitHub CI terminal-run replay across daemon restart so stale CI events do not re-trigger alerts
+- bind config recovery to save transaction and recover interrupted publication on startup
+- match pending CI recovery by run attempt to prevent stale recovery requests from blocking new attempts
+
 ## 0.6.12 - 2026-08-19
 
 ### Highlights
