@@ -1,7 +1,7 @@
 use std::fmt;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -157,6 +157,12 @@ pub enum DiscordThreadMessageList {
 }
 
 #[derive(Debug, Deserialize)]
+struct DiscordSelfBody {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DiscordMessageBody {
     #[serde(default)]
     id: Option<String>,
@@ -250,6 +256,9 @@ impl DiscordClient {
                 }
                 SinkTarget::SlackWebhook(_) => {
                     return Err("cannot send Slack webhook via Discord client".into());
+                }
+                SinkTarget::HttpEndpoint(_) => {
+                    return Err("cannot send HTTP target via Discord client".into());
                 }
                 SinkTarget::LocalFile(_) => {
                     return Err("cannot send localfile target via Discord client".into());
@@ -580,6 +589,64 @@ impl DiscordClient {
             }
         }
     }
+}
+
+/// Public-safe result of resolving the effective bot token's own Discord
+/// identity via `GET /users/@me`. Variants carry no response bodies and no
+/// token material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfLookup {
+    /// Token resolved to a stable bot ID.
+    Bot { id: String },
+    /// No bot token is configured.
+    NoToken,
+    /// Discord rejected the credential (401).
+    Unauthorized,
+    /// Credential valid but the endpoint is forbidden (403).
+    Forbidden,
+    /// Rate limited (429); retry later, identity unverified.
+    RateLimited,
+    /// Success response could not be parsed into a stable bot ID.
+    MalformedSuccess,
+    /// Network/transport or unexpected HTTP failure; identity unverified.
+    Transport,
+}
+
+impl DiscordClient {
+    /// Resolve the bot's own Discord identity via `GET /users/@me`.
+    ///
+    /// A read-only, bounded identity probe used by sender-identity
+    /// verification. It never touches the delivery circuit, limiter,
+    /// telemetry, or DLQ, and the returned value never contains Discord
+    /// response bodies or token material — only the stable bot ID and,
+    /// on failure, a public-safe failure mode.
+    pub async fn lookup_self(&self) -> SelfLookup {
+        let Some(client) = self.bot_client.as_ref() else {
+            return SelfLookup::NoToken;
+        };
+
+        let Some(url) = discord_lane_url(&self.api_base, &["users", "@me"]) else {
+            return SelfLookup::Transport;
+        };
+
+        match client.get(url).timeout(LANE_REQUEST_TIMEOUT).send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<DiscordSelfBody>()
+                .await
+                .ok()
+                .and_then(|body| body.id)
+                .filter(|id| is_discord_snowflake(id))
+                .map(|id| SelfLookup::Bot { id })
+                .unwrap_or(SelfLookup::MalformedSuccess),
+            Ok(response) => match lane_http_error(response.status(), None).category {
+                DiscordLaneErrorCategory::Unauthorized => SelfLookup::Unauthorized,
+                DiscordLaneErrorCategory::Forbidden => SelfLookup::Forbidden,
+                DiscordLaneErrorCategory::RateLimited => SelfLookup::RateLimited,
+                _ => SelfLookup::Transport,
+            },
+            Err(_) => SelfLookup::Transport,
+        }
+    }
 
     async fn send_message(
         &self,
@@ -670,6 +737,19 @@ impl DiscordClient {
         })
     }
 
+    /// Borrow the shared Discord delivery state, tolerating lock poisoning.
+    ///
+    /// A panic inside one Discord critical section must not permanently brick
+    /// delivery for the rest of the daemon's lifetime. The guarded state is a
+    /// rate limiter, per-target circuit breakers, and the DLQ buffer: all
+    /// individually recoverable, so recovering the poisoned guard degrades to
+    /// possibly-stale counters instead of an unrecoverable panic loop on every
+    /// later send. This matches the poison-tolerant locking already used by
+    /// the daemon, dispatch, lane, and subscription paths.
+    fn state(&self) -> MutexGuard<'_, DiscordState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn allow_request(
         &self,
         key: &str,
@@ -677,7 +757,7 @@ impl DiscordClient {
         bool,
         Option<crate::core::circuit_breaker::CircuitTransition>,
     ) {
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state
             .circuits
             .entry(key.to_string())
@@ -691,12 +771,12 @@ impl DiscordClient {
     }
 
     fn rate_limit_delay(&self, key: &str) -> Duration {
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state.limiter.delay_for(key)
     }
 
     fn record_success(&self, key: &str) -> Option<crate::core::circuit_breaker::CircuitTransition> {
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state
             .circuits
             .entry(key.to_string())
@@ -710,7 +790,7 @@ impl DiscordClient {
     }
 
     fn record_failure(&self, key: &str) -> Option<crate::core::circuit_breaker::CircuitTransition> {
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state
             .circuits
             .entry(key.to_string())
@@ -775,7 +855,7 @@ impl DiscordClient {
                 .unwrap_or_else(|_| "{\"error\":\"dlq serialize failed\"}".to_string())
         );
 
-        let mut state = self.state.lock().expect("discord state lock");
+        let mut state = self.state();
         state.dlq.push(entry);
     }
 
@@ -809,12 +889,17 @@ impl DiscordClient {
 
     #[cfg(test)]
     fn dlq_entries(&self) -> Vec<DlqEntry> {
-        self.state
-            .lock()
-            .expect("discord state lock")
-            .dlq
-            .entries()
-            .to_vec()
+        self.state().dlq.entries().to_vec()
+    }
+
+    #[cfg(test)]
+    fn poison_state_for_tests(&self) {
+        let state = Arc::clone(&self.state);
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+            panic!("poison discord state");
+        })
+        .join();
     }
 }
 
@@ -877,7 +962,7 @@ fn request_error_category(error: &reqwest::Error) -> DiscordLaneErrorCategory {
     }
 }
 
-fn is_discord_snowflake(value: &str) -> bool {
+pub(crate) fn is_discord_snowflake(value: &str) -> bool {
     (1..=20).contains(&value.len()) && value.as_bytes().iter().all(u8::is_ascii_digit)
 }
 
@@ -981,6 +1066,7 @@ fn target_rate_limit_key(target: &SinkTarget) -> String {
         SinkTarget::DiscordThread(thread_id) => format!("discord:thread:{thread_id}"),
         SinkTarget::DiscordWebhook(webhook_url) => format!("discord:webhook:{webhook_url}"),
         SinkTarget::SlackWebhook(webhook_url) => format!("slack:webhook:{webhook_url}"),
+        SinkTarget::HttpEndpoint(endpoint) => format!("http:endpoint:{endpoint}"),
         SinkTarget::LocalFile(path) => format!("localfile:{path}"),
     }
 }
@@ -1511,6 +1597,35 @@ mod tests {
         );
         assert!(!error.to_string().contains(sentinel));
         assert!(!format!("{error:?}").contains(sentinel));
+    }
+
+    #[test]
+    fn poisoned_delivery_state_still_serves_limiter_circuit_and_dlq() {
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", "http://127.0.0.1:1".to_string())
+                .unwrap();
+
+        // Baseline: a healthy client admits requests and holds an empty DLQ.
+        let (allowed, _) = client.allow_request("channel:poison");
+        assert!(allowed);
+
+        client.poison_state_for_tests();
+
+        // After poisoning, every state-touching path must keep working instead
+        // of panicking for the rest of the daemon's lifetime.
+        let (allowed_after, _) = client.allow_request("channel:poison");
+        assert!(allowed_after);
+        assert_eq!(client.rate_limit_delay("channel:poison"), Duration::ZERO);
+        assert!(client.record_success("channel:poison").is_none());
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            client.record_failure("channel:poison");
+        }
+        let (allowed_open, _) = client.allow_request("channel:poison");
+        assert!(
+            !allowed_open,
+            "circuit must still open on a recovered poisoned state"
+        );
+        assert!(client.dlq_entries().is_empty());
     }
 
     #[tokio::test]

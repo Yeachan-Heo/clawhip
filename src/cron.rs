@@ -53,6 +53,7 @@ impl Source for CronSource {
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 trait EventEmitter: Send + Sync {
     async fn emit(&self, event: IncomingEvent) -> Result<()>;
 }

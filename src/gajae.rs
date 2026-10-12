@@ -2236,6 +2236,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2350,9 +2351,12 @@ mod tests {
             file.write_all(script.as_bytes()).expect("write fake gajae");
             file.sync_all().expect("sync fake gajae");
         }
-        let mut permissions = fs::metadata(&tmp_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&tmp_path, permissions).expect("chmod fake gajae");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&tmp_path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tmp_path, permissions).expect("chmod fake gajae");
+        }
         fs::rename(&tmp_path, &path).expect("install fake gajae");
         (dir, path)
     }

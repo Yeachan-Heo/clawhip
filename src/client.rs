@@ -151,6 +151,7 @@ impl DaemonClient {
             .http
             .post(format!("{}{}", self.base_url, path))
             .header(LOCAL_CONTROL_HEADER, "1")
+            .header(reqwest::header::ORIGIN, &self.base_url)
             .json(payload)
             .send()
             .await?;
@@ -161,6 +162,38 @@ impl DaemonClient {
             let body = response.text().await.unwrap_or_default();
             Err(format!("daemon request failed with {status}: {body}").into())
         }
+    }
+    pub async fn gjc_health(&self) -> Result<Value> {
+        self.private_get_json("/api/gjc/health").await
+    }
+
+    pub async fn gjc_lanes(&self, include_removed: bool) -> Result<Value> {
+        let suffix = if include_removed { "?removed=true" } else { "" };
+        self.private_get_json(&format!("/api/gjc/lanes{suffix}"))
+            .await
+    }
+
+    pub async fn gjc_register(
+        &self,
+        request: &crate::gjc_lane::GjcLaneRegistrationRequest,
+    ) -> Result<Value> {
+        self.private_post_json("/api/gjc/lanes", request).await
+    }
+
+    pub async fn gjc_reconcile(&self) -> Result<Value> {
+        self.private_post_json(
+            "/api/gjc/lane/reconcile?force_resume=true",
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn gjc_retire(&self, lane: &str, reason: Option<&str>) -> Result<Value> {
+        self.private_post_json(
+            &format!("/api/gjc/lanes/{lane}/retire"),
+            &serde_json::json!({ "reason": reason.unwrap_or("manual retirement") }),
+        )
+        .await
     }
 
     pub async fn list_lanes(&self) -> Result<Vec<LaneSnapshot>> {
@@ -200,6 +233,10 @@ impl DaemonClient {
         self.ensure_loopback_daemon()?;
         self.post_typed(path, payload).await
     }
+    async fn private_post_json<P: Serialize>(&self, path: &str, payload: &P) -> Result<Value> {
+        self.ensure_loopback_daemon()?;
+        self.post_json(path, payload).await
+    }
     fn ensure_loopback_daemon(&self) -> Result<()> {
         let url = reqwest::Url::parse(&self.base_url)?;
         let host = url
@@ -232,6 +269,8 @@ impl DaemonClient {
         let response = self
             .http
             .get(format!("{}/api/ledger/query", self.base_url))
+            .header(crate::daemon::LOCAL_CONTROL_HEADER, "1")
+            .header(reqwest::header::ORIGIN, &self.base_url)
             .query(params)
             .send()
             .await?;
@@ -269,11 +308,89 @@ impl DaemonClient {
         )
         .await
     }
+    // --- GJC SDK control plane (#323) ---
 
+    pub async fn gjc_capabilities(&self) -> Result<Value> {
+        self.gjc_private_request(reqwest::Method::GET, "/api/gjc/capabilities", None)
+            .await
+    }
+
+    pub async fn gjc_session_query(&self, session: &str, sections: Option<&str>) -> Result<Value> {
+        let mut path = format!("/api/gjc/session/{}", urlencoding_lite(session));
+        if let Some(sections) = sections {
+            path.push_str("?sections=");
+            path.push_str(sections);
+        }
+        self.gjc_private_request(reqwest::Method::GET, &path, None)
+            .await
+    }
+
+    pub async fn gjc_turn_outcome(&self, session: &str, turn: &str) -> Result<Value> {
+        self.gjc_private_request(
+            reqwest::Method::GET,
+            &format!(
+                "/api/gjc/session/{}/turn/{}",
+                urlencoding_lite(session),
+                urlencoding_lite(turn)
+            ),
+            None,
+        )
+        .await
+    }
+
+    pub async fn gjc_command_receipt(&self, session: &str, key: &str) -> Result<Value> {
+        self.gjc_private_request(
+            reqwest::Method::GET,
+            &format!(
+                "/api/gjc/command/{}?session={}",
+                urlencoding_lite(key),
+                urlencoding_lite(session)
+            ),
+            None,
+        )
+        .await
+    }
+
+    pub async fn gjc_mutation(&self, verb: &str, payload: Value) -> Result<Value> {
+        self.gjc_private_request(
+            reqwest::Method::POST,
+            &format!("/api/gjc/{verb}"),
+            Some(payload),
+        )
+        .await
+    }
+
+    /// GJC endpoints are private control surfaces: loopback daemon URLs
+    /// only, local-control header always set, typed error bodies surfaced.
+    async fn gjc_private_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<Value>,
+    ) -> Result<Value> {
+        self.ensure_loopback_daemon()?;
+        let mut request = self
+            .http
+            .request(method, format!("{}{}", self.base_url, path))
+            .header(LOCAL_CONTROL_HEADER, "1");
+        if let Some(payload) = payload.as_ref() {
+            request = request.json(payload);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.json::<Value>().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(std::io::Error::other(gjc_error_message(status, &body)).into())
+        }
+    }
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let response = self
             .http
             .get(format!("{}{}", self.base_url, path))
+            .header(crate::daemon::LOCAL_CONTROL_HEADER, "1")
+            .header(reqwest::header::ORIGIN, &self.base_url)
             .send()
             .await?;
         if response.status().is_success() {
@@ -305,6 +422,7 @@ impl DaemonClient {
             .http
             .post(format!("{}{}", self.base_url, path))
             .header(LOCAL_CONTROL_HEADER, "1")
+            .header(reqwest::header::ORIGIN, &self.base_url)
             .json(payload)
             .send()
             .await?;
@@ -355,6 +473,27 @@ fn subscription_path_name(name: &str) -> String {
             _ => format!("%{byte:02X}").chars().collect(),
         })
         .collect()
+}
+
+fn urlencoding_lite(value: &str) -> String {
+    // Session/turn/key ids are validated to exclude whitespace and control
+    // characters, so only path-hostile separators need escaping here.
+    value
+        .replace('/', "%2F")
+        .replace('?', "%3F")
+        .replace('#', "%23")
+}
+
+fn gjc_error_message(status: reqwest::StatusCode, body: &Value) -> String {
+    let code = body
+        .get("error_code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    let message = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("gjc request failed");
+    format!("daemon gjc request failed with {status} [{code}]: {message}")
 }
 
 #[cfg(test)]
@@ -457,6 +596,7 @@ mod tests {
             let request = String::from_utf8_lossy(&request[..size]);
             assert!(request.starts_with("POST /api/subscriptions/safe/start HTTP/1.1"));
             assert!(request.contains("x-clawhip-local-control: 1\r\n"));
+            assert!(request.contains("origin: http://127.0.0.1:"));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 44\r\nConnection: close\r\n\r\n{\"ok\":true,\"name\":\"safe\",\"reason\":\"started\"}",

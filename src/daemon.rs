@@ -13,6 +13,10 @@ use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::gajae::{HandlerAction, HandlerLimits, HandlerOutcome};
+use crate::gjc_sdk_events::{
+    GjcEventBridge, GjcSnapshotIdentity, snapshot_from_response_payload,
+    snapshot_from_session_query,
+};
 use crate::ledger::{EventLedger, LedgerQuery, SharedEventLedger};
 use crate::native_hooks::{
     NATIVE_NON_GIT_OUTCOME, NATIVE_NORMALIZATION_OUTCOME_FIELD,
@@ -25,7 +29,12 @@ use crate::native_observability::{
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 
-use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
+use crate::gjc_lane::{
+    GjcControlPlaneAdapter, GjcLaneRegistrationRequest, GjcLaneStore, GjcReconciler,
+    SharedGjcLaneStore, SharedGjcReconciler,
+};
+use crate::gjc_lane::{default_gjc_lane_state_path, health_json as gjc_health_json};
+use crate::sink::{DiscordSink, HttpSink, LocalFileSink, Sink, SlackSink};
 use crate::source::tmux::{
     AbsentRegistrationCandidate, prune_absent_dynamic_registrations, session_exists,
 };
@@ -36,15 +45,15 @@ use crate::source::tmux::{
     record_lane_delivery, record_lane_verification, register_lane_registration,
     retire_lane_if_absent, update_lane_evidence, update_lane_workflow,
 };
-
 use crate::source::{
     GitHubSource, GitHubStatusSource, GitMonitorLifecycleCounts, GitSource, RegisteredTmuxSession,
     SharedGitMonitorDiagnostics, SharedTmuxRegistry, Source, SubscriptionSnapshot,
     SubscriptionState, SubscriptionWorker, TmuxSource, WorkspaceSource,
-    default_registry_state_path, inspect_tmux_registry_state, list_active_tmux_registrations,
-    load_tmux_registry_state, new_shared_git_monitor_diagnostics,
+    default_github_ci_baseline_path, default_registry_state_path, inspect_tmux_registry_state,
+    list_active_tmux_registrations, load_tmux_registry_state, new_shared_git_monitor_diagnostics,
+    new_shared_github_monitor_auth_status, reconcile_restored_tmux_registry,
     register_runtime_tmux_registration, snapshot_git_monitor_diagnostics,
-    tmux_registry_diagnostics,
+    snapshot_github_monitor_auth_status, tmux_registry_diagnostics,
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
@@ -74,6 +83,20 @@ fn shared_event_ledger() -> Option<SharedEventLedger> {
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
+}
+
+/// Process-wide GJC SDK event bridge (#324): authoritative snapshots pushed by
+/// sibling tracks reduce here into lifecycle/question/notification events that
+/// flow through the normal accept pipeline (ledger -> router -> sinks).
+static GJC_SDK_BRIDGE: OnceLock<std::sync::Mutex<GjcEventBridge>> = OnceLock::new();
+static GJC_BRIDGE_INGRESS: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn gjc_bridge_slot() -> &'static std::sync::Mutex<GjcEventBridge> {
+    GJC_SDK_BRIDGE.get_or_init(|| std::sync::Mutex::new(GjcEventBridge::new()))
+}
+
+fn gjc_bridge_ingress() -> &'static tokio::sync::Mutex<()> {
+    GJC_BRIDGE_INGRESS.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 const STALE_NATIVE_REPLAY_GRACE: Duration = Duration::from_secs(5 * 60);
@@ -106,6 +129,9 @@ struct AppState {
     discord_watch_lock: Arc<Mutex<()>>,
     subscriptions: SharedSubscriptionRegistry,
     git_monitor_diagnostics: SharedGitMonitorDiagnostics,
+    gjc: crate::gjc::control::GjcControlPlane,
+    gjc_store: Option<SharedGjcLaneStore>,
+    gjc_reconciler: Option<SharedGjcReconciler>,
 }
 
 type SharedSubscriptionRegistry = Arc<RwLock<BTreeMap<String, SubscriptionEntry>>>;
@@ -130,10 +156,19 @@ pub async fn run(
 ) -> Result<()> {
     config.validate()?;
     let token_source = config.discord_token_source();
-    println!("clawhip v{VERSION} starting (token_source: {token_source})");
+    let build = crate::build_info::stamp();
+    println!(
+        "clawhip v{} starting (token_source: {token_source})",
+        build.describe()
+    );
     telemetry::emit(daemon_record(
         telemetry::reason::DAEMON_STARTUP,
-        json!({"version": VERSION, "token_source": token_source}),
+        json!({
+            "version": VERSION,
+            "build": build.payload(),
+            "token_source": token_source,
+            "http_routes_configured": config.has_http_routes(),
+        }),
     ));
     if let Some(env_var) = config.discord_token_env_shadow() {
         let warning = discord_token_shadow_warning(env_var);
@@ -151,11 +186,26 @@ pub async fn run(
     );
     sinks.insert("slack".into(), Box::new(SlackSink::default()));
     sinks.insert("localfile".into(), Box::new(LocalFileSink));
+    if config.has_http_routes() {
+        sinks.insert(
+            "http".into(),
+            Box::new(HttpSink::from_config(&config.providers.http)?),
+        );
+    }
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
     let tmux_registry_state_path = default_registry_state_path(&cron_state_path);
     load_tmux_registry_state(&tmux_registry_state_path, &tmux_registry).await;
+    // #341: reconcile runtime-gone dynamic registrations out of the restored
+    // active set before the daemon serves or polls, so a restart cannot
+    // resurrect persisted ghost watches. Reconciled entries leave bounded
+    // tombstone evidence in the audit trail beside the registry state.
+    if let Err(error) =
+        reconcile_restored_tmux_registry(&tmux_registry, &tmux_registry_state_path).await
+    {
+        eprintln!("clawhip tmux restart reconcile failed: {error}");
+    }
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
     let native_observability = new_shared_native_hook_observability();
     let subscriptions = new_subscription_registry(config.as_ref(), tx.clone()).await;
@@ -192,11 +242,19 @@ pub async fn run(
         }
     });
     let git_monitor_diagnostics = new_shared_git_monitor_diagnostics();
+    let github_monitor_auth = new_shared_github_monitor_auth_status();
     spawn_source(
         GitSource::new(config.clone(), git_monitor_diagnostics.clone()),
         tx.clone(),
     );
-    spawn_source(GitHubSource::new(config.clone()), tx.clone());
+    spawn_source(
+        GitHubSource::with_ci_baseline_path_and_auth(
+            config.clone(),
+            default_github_ci_baseline_path(&cron_state_path),
+            github_monitor_auth.clone(),
+        ),
+        tx.clone(),
+    );
     spawn_source(GitHubStatusSource::new(config.clone()), tx.clone());
     spawn_source(
         TmuxSource::new(
@@ -221,6 +279,36 @@ pub async fn run(
             update::run_checker(config, tx, pending).await;
         });
     }
+    {
+        // Detect a running binary that no longer matches its source checkout,
+        // so a merged-but-undeployed fix reports itself instead of waiting for
+        // an operator to compare revisions by hand.
+        let config = config.clone();
+        let tx = tx.clone();
+        let report = crate::deployment::shared_drift_report();
+        tokio::spawn(async move {
+            crate::deployment::run_checker(config, tx, report).await;
+        });
+    }
+    let gjc_registry = crate::gjc::control::new_shared_command_registry();
+    let gjc_control = match std::env::current_dir() {
+        Ok(cwd) => Arc::new(crate::gjc::control::GjcControlPlane::for_worktree(
+            &cwd,
+            gjc_registry.clone(),
+        )),
+        // Without a resolvable worktree anchor the plane stays explicitly
+        // unavailable instead of silently re-scoping the trust boundary.
+        Err(_) => Arc::new(crate::gjc::control::GjcControlPlane::unavailable(
+            gjc_registry.clone(),
+        )),
+    };
+    if config.gjc.enabled && config.gjc_lanes.enabled {
+        let _ = crate::gjc_lane::register_gjc_control_plane(Arc::new(GjcControlPlaneAdapter::new(
+            gjc_registry.clone(),
+        )));
+    }
+    let (gjc_store, gjc_reconciler) =
+        spawn_gjc_lane_reconciler(config.clone(), cron_state_path.clone(), tx.clone()).await?;
 
     let app = AxumRouter::new()
         .route("/health", get(health))
@@ -254,6 +342,40 @@ pub async fn run(
         .route("/api/ledger/query", get(ledger_query))
         .route("/api/subscriptions/{name}/start", post(start_subscription))
         .route("/api/subscriptions/{name}/stop", post(stop_subscription));
+    // The GJC surface is strictly opt-in: with `[gjc] enabled = false` no
+    // /api/gjc route is registered at all, not merely reported disabled.
+    let app = if config.gjc.enabled {
+        app.route("/api/gjc/health", get(gjc_health_handler))
+            .route(
+                "/api/gjc/lanes",
+                get(list_gjc_lanes_handler).post(register_gjc_lane_handler),
+            )
+            .route("/api/gjc/lanes/{lane}", get(gjc_lane_detail_handler))
+            .route(
+                "/api/gjc/lanes/{lane}/retire",
+                post(retire_gjc_lane_handler),
+            )
+            .route("/api/gjc/lane/reconcile", post(reconcile_gjc_lanes_handler))
+            .route("/api/gjc/capabilities", get(gjc_capabilities))
+            .route("/api/gjc/session/{session}", get(gjc_session_query))
+            .route(
+                "/api/gjc/session/{session}/turn/{turn}",
+                get(gjc_turn_outcome),
+            )
+            .route("/api/gjc/prompt", post(gjc_prompt))
+            .route("/api/gjc/steer", post(gjc_steer))
+            .route("/api/gjc/abort-and-prompt", post(gjc_abort_and_prompt))
+            .route(
+                "/api/gjc/workflow-gate-answer",
+                post(gjc_workflow_gate_answer),
+            )
+            .route("/api/gjc/ask-answer", post(gjc_ask_answer))
+            .route("/api/gjc/model-selection", post(gjc_model_selection))
+            .route("/api/gjc/command/{key}", get(gjc_command_receipt))
+            .route("/api/gjc/bridge", post(post_gjc_bridge))
+    } else {
+        app
+    };
     let port = port_override.unwrap_or(config.daemon.port);
 
     let app = app.with_state(AppState {
@@ -267,6 +389,9 @@ pub async fn run(
         discord_watch_lock: Arc::new(Mutex::new(())),
         subscriptions: subscriptions.clone(),
         git_monitor_diagnostics,
+        gjc: (*gjc_control).clone(),
+        gjc_store,
+        gjc_reconciler,
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -354,6 +479,237 @@ async fn ledger_query(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":"ledger_unavailable"})),
         ),
+    }
+}
+
+/// Open the durable GJC lane store and start the reconciler when enabled.
+///
+/// The reconciler runs only once a control plane registers through the
+/// [`crate::gjc_lane::register_gjc_control_plane`] seam; until then durable
+/// ownership, status surfaces, and PR reconciliation stay live while polling
+/// stays idle instead of fabricating SDK evidence (transport contract under
+/// repair by its own track).
+async fn spawn_gjc_lane_reconciler(
+    config: Arc<AppConfig>,
+    cron_state_path: PathBuf,
+    tx: mpsc::Sender<IncomingEvent>,
+) -> Result<(Option<SharedGjcLaneStore>, Option<SharedGjcReconciler>)> {
+    if !config.gjc_lanes.enabled {
+        return Ok((None, None));
+    }
+    let path = config
+        .gjc_lanes
+        .state_path
+        .clone()
+        .unwrap_or_else(|| default_gjc_lane_state_path(&cron_state_path));
+    let store = Arc::new(GjcLaneStore::open(&path)?);
+    store.note_restart()?;
+    println!(
+        "clawhip gjc lane reconciliation enabled ({})",
+        path.display()
+    );
+    let Some(plane) = crate::gjc_lane::take_registered_control_plane() else {
+        eprintln!("clawhip gjc lanes: control plane not registered yet; reconciliation idle");
+        return Ok((Some(store), None));
+    };
+    let pr_resolver: Option<std::sync::Arc<dyn crate::gjc_lane::GjcLanePrResolver>> =
+        crate::gjc_lane::GithubApiPrResolver::from_config(&config.gjc_lanes.pr)?
+            .map(|resolver| resolver as _);
+    let reconciler = Arc::new(
+        GjcReconciler::new(
+            plane,
+            pr_resolver,
+            store.clone(),
+            tx,
+            config.gjc_lanes.polling_policy(),
+        )
+        .with_auto_enrollment({
+            let mut worktrees = vec![std::env::current_dir().unwrap_or_default()];
+            worktrees.extend(config.gjc_lanes.discovery_worktrees.iter().cloned());
+            worktrees
+        }),
+    );
+    {
+        let runner = reconciler.clone();
+        tokio::spawn(async move {
+            runner.run().await;
+        });
+    }
+    Ok((Some(store), Some(reconciler)))
+}
+
+fn gjc_lanes_disabled() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"ok": false, "error": "gjc lanes are not enabled"})),
+    )
+}
+
+fn gjc_lane_error(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    let message = error.to_string();
+    let status = if message.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("conflict") || message.contains("revision") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(json!({"ok": false, "error": "gjc lane request rejected"})),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GjcLaneListParams {
+    removed: Option<bool>,
+}
+
+async fn gjc_health_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    Json(gjc_health_json(store, state.gjc_reconciler.is_some())).into_response()
+}
+
+async fn list_gjc_lanes_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Query(params): Query<GjcLaneListParams>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    let include_removed = params.removed.unwrap_or(false);
+    Json(json!({
+        "schema": crate::gjc_lane::GJC_LANE_STATE_SCHEMA,
+        "lanes": store.snapshot_watches(include_removed),
+    }))
+    .into_response()
+}
+
+async fn gjc_lane_detail_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(lane_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    match store.record(&lane_id) {
+        Some(record) => Json(record).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": "gjc lane not found"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn register_gjc_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(request): Json<GjcLaneRegistrationRequest>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    match store.register_lane(&request, &crate::gjc_lane::now_rfc3339()) {
+        Ok(record) => Json(record).into_response(),
+        Err(error) if error.to_string().contains("registration conflict") => {
+            let Some(record) = store.record_for_session(&request.sdk_session_id) else {
+                return gjc_lane_error(error).into_response();
+            };
+            let same_owner = record.ownership.owner_id == request.owner_id;
+            let same_endpoint = request
+                .endpoint_generation
+                .is_none_or(|generation| record.endpoint_generation == generation);
+            let same_worktree = record.worktree == request.worktree;
+            let same_pr = record
+                .pr
+                .as_ref()
+                .map(|pr| {
+                    request.pr.as_ref().is_some_and(|input| {
+                        pr.repo == input.repo
+                            && pr.number == input.number
+                            && pr.head_sha == input.head_sha.to_ascii_lowercase()
+                            && pr.base_branch == input.base_branch
+                    })
+                })
+                .unwrap_or(request.pr.is_none());
+            if record.watch_removed_at.is_some() || record.terminal_disposition.is_some() {
+                gjc_lane_error("lane registration conflict: session is retired").into_response()
+            } else if same_owner && same_endpoint && same_worktree && same_pr {
+                Json(record).into_response()
+            } else {
+                gjc_lane_error(error).into_response()
+            }
+        }
+        Err(error) => gjc_lane_error(error).into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GjcLaneRetireRequest {
+    reason: Option<String>,
+}
+
+async fn retire_gjc_lane_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    axum::extract::Path(lane_id): axum::extract::Path<String>,
+    Json(request): Json<GjcLaneRetireRequest>,
+) -> impl IntoResponse {
+    let Some(store) = &state.gjc_store else {
+        return gjc_lanes_disabled().into_response();
+    };
+    let Some(record) = store.record(&lane_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": "gjc lane not found"})),
+        )
+            .into_response();
+    };
+    match store.retire_lane(
+        &lane_id,
+        record.revision,
+        request.reason.as_deref().unwrap_or("manual retirement"),
+        &crate::gjc_lane::now_rfc3339(),
+    ) {
+        Ok(updated) => Json(updated).into_response(),
+        Err(error) => gjc_lane_error(error).into_response(),
+    }
+}
+
+async fn reconcile_gjc_lanes_handler(
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(reconciler) = &state.gjc_reconciler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "gjc reconciler is idle; control plane not registered"})),
+        )
+            .into_response();
+    };
+    if params
+        .get("force_resume")
+        .is_some_and(|value| value == "true")
+        && let Some(store) = &state.gjc_store
+    {
+        store.resume_suspended(&crate::gjc_lane::now_rfc3339());
+    }
+    match reconciler.poll_once(OffsetDateTime::now_utc()).await {
+        Ok(outcome) => Json(json!({"ok": true, "outcome": outcome})).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": "gjc reconcile pass failed"})),
+        )
+            .into_response(),
     }
 }
 
@@ -463,7 +819,14 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let tmux = tmux_registry_diagnostics(&state.tmux_registry, registry_state).await;
     let subscriptions = subscription_snapshots(&state.subscription_registry()).await;
     let git_monitors = snapshot_git_monitor_diagnostics(&state.git_monitor_diagnostics);
-    Json(health_payload(
+    let github_monitor_auth =
+        snapshot_github_monitor_auth_status(&new_shared_github_monitor_auth_status());
+    let deployment = crate::deployment::shared_drift_report()
+        .read()
+        .await
+        .as_ref()
+        .map(crate::deployment::DriftReport::payload);
+    let mut payload = health_payload(
         state.config.as_ref(),
         state.port,
         registered,
@@ -471,7 +834,17 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         json!(tmux),
         &subscriptions,
         git_monitors,
-    ))
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "github_monitor_auth".to_string(),
+            json!(github_monitor_auth),
+        );
+        if let Some(deployment) = deployment {
+            object.insert("deployment".to_string(), deployment);
+        }
+    }
+    Json(payload)
 }
 
 fn health_payload(
@@ -502,9 +875,21 @@ fn health_payload(
     json!({
         "ok": !subscription_degraded && !git_degraded,
         "version": VERSION,
+        // Build provenance of the running binary. `version` alone cannot
+        // distinguish a freshly deployed daemon from one still running a
+        // binary built several merges ago, which is how deployment drift
+        // stayed invisible behind a green repository backlog.
+        "build": crate::build_info::stamp().payload(),
         "token_source": config.discord_token_source(),
         "token_precedence_warning": config.discord_token_env_shadow().map(discord_token_shadow_warning),
+        "github_monitor_auth": {
+            "ready": config.monitor_github_token().is_some(),
+            "source": if std::env::var("CLAWHIP_GITHUB_TOKEN").ok().is_some_and(|value| !value.trim().is_empty()) { "environment" } else if config.monitors.github_token.as_deref().is_some_and(|value| !value.trim().is_empty()) { "config" } else { "unavailable" },
+            "error": if config.monitor_github_token().is_some() { Value::Null } else { json!("GitHub monitor authentication has not been checked") },
+        },
+        "expected_discord_bot_id": config.expected_discord_bot_id(),
         "webhook_routes_configured": config.has_webhook_routes(),
+        "http_routes_configured": config.has_http_routes(),
         "port": port,
         "configured_git_monitors": config.monitors.git.repos.len(),
         "git_monitors": git_monitors,
@@ -516,6 +901,12 @@ fn health_payload(
         "tmux": tmux,
         "native_hooks": native_hooks,
         "subscriptions": {"configured": subscriptions.len(), "degraded": subscription_degraded},
+        "gjc": {
+            "enabled": config.gjc.enabled,
+            "question_subscription": config.subscriptions.iter().any(|subscription| {
+                subscription.name == crate::config::GJC_QUESTION_SUBSCRIPTION_NAME
+            }),
+        },
     })
 }
 
@@ -736,6 +1127,447 @@ async fn stop_subscription(
         Err((status, reason)) => subscription_error(status, reason),
     }
 }
+// --- GJC SDK control plane (#323): public-safe, loopback-guarded surface ---
+
+fn gjc_error_response(error: &crate::gjc::model::GjcError) -> axum::response::Response {
+    let (status, body) = crate::gjc::api::error_response(error);
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+        Json(body),
+    )
+        .into_response()
+}
+
+/// Resolve the authoritative control plane for an enrolled SDK session.
+///
+/// The daemon's startup control plane is anchored to its own current working
+/// directory, which is not necessarily the worktree owning a requested lane.
+/// Public session handlers must first consult the durable lane store, reject
+/// sessions that are not enrolled (or whose watch has been retired), then
+/// scope transport discovery to the stored worktree. Missing worktree
+/// identity is treated as an invisible session rather than falling back to
+/// the daemon CWD.
+fn gjc_control_for_session(
+    state: &AppState,
+    session: &crate::gjc::model::SessionId,
+) -> crate::gjc::model::GjcResult<crate::gjc::control::GjcControlPlane> {
+    gjc_control_for_session_with_policy(state, session, true)
+}
+
+fn gjc_read_control_for_session(
+    state: &AppState,
+    session: &crate::gjc::model::SessionId,
+) -> crate::gjc::model::GjcResult<crate::gjc::control::GjcControlPlane> {
+    gjc_control_for_session_with_policy(state, session, false)
+}
+
+fn gjc_control_for_session_with_policy(
+    state: &AppState,
+    session: &crate::gjc::model::SessionId,
+    reject_terminal: bool,
+) -> crate::gjc::model::GjcResult<crate::gjc::control::GjcControlPlane> {
+    let not_found = || crate::gjc::model::GjcError::SessionNotFound {
+        session_id: session.as_str().to_string(),
+    };
+    let Some(store) = state.gjc_store.as_ref() else {
+        if state.config.gjc_lanes.enabled {
+            return Err(not_found());
+        }
+        // Preserve pre-#349 configurations where [gjc] was enabled without
+        // [gjc_lanes]. The lane-scoped store is unavailable there, so the
+        // existing daemon-CWD control plane remains the explicit legacy
+        // boundary instead of silently disabling established controls.
+        return Ok(state.gjc.clone());
+    };
+    let Some(record) = store.record_for_session(session.as_str()) else {
+        return Err(not_found());
+    };
+    if record.watch_removed_at.is_some()
+        || (reject_terminal && record.terminal_disposition.is_some())
+    {
+        return Err(not_found());
+    }
+    let Some(worktree) = record
+        .worktree
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return Err(not_found());
+    };
+    Ok(state.gjc.scoped_to_worktree(std::path::Path::new(worktree)))
+}
+
+async fn gjc_capabilities(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let caps = if let Some(session) = params.get("session") {
+        let session_id = match crate::gjc::model::SessionId::new(session) {
+            Ok(session_id) => session_id,
+            Err(error) => return gjc_error_response(&error),
+        };
+        match gjc_control_for_session(&state, &session_id) {
+            Ok(control) => control.capabilities_for_session(&session_id).await,
+            Err(error) => return gjc_error_response(&error),
+        }
+    } else {
+        state.gjc.capabilities().await
+    };
+    Json(crate::gjc::api::capabilities_body(&caps)).into_response()
+}
+
+async fn gjc_session_query(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    axum::extract::Path(session): axum::extract::Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let session_id = match crate::gjc::model::SessionId::new(&session) {
+        Ok(session) => session,
+        Err(error) => return gjc_error_response(&error),
+    };
+    let sections = match crate::gjc::api::parse_sections(params.get("sections").map(String::as_str))
+    {
+        Ok(sections) => sections,
+        Err(error) => return gjc_error_response(&error),
+    };
+    let control = match gjc_read_control_for_session(&state, &session_id) {
+        Ok(control) => control,
+        Err(error) => return gjc_error_response(&error),
+    };
+    let refs = sections.iter().map(String::as_str).collect::<Vec<_>>();
+    // Full-section reads feed the #324 event bridge from the same authoritative
+    // evidence they return; partial `sections` reads skip the bridge because a
+    // reducer fed partial state could derive wrong transitions.
+    if !params.contains_key("sections") {
+        match control.query_session(&session_id, &refs).await {
+            Ok(query) => {
+                if state.gjc_store.is_none() {
+                    return Json(crate::gjc::api::session_query_body(&query)).into_response();
+                }
+                if !feed_gjc_bridge_from_query(&state, &session, &query).await {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"ok": false, "error": "gjc bridge delivery unavailable"})),
+                    )
+                        .into_response();
+                }
+                return Json(crate::gjc::api::session_query_body(&query)).into_response();
+            }
+            Err(error) => return gjc_error_response(&error),
+        }
+    }
+    match crate::gjc::api::run_session_query(
+        &control,
+        &session,
+        params.get("sections").map(String::as_str),
+    )
+    .await
+    {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+/// Reduce one authoritative #323 session query through the #324 event bridge.
+/// Only registered lanes feed the bridge: routing identity and the monotonic
+/// dedupe revision come from the durable lane store (#325). Emitted events are
+/// enqueued through the normal dispatch pipeline (ledger -> router -> sinks).
+async fn feed_gjc_bridge_from_query(
+    state: &AppState,
+    sdk_session_id: &str,
+    query: &crate::gjc::model::SessionQuery,
+) -> bool {
+    let Some(store) = state.gjc_store.as_ref() else {
+        return false;
+    };
+    let lane_id = crate::gjc_lane::gjc_lane_id(sdk_session_id);
+    let Some(record) = store.record(&lane_id) else {
+        return false;
+    };
+    let identity = GjcSnapshotIdentity {
+        repo_name: record.pr.as_ref().map(|pr| pr.repo.clone()),
+        repo_path: record.worktree.clone(),
+        worktree_path: record.worktree.clone(),
+        branch: record.branch.clone(),
+    };
+    let _ingress_guard = gjc_bridge_ingress().lock().await;
+    let Some(query_revision) = query.revision else {
+        return false;
+    };
+    let (candidate, mut events) = {
+        let Ok(bridge) = gjc_bridge_slot().lock() else {
+            return false;
+        };
+        let Some(record) = store.record(&lane_id) else {
+            return false;
+        };
+        if query_revision <= record.sdk_revision {
+            return true;
+        }
+        let snapshot =
+            snapshot_from_session_query(sdk_session_id, query_revision, query, &identity);
+        let mut candidate = bridge.clone();
+        let Ok(outcome) = candidate.observe(&snapshot) else {
+            return false;
+        };
+        (candidate, outcome.events)
+    };
+    let failure_event = events
+        .iter()
+        .find(|event| event.kind == "session.failed")
+        .cloned();
+    let staged_failure = failure_event.is_some();
+    if let Some(failure_event) = failure_event.as_ref() {
+        let Some(current) = store.record(&lane_id) else {
+            return false;
+        };
+        if store
+            .stage_bridge_failure(
+                &lane_id,
+                current.revision,
+                failure_event,
+                &crate::gjc_lane::now_rfc3339(),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        events.retain(|event| event.kind != "session.failed");
+    }
+    for event in &events {
+        if enqueue_event(&state.tx, normalize_event(event.clone()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if !staged_failure {
+        let Some(current) = store.record(&lane_id) else {
+            return false;
+        };
+        if store
+            .set_sdk_revision_if(
+                &lane_id,
+                current.sdk_revision,
+                query_revision,
+                &crate::gjc_lane::now_rfc3339(),
+            )
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let Ok(mut bridge) = gjc_bridge_slot().lock() else {
+        return false;
+    };
+    *bridge = candidate;
+    true
+}
+
+async fn gjc_turn_outcome(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    axum::extract::Path((session, turn)): axum::extract::Path<(String, String)>,
+) -> axum::response::Response {
+    let session = match crate::gjc::model::SessionId::new(session) {
+        Ok(session) => session,
+        Err(error) => return gjc_error_response(&error),
+    };
+    if turn.is_empty() || turn.len() > 128 {
+        return gjc_error_response(&crate::gjc::model::GjcError::InvalidRequest {
+            field: "turn_id",
+            reason: "must be 1..=128 bytes".into(),
+        });
+    }
+    let control = match gjc_read_control_for_session(&state, &session) {
+        Ok(control) => control,
+        Err(error) => return gjc_error_response(&error),
+    };
+    match control.turn_outcome(&session, &turn).await {
+        Ok(outcome) => Json(crate::gjc::api::outcome_body(&outcome)).into_response(),
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_prompt(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::PromptDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.prompt(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_steer(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::SteerDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.steer(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_abort_and_prompt(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::AbortAndPromptDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.abort_and_prompt(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_workflow_gate_answer(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::WorkflowGateAnswerDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.answer_workflow_gate(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_ask_answer(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::AskAnswerDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => {
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.answer_ask(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_model_selection(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    Json(dto): Json<crate::gjc::api::ModelSelectionDto>,
+) -> axum::response::Response {
+    match dto.into_request() {
+        Ok(request) => {
+            if request.model.is_none() == request.profile.is_none() {
+                return gjc_error_response(&crate::gjc::model::GjcError::InvalidRequest {
+                    field: "model",
+                    reason: "exactly one of model or profile must be provided".into(),
+                });
+            }
+            let control = match gjc_control_for_session(&state, &request.envelope.session) {
+                Ok(control) => control,
+                Err(error) => return gjc_error_response(&error),
+            };
+            match control.select_model(request).await {
+                Ok(receipt) => {
+                    Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+                }
+                Err(error) => gjc_error_response(&error),
+            }
+        }
+        Err(error) => gjc_error_response(&error),
+    }
+}
+
+async fn gjc_command_receipt(
+    _control: SubscriptionControlRequest,
+    State(state): State<AppState>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let Some(session) = params.get("session") else {
+        return gjc_error_response(&crate::gjc::model::GjcError::InvalidRequest {
+            field: "session",
+            reason: "receipt lookup requires a session".into(),
+        });
+    };
+    let key = match crate::gjc::model::IdempotencyKey::new(key) {
+        Ok(key) => key,
+        Err(error) => return gjc_error_response(&error),
+    };
+    if let Some(store) = &state.gjc_store
+        && store
+            .record_for_session(session)
+            .is_none_or(|record| record.watch_removed_at.is_some())
+    {
+        return gjc_error_response(&crate::gjc::model::GjcError::SessionNotFound {
+            session_id: session.clone(),
+        });
+    }
+    match state.gjc.command_receipt(&key).await {
+        Ok(receipt) => {
+            if receipt.session_id != *session {
+                return gjc_error_response(&crate::gjc::model::GjcError::InvalidRequest {
+                    field: "session",
+                    reason: "receipt is bound to another session".into(),
+                });
+            }
+            Json(crate::gjc::api::command_receipt_body(&receipt)).into_response()
+        }
+        Err(error) => gjc_error_response(&error),
+    }
+}
 
 async fn shutdown_subscriptions(registry: &SharedSubscriptionRegistry) {
     let workers: Vec<_> = {
@@ -905,6 +1737,244 @@ async fn post_native_hook(
     }
 
     accept_event(&state, event).await
+}
+
+/// Ingress for authoritative GJC SDK state snapshots (#324).
+///
+/// Push-only: sibling transport/control/reconcile tracks deliver one typed
+/// snapshot per observation; the process-wide bridge reduces transitions and
+/// the emitted events flow through `accept_event` (ledger, router, sinks).
+/// No polling loop or durable lane ownership lives here.
+///
+/// Fail-closed like the rest of the GJC control plane: the route is absent
+/// when `[gjc] enabled = false`, and live ingress requires the local-control
+/// header plus a loopback peer/Host/Origin (`SubscriptionControlRequest` and
+/// `LoopbackLanePeer`). Unauthenticated or remote snapshot forgery is rejected.
+async fn post_gjc_bridge(
+    _control: SubscriptionControlRequest,
+    _peer: LoopbackLanePeer,
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    if !state.config.gjc.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut snapshot = match snapshot_from_response_payload(&payload) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error})),
+            )
+                .into_response();
+        }
+    };
+    let session_id = snapshot.session_id.trim().to_string();
+    let _ingress_guard = gjc_bridge_ingress().lock().await;
+    let mut push_lane_id = None;
+    if state.config.gjc_lanes.enabled {
+        let Some(store) = &state.gjc_store else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc lane reconciliation is disabled"})),
+            )
+                .into_response();
+        };
+        if store.record_for_session(&session_id).is_none_or(|record| {
+            record.watch_removed_at.is_some()
+                || record.terminal_disposition.is_some()
+                || record
+                    .worktree
+                    .as_deref()
+                    .is_none_or(|worktree| worktree.trim().is_empty())
+        }) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"ok": false, "error": "gjc session is not enrolled"})),
+            )
+                .into_response();
+        }
+        let record = store
+            .record_for_session(&session_id)
+            .expect("membership checked");
+        push_lane_id = Some(record.lane_id.clone());
+        if snapshot.revision <= record.sdk_revision {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"ok": false, "error": "stale or non-authoritative bridge revision"})),
+            )
+                .into_response();
+        }
+        snapshot.repo_name = record.pr.as_ref().map(|pr| pr.repo.clone());
+        snapshot.repo_path = record.worktree.clone();
+        snapshot.worktree_path = record.worktree.clone();
+        snapshot.branch = record.branch.clone();
+    }
+    let revision = snapshot.revision;
+    let outcome = {
+        let Ok(bridge) = gjc_bridge_slot().lock() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc_bridge_unavailable"})),
+            )
+                .into_response();
+        };
+        let mut candidate = bridge.clone();
+        candidate
+            .observe(&snapshot)
+            .map(|outcome| (candidate, outcome))
+    };
+    let (candidate, outcome) = match outcome {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut events = outcome.events;
+    let failure_event = events
+        .iter()
+        .find(|event| event.kind == "session.failed")
+        .cloned();
+    let staged_event = failure_event.as_ref().map(|event| {
+        json!({
+            "type": event.kind,
+            "event_id": event.payload.get("event_id").and_then(Value::as_str).unwrap_or_default(),
+            "staged": true,
+        })
+    });
+    let has_failure = staged_event.is_some();
+    let staged_failure = if has_failure && let Some(lane_id) = push_lane_id.as_deref() {
+        let Some(store) = state.gjc_store.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc lane store unavailable"})),
+            )
+                .into_response();
+        };
+        let Some(current) = store.record(lane_id) else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc lane record unavailable"})),
+            )
+                .into_response();
+        };
+        if store
+            .stage_bridge_failure(
+                lane_id,
+                current.revision,
+                failure_event.as_ref().expect("failure event checked"),
+                &crate::gjc_lane::now_rfc3339(),
+            )
+            .is_err()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc failure staging unavailable"})),
+            )
+                .into_response();
+        }
+        true
+    } else {
+        false
+    };
+    if staged_failure {
+        events.retain(|event| event.kind != "session.failed");
+    }
+    let mut emitted = staged_event.into_iter().collect::<Vec<_>>();
+    let mut rejected = Vec::new();
+    for event in events {
+        let kind = event.kind.clone();
+        let event_id = event
+            .payload
+            .get("event_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let response = accept_event(&state, normalize_event(event)).await;
+        if response.status().is_success() {
+            emitted.push(json!({"type": kind, "event_id": event_id}));
+        } else {
+            rejected.push(json!({"type": kind, "event_id": event_id}));
+        }
+    }
+    let mut record = telemetry::record(
+        "gjc_bridge_snapshot",
+        if rejected.is_empty() {
+            "gjc_bridge_accepted"
+        } else {
+            "gjc_bridge_partial"
+        },
+        format!("gjc-{session_id}"),
+    );
+    record.insert(
+        "details".to_string(),
+        json!({
+            "session_id": session_id,
+            "revision": revision,
+            "emitted": emitted.len(),
+            "rejected": rejected.len(),
+            "duplicate": outcome.duplicate,
+            "stale": outcome.stale,
+        }),
+    );
+    telemetry::emit(record);
+
+    let response_status = if rejected.is_empty() {
+        if !staged_failure
+            && let Some(lane_id) = push_lane_id.as_deref()
+            && let Some(store) = &state.gjc_store
+            && let Some(current) = store.record(lane_id)
+            && store
+                .set_sdk_revision_if(
+                    lane_id,
+                    current.sdk_revision,
+                    revision,
+                    &crate::gjc_lane::now_rfc3339(),
+                )
+                .is_err()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc bridge watermark conflict"})),
+            )
+                .into_response();
+        }
+        if let Ok(mut bridge) = gjc_bridge_slot().lock() {
+            *bridge = candidate;
+        } else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "gjc_bridge_unavailable"})),
+            )
+                .into_response();
+        }
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let totals = gjc_bridge_slot()
+        .lock()
+        .map(|bridge| bridge.stats())
+        .unwrap_or_default();
+    (
+        response_status,
+        Json(json!({
+            "ok": rejected.is_empty(),
+            "session_id": session_id,
+            "revision": revision,
+            "duplicate": outcome.duplicate,
+            "stale": outcome.stale,
+            "emitted": emitted,
+            "rejected": rejected,
+            "totals": totals,
+        })),
+    )
+        .into_response()
 }
 
 fn native_payload_is_non_git(payload: &Value) -> bool {
@@ -1526,6 +2596,9 @@ fn local_control_error() -> (StatusCode, Json<Value>) {
 
 fn is_loopback_host(host: &str) -> bool {
     let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
     host.parse::<std::net::IpAddr>().is_ok_and(|ip| {
         ip.is_loopback()
             || matches!(ip, std::net::IpAddr::V6(ip) if ip.to_ipv4().is_some_and(|ip| ip.is_loopback()))
@@ -1597,6 +2670,11 @@ impl<S: Send + Sync> FromRequestParts<S> for LoopbackLanePeer {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
+        if parts.uri.path().starts_with("/api/gjc/") {
+            return SubscriptionControlRequest::from_request_parts(parts, _state)
+                .await
+                .map(|_| Self);
+        }
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
@@ -2154,6 +3232,11 @@ async fn enqueue_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_gjc_plane() -> crate::gjc::control::GjcControlPlane {
+        crate::gjc::control::GjcControlPlane::unavailable(
+            crate::gjc::control::new_shared_command_registry(),
+        )
+    }
     use crate::config::AppConfig;
     use crate::config::{CronJob, CronJobKind};
     use crate::events::{MessageFormat, RoutingMetadata};
@@ -2161,6 +3244,7 @@ mod tests {
     use crate::sink::SinkTarget;
     use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
+    use futures_util::{SinkExt, StreamExt};
     use serial_test::serial;
 
     use std::fs;
@@ -2182,6 +3266,9 @@ mod tests {
                 discord_watch_lock: Arc::new(Mutex::new(())),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
                 git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+                gjc: test_gjc_plane(),
+                gjc_store: None,
+                gjc_reconciler: None,
             },
             rx,
         )
@@ -2194,6 +3281,16 @@ mod tests {
             parts
                 .extensions
                 .insert(ConnectInfo(address.parse::<SocketAddr>().unwrap()));
+            parts
+                .headers
+                .insert(axum::http::header::HOST, "127.0.0.1:25294".parse().unwrap());
+            parts.headers.insert(
+                axum::http::header::ORIGIN,
+                "http://127.0.0.1:25294".parse().unwrap(),
+            );
+            parts
+                .headers
+                .insert(LOCAL_CONTROL_HEADER, "1".parse().unwrap());
             assert!(
                 LoopbackLanePeer::from_request_parts(&mut parts, &())
                     .await
@@ -2327,6 +3424,9 @@ mod tests {
                 discord_watch_lock: Arc::new(Mutex::new(())),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
                 git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+                gjc: test_gjc_plane(),
+                gjc_store: None,
+                gjc_reconciler: None,
             },
             rx,
         )
@@ -2677,6 +3777,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -2795,6 +3898,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -2859,6 +3965,150 @@ mod tests {
         );
         assert!(payload["native_hooks"]["totals"]["received"].is_number());
         assert_eq!(payload["token_precedence_warning"], Value::Null);
+        assert_eq!(payload["http_routes_configured"], Value::Bool(false));
+        assert_eq!(payload["expected_discord_bot_id"], Value::Null);
+
+        // Deployment drift is only detectable if the running binary reports
+        // which revision it was built from, not just the crate version.
+        let build = &payload["build"];
+        assert_eq!(build["version"], Value::String(VERSION.to_string()));
+        assert!(build["dirty"].is_boolean());
+        assert!(
+            matches!(
+                build["commit_source"].as_str(),
+                Some("git" | "environment" | "unavailable")
+            ),
+            "unexpected build commit source: {build}"
+        );
+        assert_eq!(
+            build["commit"].is_null(),
+            build["short_commit"].is_null(),
+            "build revision fields must agree: {build}"
+        );
+        if let Some(commit) = build["commit"].as_str() {
+            assert!(commit.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(commit.starts_with(build["short_commit"].as_str().unwrap()));
+        }
+        // The stamp must stay public-safe: no paths, branches, or hostnames.
+        let rendered = build.to_string();
+        assert!(!rendered.contains('/'), "build stamp leaked a path");
+    }
+
+    #[test]
+    fn health_payload_surfaces_expected_discord_bot_id_when_configured() {
+        let mut config = AppConfig::default();
+        config.providers.discord.bot_token = Some("config-token".into());
+        config.providers.discord.expected_bot_id = Some("900000000000000101".into());
+
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
+            &[],
+            GitMonitorLifecycleCounts::default(),
+        );
+
+        // The health payload exposes only the public-safe expected bot ID —
+        // never the token. `ok` semantics stay unchanged: identity
+        // verification itself is the fail-closed CLI preflight's job.
+        assert_eq!(
+            payload["expected_discord_bot_id"],
+            Value::String("900000000000000101".to_string())
+        );
+        let rendered = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !rendered.contains("config-token"),
+            "token leaked: {rendered}"
+        );
+        assert_eq!(payload["ok"], Value::Bool(true));
+    }
+
+    #[test]
+    fn tmux_watch_coverage_diagnostics_do_not_degrade_daemon_health() {
+        let payload = health_payload(
+            &AppConfig::default(),
+            25294,
+            1,
+            snapshot_shared(&new_shared_native_hook_observability()),
+            json!({
+                "watch_coverage": {
+                    "live_lane_count": 2,
+                    "registered_live_lane_count": 1,
+                    "unregistered_live_lane_count": 1,
+                    "unregistered_live_lane_sample": ["gc-pr-5280-lane"]
+                }
+            }),
+            &[],
+            GitMonitorLifecycleCounts::default(),
+        );
+
+        assert_eq!(payload["ok"], Value::Bool(true));
+        assert_eq!(
+            payload["tmux"]["watch_coverage"]["unregistered_live_lane_count"],
+            Value::from(1)
+        );
+        assert_eq!(
+            payload["tmux"]["watch_coverage"]["unregistered_live_lane_sample"],
+            json!(["gc-pr-5280-lane"])
+        );
+    }
+
+    #[test]
+    fn health_payload_surfaces_gjc_state_without_endpoints_or_tokens() {
+        let mut config = AppConfig::default();
+        config.gjc.enabled = true;
+
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
+            &[],
+            GitMonitorLifecycleCounts::default(),
+        );
+
+        assert_eq!(payload["gjc"]["enabled"], Value::Bool(true));
+        assert_eq!(payload["gjc"]["question_subscription"], Value::Bool(false));
+
+        // Redaction assertions: the health surface carries flags only — the
+        // SDK endpoint URL and token live in the 0600 worktree metadata file
+        // (landed #322 transport) and must never reach health output.
+        assert_eq!(
+            payload["gjc"],
+            json!({"enabled": true, "question_subscription": false})
+        );
+    }
+
+    #[test]
+    fn health_payload_reports_http_routes_without_exposing_endpoint() {
+        let mut config = AppConfig::default();
+        config.providers.http.endpoint =
+            Some("https://controller.example/webhooks/clawhip-controller?token=secret".into());
+        config.providers.http.hmac_secret_env = Some("HERMES_CLAWHIP_HMAC_SECRET".into());
+        config.routes.push(RouteRule {
+            event: "*".into(),
+            sink: "http".into(),
+            ..RouteRule::default()
+        });
+
+        let payload = health_payload(
+            &config,
+            25294,
+            0,
+            snapshot_shared(&new_shared_native_hook_observability()),
+            json!({}),
+            &[],
+            GitMonitorLifecycleCounts::default(),
+        );
+        let rendered = serde_json::to_string(&payload).unwrap();
+
+        assert_eq!(payload["http_routes_configured"], Value::Bool(true));
+        assert!(!rendered.contains("controller.example"));
+        assert!(!rendered.contains("clawhip-controller"));
+        assert!(!rendered.contains("secret"));
     }
 
     #[tokio::test]
@@ -3232,6 +4482,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -3273,6 +4526,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let event = IncomingEvent {
             kind: "tool.post".into(),
@@ -3307,6 +4563,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let event = IncomingEvent::agent_started(
             "worker-1".into(),
@@ -3353,6 +4612,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -3410,6 +4672,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -3472,6 +4737,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = accept_event(
@@ -3532,6 +4800,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let event = |id: &str| IncomingEvent {
@@ -3590,6 +4861,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -3620,6 +4894,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let payload = json!({"provider": "codex", "event_name": "Bogus"});
 
@@ -3649,6 +4926,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -3692,6 +4972,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = post_native_hook(State(state), Json(payload))
@@ -3734,6 +5017,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let payload = json!({
             "provider": "codex",
@@ -3805,6 +5091,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let payload = json!({
             "provider": "claude-code",
@@ -3973,6 +5262,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
         let dir = tempdir().expect("tempdir");
         let payload = json!({
@@ -4063,6 +5355,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = list_tmux(State(state)).await.into_response();
@@ -4111,6 +5406,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -4144,6 +5442,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -4170,6 +5471,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = approve_update(State(state)).await.into_response();
@@ -4208,6 +5512,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = dismiss_update(State(state)).await.into_response();
@@ -4234,6 +5541,9 @@ mod tests {
             discord_watch_lock: Arc::new(Mutex::new(())),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
+            gjc: test_gjc_plane(),
+            gjc_store: None,
+            gjc_reconciler: None,
         };
 
         let response = dismiss_update(State(state)).await.into_response();
@@ -4242,5 +5552,263 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn gjc_handlers_fail_closed_and_validate_before_transport() {
+        let (state, _rx) = native_hook_test_state();
+
+        // Capabilities surface is honest about the missing transport.
+        let response = gjc_capabilities(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["transport_implemented"], Value::Bool(false));
+        assert_eq!(body["capabilities"], json!([]));
+
+        // Legacy configurations without lane reconciliation retain the
+        // daemon-CWD control boundary; this test plane has no transport.
+        let response = gjc_session_query(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            axum::extract::Path("sess-1".into()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_code"], "transport_unavailable");
+
+        // Local validation runs before the transport check.
+        let invalid = crate::gjc::api::PromptDto {
+            base: crate::gjc::api::MutationDto {
+                session: "sess-1".into(),
+                idempotency_key: "short".into(),
+                expected_session: None,
+                timeout_ms: None,
+            },
+            prompt: "hello".into(),
+        };
+        let response = gjc_prompt(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            Json(invalid),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_code"], "invalid_request");
+
+        // Well-formed mutations still fail closed when the session is not
+        // enrolled; no daemon-CWD transport is consulted.
+        let valid = crate::gjc::api::PromptDto {
+            base: crate::gjc::api::MutationDto {
+                session: "sess-1".into(),
+                idempotency_key: "idem-key-e2e1".into(),
+                expected_session: Some("sess-1".into()),
+                timeout_ms: None,
+            },
+            prompt: "hello".into(),
+        };
+        let response = gjc_prompt(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            Json(valid),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Receipt lookups require a session before key resolution.
+        let response = gjc_command_receipt(
+            SubscriptionControlRequest,
+            State(state.clone()),
+            axum::extract::Path("idem-key-missing".into()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = gjc_command_receipt(
+            SubscriptionControlRequest,
+            State(state),
+            axum::extract::Path("bad key!".into()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gjc_session_query_uses_enrolled_external_worktree() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut stream) = websocket.split();
+            sink.send(tokio_tungstenite::tungstenite::Message::text(
+                r#"{"type":"hello","connectionId":"external-query"}"#,
+            ))
+            .await
+            .unwrap();
+            let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(request))) =
+                stream.next().await
+            else {
+                return;
+            };
+            let request: Value = serde_json::from_str(request.as_ref()).unwrap();
+            sink.send(tokio_tungstenite::tungstenite::Message::text(
+                json!({
+                    "type": "query_response",
+                    "id": request["id"],
+                    "ok": true,
+                    "result": {
+                        "metadata": {
+                            "session_id": "external-session",
+                            "title": "external lane"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let worktree = tempdir().unwrap();
+        let sdk_dir = worktree.path().join(".gjc").join("state").join("sdk");
+        fs::create_dir_all(&sdk_dir).unwrap();
+        let metadata = sdk_dir.join("external-session.json");
+        fs::write(
+            &metadata,
+            json!({
+                "version": 1,
+                "sessionId": "external-session",
+                "url": format!("ws://{address}/"),
+                "token": "external-token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&metadata, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let lane_state = tempdir().unwrap();
+        let store = Arc::new(GjcLaneStore::open(&lane_state.path().join("lanes.json")).unwrap());
+        store
+            .register_lane(
+                &GjcLaneRegistrationRequest {
+                    sdk_session_id: "external-session".into(),
+                    worktree: Some(worktree.path().display().to_string()),
+                    endpoint_generation: None,
+                    owner_id: None,
+                    pr: None,
+                },
+                "2026-08-29T00:00:00Z",
+            )
+            .unwrap();
+        let (mut state, _rx) = native_hook_test_state();
+        state.gjc_store = Some(store);
+
+        let response = gjc_session_query(
+            SubscriptionControlRequest,
+            State(state),
+            axum::extract::Path("external-session".into()),
+            Query(std::collections::HashMap::from([(
+                "sections".into(),
+                "metadata".into(),
+            )])),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["metadata"]["title"], "external lane");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gjc_handlers_reject_unbound_and_retired_sessions() {
+        let lane_state = tempdir().unwrap();
+        let store = Arc::new(GjcLaneStore::open(&lane_state.path().join("lanes.json")).unwrap());
+        store
+            .register_lane(
+                &GjcLaneRegistrationRequest {
+                    sdk_session_id: "unbound-session".into(),
+                    worktree: None,
+                    endpoint_generation: None,
+                    owner_id: None,
+                    pr: None,
+                },
+                "2026-08-29T00:00:00Z",
+            )
+            .unwrap();
+        let retired = store
+            .register_lane(
+                &GjcLaneRegistrationRequest {
+                    sdk_session_id: "retired-session".into(),
+                    worktree: Some("/tmp/retired-worktree".into()),
+                    endpoint_generation: None,
+                    owner_id: None,
+                    pr: None,
+                },
+                "2026-08-29T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .retire_lane(
+                &retired.lane_id,
+                retired.revision,
+                "test retirement",
+                "2026-08-29T00:00:01Z",
+            )
+            .unwrap();
+
+        let (mut state, _rx) = native_hook_test_state();
+        state.gjc_store = Some(store);
+        for session in ["unbound-session", "retired-session"] {
+            let response = gjc_prompt(
+                SubscriptionControlRequest,
+                State(state.clone()),
+                Json(crate::gjc::api::PromptDto {
+                    base: crate::gjc::api::MutationDto {
+                        session: session.into(),
+                        idempotency_key: format!("idem-{session}-0001"),
+                        expected_session: None,
+                        timeout_ms: None,
+                    },
+                    prompt: "hello".into(),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error_code"], "session_not_found");
+        }
     }
 }

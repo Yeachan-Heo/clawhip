@@ -1169,7 +1169,9 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
 
-        let before_sparse_probe = probe_at - Duration::from_secs(1);
+        let before_sparse_probe = probe_at
+            .checked_sub(Duration::from_secs(1))
+            .expect("quarantine retry instant is at least one second past boot");
         poll_git_at(&config, &tx, &mut state, &diagnostics, before_sparse_probe)
             .await
             .unwrap();
