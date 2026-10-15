@@ -8432,6 +8432,172 @@ mod tests {
     }
 
     #[test]
+    fn issue_opened_at_exact_watermark_boundary() {
+        // Boundary regression: GitHub timestamps have 1-second precision.
+        // Test that an issue created at exactly the watermark timestamp is emitted.
+        // This verifies >= comparison (not >), which is critical at second boundaries.
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            emit_issue_opened: true,
+            ..GitRepoMonitor::default()
+        };
+
+        let previous: HashMap<u64, IssueSnapshot> = HashMap::new();
+
+        let mut current = HashMap::new();
+        current.insert(
+            1,
+            IssueSnapshot {
+                title: "issue at boundary".into(),
+                state: "open".into(),
+                comments: 0,
+                created_at: "2026-10-15T10:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
+                closed_at: None,
+            },
+        );
+
+        let last_poll_time = "2026-10-15T10:00:00Z"; // Exact same timestamp
+        let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
+
+        let events = test_collect_issue_events_with_comments_helper(
+            &repo,
+            "clawhip",
+            &previous,
+            &current,
+            Some(last_poll_time),
+            &api_comments,
+        );
+
+        let has_opened = events
+            .iter()
+            .any(|e| e.canonical_kind() == "github.issue-opened");
+        assert!(
+            has_opened,
+            "Issue created at boundary timestamp must emit (uses >= not >)"
+        );
+    }
+
+    #[test]
+    fn comment_at_exact_watermark_boundary_emitted() {
+        // Boundary regression: GitHub timestamps have 1-second precision.
+        // Test that a comment created at exactly the watermark timestamp is emitted.
+        // This verifies >= comparison (not >), which is critical at second boundaries.
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        let mut previous = HashMap::new();
+        previous.insert(
+            10,
+            IssueSnapshot {
+                title: "issue".into(),
+                state: "open".into(),
+                comments: 0,
+                created_at: "2026-10-01T00:00:00Z".into(),
+                updated_at: "2026-10-01T00:00:00Z".into(),
+                closed_at: None,
+            },
+        );
+
+        let mut current = HashMap::new();
+        current.insert(
+            10,
+            IssueSnapshot {
+                title: "issue".into(),
+                state: "open".into(),
+                comments: 1,
+                created_at: "2026-10-01T00:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
+                closed_at: None,
+            },
+        );
+
+        let last_poll_time = "2026-10-15T10:00:00Z";
+
+        // Comment created at exactly the watermark timestamp
+        let mut api_comments = HashMap::new();
+        api_comments.insert(
+            10,
+            vec![GitHubComment {
+                id: 1,
+                issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
+                html_url: "https://github.com/org/repo/issues/10#issuecomment-1".into(),
+                created_at: "2026-10-15T10:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
+                body: "Comment at boundary".into(),
+            }],
+        );
+
+        let events = test_collect_issue_events_with_comments_helper(
+            &repo,
+            "clawhip",
+            &previous,
+            &current,
+            Some(last_poll_time),
+            &api_comments,
+        );
+
+        let has_commented = events
+            .iter()
+            .any(|e| e.canonical_kind() == "github.issue-commented");
+        assert!(
+            has_commented,
+            "Comment at boundary timestamp must emit (uses >= not >)"
+        );
+    }
+
+    #[test]
+    fn issue_closed_at_exact_watermark_boundary() {
+        // Boundary regression: GitHub timestamps have 1-second precision.
+        // Test that an issue closed at exactly the watermark timestamp is emitted.
+        // This verifies >= comparison (not >), which is critical at second boundaries.
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        let previous: HashMap<u64, IssueSnapshot> = HashMap::new();
+
+        let mut current = HashMap::new();
+        current.insert(
+            5,
+            IssueSnapshot {
+                title: "closed issue".into(),
+                state: "closed".into(),
+                comments: 0,
+                created_at: "2026-10-01T00:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
+                closed_at: Some("2026-10-15T10:00:00Z".into()),
+            },
+        );
+
+        let last_poll_time = "2026-10-15T10:00:00Z"; // Exact same timestamp as close
+        let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
+
+        let events = test_collect_issue_events_with_comments_helper(
+            &repo,
+            "clawhip",
+            &previous,
+            &current,
+            Some(last_poll_time),
+            &api_comments,
+        );
+
+        let has_closed = events
+            .iter()
+            .any(|e| e.canonical_kind() == "github.issue-closed");
+        assert!(
+            has_closed,
+            "Issue closed at boundary timestamp must emit (uses >= not >)"
+        );
+    }
+
+    #[test]
     fn dedup_same_comment_across_consecutive_polls() {
         // Test that a comment appearing in two consecutive polls is emitted only once,
         // preventing duplicates despite synchronization timing differences between
