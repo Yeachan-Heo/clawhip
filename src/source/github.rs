@@ -649,6 +649,7 @@ const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
 const MAX_BASELINE_RUNS_PER_REPO: usize = CI_PAGE_SIZE * MAX_CI_PAGES;
 const MAX_EMITTED_COMMENT_IDS: usize = 1000;
+const MAX_EMITTED_OPENED_CLOSED: usize = 500;
 /// Hard bound on protected current-window identities per repo. The fetched
 /// window is normally at most [`MAX_BASELINE_RUNS_PER_REPO`] runs, but each
 /// run can contribute several durable aliases (attempt-qualified run ids,
@@ -2519,37 +2520,36 @@ async fn poll_issues(
             // Fetch real comments from the API for proper issue-commented detection.
             // This is the source of truth for detecting new comments on issues,
             // including old issues that re-enter the window.
-            let (api_comments, _comments_complete, max_comment_timestamp) = if let Some(client) =
-                github_client
-            {
-                // Use separate comment cursor for advancing comment watermark
-                let comment_watermark = previous.and_then(|p| p.comment_cursor.as_deref());
-                // Fallback to issue cursor on first poll if comment cursor not yet established
-                let comment_watermark =
-                    comment_watermark.or_else(|| previous.and_then(|p| p.issue_cursor.as_deref()));
-                match fetch_issue_comments(
-                    client,
-                    &config.monitors.github_api_base,
-                    repo,
-                    snapshot,
-                    comment_watermark,
-                    &[], // Empty PR list for now; filtered by html_url in fetch_issue_comments
-                )
-                .await
-                {
-                    Ok((comments, complete, max_ts)) => (comments, complete, max_ts),
-                    Err(error) => {
-                        // If comments fetch fails, we'll fall back to comment-count delta
-                        eprintln!(
-                            "clawhip source GitHub issue comments fetch failed for {}: {error}; falling back to comment-count delta",
-                            repo.path
-                        );
-                        (HashMap::new(), true, None)
+            let (api_comments, _comments_complete, max_comment_timestamp) =
+                if let Some(client) = github_client {
+                    // Use separate comment cursor for advancing comment watermark
+                    let comment_watermark = previous.and_then(|p| p.comment_cursor.as_deref());
+                    // Fallback to issue cursor on first poll if comment cursor not yet established
+                    let comment_watermark = comment_watermark
+                        .or_else(|| previous.and_then(|p| p.issue_cursor.as_deref()));
+                    match fetch_issue_comments(
+                        client,
+                        &config.monitors.github_api_base,
+                        repo,
+                        snapshot,
+                        comment_watermark,
+                        &[], // Empty PR list for now; filtered by html_url in fetch_issue_comments
+                    )
+                    .await
+                    {
+                        Ok((comments, complete, max_ts)) => (comments, complete, max_ts),
+                        Err(error) => {
+                            // If comments fetch fails, emit no comment events.
+                            eprintln!(
+                                "clawhip source GitHub issue comments fetch failed for {}: {error}",
+                                repo.path
+                            );
+                            (HashMap::new(), true, None)
+                        }
                     }
-                }
-            } else {
-                (HashMap::new(), true, None)
-            };
+                } else {
+                    (HashMap::new(), true, None)
+                };
 
             let mut emitted_comment_ids = previous
                 .map(|p| p.emitted_comment_ids.clone())
@@ -2576,6 +2576,8 @@ async fn poll_issues(
                     send_event(tx, event).await?;
                 }
             }
+            prune_emitted_opened_closed(&mut emitted_opened);
+            prune_emitted_opened_closed(&mut emitted_closed);
             Ok((
                 merged_issues,
                 true,
@@ -2973,6 +2975,18 @@ fn test_collect_issue_events_with_dedup(
     )
 }
 
+/// Prune emitted_opened/emitted_closed to stay within MAX_EMITTED_OPENED_CLOSED.
+fn prune_emitted_opened_closed(set: &mut HashSet<(u64, String)>) {
+    if set.len() > MAX_EMITTED_OPENED_CLOSED {
+        let mut entries: Vec<_> = set.drain().collect();
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        let to_remove = entries.len() - MAX_EMITTED_OPENED_CLOSED;
+        for entry in entries.into_iter().skip(to_remove) {
+            set.insert(entry);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_issue_events_with_comments(
     repo: &GitRepoMonitor,
@@ -2986,7 +3000,6 @@ fn collect_issue_events_with_comments(
     emitted_closed: &mut HashSet<(u64, String)>,
 ) -> Vec<IncomingEvent> {
     let mut events = Vec::new();
-    let mut commented_via_api = std::collections::HashSet::new();
     let emitted_ids_set: HashSet<u64> = emitted_comment_ids.iter().copied().collect();
 
     // First pass: process open/close events (lifecycle events)
@@ -3068,7 +3081,6 @@ fn collect_issue_events_with_comments(
         for comment in comments {
             // Only emit if comment ID not in emitted set
             if !emitted_ids_set.contains(&comment.id) {
-                commented_via_api.insert(*issue_num);
                 events.push(
                     IncomingEvent::github_issue_commented(
                         repo_name.to_string(),
@@ -3097,26 +3109,6 @@ fn collect_issue_events_with_comments(
         }
     }
 
-    // Third pass: process comment delta for issues in history.
-    // Use this fallback only if we didn't already emit via API comments (e.g., fetch failed).
-    #[allow(clippy::collapsible_if)]
-    for (number, issue) in current {
-        if let Some(old) = previous.get(number) {
-            if !commented_via_api.contains(number) && issue.comments > old.comments {
-                events.push(
-                    IncomingEvent::github_issue_commented(
-                        repo_name.to_string(),
-                        *number,
-                        issue.title.clone(),
-                        issue.comments,
-                        repo.channel.clone(),
-                    )
-                    .with_mention(repo.mention.clone())
-                    .with_format(repo.format.clone()),
-                );
-            }
-        }
-    }
     events
 }
 
@@ -3911,9 +3903,19 @@ impl GitHubComment {
             .and_then(|s| s.parse().ok())
     }
 
-    /// Check if this comment is on a PR by checking if html_url contains /pull/
+    /// Check if this comment is on a PR by parsing the URL path.
+    /// URL format for issues: https://github.com/owner/repo/issues/123#issuecomment-xxx
+    /// URL format for PRs: https://github.com/owner/repo/pull/456#issuecomment-xxx
     fn is_pr_comment(&self) -> bool {
-        self.html_url.contains("/pull/")
+        if let Some(path_start) = self.html_url.find(".com/") {
+            let path_part = &self.html_url[path_start + 5..];
+            let path_only = path_part.split('#').next().unwrap_or("");
+            let segments: Vec<&str> = path_only.split('/').collect();
+            if segments.len() >= 3 {
+                return segments[2] == "pull";
+            }
+        }
+        false
     }
 }
 
@@ -4181,52 +4183,6 @@ mod tests {
         assert_eq!(channel, "route-channel");
         assert!(content.starts_with("<@1465264645320474637> "));
         assert!(content.contains("live issue"));
-    }
-
-    #[test]
-    fn issue_comment_and_close_events_are_emitted() {
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-        let previous = [(
-            2_u64,
-            IssueSnapshot {
-                title: "live issue".into(),
-                state: "open".into(),
-                comments: 0,
-                created_at: "2026-10-01T10:00:00Z".into(),
-                updated_at: "2026-10-01T10:00:00Z".into(),
-                closed_at: None,
-            },
-        )]
-        .into_iter()
-        .collect();
-        let current = [(
-            2_u64,
-            IssueSnapshot {
-                title: "live issue".into(),
-                state: "closed".into(),
-                comments: 1,
-                created_at: "2024-06-15T12:00:00Z".into(),
-                updated_at: "2024-06-15T12:30:00Z".into(),
-                closed_at: Some("2024-06-15T12:30:00Z".into()),
-            },
-        )]
-        .into_iter()
-        .collect();
-        let events = collect_issue_events(&repo, "clawhip", &previous, &current, None);
-        assert!(
-            events
-                .iter()
-                .any(|event| event.canonical_kind() == "github.issue-commented")
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| event.canonical_kind() == "github.issue-closed")
-        );
     }
 
     fn ci_snapshot(
@@ -7966,65 +7922,6 @@ mod tests {
     }
 
     #[test]
-    fn fetch_issues_sorts_by_updated_to_detect_old_issue_comments() {
-        // Regression test for issue #380: detect comments on older issues.
-        // When repos have 100+ issues/PRs combined, sorting by created (default)
-        // means old issues fall off the first page. If an old issue gets a comment,
-        // it stays at the bottom of the created sort, so comment activity is missed.
-        //
-        // FIX: Sort by updated (desc) so recently-modified issues (including
-        // commented-on issues) always appear near the top, within the first 100.
-        //
-        // This test verifies the consequence: if issue #10 (old issue with
-        // a new comment) is fetched, the comment delta is detected.
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        // Previous state: issue #10 with 0 comments
-        let mut previous = HashMap::new();
-        previous.insert(
-            10,
-            IssueSnapshot {
-                title: "old issue".into(),
-                state: "open".into(),
-                comments: 0,
-                created_at: "2024-01-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T09:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        // Current state: issue #10 is now in the results (because it was recently
-        // updated) with 1 comment. With sort=updated&direction=desc, recently-
-        // commented issues appear in the first page regardless of creation date.
-        let mut current = HashMap::new();
-        current.insert(
-            10,
-            IssueSnapshot {
-                title: "old issue".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2024-01-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let events = collect_issue_events(&repo, "clawhip", &previous, &current, None);
-
-        // With sort=updated, issue #10 is included, so the comment event is detected
-        assert!(
-            events
-                .iter()
-                .any(|event| event.canonical_kind() == "github.issue-commented"),
-            "Issue #10 should emit a comment event when fetched with sort=updated"
-        );
-    }
-
-    #[test]
     fn old_issue_reentries_with_comment_not_marked_as_opened() {
         // Regression test for issue #380: when an old issue falls off the first page
         // and then re-enters the window, it should NOT be marked as issue-opened.
@@ -8416,69 +8313,6 @@ mod tests {
     }
 
     #[test]
-    fn closed_issue_receives_new_comment_allows_comment_check() {
-        // Test for F6 fix: the comment condition should be evaluated independently
-        // of the closed state. Previously, the conditions were mutually exclusive:
-        // `if closed { ... } else if comments { ... }`, so comments on closed issues
-        // were silently lost.
-        //
-        // After F6 fix, we check comments independently: both close and comment
-        // conditions are evaluated separately, not in an if-else chain.
-        //
-        // However, with F2 fix (removing the heuristic), re-entering issues
-        // don't emit issue-commented without real comment fetching.
-        // So this test verifies the structural fix (independent checks) by ensuring
-        // a closed issue that's in the history DOES emit issue-commented.
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        // Previous state: closed issue already known to have 0 comments
-        let mut previous = HashMap::new();
-        previous.insert(
-            7,
-            IssueSnapshot {
-                title: "old closed issue".into(),
-                state: "closed".into(),
-                comments: 0, // No comments before
-                created_at: "2026-09-01T00:00:00Z".into(),
-                updated_at: "2026-10-14T08:00:00Z".into(),
-                closed_at: Some("2026-10-01T00:00:00Z".into()),
-            },
-        );
-
-        // Current state: closed issue now has 1 comment
-        let mut current = HashMap::new();
-        current.insert(
-            7,
-            IssueSnapshot {
-                title: "old closed issue".into(),
-                state: "closed".into(),
-                comments: 1, // New comment added
-                created_at: "2026-09-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: Some("2026-10-01T00:00:00Z".into()),
-            },
-        );
-
-        let last_poll_time = "2026-10-14T09:00:00Z";
-        let events =
-            collect_issue_events(&repo, "clawhip", &previous, &current, Some(last_poll_time));
-
-        // With F6 fix, should emit issue-commented (comment check independent of closed)
-        // Since the issue is in history, we can compare comment counts (0 -> 1)
-        let has_commented = events
-            .iter()
-            .any(|event| event.canonical_kind() == "github.issue-commented");
-        assert!(
-            has_commented,
-            "Closed issue in history with new comment should emit issue-commented (F6 fix)"
-        );
-    }
-
-    #[test]
     fn bounded_history_deduplicates_overlap() {
         // Regression test for F7: the history cap calculation counts overlapping
         // keys twice. With 500 retained entries and an unchanged 100-item current
@@ -8861,69 +8695,6 @@ mod tests {
             commented_events.len(),
             1,
             "Should emit exactly one issue-commented event (API comments are source of truth)"
-        );
-    }
-
-    #[test]
-    fn comments_api_failed_request_falls_back_to_delta() {
-        // Test case (f): when comments API fetch fails, we fall back to comment-count delta
-        // for issues in history. This ensures we still detect comments even when the API fails.
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let mut previous = HashMap::new();
-        previous.insert(
-            10,
-            IssueSnapshot {
-                title: "issue".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T09:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let mut current = HashMap::new();
-        current.insert(
-            10,
-            IssueSnapshot {
-                title: "issue".into(),
-                state: "open".into(),
-                comments: 2, // Increased from previous
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let last_poll_time = "2026-10-15T09:00:00Z";
-
-        // Comments API is empty (fetch failed, no data)
-        let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
-
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        let commented_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.canonical_kind() == "github.issue-commented")
-            .collect();
-
-        // Should emit issue-commented via the delta (fallback when API fails)
-        assert_eq!(
-            commented_events.len(),
-            1,
-            "Should fall back to comment-count delta when API returns no results"
         );
     }
 
