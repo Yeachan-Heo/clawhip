@@ -3075,36 +3075,43 @@ fn collect_issue_events_with_comments(
     }
 
     // Second pass: emit issue-commented events from the real API comments.
-    // Only emit comments with IDs not in the emitted set.
+    // Emit exactly ONE event per issue that has unseen comments, and track ALL comment IDs.
     // This is the source of truth for new comments on both old and new issues.
     for (issue_num, comments) in api_comments {
+        let mut has_unseen_comments = false;
+
+        // First, check if this issue has any unseen comments and track all IDs
         for comment in comments {
-            // Only emit if comment ID not in emitted set
             if !emitted_ids_set.contains(&comment.id) {
-                events.push(
-                    IncomingEvent::github_issue_commented(
-                        repo_name.to_string(),
-                        *issue_num,
-                        current
-                            .get(issue_num)
-                            .map(|issue| issue.title.clone())
-                            .unwrap_or_else(|| format!("Issue #{}", issue_num)),
-                        current
-                            .get(issue_num)
-                            .map(|issue| issue.comments)
-                            .unwrap_or(comments.len() as u64),
-                        repo.channel.clone(),
-                    )
-                    .with_mention(repo.mention.clone())
-                    .with_format(repo.format.clone()),
-                );
-                // Track this comment ID to prevent re-emission
-                emitted_comment_ids.push_back(comment.id);
-                // Evict oldest ID if we exceed the max
-                while emitted_comment_ids.len() > MAX_EMITTED_COMMENT_IDS {
-                    emitted_comment_ids.pop_front();
-                }
+                has_unseen_comments = true;
             }
+            // Always track this comment ID to prevent re-emission in future polls
+            emitted_comment_ids.push_back(comment.id);
+            // Evict oldest ID if we exceed the max
+            while emitted_comment_ids.len() > MAX_EMITTED_COMMENT_IDS {
+                emitted_comment_ids.pop_front();
+            }
+        }
+
+        // Emit exactly one event per issue if it has unseen comments
+        if has_unseen_comments {
+            events.push(
+                IncomingEvent::github_issue_commented(
+                    repo_name.to_string(),
+                    *issue_num,
+                    current
+                        .get(issue_num)
+                        .map(|issue| issue.title.clone())
+                        .unwrap_or_else(|| format!("Issue #{}", issue_num)),
+                    current
+                        .get(issue_num)
+                        .map(|issue| issue.comments)
+                        .unwrap_or(comments.len() as u64),
+                    repo.channel.clone(),
+                )
+                .with_mention(repo.mention.clone())
+                .with_format(repo.format.clone()),
+            );
         }
     }
 
@@ -8425,10 +8432,10 @@ mod tests {
     }
 
     #[test]
-    fn f12_shared_cutoff_prevents_duplicate_comments() {
-        // F12: Issue and comment snapshots use different cutoffs, causing
-        // comments fetched between fetch_issues and fetch_issue_comments to be emitted twice.
-        // Test that a comment appearing in two consecutive polls is emitted once.
+    fn dedup_same_comment_across_consecutive_polls() {
+        // Test that a comment appearing in two consecutive polls is emitted only once,
+        // preventing duplicates despite synchronization timing differences between
+        // issue and comment API fetches.
         let repo = GitRepoMonitor {
             path: "/tmp/clawhip".into(),
             name: Some("clawhip".into()),
@@ -8501,8 +8508,8 @@ mod tests {
     }
 
     #[test]
-    fn f13_issue_opened_before_comment_for_new_issue() {
-        // F13: For a newly created issue with comments in the same poll,
+    fn issue_opened_before_issue_commented_for_new_issue() {
+        // For a newly created issue with comments in the same poll,
         // issue-opened should be emitted before issue-commented.
         let repo = GitRepoMonitor {
             path: "/tmp/clawhip".into(),
@@ -8573,11 +8580,10 @@ mod tests {
     }
 
     #[test]
-    fn f14_separate_comment_cursor_preserved_on_fetch_failure() {
-        // F14: When comment fetch fails, the separate last_successful_comment_poll
-        // cursor should be preserved from the previous state, not cleared.
-        // This test documents that the GitHubRepoState struct has a separate
-        // last_successful_comment_poll field and validates the cursor preservation logic.
+    fn comment_cursor_preserved_on_fetch_failure() {
+        // When comment fetch fails, the comment cursor should be preserved
+        // from the previous state, allowing the next poll to resume from the
+        // correct position instead of starting over.
 
         // Create a previous state with both issue and comment cursors set
         let previous_state = GitHubRepoState {
@@ -8624,11 +8630,10 @@ mod tests {
     }
 
     #[test]
-    fn f15_comment_cursor_used_in_normal_and_failure_paths() {
-        // F15: The comment cursor logic must be applied in both:
-        // 1. Normal success path (when fetch_succeeded is true)
-        // 2. CI-persist-failure path (when persist fails after fetch succeeds)
-        // Both paths should use the separate comment cursor.
+    fn comment_cursor_advanced_on_success_preserved_on_failure() {
+        // The comment cursor should be advanced to the latest timestamp on successful
+        // fetch, but preserved from the previous state on fetch failure. This ensures
+        // cursor progression in all code paths.
 
         let previous_state = GitHubRepoState {
             issues: HashMap::new(),
@@ -8680,12 +8685,11 @@ mod tests {
     }
 
     #[test]
-    fn f16_pr_comment_timestamp_advances_watermark() {
-        // F16: When tracking max_comment_timestamp, PR comments must be included
-        // in the watermark calculation even though they are filtered out from the
-        // issue comments result. This prevents PR comments from blocking watermark
-        // advancement.
-        // Test: verify that the timestamp tracking logic runs before the PR filter.
+    fn pr_comment_timestamp_included_in_watermark_before_filtering() {
+        // PR comments must be included in the watermark calculation even though
+        // they are filtered out from the issue comments result. The timestamp tracking
+        // logic must run before the PR filter to prevent PR comments from blocking
+        // watermark advancement in future polls.
 
         // Simulate comment sequence where PR comment has the latest timestamp
         let issue_comment_ts = "2026-10-15T10:00:00Z";
@@ -8900,10 +8904,10 @@ mod tests {
     }
 
     #[test]
-    fn g1_multiple_unseen_comments_emitted_in_same_poll() {
-        // G1: Multiple unseen comments on the same issue should all be emitted,
-        // not just the first one. Previously a `break` statement caused only the
-        // first unseen comment per issue to be emitted.
+    fn h1_exactly_one_event_per_issue_per_poll_records_all_ids() {
+        // H1: Multiple unseen comments on the same issue should result in exactly
+        // ONE issue-commented event per poll, but ALL comment IDs should be tracked
+        // in the dedupe set to prevent future re-emission.
         let repo = GitRepoMonitor {
             path: "/tmp/clawhip".into(),
             name: Some("clawhip".into()),
@@ -8986,25 +8990,26 @@ mod tests {
 
         assert_eq!(
             commented_events.len(),
-            2,
-            "Both unseen comments should be emitted, but got {}",
+            1,
+            "H1: Exactly one event per issue per poll (not one per comment), but got {}",
             commented_events.len()
         );
         assert!(
             emitted_ids.contains(&comment_id_1),
-            "Comment 1 should be tracked"
+            "Comment 1 should be tracked in dedupe set"
         );
         assert!(
             emitted_ids.contains(&comment_id_2),
-            "Comment 2 should be tracked"
+            "Comment 2 should be tracked in dedupe set"
         );
     }
 
     #[test]
-    fn g1_edited_comment_deduped_after_poll() {
-        // G1: When a comment is edited (updated_at changes) but created_at
-        // equals the prior cursor (making it appear as an old comment),
-        // the next poll should emit nothing because it's already in the dedup set.
+    fn h1_edited_comment_suppressed_by_dedup() {
+        // H1: When a comment is edited (updated_at changes) but was already
+        // seen before (in dedup set by ID), the next poll should emit nothing
+        // because the ID is already tracked. This satisfies the H1 requirement:
+        // "editing any of them later → no event".
         let repo = GitRepoMonitor {
             path: "/tmp/clawhip".into(),
             name: Some("clawhip".into()),
