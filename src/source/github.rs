@@ -1968,6 +1968,8 @@ struct GitHubRepoState {
     ci: HashMap<String, GitHubCISnapshot>,
     ci_baseline_established: bool,
     last_successful_issue_poll: Option<String>,
+    // F14 fix: separate comment cursor to preserve comments if comments fetch fails
+    last_successful_comment_poll: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2316,6 +2318,8 @@ async fn poll_github(
                             .map(|entry| entry.ci_baseline_established)
                             .unwrap_or(false),
                         last_successful_issue_poll: last_poll_time,
+                        last_successful_comment_poll: previous
+                            .and_then(|p| p.last_successful_comment_poll.clone()),
                     },
                 );
                 continue;
@@ -2345,10 +2349,10 @@ async fn poll_github(
                 .map(|s| s.to_string())
                 .unwrap_or_else(current_utc_iso8601);
 
-            let final_watermark = if let Some(comment_ts) = max_comment_timestamp {
+            let final_watermark = if let Some(comment_ts) = &max_comment_timestamp {
                 // Use the later of issue or comment timestamp
                 if comment_ts.as_str() > issue_max.as_str() {
-                    comment_ts
+                    comment_ts.clone()
                 } else {
                     issue_max
                 }
@@ -2360,6 +2364,12 @@ async fn poll_github(
             // Fetch failed: preserve previous watermark
             previous.and_then(|p| p.last_successful_issue_poll.clone())
         };
+        // F14/F15 fix: use separate comment cursor
+        let comment_cursor = if fetch_succeeded {
+            max_comment_timestamp.clone()
+        } else {
+            previous.and_then(|p| p.last_successful_comment_poll.clone())
+        };
         state.insert(
             repo.path.clone(),
             GitHubRepoState {
@@ -2368,6 +2378,7 @@ async fn poll_github(
                 ci,
                 ci_baseline_established,
                 last_successful_issue_poll: last_poll_time,
+                last_successful_comment_poll: comment_cursor,
             },
         );
     }
@@ -2437,12 +2448,16 @@ async fn poll_issues(
             let (api_comments, _comments_complete, max_comment_timestamp) = if let Some(client) =
                 github_client
             {
+                // F14 fix: use separate comment cursor, not issue cursor
+                let comment_watermark = previous
+                    .and_then(|p| p.last_successful_comment_poll.as_deref())
+                    .or_else(|| previous.and_then(|p| p.last_successful_issue_poll.as_deref()));
                 match fetch_issue_comments(
                     client,
                     &config.monitors.github_api_base,
                     repo,
                     snapshot,
-                    previous.and_then(|p| p.last_successful_issue_poll.as_deref()),
+                    comment_watermark,
                     &[], // Empty PR list for now; filtered by html_url in fetch_issue_comments
                 )
                 .await
@@ -3156,6 +3171,13 @@ async fn fetch_issue_comments(
     let mut max_comment_timestamp: Option<String> = None;
 
     for comment in comments {
+        // F16 fix: track max timestamp BEFORE filtering so PR comments advance the watermark
+        if max_comment_timestamp.is_none()
+            || comment.updated_at.as_str() > max_comment_timestamp.as_ref().unwrap().as_str()
+        {
+            max_comment_timestamp = Some(comment.updated_at.clone());
+        }
+
         // Skip PR comments
         if comment.is_pr_comment() {
             continue;
@@ -3168,13 +3190,6 @@ async fn fetch_issue_comments(
             // F10 fix: use >= instead of > for boundary timestamp
             // Only include comments created at or after the watermark
             if watermark.is_none() || comment.created_at.as_str() >= watermark_param {
-                // F12 fix: track max timestamp for watermark advancement
-                if max_comment_timestamp.is_none()
-                    || comment.updated_at.as_str()
-                        > max_comment_timestamp.as_ref().unwrap().as_str()
-                {
-                    max_comment_timestamp = Some(comment.updated_at.clone());
-                }
                 grouped.entry(issue_num).or_default().push(comment);
             }
         }
@@ -4515,6 +4530,7 @@ mod tests {
                 ci: HashMap::new(),
                 ci_baseline_established: true,
                 last_successful_issue_poll: None,
+                last_successful_comment_poll: None,
             },
         );
         let mut baseline = CIBaseline::default();
