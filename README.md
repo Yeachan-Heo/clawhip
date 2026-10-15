@@ -494,8 +494,9 @@ Verification:
 ### 3. GitHub issue commented preset
 
 Input:
-- GitHub webhook `issue_comment.created`
 - built-in GitHub issue monitor comment delta
+  (polls issues sorted by `updated` desc to detect comment changes)
+- GitHub webhook `issue_comment.created` (not yet implemented; requires signature verification)
 
 Behavior:
 - emit `github.issue-commented`
