@@ -2825,7 +2825,12 @@ async fn fetch_issues(
         client,
         api_base,
         &format!("repos/{github_repo}/issues"),
-        &[("state", "all"), ("per_page", "100")],
+        &[
+            ("state", "all"),
+            ("per_page", "100"),
+            ("sort", "updated"),
+            ("direction", "desc"),
+        ],
         &format!("issues for {github_repo}"),
     )
     .await?;
@@ -7380,5 +7385,58 @@ mod tests {
 
         source_task.abort();
         let _ = source_task.await;
+    }
+
+    #[test]
+    fn fetch_issues_sorts_by_updated_to_detect_old_issue_comments() {
+        // Regression test for issue #380: detect comments on older issues.
+        // When repos have 100+ issues/PRs combined, sorting by created (default)
+        // means old issues fall off the first page. If an old issue gets a comment,
+        // it stays at the bottom of the created sort, so comment activity is missed.
+        //
+        // FIX: Sort by updated (desc) so recently-modified issues (including
+        // commented-on issues) always appear near the top, within the first 100.
+        //
+        // This test verifies the consequence: if issue #10 (old issue with
+        // a new comment) is fetched, the comment delta is detected.
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        // Previous state: issue #10 with 0 comments
+        let mut previous = HashMap::new();
+        previous.insert(
+            10,
+            IssueSnapshot {
+                title: "old issue".into(),
+                state: "open".into(),
+                comments: 0,
+            },
+        );
+
+        // Current state: issue #10 is now in the results (because it was recently
+        // updated) with 1 comment. With sort=updated&direction=desc, recently-
+        // commented issues appear in the first page regardless of creation date.
+        let mut current = HashMap::new();
+        current.insert(
+            10,
+            IssueSnapshot {
+                title: "old issue".into(),
+                state: "open".into(),
+                comments: 1,
+            },
+        );
+
+        let events = collect_issue_events(&repo, "clawhip", &previous, &current);
+
+        // With sort=updated, issue #10 is included, so the comment event is detected
+        assert!(
+            events
+                .iter()
+                .any(|event| event.canonical_kind() == "github.issue-commented"),
+            "Issue #10 should emit a comment event when fetched with sort=updated"
+        );
     }
 }
