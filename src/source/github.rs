@@ -1959,6 +1959,7 @@ struct GitHubRepoState {
     prs: HashMap<u64, PullRequestSnapshot>,
     ci: HashMap<String, GitHubCISnapshot>,
     ci_baseline_established: bool,
+    last_successful_issue_poll: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1966,6 +1967,8 @@ struct IssueSnapshot {
     title: String,
     state: String,
     comments: u64,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Clone)]
@@ -2273,6 +2276,12 @@ async fn poll_github(
                     "clawhip source github CI baseline persist failed for {}: {error}",
                     repo.path
                 );
+                let last_poll_time = issues
+                    .values()
+                    .map(|issue| issue.updated_at.as_str())
+                    .max()
+                    .map(|s| s.to_string())
+                    .or_else(|| previous.and_then(|p| p.last_successful_issue_poll.clone()));
                 state.insert(
                     repo.path.clone(),
                     GitHubRepoState {
@@ -2282,6 +2291,7 @@ async fn poll_github(
                         ci_baseline_established: previous
                             .map(|entry| entry.ci_baseline_established)
                             .unwrap_or(false),
+                        last_successful_issue_poll: last_poll_time,
                     },
                 );
                 continue;
@@ -2301,6 +2311,12 @@ async fn poll_github(
             send_then_ack_prefix(tx, ci_baseline, ci_baseline_path, ci_events, &delivered).await?;
         }
 
+        let last_poll_time = issues
+            .values()
+            .map(|issue| issue.updated_at.as_str())
+            .max()
+            .map(|s| s.to_string())
+            .or_else(|| previous.and_then(|p| p.last_successful_issue_poll.clone()));
         state.insert(
             repo.path.clone(),
             GitHubRepoState {
@@ -2308,6 +2324,7 @@ async fn poll_github(
                 prs,
                 ci,
                 ci_baseline_established,
+                last_successful_issue_poll: last_poll_time,
             },
         );
     }
@@ -2337,14 +2354,37 @@ async fn poll_issues(
 
     match fetch_issues(client, &config.monitors.github_api_base, repo, snapshot).await {
         Ok(issues) => {
+            // Merge newly fetched issues with history to retain information about
+            // issues that have cycled out of the first page. Bound the history to prevent
+            // unbounded growth: keep current page (~100 issues) plus a buffer of older
+            // entries to handle issues cycling in/out for ~1-2 weeks. Limit to 500 total.
+            const MAX_ISSUE_HISTORY: usize = 500;
+            let mut merged_issues = previous
+                .map(|entry| entry.issues.clone())
+                .unwrap_or_default();
+            // Remove oldest entries if we'd exceed the bound after merging
+            if merged_issues.len() + issues.len() > MAX_ISSUE_HISTORY {
+                // Sort by updated_at (oldest first) and drop old entries
+                let mut to_keep: Vec<_> = merged_issues.into_iter().collect();
+                to_keep.sort_by(|a, b| a.1.updated_at.cmp(&b.1.updated_at));
+                let excess = to_keep.len() + issues.len() - MAX_ISSUE_HISTORY;
+                to_keep.drain(0..excess);
+                merged_issues = to_keep.into_iter().collect();
+            }
+            merged_issues.extend(issues.clone());
+
             if let Some(previous) = previous {
-                for event in
-                    collect_issue_events(repo, &snapshot.repo_name, &previous.issues, &issues)
-                {
+                for event in collect_issue_events(
+                    repo,
+                    &snapshot.repo_name,
+                    &previous.issues,
+                    &issues,
+                    previous.last_successful_issue_poll.as_deref(),
+                ) {
                     send_event(tx, event).await?;
                 }
             }
-            Ok(issues)
+            Ok(merged_issues)
         }
         Err(error) => {
             if emit_source_degraded(Some(&repo.path), &error.to_string()) {
@@ -2657,20 +2697,47 @@ fn collect_issue_events(
     repo_name: &str,
     previous: &HashMap<u64, IssueSnapshot>,
     current: &HashMap<u64, IssueSnapshot>,
+    last_poll_time: Option<&str>,
 ) -> Vec<IncomingEvent> {
     let mut events = Vec::new();
     for (number, issue) in current {
         match previous.get(number) {
-            None => events.push(
-                IncomingEvent::github_issue_opened(
-                    repo_name.to_string(),
-                    *number,
-                    issue.title.clone(),
-                    repo.channel.clone(),
-                )
-                .with_mention(repo.mention.clone())
-                .with_format(repo.format.clone()),
-            ),
+            None => {
+                // Issue is not in history. It could be newly created or an old issue
+                // that fell off the page and is re-entering.
+                let is_newly_created = last_poll_time
+                    .map(|last_time| issue.created_at.as_str() > last_time)
+                    .unwrap_or(false);
+
+                if is_newly_created {
+                    // Brand new issue
+                    events.push(
+                        IncomingEvent::github_issue_opened(
+                            repo_name.to_string(),
+                            *number,
+                            issue.title.clone(),
+                            repo.channel.clone(),
+                        )
+                        .with_mention(repo.mention.clone())
+                        .with_format(repo.format.clone()),
+                    );
+                } else if let Some(last_time) = last_poll_time {
+                    // Old issue re-entering: emit comment/close if it changed since last poll
+                    if issue.comments > 0 && issue.updated_at.as_str() > last_time {
+                        events.push(
+                            IncomingEvent::github_issue_commented(
+                                repo_name.to_string(),
+                                *number,
+                                issue.title.clone(),
+                                issue.comments,
+                                repo.channel.clone(),
+                            )
+                            .with_mention(repo.mention.clone())
+                            .with_format(repo.format.clone()),
+                        );
+                    }
+                }
+            }
             Some(old) => {
                 if old.state != issue.state && issue.state == "closed" {
                     events.push(
@@ -2845,6 +2912,8 @@ async fn fetch_issues(
                     title: issue.title,
                     state: issue.state,
                     comments: issue.comments,
+                    created_at: issue.created_at,
+                    updated_at: issue.updated_at,
                 },
             )
         })
@@ -3350,6 +3419,8 @@ struct GitHubIssue {
     title: String,
     state: String,
     comments: u64,
+    created_at: String,
+    updated_at: String,
     #[serde(default)]
     pull_request: Option<serde_json::Value>,
 }
@@ -3575,11 +3646,19 @@ mod tests {
                 title: "live issue".into(),
                 state: "open".into(),
                 comments: 0,
+                created_at: "2026-10-15T10:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
             },
         )]
         .into_iter()
         .collect();
-        let events = collect_issue_events(&repo, "clawhip", &previous, &current);
+        let events = collect_issue_events(
+            &repo,
+            "clawhip",
+            &previous,
+            &current,
+            Some("2026-10-15T09:00:00Z"),
+        );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.issue-opened");
         assert_eq!(events[0].payload["repo"], "clawhip");
@@ -3630,6 +3709,8 @@ mod tests {
                 title: "live issue".into(),
                 state: "open".into(),
                 comments: 0,
+                created_at: "2026-10-01T10:00:00Z".into(),
+                updated_at: "2026-10-01T10:00:00Z".into(),
             },
         )]
         .into_iter()
@@ -3640,11 +3721,13 @@ mod tests {
                 title: "live issue".into(),
                 state: "closed".into(),
                 comments: 1,
+                created_at: "2026-10-01T10:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
             },
         )]
         .into_iter()
         .collect();
-        let events = collect_issue_events(&repo, "clawhip", &previous, &current);
+        let events = collect_issue_events(&repo, "clawhip", &previous, &current, None);
         assert!(
             events
                 .iter()
@@ -4131,6 +4214,7 @@ mod tests {
                 prs: HashMap::new(),
                 ci: HashMap::new(),
                 ci_baseline_established: true,
+                last_successful_issue_poll: None,
             },
         );
         let mut baseline = CIBaseline::default();
@@ -7413,6 +7497,8 @@ mod tests {
                 title: "old issue".into(),
                 state: "open".into(),
                 comments: 0,
+                created_at: "2024-01-01T00:00:00Z".into(),
+                updated_at: "2026-10-15T09:00:00Z".into(),
             },
         );
 
@@ -7426,10 +7512,12 @@ mod tests {
                 title: "old issue".into(),
                 state: "open".into(),
                 comments: 1,
+                created_at: "2024-01-01T00:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
             },
         );
 
-        let events = collect_issue_events(&repo, "clawhip", &previous, &current);
+        let events = collect_issue_events(&repo, "clawhip", &previous, &current, None);
 
         // With sort=updated, issue #10 is included, so the comment event is detected
         assert!(
@@ -7438,5 +7526,107 @@ mod tests {
                 .any(|event| event.canonical_kind() == "github.issue-commented"),
             "Issue #10 should emit a comment event when fetched with sort=updated"
         );
+    }
+
+    #[test]
+    fn old_issue_reentries_with_comment_not_marked_as_opened() {
+        // Regression test for issue #380: when an old issue falls off the first page
+        // and then re-enters the window with new comments, it should emit
+        // issue-commented, not issue-opened.
+        //
+        // This test simulates the scenario where:
+        // 1. Previous poll: issues on first page (issue #10 was on page 1, not included)
+        // 2. Current poll: issue #10 re-enters because it got a comment
+        //
+        // The issue is absent from `previous` (previous.issues is empty), but it
+        // existed before (created_at is older than the last poll time).
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        // Previous state: empty (issue #10 fell off the page in the last poll)
+        let previous = HashMap::new();
+
+        // Current state: issue #10 re-appears with 1 comment
+        // created_at is before the last_poll_time (it's an old issue)
+        // updated_at is after the last_poll_time (it just got a comment)
+        let mut current = HashMap::new();
+        current.insert(
+            10,
+            IssueSnapshot {
+                title: "old issue".into(),
+                state: "open".into(),
+                comments: 1,
+                created_at: "2024-01-01T00:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
+            },
+        );
+
+        // last_poll_time is set to a time between created_at and updated_at
+        let events = collect_issue_events(
+            &repo,
+            "clawhip",
+            &previous,
+            &current,
+            Some("2026-10-15T09:00:00Z"), // Between created and updated
+        );
+
+        // Should emit issue-commented (not issue-opened)
+        let has_commented = events
+            .iter()
+            .any(|event| event.canonical_kind() == "github.issue-commented");
+        let has_opened = events
+            .iter()
+            .any(|event| event.canonical_kind() == "github.issue-opened");
+
+        assert!(
+            has_commented,
+            "Old issue re-entering should emit issue-commented"
+        );
+        assert!(
+            !has_opened,
+            "Old issue re-entering should not emit issue-opened"
+        );
+    }
+
+    #[test]
+    fn truly_new_issue_still_emits_opened() {
+        // Verify that truly new issues (created after last poll) still emit opened.
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        let previous = HashMap::new();
+
+        let mut current = HashMap::new();
+        current.insert(
+            15,
+            IssueSnapshot {
+                title: "brand new issue".into(),
+                state: "open".into(),
+                comments: 0,
+                created_at: "2026-10-15T10:30:00Z".into(),
+                updated_at: "2026-10-15T10:30:00Z".into(),
+            },
+        );
+
+        // last_poll_time is before the created_at
+        let events = collect_issue_events(
+            &repo,
+            "clawhip",
+            &previous,
+            &current,
+            Some("2026-10-15T09:00:00Z"), // Before created_at
+        );
+
+        let has_opened = events
+            .iter()
+            .any(|event| event.canonical_kind() == "github.issue-opened");
+
+        assert!(has_opened, "Truly new issue should emit issue-opened");
     }
 }
