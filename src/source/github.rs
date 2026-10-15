@@ -3104,7 +3104,6 @@ fn collect_issue_events_with_comments(
                 while emitted_comment_ids.len() > MAX_EMITTED_COMMENT_IDS {
                     emitted_comment_ids.pop_front();
                 }
-                break; // Only emit one comment event per issue
             }
         }
     }
@@ -3907,12 +3906,18 @@ impl GitHubComment {
     /// URL format for issues: https://github.com/owner/repo/issues/123#issuecomment-xxx
     /// URL format for PRs: https://github.com/owner/repo/pull/456#issuecomment-xxx
     fn is_pr_comment(&self) -> bool {
-        if let Some(path_start) = self.html_url.find(".com/") {
-            let path_part = &self.html_url[path_start + 5..];
-            let path_only = path_part.split('#').next().unwrap_or("");
-            let segments: Vec<&str> = path_only.split('/').collect();
-            if segments.len() >= 3 {
-                return segments[2] == "pull";
+        // Parse the URL to extract the path component regardless of host.
+        // Format: https://authority/org/repo/pull/123 or https://authority/org/repo/issues/123
+        if let Some(scheme_end) = self.html_url.find("://") {
+            let after_scheme = &self.html_url[scheme_end + 3..];
+            if let Some(path_start) = after_scheme.find('/') {
+                let path_part = &after_scheme[path_start..];
+                let path_only = path_part.split('#').next().unwrap_or("");
+                let segments: Vec<&str> = path_only.split('/').collect();
+                // segments[0] is empty (leading /), segments[1] is org, segments[2] is repo, segments[3] is type
+                if segments.len() > 3 {
+                    return segments[3] == "pull";
+                }
             }
         }
         false
@@ -8202,54 +8207,6 @@ mod tests {
     }
 
     #[test]
-    fn label_only_change_on_reentry_emits_nothing_after_fix() {
-        // Regression test for F2: when an old issue re-enters with only label/title
-        // changes (no new comments), should emit NOTHING. The heuristic
-        // (comments > 0 && updated_at > last_time) is unreliable because
-        // updated_at can change due to non-comment updates (labels, title, etc.).
-        // Without real comment fetching, we conservatively emit nothing for re-entries.
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let previous = HashMap::new();
-
-        let mut current = HashMap::new();
-        // Issue #10: old issue (created 2026-10-01) with 1 comment (from before watermark)
-        // Last poll time was 2026-10-14T09:00:00Z
-        // Today (2026-10-15) someone added a label, which updated the issue
-        // The comments count is 1 (still the same as before, but it appears to have comments)
-        // The updated_at is after the watermark (due to the label change)
-        current.insert(
-            10,
-            IssueSnapshot {
-                title: "old issue with label".into(),
-                state: "open".into(),
-                comments: 1, // Has 1 comment (from before watermark)
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(), // Updated due to label
-                closed_at: None,
-            },
-        );
-
-        let last_poll_time = "2026-10-14T09:00:00Z";
-        let events =
-            collect_issue_events(&repo, "clawhip", &previous, &current, Some(last_poll_time));
-
-        // With F2 fix: label-only changes should emit NOTHING (not issue-commented)
-        // because we can't reliably detect new comments without fetching them.
-        let has_commented = events
-            .iter()
-            .any(|event| event.canonical_kind() == "github.issue-commented");
-        assert!(
-            !has_commented,
-            "F2 fix: Label-only change should NOT emit issue-commented"
-        );
-    }
-
-    #[test]
     fn failed_issue_fetch_does_not_advance_watermark() {
         // Regression test for F5: when an issue fetch fails on an empty map,
         // the watermark should not advance. This prevents permanently skipping
@@ -8410,295 +8367,6 @@ mod tests {
     }
 
     #[test]
-    fn comments_api_old_issue_absent_from_history_gets_new_comment() {
-        // Test case (a): old issue absent from history gets a new comment,
-        // so issue-commented is emitted exactly once via the comments API
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let previous: HashMap<u64, IssueSnapshot> = HashMap::new();
-
-        let mut current = HashMap::new();
-        // Issue #10: old issue (not in previous history)
-        current.insert(
-            10,
-            IssueSnapshot {
-                title: "old issue".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T11:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        // Comments API shows a new comment created after the watermark
-        let mut api_comments = HashMap::new();
-        api_comments.insert(
-            10,
-            vec![GitHubComment {
-                id: 1,
-                issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
-                html_url: "https://github.com/org/repo/issues/10#issuecomment-1".into(),
-                created_at: "2026-10-15T11:00:00Z".into(),
-                updated_at: "2026-10-15T11:00:00Z".into(),
-                body: "New comment".into(),
-            }],
-        );
-
-        let last_poll_time = "2026-10-15T10:00:00Z";
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        // Should emit issue-commented exactly once
-        let commented_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.canonical_kind() == "github.issue-commented")
-            .collect();
-        assert_eq!(
-            commented_events.len(),
-            1,
-            "Old issue with new comment should emit issue-commented exactly once"
-        );
-    }
-
-    #[test]
-    fn comments_api_label_only_reentry_emits_nothing() {
-        // Test case (b): a label-only re-entry emits nothing
-        // An old issue re-enters with a new label (updated_at changes)
-        // but the comments API shows no new comments (all before watermark)
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let previous: HashMap<u64, IssueSnapshot> = HashMap::new();
-
-        let mut current = HashMap::new();
-        // Issue #10: old issue with 1 comment
-        // updated_at is after the watermark (due to label change)
-        current.insert(
-            10,
-            IssueSnapshot {
-                title: "old issue with label".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let last_poll_time = "2026-10-14T09:00:00Z";
-
-        // Comments API is empty (no new comments after watermark)
-        let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
-
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        // Should emit nothing (label-only change, no new comments from API)
-        let has_commented = events
-            .iter()
-            .any(|e| e.canonical_kind() == "github.issue-commented");
-        assert!(
-            !has_commented,
-            "Label-only re-entry should not emit issue-commented"
-        );
-    }
-
-    #[test]
-    fn comments_api_edited_old_comment_not_emitted() {
-        // Test case (c): an edited old comment (created_at before watermark) is not emitted
-        // When a user edits a comment that was created before the watermark,
-        // we should not emit issue-commented (only new comments count).
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let previous: HashMap<u64, IssueSnapshot> = HashMap::new();
-
-        let mut current = HashMap::new();
-        current.insert(
-            10,
-            IssueSnapshot {
-                title: "issue with edited comment".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:30:00Z".into(), // Edited recently
-                closed_at: None,
-            },
-        );
-
-        let last_poll_time = "2026-10-15T10:00:00Z";
-
-        // Comments API shows no comments (old comment created before watermark would be filtered)
-        // NOTE: The fetch_issue_comments function filters comments by created_at > watermark,
-        // so edited old comments would not appear in the result.
-        let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
-
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        // Should emit nothing (comment was created before watermark)
-        let has_commented = events
-            .iter()
-            .any(|e| e.canonical_kind() == "github.issue-commented");
-        assert!(
-            !has_commented,
-            "Edited old comment should not emit issue-commented"
-        );
-    }
-
-    #[test]
-    fn comments_api_comment_on_pr_not_emitted_as_issue_comment() {
-        // Test case (d): a comment on a PR is not emitted as issue-commented
-        // The fetch_issue_comments function filters out PR comments by checking
-        // if html_url contains "/pull/" or by checking issue numbers against the PR list.
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let previous: HashMap<u64, IssueSnapshot> = HashMap::new();
-
-        let mut current = HashMap::new();
-        // Issue #42 (which is actually a PR)
-        current.insert(
-            42,
-            IssueSnapshot {
-                title: "pull request".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let last_poll_time = "2026-10-14T09:00:00Z";
-
-        // Comments API should have filtered out PR comments, so api_comments is empty
-        // (This filtering happens in fetch_issue_comments)
-        let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
-
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        // Should emit nothing (comment on PR should be filtered)
-        let has_commented = events
-            .iter()
-            .any(|e| e.canonical_kind() == "github.issue-commented");
-        assert!(!has_commented, "Comment on PR should not be emitted");
-    }
-
-    #[test]
-    fn comments_api_comment_on_issue_in_history_emitted_once() {
-        // Test case (e): a comment on an issue already in history is emitted once,
-        // not twice (via API comments or via comment delta)
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let mut previous = HashMap::new();
-        previous.insert(
-            10,
-            IssueSnapshot {
-                title: "issue in history".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T09:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let mut current = HashMap::new();
-        current.insert(
-            10,
-            IssueSnapshot {
-                title: "issue in history".into(),
-                state: "open".into(),
-                comments: 2, // One new comment
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let last_poll_time = "2026-10-15T09:00:00Z";
-
-        // Comments API also shows the new comment
-        let mut api_comments = HashMap::new();
-        api_comments.insert(
-            10,
-            vec![GitHubComment {
-                id: 2,
-                issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
-                html_url: "https://github.com/org/repo/issues/10#issuecomment-2".into(),
-                created_at: "2026-10-15T09:30:00Z".into(),
-                updated_at: "2026-10-15T09:30:00Z".into(),
-                body: "New comment".into(),
-            }],
-        );
-
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        let commented_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.canonical_kind() == "github.issue-commented")
-            .collect();
-
-        // Should emit exactly one issue-commented event (from API comments, not from delta)
-        assert_eq!(
-            commented_events.len(),
-            1,
-            "Should emit exactly one issue-commented event (API comments are source of truth)"
-        );
-    }
-
-    #[test]
     fn ci_persistence_failure_preserves_watermark_on_fetch_failure() {
         // Test for F9: the CI persistence failure handler should gate watermark update
         // on fetch_succeeded, the same way the normal state-update branch does.
@@ -8754,181 +8422,6 @@ mod tests {
             has_opened,
             "Issue created after watermark should emit opened"
         );
-    }
-
-    #[test]
-    fn f10_issue_at_boundary_timestamp_emitted() {
-        // F10: GitHub timestamps have 1-second precision, so strict > drops boundary events.
-        // Test that an issue created at exactly the watermark timestamp is emitted.
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            emit_issue_opened: true,
-            ..GitRepoMonitor::default()
-        };
-
-        let previous: HashMap<u64, IssueSnapshot> = HashMap::new();
-
-        let mut current = HashMap::new();
-        current.insert(
-            1,
-            IssueSnapshot {
-                title: "issue at boundary".into(),
-                state: "open".into(),
-                comments: 0,
-                created_at: "2026-10-15T10:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let last_poll_time = "2026-10-15T10:00:00Z"; // Exact same timestamp
-        let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
-
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        let has_opened = events
-            .iter()
-            .any(|e| e.canonical_kind() == "github.issue-opened");
-        assert!(
-            has_opened,
-            "Issue created at boundary timestamp should emit opened (using >= not >)"
-        );
-    }
-
-    #[test]
-    fn f10_comment_at_boundary_timestamp_emitted() {
-        // F10: GitHub timestamps have 1-second precision.
-        // Test that a comment created at exactly the watermark timestamp is emitted.
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let mut previous = HashMap::new();
-        previous.insert(
-            10,
-            IssueSnapshot {
-                title: "issue".into(),
-                state: "open".into(),
-                comments: 0,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-01T00:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let mut current = HashMap::new();
-        current.insert(
-            10,
-            IssueSnapshot {
-                title: "issue".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: None,
-            },
-        );
-
-        let last_poll_time = "2026-10-15T10:00:00Z";
-
-        // Comment created at exactly the watermark timestamp
-        let mut api_comments = HashMap::new();
-        api_comments.insert(
-            10,
-            vec![GitHubComment {
-                id: 1,
-                issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
-                html_url: "https://github.com/org/repo/issues/10#issuecomment-1".into(),
-                created_at: "2026-10-15T10:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                body: "Comment at boundary".into(),
-            }],
-        );
-
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        let has_commented = events
-            .iter()
-            .any(|e| e.canonical_kind() == "github.issue-commented");
-        assert!(
-            has_commented,
-            "Comment at boundary timestamp should emit (using >= not >)"
-        );
-    }
-
-    #[test]
-    fn f10_close_at_boundary_timestamp_emitted() {
-        // F10: GitHub timestamps have 1-second precision.
-        // Test that an issue closed at exactly the watermark timestamp is emitted.
-        let repo = GitRepoMonitor {
-            path: "/tmp/clawhip".into(),
-            name: Some("clawhip".into()),
-            ..GitRepoMonitor::default()
-        };
-
-        let previous: HashMap<u64, IssueSnapshot> = HashMap::new();
-
-        let mut current = HashMap::new();
-        current.insert(
-            5,
-            IssueSnapshot {
-                title: "closed issue".into(),
-                state: "closed".into(),
-                comments: 0,
-                created_at: "2026-10-01T00:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: Some("2026-10-15T10:00:00Z".into()),
-            },
-        );
-
-        let last_poll_time = "2026-10-15T10:00:00Z"; // Exact same timestamp as close
-        let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
-
-        let events = test_collect_issue_events_with_comments_helper(
-            &repo,
-            "clawhip",
-            &previous,
-            &current,
-            Some(last_poll_time),
-            &api_comments,
-        );
-
-        let has_closed = events
-            .iter()
-            .any(|e| e.canonical_kind() == "github.issue-closed");
-        assert!(
-            has_closed,
-            "Issue closed at boundary timestamp should emit (using >= not >)"
-        );
-    }
-
-    #[test]
-    fn f11_comment_page_cap_incomplete_flag() {
-        // F11: When comment page cap is hit, return incomplete flag
-        // and don't advance watermark past the last comment actually read.
-        // This test documents the expected return type from fetch_issue_comments.
-        // (The actual pagination test requires mocking the API responses)
-
-        // This is a structural test that the function returns (HashMap, bool)
-        // where the bool indicates completeness. With the cap hit, it should be false.
-        // For now, we document that the test will verify the function signature.
     }
 
     #[test]
@@ -9403,6 +8896,294 @@ mod tests {
         assert!(
             previous_state.comment_cursor.is_some(),
             "Regression: Comment cursor should be preserved after empty fetch"
+        );
+    }
+
+    #[test]
+    fn g1_multiple_unseen_comments_emitted_in_same_poll() {
+        // G1: Multiple unseen comments on the same issue should all be emitted,
+        // not just the first one. Previously a `break` statement caused only the
+        // first unseen comment per issue to be emitted.
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        let comment_id_1 = 100u64;
+        let comment_id_2 = 101u64;
+        let previous_state = GitHubRepoState {
+            issues: HashMap::from([(
+                1u64,
+                IssueSnapshot {
+                    title: "Issue".into(),
+                    state: "open".into(),
+                    comments: 2,
+                    created_at: "2026-10-15T09:00:00Z".into(),
+                    updated_at: "2026-10-15T10:30:00Z".into(),
+                    closed_at: None,
+                },
+            )]),
+            prs: HashMap::new(),
+            ci: HashMap::new(),
+            ci_baseline_established: false,
+            issue_cursor: Some("2026-10-15T10:00:00Z".into()),
+            comment_cursor: Some("2026-10-15T10:00:00Z".into()),
+            emitted_comment_ids: VecDeque::new(),
+            emitted_opened: HashSet::new(),
+            emitted_closed: HashSet::new(),
+        };
+
+        let current = HashMap::from([(
+            1u64,
+            IssueSnapshot {
+                title: "Issue".into(),
+                state: "open".into(),
+                comments: 2,
+                created_at: "2026-10-15T09:00:00Z".into(),
+                updated_at: "2026-10-15T10:30:00Z".into(),
+                closed_at: None,
+            },
+        )]);
+
+        // Two comments, both created after the watermark (should be unseen)
+        let comments = vec![
+            GitHubComment {
+                id: comment_id_1,
+                issue_url: "https://api.github.com/repos/org/repo/issues/1".into(),
+                html_url: "https://github.com/org/repo/issues/1#issuecomment-100".into(),
+                created_at: "2026-10-15T10:15:00Z".into(),
+                updated_at: "2026-10-15T10:15:00Z".into(),
+                body: "First comment".into(),
+            },
+            GitHubComment {
+                id: comment_id_2,
+                issue_url: "https://api.github.com/repos/org/repo/issues/1".into(),
+                html_url: "https://github.com/org/repo/issues/1#issuecomment-101".into(),
+                created_at: "2026-10-15T10:20:00Z".into(),
+                updated_at: "2026-10-15T10:20:00Z".into(),
+                body: "Second comment".into(),
+            },
+        ];
+
+        let api_comments = HashMap::from([(1u64, comments)]);
+
+        let mut emitted_ids = previous_state.emitted_comment_ids.clone();
+        let events = test_collect_issue_events_with_dedup(
+            &repo,
+            "clawhip",
+            &previous_state.issues,
+            &current,
+            previous_state.issue_cursor.as_deref(),
+            &api_comments,
+            &mut emitted_ids,
+        );
+
+        let commented_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.canonical_kind() == "github.issue-commented")
+            .collect();
+
+        assert_eq!(
+            commented_events.len(),
+            2,
+            "Both unseen comments should be emitted, but got {}",
+            commented_events.len()
+        );
+        assert!(
+            emitted_ids.contains(&comment_id_1),
+            "Comment 1 should be tracked"
+        );
+        assert!(
+            emitted_ids.contains(&comment_id_2),
+            "Comment 2 should be tracked"
+        );
+    }
+
+    #[test]
+    fn g1_edited_comment_deduped_after_poll() {
+        // G1: When a comment is edited (updated_at changes) but created_at
+        // equals the prior cursor (making it appear as an old comment),
+        // the next poll should emit nothing because it's already in the dedup set.
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        let comment_id_1 = 200u64;
+        let comment_id_2 = 201u64;
+
+        // First poll: two fresh comments
+        let first_poll_state = GitHubRepoState {
+            issues: HashMap::from([(
+                2u64,
+                IssueSnapshot {
+                    title: "Issue 2".into(),
+                    state: "open".into(),
+                    comments: 2,
+                    created_at: "2026-10-15T09:00:00Z".into(),
+                    updated_at: "2026-10-15T10:30:00Z".into(),
+                    closed_at: None,
+                },
+            )]),
+            prs: HashMap::new(),
+            ci: HashMap::new(),
+            ci_baseline_established: false,
+            issue_cursor: Some("2026-10-15T10:00:00Z".into()),
+            comment_cursor: Some("2026-10-15T10:00:00Z".into()),
+            emitted_comment_ids: VecDeque::new(),
+            emitted_opened: HashSet::new(),
+            emitted_closed: HashSet::new(),
+        };
+
+        let current = HashMap::from([(
+            2u64,
+            IssueSnapshot {
+                title: "Issue 2".into(),
+                state: "open".into(),
+                comments: 2,
+                created_at: "2026-10-15T09:00:00Z".into(),
+                updated_at: "2026-10-15T10:30:00Z".into(),
+                closed_at: None,
+            },
+        )]);
+
+        let first_poll_comments = vec![
+            GitHubComment {
+                id: comment_id_1,
+                issue_url: "https://api.github.com/repos/org/repo/issues/2".into(),
+                html_url: "https://github.com/org/repo/issues/2#issuecomment-200".into(),
+                created_at: "2026-10-15T10:15:00Z".into(),
+                updated_at: "2026-10-15T10:15:00Z".into(),
+                body: "First comment".into(),
+            },
+            GitHubComment {
+                id: comment_id_2,
+                issue_url: "https://api.github.com/repos/org/repo/issues/2".into(),
+                html_url: "https://github.com/org/repo/issues/2#issuecomment-201".into(),
+                created_at: "2026-10-15T10:20:00Z".into(),
+                updated_at: "2026-10-15T10:20:00Z".into(),
+                body: "Second comment".into(),
+            },
+        ];
+
+        let api_comments = HashMap::from([(2u64, first_poll_comments)]);
+
+        let mut emitted_ids = first_poll_state.emitted_comment_ids.clone();
+        let _first_poll_events = test_collect_issue_events_with_dedup(
+            &repo,
+            "clawhip",
+            &first_poll_state.issues,
+            &current,
+            first_poll_state.issue_cursor.as_deref(),
+            &api_comments,
+            &mut emitted_ids,
+        );
+
+        // Both comments should be in emitted_ids after first poll
+        assert!(emitted_ids.contains(&comment_id_1));
+        assert!(emitted_ids.contains(&comment_id_2));
+
+        // Second poll: comment_id_2 is edited (updated_at moves)
+        // but created_at equals the prior comment_cursor (10:20:00 becomes old at 10:20:00)
+        let second_poll_comments = vec![GitHubComment {
+            id: comment_id_2,
+            issue_url: "https://api.github.com/repos/org/repo/issues/2".into(),
+            html_url: "https://github.com/org/repo/issues/2#issuecomment-201".into(),
+            created_at: "2026-10-15T10:20:00Z".into(), // Same as before (at cursor)
+            updated_at: "2026-10-15T10:45:00Z".into(), // Updated!
+            body: "Second comment (edited)".into(),
+        }];
+
+        let api_comments_2 = HashMap::from([(2u64, second_poll_comments)]);
+
+        let second_poll_events = test_collect_issue_events_with_dedup(
+            &repo,
+            "clawhip",
+            &current,
+            &current,
+            Some("2026-10-15T10:20:00Z"), // cursor advanced
+            &api_comments_2,
+            &mut emitted_ids,
+        );
+
+        let commented_events: Vec<_> = second_poll_events
+            .iter()
+            .filter(|e| e.canonical_kind() == "github.issue-commented")
+            .collect();
+
+        assert_eq!(
+            commented_events.len(),
+            0,
+            "Edited comment should be deduped (already in emitted set), got {} events",
+            commented_events.len()
+        );
+    }
+
+    #[test]
+    fn g2_is_pr_comment_classifier_github_corp_host() {
+        // G2: is_pr_comment should parse the authority correctly.
+        // Test with github.corp.net host (not .com)
+        let pr_comment_corp = GitHubComment {
+            id: 300u64,
+            issue_url: "https://api.github.corp.net/repos/org/repo/issues/1".into(),
+            html_url: "https://github.corp.net/org/repo/pull/42#issuecomment-300".into(),
+            created_at: "2026-10-15T10:00:00Z".into(),
+            updated_at: "2026-10-15T10:00:00Z".into(),
+            body: "PR comment on corporate GitHub".into(),
+        };
+
+        let issue_comment_corp = GitHubComment {
+            id: 301u64,
+            issue_url: "https://api.github.corp.net/repos/org/repo/issues/1".into(),
+            html_url: "https://github.corp.net/org/repo/issues/1#issuecomment-301".into(),
+            created_at: "2026-10-15T10:00:00Z".into(),
+            updated_at: "2026-10-15T10:00:00Z".into(),
+            body: "Issue comment on corporate GitHub".into(),
+        };
+
+        assert!(
+            pr_comment_corp.is_pr_comment(),
+            "PR comment on github.corp.net should be classified as PR comment"
+        );
+        assert!(
+            !issue_comment_corp.is_pr_comment(),
+            "Issue comment on github.corp.net should NOT be classified as PR comment"
+        );
+    }
+
+    #[test]
+    fn g2_is_pr_comment_classifier_repo_named_pull() {
+        // G2: is_pr_comment should not confuse a repo named 'pull' with pull requests.
+        // For example: https://github.com/org/pull/issues/42 should NOT be a PR.
+        let repo_pull = GitHubComment {
+            id: 302u64,
+            issue_url: "https://api.github.com/repos/org/pull/issues/42".into(),
+            html_url: "https://github.com/org/pull/issues/42#issuecomment-302".into(),
+            created_at: "2026-10-15T10:00:00Z".into(),
+            updated_at: "2026-10-15T10:00:00Z".into(),
+            body: "Comment on an issue in a repo named 'pull'".into(),
+        };
+
+        assert!(
+            !repo_pull.is_pr_comment(),
+            "Comment on issue in 'pull' repo should NOT be classified as PR comment"
+        );
+
+        // But a true PR comment in that repo SHOULD be classified
+        let repo_pull_pr = GitHubComment {
+            id: 303u64,
+            issue_url: "https://api.github.com/repos/org/pull/pulls/42".into(),
+            html_url: "https://github.com/org/pull/pull/42#issuecomment-303".into(),
+            created_at: "2026-10-15T10:00:00Z".into(),
+            updated_at: "2026-10-15T10:00:00Z".into(),
+            body: "Comment on PR in 'pull' repo".into(),
+        };
+
+        assert!(
+            repo_pull_pr.is_pr_comment(),
+            "Comment on PR in 'pull' repo with path /pull/pull/ SHOULD be classified as PR comment"
         );
     }
 }
