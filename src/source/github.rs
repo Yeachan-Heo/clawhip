@@ -648,6 +648,7 @@ where
 const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
 const MAX_BASELINE_RUNS_PER_REPO: usize = CI_PAGE_SIZE * MAX_CI_PAGES;
+const MAX_EMITTED_COMMENT_IDS: usize = 1000;
 /// Hard bound on protected current-window identities per repo. The fetched
 /// window is normally at most [`MAX_BASELINE_RUNS_PER_REPO`] runs, but each
 /// run can contribute several durable aliases (attempt-qualified run ids,
@@ -1967,9 +1968,21 @@ struct GitHubRepoState {
     prs: HashMap<u64, PullRequestSnapshot>,
     ci: HashMap<String, GitHubCISnapshot>,
     ci_baseline_established: bool,
-    last_successful_issue_poll: Option<String>,
-    // F14 fix: separate comment cursor to preserve comments if comments fetch fails
-    last_successful_comment_poll: Option<String>,
+    /// Cursor for issue polling: advanced only from issue updated_at after successful fetch.
+    /// Never advanced from comment timestamps.
+    issue_cursor: Option<String>,
+    /// Cursor for comment polling: advanced only from max comment updated_at over ALL comments
+    /// (including PR comments) returned by successful, complete fetch. Exclusive of `is_pr_comment`
+    /// filtering — PR comments still advance this cursor. Failed or page-capped fetch preserves cursor.
+    comment_cursor: Option<String>,
+    /// Deduplication set: most recent ~1000 comment IDs (FIFO eviction).
+    /// Comments with ID in this set are never emitted.
+    emitted_comment_ids: VecDeque<u64>,
+    /// Boundary-second tracking for issue-opened events: (issue_num, timestamp).
+    /// Prevents re-emitting opened on label-only re-entry.
+    emitted_opened: HashSet<(u64, String)>,
+    /// Boundary-second tracking for issue-closed events: (issue_num, timestamp).
+    emitted_closed: HashSet<(u64, String)>,
 }
 
 #[derive(Clone)]
@@ -2151,23 +2164,43 @@ async fn poll_github(
         };
 
         let previous = state.get(&repo.path);
-        let (issues, fetch_succeeded, max_comment_timestamp) =
-            match poll_issues(config, github_client, repo, &snapshot, previous, tx).await {
-                Ok((issues, success, max_ts)) => (issues, success, max_ts),
-                Err(error) => {
-                    eprintln!(
-                        "clawhip source GitHub issue processing failed for {}: {error}",
-                        repo.path
-                    );
-                    (
-                        previous
-                            .map(|entry| entry.issues.clone())
-                            .unwrap_or_default(),
-                        false,
-                        None,
-                    )
-                }
-            };
+        let (
+            issues,
+            fetch_succeeded,
+            max_comment_timestamp,
+            emitted_comment_ids,
+            emitted_opened,
+            emitted_closed,
+        ) = match poll_issues(config, github_client, repo, &snapshot, previous, tx).await {
+            Ok((issues, success, max_ts, ids, opened, closed)) => {
+                (issues, success, max_ts, ids, opened, closed)
+            }
+            Err(error) => {
+                eprintln!(
+                    "clawhip source GitHub issue processing failed for {}: {error}",
+                    repo.path
+                );
+                let (ids, opened, closed) = previous
+                    .map(|p| {
+                        (
+                            p.emitted_comment_ids.clone(),
+                            p.emitted_opened.clone(),
+                            p.emitted_closed.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                (
+                    previous
+                        .map(|entry| entry.issues.clone())
+                        .unwrap_or_default(),
+                    false,
+                    None,
+                    ids,
+                    opened,
+                    closed,
+                )
+            }
+        };
         let (prs, prs_window_complete) =
             match poll_pull_requests(config, github_client, repo, &snapshot, previous, tx).await {
                 Ok(result) => result,
@@ -2306,7 +2339,7 @@ async fn poll_github(
                     )
                 } else {
                     // Preserve previous watermark on fetch failure
-                    previous.and_then(|p| p.last_successful_issue_poll.clone())
+                    previous.and_then(|p| p.issue_cursor.clone())
                 };
                 state.insert(
                     repo.path.clone(),
@@ -2317,9 +2350,17 @@ async fn poll_github(
                         ci_baseline_established: previous
                             .map(|entry| entry.ci_baseline_established)
                             .unwrap_or(false),
-                        last_successful_issue_poll: last_poll_time,
-                        last_successful_comment_poll: previous
-                            .and_then(|p| p.last_successful_comment_poll.clone()),
+                        issue_cursor: last_poll_time,
+                        comment_cursor: previous.and_then(|p| p.comment_cursor.clone()),
+                        emitted_comment_ids: previous
+                            .map(|p| p.emitted_comment_ids.clone())
+                            .unwrap_or_default(),
+                        emitted_opened: previous
+                            .map(|p| p.emitted_opened.clone())
+                            .unwrap_or_default(),
+                        emitted_closed: previous
+                            .map(|p| p.emitted_closed.clone())
+                            .unwrap_or_default(),
                     },
                 );
                 continue;
@@ -2362,13 +2403,13 @@ async fn poll_github(
             Some(final_watermark)
         } else {
             // Fetch failed: preserve previous watermark
-            previous.and_then(|p| p.last_successful_issue_poll.clone())
+            previous.and_then(|p| p.issue_cursor.clone())
         };
-        // F14/F15 fix: use separate comment cursor
+        // Separate comment cursor: advanced only from max comment updated_at
         let comment_cursor = if fetch_succeeded {
             max_comment_timestamp.clone()
         } else {
-            previous.and_then(|p| p.last_successful_comment_poll.clone())
+            previous.and_then(|p| p.comment_cursor.clone())
         };
         state.insert(
             repo.path.clone(),
@@ -2377,8 +2418,11 @@ async fn poll_github(
                 prs,
                 ci,
                 ci_baseline_established,
-                last_successful_issue_poll: last_poll_time,
-                last_successful_comment_poll: comment_cursor,
+                issue_cursor: last_poll_time,
+                comment_cursor,
+                emitted_comment_ids,
+                emitted_opened,
+                emitted_closed,
             },
         );
     }
@@ -2386,8 +2430,7 @@ async fn poll_github(
     Ok(())
 }
 
-// Returns: (issues HashMap, fetch_succeeded, max_comment_timestamp)
-// F12 fix: Include max_comment_timestamp for watermark advancement
+// Returns: (issues HashMap, fetch_succeeded, max_comment_timestamp, emitted_comment_ids, emitted_opened, emitted_closed)
 async fn poll_issues(
     config: &AppConfig,
     github_client: Option<&GitHubClient>,
@@ -2395,24 +2438,55 @@ async fn poll_issues(
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
     tx: &mpsc::Sender<IncomingEvent>,
-) -> Result<(HashMap<u64, IssueSnapshot>, bool, Option<String>)> {
+) -> Result<(
+    HashMap<u64, IssueSnapshot>,
+    bool,
+    Option<String>,
+    VecDeque<u64>,
+    HashSet<(u64, String)>,
+    HashSet<(u64, String)>,
+)> {
     if !repo.emit_issue_opened {
+        let (ids, opened, closed) = previous
+            .map(|p| {
+                (
+                    p.emitted_comment_ids.clone(),
+                    p.emitted_opened.clone(),
+                    p.emitted_closed.clone(),
+                )
+            })
+            .unwrap_or_default();
         return Ok((
             previous
                 .map(|entry| entry.issues.clone())
                 .unwrap_or_default(),
             false,
             None,
+            ids,
+            opened,
+            closed,
         ));
     }
 
     let Some(client) = github_client else {
+        let (ids, opened, closed) = previous
+            .map(|p| {
+                (
+                    p.emitted_comment_ids.clone(),
+                    p.emitted_opened.clone(),
+                    p.emitted_closed.clone(),
+                )
+            })
+            .unwrap_or_default();
         return Ok((
             previous
                 .map(|entry| entry.issues.clone())
                 .unwrap_or_default(),
             false,
             None,
+            ids,
+            opened,
+            closed,
         ));
     };
 
@@ -2448,10 +2522,11 @@ async fn poll_issues(
             let (api_comments, _comments_complete, max_comment_timestamp) = if let Some(client) =
                 github_client
             {
-                // F14 fix: use separate comment cursor, not issue cursor
-                let comment_watermark = previous
-                    .and_then(|p| p.last_successful_comment_poll.as_deref())
-                    .or_else(|| previous.and_then(|p| p.last_successful_issue_poll.as_deref()));
+                // Use separate comment cursor for advancing comment watermark
+                let comment_watermark = previous.and_then(|p| p.comment_cursor.as_deref());
+                // Fallback to issue cursor on first poll if comment cursor not yet established
+                let comment_watermark =
+                    comment_watermark.or_else(|| previous.and_then(|p| p.issue_cursor.as_deref()));
                 match fetch_issue_comments(
                     client,
                     &config.monitors.github_api_base,
@@ -2476,19 +2551,39 @@ async fn poll_issues(
                 (HashMap::new(), true, None)
             };
 
+            let mut emitted_comment_ids = previous
+                .map(|p| p.emitted_comment_ids.clone())
+                .unwrap_or_default();
+            let mut emitted_opened = previous
+                .map(|p| p.emitted_opened.clone())
+                .unwrap_or_default();
+            let mut emitted_closed = previous
+                .map(|p| p.emitted_closed.clone())
+                .unwrap_or_default();
+
             if let Some(previous) = previous {
                 for event in collect_issue_events_with_comments(
                     repo,
                     &snapshot.repo_name,
                     &previous.issues,
                     &issues,
-                    previous.last_successful_issue_poll.as_deref(),
+                    previous.issue_cursor.as_deref(),
                     &api_comments,
+                    &mut emitted_comment_ids,
+                    &mut emitted_opened,
+                    &mut emitted_closed,
                 ) {
                     send_event(tx, event).await?;
                 }
             }
-            Ok((merged_issues, true, max_comment_timestamp)) // F5 fix: return success flag + F12 fix: include max_comment_timestamp
+            Ok((
+                merged_issues,
+                true,
+                max_comment_timestamp,
+                emitted_comment_ids,
+                emitted_opened,
+                emitted_closed,
+            ))
         }
         Err(error) => {
             if emit_source_degraded(Some(&repo.path), &error.to_string()) {
@@ -2497,13 +2592,25 @@ async fn poll_issues(
                     repo.path
                 );
             }
+            let (ids, opened, closed) = previous
+                .map(|p| {
+                    (
+                        p.emitted_comment_ids.clone(),
+                        p.emitted_opened.clone(),
+                        p.emitted_closed.clone(),
+                    )
+                })
+                .unwrap_or_default();
             Ok((
                 previous
                     .map(|entry| entry.issues.clone())
                     .unwrap_or_default(),
                 false,
                 None,
-            )) // F5 fix: return failure flag
+                ids,
+                opened,
+                closed,
+            ))
         }
     }
 }
@@ -2815,10 +2922,14 @@ fn collect_issue_events(
         current,
         last_poll_time,
         &HashMap::new(),
+        &mut VecDeque::new(),
+        &mut HashSet::new(),
+        &mut HashSet::new(),
     )
 }
 
-fn collect_issue_events_with_comments(
+#[cfg(test)]
+fn test_collect_issue_events_with_comments_helper(
     repo: &GitRepoMonitor,
     repo_name: &str,
     previous: &HashMap<u64, IssueSnapshot>,
@@ -2826,14 +2937,37 @@ fn collect_issue_events_with_comments(
     last_poll_time: Option<&str>,
     api_comments: &HashMap<u64, Vec<GitHubComment>>,
 ) -> Vec<IncomingEvent> {
+    collect_issue_events_with_comments(
+        repo,
+        repo_name,
+        previous,
+        current,
+        last_poll_time,
+        api_comments,
+        &mut VecDeque::new(),
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_issue_events_with_comments(
+    repo: &GitRepoMonitor,
+    repo_name: &str,
+    previous: &HashMap<u64, IssueSnapshot>,
+    current: &HashMap<u64, IssueSnapshot>,
+    last_poll_time: Option<&str>,
+    api_comments: &HashMap<u64, Vec<GitHubComment>>,
+    emitted_comment_ids: &mut VecDeque<u64>,
+    emitted_opened: &mut HashSet<(u64, String)>,
+    emitted_closed: &mut HashSet<(u64, String)>,
+) -> Vec<IncomingEvent> {
     let mut events = Vec::new();
     let mut commented_via_api = std::collections::HashSet::new();
-
-    // F10 fix: use >= instead of > for timestamp comparisons to handle boundary seconds
-    // Deduplication is handled by the comment API filtering and lifecycle event ordering
+    let emitted_ids_set: HashSet<u64> = emitted_comment_ids.iter().copied().collect();
 
     // First pass: process open/close events (lifecycle events)
-    // F13 fix: emit these BEFORE comments for each issue
+    // Emit these BEFORE comments for each issue.
     for (number, issue) in current {
         match previous.get(number) {
             None => {
@@ -2844,25 +2978,50 @@ fn collect_issue_events_with_comments(
                     .unwrap_or(false);
 
                 if is_newly_created {
-                    // Brand new issue (F10 fix: use >= instead of >)
-                    events.push(
-                        IncomingEvent::github_issue_opened(
-                            repo_name.to_string(),
-                            *number,
-                            issue.title.clone(),
-                            repo.channel.clone(),
-                        )
-                        .with_mention(repo.mention.clone())
-                        .with_format(repo.format.clone()),
-                    );
+                    // Brand new issue: emit opened once per boundary second
+                    let boundary_key = (*number, issue.created_at.clone());
+                    if !emitted_opened.contains(&boundary_key) {
+                        emitted_opened.insert(boundary_key);
+                        events.push(
+                            IncomingEvent::github_issue_opened(
+                                repo_name.to_string(),
+                                *number,
+                                issue.title.clone(),
+                                repo.channel.clone(),
+                            )
+                            .with_mention(repo.mention.clone())
+                            .with_format(repo.format.clone()),
+                        );
+                    }
                 } else if let Some(last_time) = last_poll_time {
-                    // Old issue re-entering: emit close if it was closed since last poll
-                    // Check close and comment conditions independently (F6 fix: remove else)
-                    // F10 fix: use >= instead of > for boundary timestamp
+                    // Old issue re-entering: emit close if it was closed since last poll.
+                    // Check close and comment conditions independently.
                     if issue.state == "closed"
                         && let Some(closed_at) = &issue.closed_at
                         && closed_at.as_str() >= last_time
                     {
+                        let boundary_key = (*number, closed_at.clone());
+                        if !emitted_closed.contains(&boundary_key) {
+                            emitted_closed.insert(boundary_key);
+                            events.push(
+                                IncomingEvent::github_issue_closed(
+                                    repo_name.to_string(),
+                                    *number,
+                                    issue.title.clone(),
+                                    repo.channel.clone(),
+                                )
+                                .with_mention(repo.mention.clone())
+                                .with_format(repo.format.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+            Some(old) => {
+                if old.state != issue.state && issue.state == "closed" {
+                    let boundary_key = (*number, issue.closed_at.clone().unwrap_or_default());
+                    if !emitted_closed.contains(&boundary_key) {
+                        emitted_closed.insert(boundary_key);
                         events.push(
                             IncomingEvent::github_issue_closed(
                                 repo_name.to_string(),
@@ -2874,60 +3033,52 @@ fn collect_issue_events_with_comments(
                             .with_format(repo.format.clone()),
                         );
                     }
-                    // For re-entering issues, use the API comments as the source of truth.
-                    // If API comments were found, we already emitted issue-commented above.
-                    // No need to duplicate via heuristic.
-                }
-            }
-            Some(old) => {
-                if old.state != issue.state && issue.state == "closed" {
-                    events.push(
-                        IncomingEvent::github_issue_closed(
-                            repo_name.to_string(),
-                            *number,
-                            issue.title.clone(),
-                            repo.channel.clone(),
-                        )
-                        .with_mention(repo.mention.clone())
-                        .with_format(repo.format.clone()),
-                    );
                 }
             }
         }
     }
 
-    // Second pass: emit issue-commented events from the real API comments
+    // Second pass: emit issue-commented events from the real API comments.
+    // Only emit comments with IDs not in the emitted set.
     // This is the source of truth for new comments on both old and new issues.
-    // F13 fix: emit comments AFTER lifecycle events
     for (issue_num, comments) in api_comments {
-        if !comments.is_empty() {
-            commented_via_api.insert(*issue_num);
-            events.push(
-                IncomingEvent::github_issue_commented(
-                    repo_name.to_string(),
-                    *issue_num,
-                    current
-                        .get(issue_num)
-                        .map(|issue| issue.title.clone())
-                        .unwrap_or_else(|| format!("Issue #{}", issue_num)),
-                    current
-                        .get(issue_num)
-                        .map(|issue| issue.comments)
-                        .unwrap_or(comments.len() as u64),
-                    repo.channel.clone(),
-                )
-                .with_mention(repo.mention.clone())
-                .with_format(repo.format.clone()),
-            );
+        for comment in comments {
+            // Only emit if comment ID not in emitted set
+            if !emitted_ids_set.contains(&comment.id) {
+                commented_via_api.insert(*issue_num);
+                events.push(
+                    IncomingEvent::github_issue_commented(
+                        repo_name.to_string(),
+                        *issue_num,
+                        current
+                            .get(issue_num)
+                            .map(|issue| issue.title.clone())
+                            .unwrap_or_else(|| format!("Issue #{}", issue_num)),
+                        current
+                            .get(issue_num)
+                            .map(|issue| issue.comments)
+                            .unwrap_or(comments.len() as u64),
+                        repo.channel.clone(),
+                    )
+                    .with_mention(repo.mention.clone())
+                    .with_format(repo.format.clone()),
+                );
+                // Track this comment ID to prevent re-emission
+                emitted_comment_ids.push_back(comment.id);
+                // Evict oldest ID if we exceed the max
+                while emitted_comment_ids.len() > MAX_EMITTED_COMMENT_IDS {
+                    emitted_comment_ids.pop_front();
+                }
+                break; // Only emit one comment event per issue
+            }
         }
     }
 
-    // Third pass: process comment delta for issues in history
+    // Third pass: process comment delta for issues in history.
+    // Use this fallback only if we didn't already emit via API comments (e.g., fetch failed).
+    #[allow(clippy::collapsible_if)]
     for (number, issue) in current {
         if let Some(old) = previous.get(number) {
-            // For issues in history, use the comment delta ONLY if we didn't already emit
-            // via API comments. This ensures we emit for issues that have new comments
-            // but weren't in the API response (e.g., fetch failed).
             if !commented_via_api.contains(number) && issue.comments > old.comments {
                 events.push(
                     IncomingEvent::github_issue_commented(
@@ -4529,8 +4680,11 @@ mod tests {
                 prs: HashMap::new(),
                 ci: HashMap::new(),
                 ci_baseline_established: true,
-                last_successful_issue_poll: None,
-                last_successful_comment_poll: None,
+                issue_cursor: None,
+                comment_cursor: None,
+                emitted_comment_ids: VecDeque::new(),
+                emitted_opened: HashSet::new(),
+                emitted_closed: HashSet::new(),
             },
         );
         let mut baseline = CIBaseline::default();
@@ -8439,7 +8593,7 @@ mod tests {
         );
 
         let last_poll_time = "2026-10-15T10:00:00Z";
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8493,7 +8647,7 @@ mod tests {
         // Comments API is empty (no new comments after watermark)
         let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8545,7 +8699,7 @@ mod tests {
         // so edited old comments would not appear in the result.
         let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8597,7 +8751,7 @@ mod tests {
         // (This filtering happens in fetch_issue_comments)
         let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8665,7 +8819,7 @@ mod tests {
             }],
         );
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8728,7 +8882,7 @@ mod tests {
         // Comments API is empty (fetch failed, no data)
         let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8790,7 +8944,7 @@ mod tests {
         let last_poll_time = "2026-10-15T10:00:00Z"; // Watermark from successful empty poll
         let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8837,7 +8991,7 @@ mod tests {
         let last_poll_time = "2026-10-15T10:00:00Z"; // Exact same timestamp
         let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8907,7 +9061,7 @@ mod tests {
             }],
         );
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -8953,7 +9107,7 @@ mod tests {
         let last_poll_time = "2026-10-15T10:00:00Z"; // Exact same timestamp as close
         let api_comments: HashMap<u64, Vec<GitHubComment>> = HashMap::new();
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -9038,7 +9192,7 @@ mod tests {
             }],
         );
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -9100,7 +9254,7 @@ mod tests {
             }],
         );
 
-        let events = collect_issue_events_with_comments(
+        let events = test_collect_issue_events_with_comments_helper(
             &repo,
             "clawhip",
             &previous,
@@ -9144,19 +9298,21 @@ mod tests {
             prs: HashMap::new(),
             ci: HashMap::new(),
             ci_baseline_established: false,
-            last_successful_issue_poll: Some("2026-10-15T10:00:00Z".into()),
-            // F14: separate comment cursor field
-            last_successful_comment_poll: Some("2026-10-15T10:05:00Z".into()),
+            issue_cursor: Some("2026-10-15T10:00:00Z".into()),
+            comment_cursor: Some("2026-10-15T10:05:00Z".into()),
+            emitted_comment_ids: VecDeque::new(),
+            emitted_opened: HashSet::new(),
+            emitted_closed: HashSet::new(),
         };
 
         // Verify that the comment cursor is separate from issue cursor
         assert_eq!(
-            previous_state.last_successful_issue_poll.as_deref(),
+            previous_state.issue_cursor.as_deref(),
             Some("2026-10-15T10:00:00Z"),
             "Issue cursor should be at 10:00:00Z"
         );
         assert_eq!(
-            previous_state.last_successful_comment_poll.as_deref(),
+            previous_state.comment_cursor.as_deref(),
             Some("2026-10-15T10:05:00Z"),
             "Comment cursor should be at 10:05:00Z (independent from issue cursor)"
         );
@@ -9169,7 +9325,7 @@ mod tests {
             max_comment_timestamp.clone()
         } else {
             // F14/F15 fix: preserve previous comment cursor on fetch failure
-            previous_state.last_successful_comment_poll.clone()
+            previous_state.comment_cursor.clone()
         };
 
         // Verify cursor is preserved
@@ -9192,8 +9348,11 @@ mod tests {
             prs: HashMap::new(),
             ci: HashMap::new(),
             ci_baseline_established: false,
-            last_successful_issue_poll: Some("2026-10-15T10:00:00Z".into()),
-            last_successful_comment_poll: Some("2026-10-15T10:05:00Z".into()),
+            issue_cursor: Some("2026-10-15T10:00:00Z".into()),
+            comment_cursor: Some("2026-10-15T10:05:00Z".into()),
+            emitted_comment_ids: VecDeque::new(),
+            emitted_opened: HashSet::new(),
+            emitted_closed: HashSet::new(),
         };
 
         // Test normal success path: comment cursor uses max_comment_timestamp
@@ -9204,7 +9363,7 @@ mod tests {
             let comment_cursor = if fetch_succeeded {
                 max_comment_timestamp.clone()
             } else {
-                previous_state.last_successful_comment_poll.clone()
+                previous_state.comment_cursor.clone()
             };
 
             assert_eq!(
@@ -9222,7 +9381,7 @@ mod tests {
             let comment_cursor = if fetch_succeeded {
                 max_comment_timestamp.clone()
             } else {
-                previous_state.last_successful_comment_poll.clone()
+                previous_state.comment_cursor.clone()
             };
 
             assert_eq!(
