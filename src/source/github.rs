@@ -2950,6 +2950,29 @@ fn test_collect_issue_events_with_comments_helper(
     )
 }
 
+#[cfg(test)]
+fn test_collect_issue_events_with_dedup(
+    repo: &GitRepoMonitor,
+    repo_name: &str,
+    previous: &HashMap<u64, IssueSnapshot>,
+    current: &HashMap<u64, IssueSnapshot>,
+    last_poll_time: Option<&str>,
+    api_comments: &HashMap<u64, Vec<GitHubComment>>,
+    emitted_comment_ids: &mut VecDeque<u64>,
+) -> Vec<IncomingEvent> {
+    collect_issue_events_with_comments(
+        repo,
+        repo_name,
+        previous,
+        current,
+        last_poll_time,
+        api_comments,
+        emitted_comment_ids,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_issue_events_with_comments(
     repo: &GitRepoMonitor,
@@ -9456,14 +9479,17 @@ mod tests {
 
         let comment_id = 12345u64;
         let previous_state = GitHubRepoState {
-            issues: HashMap::from([(1u64, IssueSnapshot {
-                title: "Issue".into(),
-                state: "open".into(),
-                comments: 1,
-                created_at: "2026-10-15T09:00:00Z".into(),
-                updated_at: "2026-10-15T10:00:00Z".into(),
-                closed_at: None,
-            })]),
+            issues: HashMap::from([(
+                1u64,
+                IssueSnapshot {
+                    title: "Issue".into(),
+                    state: "open".into(),
+                    comments: 1,
+                    created_at: "2026-10-15T09:00:00Z".into(),
+                    updated_at: "2026-10-15T10:00:00Z".into(),
+                    closed_at: None,
+                },
+            )]),
             prs: HashMap::new(),
             ci: HashMap::new(),
             ci_baseline_established: false,
@@ -9476,33 +9502,36 @@ mod tests {
 
         let comment = GitHubComment {
             id: comment_id,
-            issue_number: 1,
             issue_url: "https://api.github.com/repos/org/repo/issues/1".into(),
-            is_pr_comment: false,
             html_url: "https://github.com/org/repo/issues/1#issuecomment-12345".into(),
             created_at: "2026-10-15T10:00:00Z".into(),
             updated_at: "2026-10-15T10:00:00Z".into(),
             body: "Same comment".into(),
         };
 
-        let current = HashMap::from([(1u64, IssueSnapshot {
-            title: "Issue".into(),
-            state: "open".into(),
-            comments: 1,
-            created_at: "2026-10-15T09:00:00Z".into(),
-            updated_at: "2026-10-15T10:00:00Z".into(),
-            closed_at: None,
-        })]);
+        let current = HashMap::from([(
+            1u64,
+            IssueSnapshot {
+                title: "Issue".into(),
+                state: "open".into(),
+                comments: 1,
+                created_at: "2026-10-15T09:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
+                closed_at: None,
+            },
+        )]);
 
         let api_comments = HashMap::from([(1u64, vec![comment])]);
 
-        let events = test_collect_issue_events_with_comments_helper(
+        let mut emitted_ids = previous_state.emitted_comment_ids.clone();
+        let events = test_collect_issue_events_with_dedup(
             &repo,
             "clawhip",
             &previous_state.issues,
             &current,
             previous_state.issue_cursor.as_deref(),
             &api_comments,
+            &mut emitted_ids,
         );
 
         let commented_events: Vec<_> = events
