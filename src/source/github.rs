@@ -30,6 +30,30 @@ fn current_utc_iso8601() -> String {
         .format(&Iso8601::DEFAULT)
         .unwrap_or_else(|_| "2000-01-01T00:00:00Z".to_string())
 }
+
+/// J1 fix: Subtract 1 second from an ISO 8601 timestamp.
+/// GitHub's `since` parameter is strictly-after (exclusive), so we query with
+/// `since = cursor - 1s` and rely on dedup to handle boundary-second comments.
+/// Returns the input if parsing fails.
+fn subtract_one_second(timestamp: &str) -> String {
+    use time::Duration as TimeDuration;
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Iso8601;
+
+    match OffsetDateTime::parse(timestamp, &Iso8601::DEFAULT) {
+        Ok(dt) => {
+            if let Some(earlier) = dt.checked_sub(TimeDuration::seconds(1)) {
+                earlier
+                    .format(&Iso8601::DEFAULT)
+                    .unwrap_or_else(|_| timestamp.to_string())
+            } else {
+                timestamp.to_string()
+            }
+        }
+        Err(_) => timestamp.to_string(),
+    }
+}
+
 // MoveFileExW with write-through and the following file flush can exceed the
 // old 200 ms retry window on loaded Windows runners.
 const BASELINE_LOCK_MAX_WAIT: Duration = Duration::from_secs(5);
@@ -2491,6 +2515,9 @@ async fn poll_issues(
         ));
     };
 
+    // J3 fix: Capture wall-clock BEFORE issues request for empty-issue fallback cursor
+    let pre_fetch_cutoff = current_utc_iso8601();
+
     match fetch_issues(client, &config.monitors.github_api_base, repo, snapshot).await {
         Ok(issues) => {
             // Merge newly fetched issues with history to retain information about
@@ -2520,7 +2547,9 @@ async fn poll_issues(
             // Fetch real comments from the API for proper issue-commented detection.
             // This is the source of truth for detecting new comments on issues,
             // including old issues that re-enter the window.
-            let (api_comments, _comments_complete, max_comment_timestamp) =
+            // J2 fix: Capture wall-clock BEFORE comment fetch for baseline poll cursor
+            let pre_comment_fetch_cutoff = current_utc_iso8601();
+            let (api_comments, comments_complete, max_comment_timestamp) =
                 if let Some(client) = github_client {
                     // Use separate comment cursor for advancing comment watermark
                     let comment_watermark = previous.and_then(|p| p.comment_cursor.as_deref());
@@ -2561,7 +2590,12 @@ async fn poll_issues(
                 .map(|p| p.emitted_closed.clone())
                 .unwrap_or_default();
 
+            // J2 fix: On baseline poll with page-capped comments, emit nothing and use pre-fetch cutoff
+            let is_baseline = previous.is_none();
+            let is_comments_incomplete = !comments_complete;
+
             if let Some(previous) = previous {
+                // Emit events normally (not a baseline poll)
                 for event in collect_issue_events_with_comments(
                     repo,
                     &snapshot.repo_name,
@@ -2575,13 +2609,27 @@ async fn poll_issues(
                 ) {
                     send_event(tx, event).await?;
                 }
+            } else if is_baseline && is_comments_incomplete {
+                // J2: Baseline poll with page-capped comments: emit nothing
+                // The comments will be detected on the next poll with proper cursor
             }
             prune_emitted_opened_closed(&mut emitted_opened);
             prune_emitted_opened_closed(&mut emitted_closed);
+
+            // J2 fix: On baseline poll with page-capped comments, use pre-fetch cutoff
+            let final_comment_timestamp = if is_baseline && is_comments_incomplete {
+                Some(pre_comment_fetch_cutoff)
+            } else if issues.is_empty() {
+                // J3 fix: If no issues fetched, use pre-fetch cutoff from issues request
+                Some(pre_fetch_cutoff)
+            } else {
+                max_comment_timestamp
+            };
+
             Ok((
                 merged_issues,
                 true,
-                max_comment_timestamp,
+                final_comment_timestamp,
                 emitted_comment_ids,
                 emitted_opened,
                 emitted_closed,
@@ -3289,6 +3337,15 @@ async fn fetch_issue_comments(
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
 
     let watermark_param = watermark.unwrap_or("");
+    // J1 fix: GitHub 'since' is strictly-after (exclusive), so query with since = cursor - 1s
+    // and rely on dedup (emitted_comment_ids) + created_at >= cursor filter for boundary seconds.
+    let since_param = if !watermark_param.is_empty() {
+        subtract_one_second(watermark_param)
+    } else {
+        String::new()
+    };
+    let since_str = since_param.as_str();
+
     let mut comments = Vec::new();
     let mut page = 1_usize;
     let mut seen_next_urls = HashSet::new();
@@ -3298,7 +3355,7 @@ async fn fetch_issue_comments(
     loop {
         let page_str = page.to_string();
         let current_page = format!(
-            "{}/repos/{github_repo}/issues/comments?since={watermark_param}&page={page_str}",
+            "{}/repos/{github_repo}/issues/comments?since={since_str}&page={page_str}",
             api_base.trim_end_matches('/')
         );
         seen_next_urls.insert(pagination_page_key(&current_page));
@@ -3308,7 +3365,7 @@ async fn fetch_issue_comments(
             api_base,
             &format!("repos/{github_repo}/issues/comments"),
             &[
-                ("since", watermark_param),
+                ("since", since_str),
                 ("sort", "updated"),
                 ("direction", "asc"),
                 ("per_page", "100"),
@@ -3915,15 +3972,15 @@ impl GitHubComment {
     fn is_pr_comment(&self) -> bool {
         // Parse the URL to extract the path component regardless of host.
         // Format: https://authority/org/repo/pull/123 or https://authority/org/repo/issues/123
+        // J4 fix: iterate segments without allocating Vec
         if let Some(scheme_end) = self.html_url.find("://") {
             let after_scheme = &self.html_url[scheme_end + 3..];
             if let Some(path_start) = after_scheme.find('/') {
                 let path_part = &after_scheme[path_start..];
                 let path_only = path_part.split('#').next().unwrap_or("");
-                let segments: Vec<&str> = path_only.split('/').collect();
-                // segments[0] is empty (leading /), segments[1] is org, segments[2] is repo, segments[3] is type
-                if segments.len() > 3 {
-                    return segments[3] == "pull";
+                // Check if the 4th segment (index 3) is "pull" without allocating
+                if let Some(type_segment) = path_only.split('/').nth(3) {
+                    return type_segment == "pull";
                 }
             }
         }
@@ -9070,7 +9127,7 @@ mod tests {
     }
 
     #[test]
-    fn h1_exactly_one_event_per_issue_per_poll_records_all_ids() {
+    fn exactly_one_event_per_issue_per_poll_records_all_ids() {
         // H1: Multiple unseen comments on the same issue should result in exactly
         // ONE issue-commented event per poll, but ALL comment IDs should be tracked
         // in the dedupe set to prevent future re-emission.
@@ -9171,7 +9228,7 @@ mod tests {
     }
 
     #[test]
-    fn h1_edited_comment_suppressed_by_dedup() {
+    fn edited_comment_suppressed_by_dedup() {
         // H1: When a comment is edited (updated_at changes) but was already
         // seen before (in dedup set by ID), the next poll should emit nothing
         // because the ID is already tracked. This satisfies the H1 requirement:
