@@ -2196,9 +2196,10 @@ async fn poll_github(
             emitted_comment_ids,
             emitted_opened,
             emitted_closed,
+            pre_fetch_cutoff,
         ) = match poll_issues(config, github_client, repo, &snapshot, previous, tx).await {
-            Ok((issues, success, max_ts, ids, opened, closed)) => {
-                (issues, success, max_ts, ids, opened, closed)
+            Ok((issues, success, max_ts, ids, opened, closed, cutoff)) => {
+                (issues, success, max_ts, ids, opened, closed, cutoff)
             }
             Err(error) => {
                 eprintln!(
@@ -2223,6 +2224,7 @@ async fn poll_github(
                     ids,
                     opened,
                     closed,
+                    current_utc_iso8601(),
                 )
             }
         };
@@ -2405,27 +2407,19 @@ async fn poll_github(
             send_then_ack_prefix(tx, ci_baseline, ci_baseline_path, ci_events, &delivered).await?;
         }
 
-        // F5 fix: Only update watermark if fetch succeeded
-        // F12 fix: Fold max comment timestamp into watermark for shared cutoff
+        // K1 fix: issue_cursor is based only on issue timestamps, never on comment timestamps.
+        // When issues are empty, use pre_fetch_cutoff (captured before the request) to avoid
+        // permanently skipping issues created after the empty response.
         let last_poll_time = if fetch_succeeded {
-            let issue_max = issues
-                .values()
-                .map(|issue| issue.updated_at.as_str())
-                .max()
-                .map(|s| s.to_string())
-                .unwrap_or_else(current_utc_iso8601);
-
-            let final_watermark = if let Some(comment_ts) = &max_comment_timestamp {
-                // Use the later of issue or comment timestamp
-                if comment_ts.as_str() > issue_max.as_str() {
-                    comment_ts.clone()
-                } else {
-                    issue_max
-                }
+            if issues.is_empty() {
+                Some(pre_fetch_cutoff)
             } else {
-                issue_max
-            };
-            Some(final_watermark)
+                issues
+                    .values()
+                    .map(|issue| issue.updated_at.as_str())
+                    .max()
+                    .map(|s| s.to_string())
+            }
         } else {
             // Fetch failed: preserve previous watermark
             previous.and_then(|p| p.issue_cursor.clone())
@@ -2455,7 +2449,7 @@ async fn poll_github(
     Ok(())
 }
 
-// Returns: (issues HashMap, fetch_succeeded, max_comment_timestamp, emitted_comment_ids, emitted_opened, emitted_closed)
+// Returns: (issues HashMap, fetch_succeeded, final_comment_timestamp, emitted_comment_ids, emitted_opened, emitted_closed, pre_fetch_cutoff)
 async fn poll_issues(
     config: &AppConfig,
     github_client: Option<&GitHubClient>,
@@ -2470,7 +2464,11 @@ async fn poll_issues(
     VecDeque<u64>,
     HashSet<(u64, String)>,
     HashSet<(u64, String)>,
+    String,
 )> {
+    // Capture wall-clock BEFORE any API requests for empty-issue fallback cursor
+    let pre_fetch_cutoff = current_utc_iso8601();
+
     if !repo.emit_issue_opened {
         let (ids, opened, closed) = previous
             .map(|p| {
@@ -2490,6 +2488,7 @@ async fn poll_issues(
             ids,
             opened,
             closed,
+            pre_fetch_cutoff,
         ));
     }
 
@@ -2512,11 +2511,9 @@ async fn poll_issues(
             ids,
             opened,
             closed,
+            pre_fetch_cutoff,
         ));
     };
-
-    // J3 fix: Capture wall-clock BEFORE issues request for empty-issue fallback cursor
-    let pre_fetch_cutoff = current_utc_iso8601();
 
     match fetch_issues(client, &config.monitors.github_api_base, repo, snapshot).await {
         Ok(issues) => {
@@ -2590,7 +2587,6 @@ async fn poll_issues(
                 .map(|p| p.emitted_closed.clone())
                 .unwrap_or_default();
 
-            // J2 fix: On baseline poll with page-capped comments, emit nothing and use pre-fetch cutoff
             let is_baseline = previous.is_none();
             let is_comments_incomplete = !comments_complete;
 
@@ -2609,19 +2605,28 @@ async fn poll_issues(
                 ) {
                     send_event(tx, event).await?;
                 }
-            } else if is_baseline && is_comments_incomplete {
-                // J2: Baseline poll with page-capped comments: emit nothing
-                // The comments will be detected on the next poll with proper cursor
+            } else {
+                // K2 fix: Baseline poll - seed all comment IDs without emitting events.
+                // This prevents re-emission of old comments on the next poll.
+                for comments in api_comments.values() {
+                    for comment in comments {
+                        emitted_comment_ids.push_back(comment.id);
+                        while emitted_comment_ids.len() > MAX_EMITTED_COMMENT_IDS {
+                            emitted_comment_ids.pop_front();
+                        }
+                    }
+                }
             }
             prune_emitted_opened_closed(&mut emitted_opened);
             prune_emitted_opened_closed(&mut emitted_closed);
 
-            // J2 fix: On baseline poll with page-capped comments, use pre-fetch cutoff
+            // For comment cursor: on baseline poll with incomplete comments, use pre-comment-fetch cutoff.
+            // When issues are empty, use pre-fetch cutoff to avoid losing issues created between
+            // the empty response and the next poll.
             let final_comment_timestamp = if is_baseline && is_comments_incomplete {
                 Some(pre_comment_fetch_cutoff)
             } else if issues.is_empty() {
-                // J3 fix: If no issues fetched, use pre-fetch cutoff from issues request
-                Some(pre_fetch_cutoff)
+                Some(pre_fetch_cutoff.clone())
             } else {
                 max_comment_timestamp
             };
@@ -2633,6 +2638,7 @@ async fn poll_issues(
                 emitted_comment_ids,
                 emitted_opened,
                 emitted_closed,
+                pre_fetch_cutoff,
             ))
         }
         Err(error) => {
@@ -2660,6 +2666,7 @@ async fn poll_issues(
                 ids,
                 opened,
                 closed,
+                pre_fetch_cutoff,
             ))
         }
     }
