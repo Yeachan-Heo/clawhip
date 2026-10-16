@@ -867,7 +867,7 @@ your PRs/issues, mentions and review requests); it is not a repository-wide audi
 ```toml
 [monitors.github_notifications]
 enabled = true                  # default false: zero requests when disabled
-poll_interval_secs = 60          # min 1; server X-Poll-Interval takes precedence
+poll_interval_secs = 60          # min 1; max(configured, latest valid X-Poll-Interval)
 participating = false            # true sends participating=true
 reasons = []                     # empty = all; e.g. ["author", "mention", "review_requested"]
 repos = []                       # empty = all; e.g. ["owner/repo"]
@@ -888,14 +888,34 @@ currently documents personal access tokens **(classic)** with `notifications` or
 `repo` scope; this endpoint does **not** support fine-grained personal access tokens.
 Authenticate `gh` with a credential that can read notifications.
 
-Each poll normally costs one `GET /notifications?all=false&participating=false&per_page=50`
-(up to five pages when needed). Requests send the previous successful response's
+Each poll constructs at most five `GET /notifications` requests, with `all=false`,
+`participating` as configured, and `per_page=50`. Constructed polling/pagination
+requests stay on the configured API origin; HTTP 3xx redirects retain the shared
+GitHub client's default behavior and can add transport requests or change origin.
+The committed watermark W is the
+first-page server `Date` of the last complete scan (initialized from the cold-start
+cutoff). Normal polls request `since=W-1s`; the one-second overlap is deduplicated
+by thread ID and `updated_at`. They send the previous complete response's
 `Last-Modified` as `If-Modified-Since`; an authenticated `304 Not Modified` emits
-nothing and does not consume the primary rate limit. The poller never runs faster
-than the configured interval or the largest observed `X-Poll-Interval`. Shared
-GitHub 403/429 backoff also applies. Failures preserve the thread baseline and
-conditional cursor. Pagination caps report source degradation, retain received
-threads, and clear the conditional cursor to avoid hiding omitted pages.
+nothing and does not consume the primary rate limit. The effective interval is
+the maximum of the configured interval and the **latest valid** `X-Poll-Interval`,
+including headers on failures and 304 responses; a later lower value reduces the
+delay again. Missing/invalid interval headers retain the latest valid value.
+Shared GitHub 403/429 backoff also applies.
+
+A five-page cap reports source degradation and saves a catch-up window without
+advancing W. While catching up, each poll first fetches one fresh head page with
+`since=<original capped poll Date>-1s`, so its newest 50 updates are not delayed by
+the backlog. The remaining four requests drain `since=W-1s&before=<oldest received
+updated_at + 1s>`. Overlapping the boundary second avoids skipping tied threads;
+if that second fills the budget, the next poll resumes its next page rather than
+skipping the second. Local reason/repo filters never advance or truncate the
+scan. When the catch-up window has no next page, W advances to the original capped
+poll's Date and the continuation clears. The next normal scan includes updates
+since that Date, including any beyond the fresh head's first page. Conditional
+requests are disabled throughout catch-up and on that first normal scan.
+HTTP/decoding failures and missing/invalid first-page Date headers preserve the
+watermark, continuation, thread baseline, and conditional cursor.
 
 **Unread only; never marks read.** No PATCH/PUT requests are made. Reading a
 notification on github.com removes it from the unread feed; further activity
@@ -904,9 +924,11 @@ baseline without replaying history. Its server `Date` is the eligibility cutoff
 (missing/invalid Date defers initialization). Subsequent polls emit one
 `github.notification` per thread whose `updated_at` advances, not per comment.
 An unseen thread older than that cutoff never replays unless it changes.
-The in-memory dedupe FIFO holds 1,000 threads; an evicted post-cutoff thread can
-emit again, and restarting establishes a fresh, silent baseline. Same-second
-changes with the same `updated_at` cannot be distinguished.
+The in-memory dedupe FIFO holds 1,000 threads; overlapping windows can replay an
+evicted post-cutoff thread, and restarting establishes a fresh, silent baseline.
+GitHub's inbox is not a snapshot: reading/updating threads while paging can shift
+page offsets, including within large same-second ties. Separate changes to one
+thread with the same second-resolution `updated_at` cannot be distinguished.
 
 Payloads contain no comment/review bodies, token, or private credential metadata.
 Repository names and titles can still identify private repositories: route only
