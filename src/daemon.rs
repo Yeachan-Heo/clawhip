@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -11,6 +11,7 @@ use crate::config::{AppConfig, GajaeRouteAction, RouteRule};
 use crate::cron::CronSource;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
+use crate::event::{GitHubPRCommentEvent, GitHubPRReviewCommentEvent, GitHubPRReviewEvent};
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::gajae::{HandlerAction, HandlerLimits, HandlerOutcome};
 use crate::gjc_sdk_events::{
@@ -57,12 +58,14 @@ use crate::source::{
 };
 use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
+use ring::hmac;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
@@ -127,6 +130,7 @@ struct AppState {
     native_observability: SharedNativeHookObservability,
     cron_state_path: PathBuf,
     discord_watch_lock: Arc<Mutex<()>>,
+    github_webhook: Arc<GitHubWebhookState>,
     subscriptions: SharedSubscriptionRegistry,
     git_monitor_diagnostics: SharedGitMonitorDiagnostics,
     gjc: crate::gjc::control::GjcControlPlane,
@@ -135,6 +139,32 @@ struct AppState {
 }
 
 type SharedSubscriptionRegistry = Arc<RwLock<BTreeMap<String, SubscriptionEntry>>>;
+
+const GITHUB_DELIVERY_CAPACITY: usize = 1_000;
+
+#[derive(Default)]
+struct GitHubWebhookState {
+    deliveries: Mutex<GitHubDeliveries>,
+    missing_secret_logged: OnceLock<()>,
+}
+
+#[derive(Default)]
+struct GitHubDeliveries {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl GitHubDeliveries {
+    fn record(&mut self, delivery: &str) {
+        if self.seen.len() == GITHUB_DELIVERY_CAPACITY
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.seen.remove(&oldest);
+        }
+        self.seen.insert(delivery.to_string());
+        self.order.push_back(delivery.to_string());
+    }
+}
 
 struct SubscriptionEntry {
     config: Arc<crate::config::SubscriptionConfig>,
@@ -387,6 +417,7 @@ pub async fn run(
         native_observability,
         cron_state_path,
         discord_watch_lock: Arc::new(Mutex::new(())),
+        github_webhook: Arc::default(),
         subscriptions: subscriptions.clone(),
         git_monitor_diagnostics,
         gjc: (*gjc_control).clone(),
@@ -2957,8 +2988,120 @@ fn gajae_hold_target(config: &AppConfig, repo: &str) -> Option<String> {
 async fn post_github(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    body: Bytes,
 ) -> impl IntoResponse {
+    if !github_json_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let verified = if let Some(env_name) = &state.config.providers.github.webhook_secret_env {
+        let secret = std::env::var(env_name)
+            .ok()
+            .filter(|value| !value.is_empty());
+        let Some(secret) = secret else {
+            state.github_webhook.missing_secret_logged.get_or_init(|| {
+                eprintln!("clawhip GitHub webhook rejected: configured secret environment variable {env_name} is missing or empty");
+            });
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        if !github_signature_valid(&headers, &body, secret.as_bytes()) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        true
+    } else {
+        false
+    };
+
+    let payload = match serde_json::from_slice::<Value>(&body) {
+        Ok(payload) => payload,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    // Serialize verified deliveries through enqueue, and remember only deliveries
+    // that enqueued an event: a queue failure must remain retryable, and ignored
+    // deliveries (ping, unsupported actions) must not evict accepted ones. Unsigned
+    // legacy requests cannot poison the authenticated delivery cache.
+    let mut deliveries = if verified {
+        Some(state.github_webhook.deliveries.lock().await)
+    } else {
+        None
+    };
+    let delivery = headers
+        .get("x-github-delivery")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    if let (Some(deliveries), Some(delivery)) = (&deliveries, delivery)
+        && deliveries.seen.contains(delivery)
+    {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"ok": true, "ignored": true, "reason": "duplicate delivery"})),
+        )
+            .into_response();
+    }
+
+    let response = github_webhook_event(&state, &headers, payload, verified).await;
+    if response.status().is_success()
+        && response
+            .extensions()
+            .get::<GitHubWebhookIgnored>()
+            .is_none()
+        && let (Some(deliveries), Some(delivery)) = (&mut deliveries, delivery)
+    {
+        deliveries.record(delivery);
+    }
+    response
+}
+
+/// Marks a successful `/github` response that enqueued nothing.
+#[derive(Clone, Copy)]
+struct GitHubWebhookIgnored;
+
+/// Mirrors axum's `Json` extractor media-type check, which this handler replaced
+/// with raw `Bytes` so the signature covers the exact body.
+fn github_json_content_type(headers: &HeaderMap) -> bool {
+    let Some(content_type) = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || essence
+            .strip_prefix("application/")
+            .is_some_and(|subtype| subtype.ends_with("+json"))
+}
+
+fn github_signature_valid(headers: &HeaderMap, body: &[u8], secret: &[u8]) -> bool {
+    let Some(signature) = headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("sha256="))
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    else {
+        return false;
+    };
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let Ok(value) = u8::from_str_radix(&signature[index * 2..index * 2 + 2], 16) else {
+            return false;
+        };
+        *byte = value;
+    }
+    hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, secret), body, &bytes).is_ok()
+}
+
+async fn github_webhook_event(
+    state: &AppState,
+    headers: &HeaderMap,
+    payload: Value,
+    verified: bool,
+) -> axum::response::Response {
     let event_name = headers
         .get("x-github-event")
         .and_then(|value| value.to_str().ok())
@@ -2969,6 +3112,67 @@ async fn post_github(
         .unwrap_or_default();
 
     let event = match event_name {
+        "issue_comment" if verified && action == "created" => {
+            let issue = &payload["issue"];
+            let repo = github_webhook_text(&payload, "/repository/full_name");
+            let number = issue["number"].as_u64().unwrap_or_default();
+            let title = github_webhook_text(issue, "/title");
+            if issue.get("pull_request").is_some() {
+                Some(IncomingEvent::github_pr_commented(
+                    github_webhook_comment(&payload, issue, repo, number, title),
+                    None,
+                ))
+            } else {
+                Some(IncomingEvent::github_issue_commented(
+                    repo,
+                    number,
+                    title,
+                    issue["comments"].as_u64().unwrap_or_default(),
+                    None,
+                ))
+            }
+        }
+        "pull_request_review" if verified && action == "submitted" => {
+            let review_state = github_webhook_text(&payload, "/review/state").to_ascii_lowercase();
+            if matches!(
+                review_state.as_str(),
+                "approved" | "changes_requested" | "commented"
+            ) {
+                Some(IncomingEvent::github_pr_reviewed(
+                    GitHubPRReviewEvent {
+                        repo: github_webhook_text(&payload, "/repository/full_name"),
+                        number: payload["pull_request"]["number"]
+                            .as_u64()
+                            .unwrap_or_default(),
+                        title: github_webhook_text(&payload, "/pull_request/title"),
+                        author: github_webhook_text(&payload, "/review/user/login"),
+                        pr_author: github_webhook_text(&payload, "/pull_request/user/login"),
+                        url: github_webhook_text(&payload, "/review/html_url"),
+                        review_id: payload["review"]["id"].as_u64().unwrap_or_default(),
+                        state: review_state,
+                    },
+                    None,
+                ))
+            } else {
+                None
+            }
+        }
+        "pull_request_review_comment" if verified && action == "created" => {
+            let pr = &payload["pull_request"];
+            Some(IncomingEvent::github_pr_review_commented(
+                GitHubPRReviewCommentEvent {
+                    comment: github_webhook_comment(
+                        &payload,
+                        pr,
+                        github_webhook_text(&payload, "/repository/full_name"),
+                        pr["number"].as_u64().unwrap_or_default(),
+                        github_webhook_text(pr, "/title"),
+                    ),
+                    path: github_webhook_text(&payload, "/comment/path"),
+                },
+                None,
+            ))
+        }
         "issues" if action == "opened" => {
             Some(normalize_event(IncomingEvent::github_issue_opened(
                 payload
@@ -3019,7 +3223,7 @@ async fn post_github(
                 .map(ToString::to_string);
             if let Some(target) = gajae_hold_target(&state.config, &repo) {
                 return enqueue_accepted_event(
-                    &state,
+                    state,
                     IncomingEvent::gajae_release_hold(
                         repo,
                         target,
@@ -3093,7 +3297,7 @@ async fn post_github(
                 && let Some(target) = gajae_hold_target(&state.config, &repo)
             {
                 return enqueue_accepted_event(
-                    &state,
+                    state,
                     IncomingEvent::gajae_merge_hold(
                         repo,
                         target,
@@ -3137,11 +3341,13 @@ async fn post_github(
         } else {
             "unsupported event"
         };
-        return (
+        let mut response = (
             StatusCode::ACCEPTED,
             Json(json!({"ok": true, "ignored": true, "reason": reason})),
         )
             .into_response();
+        response.extensions_mut().insert(GitHubWebhookIgnored);
+        return response;
     };
 
     if let Err(error) = from_incoming_event(&event) {
@@ -3159,6 +3365,32 @@ async fn post_github(
             Json(json!({"ok": false, "error": error.to_string()})),
         )
             .into_response(),
+    }
+}
+
+fn github_webhook_text(payload: &Value, pointer: &str) -> String {
+    payload
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn github_webhook_comment(
+    payload: &Value,
+    subject: &Value,
+    repo: String,
+    number: u64,
+    title: String,
+) -> GitHubPRCommentEvent {
+    GitHubPRCommentEvent {
+        repo,
+        number,
+        title,
+        author: github_webhook_text(payload, "/comment/user/login"),
+        pr_author: github_webhook_text(subject, "/user/login"),
+        url: github_webhook_text(payload, "/comment/html_url"),
+        comment_id: payload["comment"]["id"].as_u64().unwrap_or_default(),
     }
 }
 
@@ -3264,6 +3496,7 @@ mod tests {
                 native_observability: new_shared_native_hook_observability(),
                 cron_state_path: PathBuf::from("cron-state.json"),
                 discord_watch_lock: Arc::new(Mutex::new(())),
+                github_webhook: Arc::default(),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
                 git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
                 gjc: test_gjc_plane(),
@@ -3422,6 +3655,7 @@ mod tests {
                 native_observability: new_shared_native_hook_observability(),
                 cron_state_path: PathBuf::from("cron-state.json"),
                 discord_watch_lock: Arc::new(Mutex::new(())),
+                github_webhook: Arc::default(),
                 subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
                 git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
                 gjc: test_gjc_plane(),
@@ -3626,6 +3860,7 @@ mod tests {
         let (state, mut rx) = app_state_with_config(hold_config());
         let mut headers = HeaderMap::new();
         headers.insert("x-github-event", "release".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
         let payload = json!({
             "action": "edited",
             "repository": {"full_name": "Yeachan-Heo/clawhip"},
@@ -3638,9 +3873,13 @@ mod tests {
             "sender": {"login": "maintainer"}
         });
 
-        let response = post_github(State(state), headers, Json(payload))
-            .await
-            .into_response();
+        let response = post_github(
+            State(state),
+            headers,
+            Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let queued = rx.recv().await.expect("queued hold");
 
@@ -3677,6 +3916,7 @@ mod tests {
         let (state, mut rx) = app_state_with_config(hold_config());
         let mut headers = HeaderMap::new();
         headers.insert("x-github-event", "pull_request".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
         let payload = json!({
             "action": "closed",
             "repository": {"full_name": "Yeachan-Heo/clawhip"},
@@ -3693,9 +3933,13 @@ mod tests {
             "sender": {"login": "maintainer"}
         });
 
-        let response = post_github(State(state), headers, Json(payload))
-            .await
-            .into_response();
+        let response = post_github(
+            State(state),
+            headers,
+            Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let queued = rx.recv().await.expect("queued hold");
 
@@ -3746,6 +3990,705 @@ mod tests {
             .insert(path[path.len() - 1].to_string(), Value::String(value));
     }
 
+    struct GitHubWebhookTest {
+        url: String,
+        client: reqwest::Client,
+        rx: mpsc::Receiver<IncomingEvent>,
+        state: AppState,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl GitHubWebhookTest {
+        async fn new(secret_env: Option<&str>) -> Self {
+            let mut config = AppConfig::default();
+            config.providers.github.webhook_secret_env = secret_env.map(str::to_string);
+            let (state, rx) = app_state_with_config(config);
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let url = format!("http://{}/github", listener.local_addr().unwrap());
+            let app = AxumRouter::new()
+                .route("/github", post(post_github))
+                .with_state(state.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self {
+                url,
+                client: reqwest::Client::new(),
+                rx,
+                state,
+                server,
+            }
+        }
+
+        async fn post_raw(
+            &self,
+            event: &str,
+            body: Vec<u8>,
+            signature: Option<&str>,
+            delivery: Option<&str>,
+        ) -> reqwest::Response {
+            let mut request = self
+                .client
+                .post(&self.url)
+                .header("x-github-event", event)
+                .header("content-type", "application/json")
+                .body(body);
+            if let Some(signature) = signature {
+                request = request.header("x-hub-signature-256", signature);
+            }
+            if let Some(delivery) = delivery {
+                request = request.header("x-github-delivery", delivery);
+            }
+            request.send().await.unwrap()
+        }
+
+        async fn post(
+            &self,
+            event: &str,
+            payload: &Value,
+            signed: bool,
+            delivery: Option<&str>,
+        ) -> reqwest::Response {
+            let body = serde_json::to_vec(payload).unwrap();
+            let signature = signed.then(|| github_test_signature(&body));
+            self.post_raw(event, body, signature.as_deref(), delivery)
+                .await
+        }
+
+        fn assert_empty(&mut self) {
+            assert!(self.rx.try_recv().is_err(), "unexpected queued event");
+        }
+    }
+
+    impl Drop for GitHubWebhookTest {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    // Use an existing non-secret environment value as a test HMAC key instead
+    // of mutating process-global environment variables in concurrent tests.
+    const GITHUB_TEST_SECRET_ENV: &str = "PATH";
+
+    fn github_test_signature(body: &[u8]) -> String {
+        use std::fmt::Write;
+        let secret = std::env::var(GITHUB_TEST_SECRET_ENV).unwrap();
+        assert!(!secret.is_empty());
+        let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes()), body);
+        let mut signature = String::from("sha256=");
+        for byte in tag.as_ref() {
+            write!(&mut signature, "{byte:02x}").unwrap();
+        }
+        signature
+    }
+
+    fn github_activity_payload() -> Value {
+        json!({
+            "action": "created",
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 42, "title": "A title", "comments": 7, "user": {"login": "pr-owner"}},
+            "pull_request": {"number": 42, "title": "A title", "user": {"login": "pr-owner"}},
+            "comment": {"id": 123, "user": {"login": "commenter"}, "html_url": "https://github.com/owner/repo/pull/42#comment-123", "path": "src/main.rs", "body": "PRIVATE COMMENT BODY"},
+            "review": {"id": 456, "user": {"login": "reviewer"}, "html_url": "https://github.com/owner/repo/pull/42#review-456", "state": "approved", "body": "PRIVATE REVIEW BODY"}
+        })
+    }
+
+    #[test]
+    fn github_webhook_signature_requires_strict_hex_and_matches_rfc4231() {
+        let mut headers = HeaderMap::new();
+        let signature = "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        headers.insert("x-hub-signature-256", signature.parse().unwrap());
+        assert!(github_signature_valid(
+            &headers,
+            b"what do ya want for nothing?",
+            b"Jefe"
+        ));
+        // from_str_radix accepts a leading '+', but GitHub signatures must be hex.
+        headers.insert(
+            "x-hub-signature-256",
+            signature.replacen("04", "+4", 1).parse().unwrap(),
+        );
+        assert!(!github_signature_valid(
+            &headers,
+            b"what do ya want for nothing?",
+            b"Jefe"
+        ));
+    }
+
+    #[tokio::test]
+    async fn github_webhook_signed_comments_emit_public_safe_issue_and_pr_payloads() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        let mut payload = github_activity_payload();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("issue-comment"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        let event = fixture.rx.try_recv().unwrap();
+        assert_eq!(event.kind, "github.issue-commented");
+        assert_eq!(
+            event.payload,
+            json!({"repo": "owner/repo", "number": 42, "title": "A title", "comments": 7})
+        );
+        fixture.assert_empty();
+
+        payload["issue"]["pull_request"] =
+            json!({"url": "https://api.github.com/repos/owner/repo/pulls/42"});
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("pr-comment"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        let event = fixture.rx.try_recv().unwrap();
+        assert_eq!(event.kind, "github.pr-commented");
+        assert_eq!(
+            event.payload,
+            json!({"repo": "owner/repo", "number": 42, "title": "A title", "author": "commenter", "pr_author": "pr-owner", "url": payload["comment"]["html_url"], "comment_id": 123})
+        );
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_signed_reviews_emit_supported_lowercase_states_without_bodies() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        for state in ["APPROVED", "changes_requested", "commented"] {
+            let mut payload = github_activity_payload();
+            payload["action"] = json!("submitted");
+            payload["review"]["state"] = json!(state);
+            assert_eq!(
+                fixture
+                    .post("pull_request_review", &payload, true, Some(state))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            let event = fixture.rx.try_recv().unwrap();
+            assert_eq!(event.kind, "github.pr-reviewed");
+            assert_eq!(
+                event.payload,
+                json!({"repo": "owner/repo", "number": 42, "title": "A title", "author": "reviewer", "pr_author": "pr-owner", "url": payload["review"]["html_url"], "review_id": 456, "state": state.to_ascii_lowercase()})
+            );
+            fixture.assert_empty();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_webhook_signed_review_comment_emits_path_without_body() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        let payload = github_activity_payload();
+        assert_eq!(
+            fixture
+                .post("pull_request_review_comment", &payload, true, None)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        let event = fixture.rx.try_recv().unwrap();
+        assert_eq!(event.kind, "github.pr-review-commented");
+        assert_eq!(
+            event.payload,
+            json!({"repo": "owner/repo", "number": 42, "title": "A title", "author": "commenter", "pr_author": "pr-owner", "url": payload["comment"]["html_url"], "comment_id": 123, "path": "src/main.rs"})
+        );
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_requires_valid_signature_for_old_and_new_events_when_configured() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        for event in [
+            "issues",
+            "release",
+            "pull_request",
+            "issue_comment",
+            "pull_request_review",
+            "pull_request_review_comment",
+        ] {
+            let mut payload = github_activity_payload();
+            payload["action"] = json!(match event {
+                "issues" | "pull_request" => "opened",
+                "release" => "published",
+                "pull_request_review" => "submitted",
+                _ => "created",
+            });
+            let body = serde_json::to_vec(&payload).unwrap();
+            for signature in [
+                None,
+                Some("sha256=0000000000000000000000000000000000000000000000000000000000000000"),
+                Some("sha1=bad"),
+                Some("sha256=short"),
+                Some("sha256=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+            ] {
+                assert_eq!(
+                    fixture
+                        .post_raw(event, body.clone(), signature, Some("untrusted"))
+                        .await
+                        .status(),
+                    StatusCode::UNAUTHORIZED
+                );
+                fixture.assert_empty();
+            }
+        }
+        // Rejected attempts must not poison a later authenticated delivery ID.
+        let mut payload = github_activity_payload();
+        payload["action"] = json!("opened");
+        assert_eq!(
+            fixture
+                .post("issues", &payload, true, Some("untrusted"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(fixture.rx.try_recv().unwrap().kind, "github.issue-opened");
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_legacy_events_work_with_or_without_a_secret() {
+        for secret_env in [None, Some(GITHUB_TEST_SECRET_ENV)] {
+            let mut fixture = GitHubWebhookTest::new(secret_env).await;
+            for (event, action, kind) in [
+                ("issues", "opened", "github.issue-opened"),
+                ("release", "published", "github.release-published"),
+                ("pull_request", "opened", "github.pr-status-changed"),
+                ("pull_request", "closed", "github.pr-status-changed"),
+            ] {
+                let mut payload = github_activity_payload();
+                payload["action"] = json!(action);
+                payload["release"] = json!({"tag_name": "v1.0.0", "name": "Release", "prerelease": false, "html_url": "https://github.com/owner/repo/releases/tag/v1.0.0"});
+                payload["pull_request"]["html_url"] =
+                    json!("https://github.com/owner/repo/pull/42");
+                assert_eq!(
+                    fixture
+                        .post(event, &payload, secret_env.is_some(), None)
+                        .await
+                        .status(),
+                    StatusCode::ACCEPTED
+                );
+                assert_eq!(fixture.rx.try_recv().unwrap().kind, kind);
+                fixture.assert_empty();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn github_webhook_without_secret_ignores_new_events_regardless_of_signature() {
+        let mut fixture = GitHubWebhookTest::new(None).await;
+        for event in [
+            "issue_comment",
+            "pull_request_review",
+            "pull_request_review_comment",
+        ] {
+            let mut payload = github_activity_payload();
+            if event == "pull_request_review" {
+                payload["action"] = json!("submitted");
+            }
+            for signature in [
+                None,
+                Some("invalid"),
+                Some(github_test_signature(
+                    &serde_json::to_vec(&payload).unwrap(),
+                ))
+                .as_deref(),
+            ] {
+                assert_eq!(
+                    fixture
+                        .post_raw(
+                            event,
+                            serde_json::to_vec(&payload).unwrap(),
+                            signature,
+                            Some("unsigned")
+                        )
+                        .await
+                        .status(),
+                    StatusCode::ACCEPTED
+                );
+                fixture.assert_empty();
+            }
+        }
+        // Legacy events still ignore signature headers and do not dedupe.
+        let mut payload = github_activity_payload();
+        payload["action"] = json!("opened");
+        for signature in [
+            None,
+            Some("invalid"),
+            Some(github_test_signature(
+                &serde_json::to_vec(&payload).unwrap(),
+            ))
+            .as_deref(),
+        ] {
+            assert_eq!(
+                fixture
+                    .post_raw(
+                        "issues",
+                        serde_json::to_vec(&payload).unwrap(),
+                        signature,
+                        Some("unsigned")
+                    )
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            assert_eq!(fixture.rx.try_recv().unwrap().kind, "github.issue-opened");
+            fixture.assert_empty();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_webhook_missing_runtime_secret_fails_closed() {
+        let missing_env = format!("CLAWHIP_MISSING_SECRET_{}", uuid::Uuid::new_v4().simple());
+        let mut fixture = GitHubWebhookTest::new(Some(&missing_env)).await;
+        for (event, action) in [("issues", "opened"), ("issue_comment", "created")] {
+            let mut payload = github_activity_payload();
+            payload["action"] = json!(action);
+            for signed in [false, true] {
+                assert_eq!(
+                    fixture.post(event, &payload, signed, None).await.status(),
+                    StatusCode::UNAUTHORIZED
+                );
+                fixture.assert_empty();
+            }
+        }
+        assert!(
+            fixture
+                .state
+                .github_webhook
+                .missing_secret_logged
+                .get()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn github_webhook_duplicate_and_concurrent_delivery_emit_once() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        let payload = github_activity_payload();
+        let (first, second) = tokio::join!(
+            fixture.post("issue_comment", &payload, true, Some("same-id")),
+            fixture.post("issue_comment", &payload, true, Some("same-id"))
+        );
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            fixture.rx.try_recv().unwrap().kind,
+            "github.issue-commented"
+        );
+        fixture.assert_empty();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("same-id"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.assert_empty();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, false, Some("same-id"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_delivery_cache_is_bounded_fifo() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        let payload = github_activity_payload();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("oldest"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.rx.try_recv().unwrap();
+        for index in 0..GITHUB_DELIVERY_CAPACITY {
+            assert_eq!(
+                fixture
+                    .post(
+                        "issue_comment",
+                        &payload,
+                        true,
+                        Some(&format!("accepted-{index}"))
+                    )
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            fixture.rx.try_recv().unwrap();
+        }
+        {
+            let deliveries = fixture.state.github_webhook.deliveries.lock().await;
+            assert_eq!(deliveries.seen.len(), GITHUB_DELIVERY_CAPACITY);
+            assert_eq!(deliveries.order.len(), GITHUB_DELIVERY_CAPACITY);
+            assert!(!deliveries.seen.contains("oldest"));
+        }
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("oldest"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.rx.try_recv().unwrap();
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_ignored_deliveries_neither_consume_nor_evict_cache() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        let payload = github_activity_payload();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("accepted"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.rx.try_recv().unwrap();
+        let mut edited = payload.clone();
+        edited["action"] = json!("edited");
+        for index in 0..GITHUB_DELIVERY_CAPACITY {
+            let delivery = format!("ignored-{index}");
+            let (event, body) = if index % 2 == 0 {
+                ("ping", json!({}))
+            } else {
+                ("issue_comment", edited.clone())
+            };
+            assert_eq!(
+                fixture
+                    .post(event, &body, true, Some(&delivery))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            fixture.assert_empty();
+        }
+        {
+            let deliveries = fixture.state.github_webhook.deliveries.lock().await;
+            assert_eq!(deliveries.seen.len(), 1);
+            assert!(deliveries.seen.contains("accepted"));
+        }
+        // Still deduplicated after 1,000 ignored deliveries.
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("accepted"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.assert_empty();
+        // A delivery ID first seen on an ignored event still enqueues its real event.
+        assert_eq!(
+            fixture
+                .post("ping", &payload, true, Some("reused"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.assert_empty();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("reused"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            fixture.rx.try_recv().unwrap().kind,
+            "github.issue-commented"
+        );
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_requires_json_media_type_like_the_json_extractor() {
+        for secret in [None, Some(GITHUB_TEST_SECRET_ENV)] {
+            let mut fixture = GitHubWebhookTest::new(secret).await;
+            let mut payload = github_activity_payload();
+            payload["action"] = json!("opened");
+            let body = serde_json::to_vec(&payload).unwrap();
+            let signature = github_test_signature(&body);
+            for content_type in [
+                None,
+                Some("text/plain"),
+                Some("application/x-www-form-urlencoded"),
+            ] {
+                let mut request = fixture
+                    .client
+                    .post(&fixture.url)
+                    .header("x-github-event", "issues")
+                    .header("x-hub-signature-256", &signature)
+                    .body(body.clone());
+                if let Some(content_type) = content_type {
+                    request = request.header("content-type", content_type);
+                }
+                assert_eq!(
+                    request.send().await.unwrap().status(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                );
+                fixture.assert_empty();
+            }
+            for content_type in [
+                "application/json; charset=utf-8",
+                "application/vnd.github+json",
+            ] {
+                let response = fixture
+                    .client
+                    .post(&fixture.url)
+                    .header("x-github-event", "issues")
+                    .header("x-hub-signature-256", &signature)
+                    .header("content-type", content_type)
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                assert_eq!(fixture.rx.try_recv().unwrap().kind, "github.issue-opened");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn github_webhook_ignores_edited_deleted_comments_and_unsupported_reviews() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        for event in [
+            "issue_comment",
+            "pull_request_review_comment",
+            "pull_request_review",
+        ] {
+            for action in ["edited", "deleted", "dismissed"] {
+                let mut payload = github_activity_payload();
+                payload["action"] = json!(action);
+                assert_eq!(
+                    fixture.post(event, &payload, true, None).await.status(),
+                    StatusCode::ACCEPTED
+                );
+                fixture.assert_empty();
+            }
+        }
+        for state in [
+            json!("pending"),
+            json!("dismissed"),
+            json!("unknown"),
+            Value::Null,
+        ] {
+            let mut payload = github_activity_payload();
+            payload["action"] = json!("submitted");
+            payload["review"]["state"] = state;
+            assert_eq!(
+                fixture
+                    .post("pull_request_review", &payload, true, None)
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            fixture.assert_empty();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_webhook_verifies_exact_raw_body_and_preserves_body_limit() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        let body = b"{ \"action\": \"created\", \"repository\": {\"full_name\": \"owner/repo\"}, \"issue\": {\"number\": 42, \"title\": \"Title\", \"comments\": 1} }".to_vec();
+        let signature = github_test_signature(&body);
+        assert_eq!(
+            fixture
+                .post_raw("issue_comment", body.clone(), Some(&signature), None)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.rx.try_recv().unwrap();
+        let mut tampered = body;
+        tampered.push(b' ');
+        assert_eq!(
+            fixture
+                .post_raw("issue_comment", tampered, Some(&signature), None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let oversized = vec![b' '; 2 * 1024 * 1024 + 1];
+        assert_eq!(
+            fixture
+                .post_raw("issue_comment", oversized, None, None)
+                .await
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn github_webhook_empty_runtime_secret_fails_closed() {
+        let env_name = format!("CLAWHIP_EMPTY_SECRET_{}", uuid::Uuid::new_v4().simple());
+        // This test owns a unique environment key; serialize environment mutation
+        // with the existing daemon environment tests.
+        unsafe { std::env::set_var(&env_name, "") };
+        let mut fixture = GitHubWebhookTest::new(Some(&env_name)).await;
+        let mut payload = github_activity_payload();
+        let activity_status = fixture
+            .post("issue_comment", &payload, true, None)
+            .await
+            .status();
+        payload["action"] = json!("opened");
+        let legacy_status = fixture.post("issues", &payload, false, None).await.status();
+        unsafe { std::env::remove_var(&env_name) };
+        assert_eq!(activity_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(legacy_status, StatusCode::UNAUTHORIZED);
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_bad_json_and_enqueue_failures_do_not_cache_delivery() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        let body = b"not json".to_vec();
+        let signature = github_test_signature(&body);
+        assert_eq!(
+            fixture
+                .post_raw("issue_comment", body, Some(&signature), Some("retryable"))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let payload = github_activity_payload();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("retryable"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.rx.try_recv().unwrap();
+        fixture.rx.close();
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .post("issue_comment", &payload, true, Some("queue-failed"))
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert!(
+            !fixture
+                .state
+                .github_webhook
+                .deliveries
+                .lock()
+                .await
+                .seen
+                .contains("queue-failed")
+        );
+    }
+
     #[cfg(unix)]
     async fn assert_terminal_event_registry_presence(
         tmux_bin: &std::path::Path,
@@ -3775,6 +4718,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -3896,6 +4840,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4480,6 +5425,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4524,6 +5470,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4561,6 +5508,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4610,6 +5558,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4670,6 +5619,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4735,6 +5685,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4798,6 +5749,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: dir.path().join("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4859,6 +5811,7 @@ mod tests {
             native_observability: observability.clone(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4892,6 +5845,7 @@ mod tests {
             native_observability: observability.clone(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4924,6 +5878,7 @@ mod tests {
             native_observability: observability.clone(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -4970,6 +5925,7 @@ mod tests {
             native_observability: observability.clone(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5015,6 +5971,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5089,6 +6046,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5260,6 +6218,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5353,6 +6312,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5404,6 +6364,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5440,6 +6401,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5469,6 +6431,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5510,6 +6473,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
@@ -5539,6 +6503,7 @@ mod tests {
             native_observability: new_shared_native_hook_observability(),
             cron_state_path: PathBuf::from("cron-state.json"),
             discord_watch_lock: Arc::new(Mutex::new(())),
+            github_webhook: Arc::default(),
             subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
             git_monitor_diagnostics: new_shared_git_monitor_diagnostics(),
             gjc: test_gjc_plane(),
