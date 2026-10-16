@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+## 0.6.14 - 2026-10-16
+
+### Highlights
+
+- add opt-in GitHub pull request review and comment activity notifications as a complement to existing PR lifecycle events
+
+### Upgrade notes
+
+- crate version is now `0.6.14`
+- to enable PR review and comment notifications on a git repository, set `emit_pr_activity = true` on `[[monitors.git.repos]]`
+- when opt-in is enabled, three new event types are emitted: `github.pr-commented`, `github.pr-review-commented`, and `github.pr-reviewed`
+- feature is opt-out by default; existing config remains compatible; no migration required
+
+### Added
+
+- add `emit_pr_activity` opt-in flag on `[[monitors.git.repos]]` config to enable pull request activity notifications
+- emit `github.pr-commented` event when a pull request receives a new comment
+- emit `github.pr-review-commented` event when a pull request review receives a reply comment
+- emit `github.pr-reviewed` event when a pull request receives a review submission
+
+## 0.6.13 - 2026-10-13
+
+### Highlights
+
+- add signed HTTP event sink for authenticated HTTP-based event delivery alongside the existing webhook sink
+- harden GitHub CI baseline durability against terminal-run replay on restart, review-blocker races, and incomplete window states
+- integrate persistent CI retry state management across merge events and daemon restarts so CI monitoring remains resilient to transient failures
+- document permanent Discord community invite for GJC operator coordination
+
+### Upgrade notes
+
+- crate version is now `0.6.13`
+- existing route/config schema remains compatible; no migration required
+
+### Added
+
+- add `http` sink with signed request delivery (digest authentication, optional webhook timestamp validation)
+- add GitHub source CI retry budget and terminal state durability across daemon restarts
+- add worktree-based build script checkout verification to prevent build script escapes
+
+### Fixed
+
+- harden GitHub CI baseline against review blocker races and incomplete baseline window states
+- suppress historical GitHub CI terminal-run replay across daemon restart so stale CI events do not re-trigger alerts
+- bind config recovery to save transaction and recover interrupted publication on startup
+- match pending CI recovery by run attempt to prevent stale recovery requests from blocking new attempts
+
+## 0.6.12 - 2026-08-19
+
+### Highlights
+
+- add durable event-ledger storage and compaction for auditable event history
+- add a GitHub Actions status monitor backed by the public GitHub Statuspage API, with baseline and deduplication handling
+- make runtime and tmux watch reconciliation converge safely across dead sessions, no-server states, same-name recreation, ownerless stale registrations, and orphaned registrations
+- add official opt-in support for GJC setup questions and document the permanent Discord community invite
+- harden config backup writes, candidate verification, retention labels, and cleanup against unsafe paths and malformed or lookalike entries
+- bound batched compact CI Discord messages to Discord's 2000-scalar limit
+
+### Upgrade notes
+
+- crate version is now `0.6.12`
+- existing route/config schema remains compatible; no migration required
+
 
 ### Added
 
@@ -141,6 +204,29 @@
 
 - if you were using wrapper-specific launch flows, migrate to provider-owned hook registration plus `clawhip native hook` for local testing
 - the shared v1 contract now documents only `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`
+
+## 0.6.0 - 2026-04-09
+
+### Highlights
+
+- replace the old bespoke OMC/OMX wrapper glue with provider-native Codex + Claude hook registration built around `clawhip native hook`
+- preserve prompt-submit and stop lifecycle events in the provider-native flow so real interactive sessions emit the same critical lifecycle signals clawhip expects
+- fix Codex native-hook installation/detection to use `~/.codex/hooks.json` as the real hook registry surface instead of treating `.codex/config.toml` as installed-state evidence
+- add tmux session/pane metadata to native hook payloads, including pane id, pane tty, attached state, and client count
+- preserve the tmux metadata through normalization and rendering so local hook logs stay attributable to the originating tmux pane/session
+
+### Documentation and tooling
+
+- update public docs to describe the shared provider-native hook contract instead of the older wrapper/launcher-specific hook assets
+- remove the checked-in OMC/OMX wrapper helper scripts and legacy hook assets that were superseded by provider-owned hook registration
+- add provider-native docs regression coverage so the new installation guidance remains consistent
+
+### Upgrade notes
+
+- crate version is now `0.6.0`
+- rerun `clawhip hooks install --all --scope global --force` to install the latest global Codex/Claude hook wiring into `~/.codex/hooks.json` and `~/.claude/settings.json`
+- Codex hook installation now targets `~/.codex/hooks.json`; `.codex/config.toml` remains a general config surface and should not be treated as the hook registry
+- if you were relying on the older wrapper-specific OMC/OMX launch helpers or checked-in wrapper hook assets, migrate to provider-owned hook registration plus `clawhip native hook` for local verification
 
 ## 0.5.4 - 2026-04-05
 
