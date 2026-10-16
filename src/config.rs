@@ -350,6 +350,8 @@ pub struct ProvidersConfig {
     pub slack: SlackConfig,
     #[serde(default, skip_serializing_if = "HttpConfig::is_empty")]
     pub http: HttpConfig,
+    #[serde(default, skip_serializing_if = "GitHubConfig::is_empty")]
+    pub github: GitHubConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -367,6 +369,18 @@ pub struct DiscordConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlackConfig {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GitHubConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_env: Option<String>,
+}
+
+impl GitHubConfig {
+    fn is_empty(&self) -> bool {
+        self.webhook_secret_env.is_none()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HttpConfig {
@@ -396,7 +410,10 @@ impl DiscordConfig {
 
 impl ProvidersConfig {
     fn is_empty(&self) -> bool {
-        self.discord.is_empty() && self.slack.is_empty() && self.http.is_empty()
+        self.discord.is_empty()
+            && self.slack.is_empty()
+            && self.http.is_empty()
+            && self.github.is_empty()
     }
 }
 
@@ -1731,6 +1748,15 @@ impl AppConfig {
             if self.gajae.handler_max_output_bytes == 0 {
                 return Err("gajae.handler_max_output_bytes must be at least 1 when GAJAE handlers are enabled".into());
             }
+        }
+
+        if let Some(name) = &self.providers.github.webhook_secret_env
+            && !valid_env_var_name(name)
+        {
+            return Err(
+                "providers.github.webhook_secret_env must be a valid environment variable name"
+                    .into(),
+            );
         }
 
         if self.has_http_routes() || !self.providers.http.is_empty() {
@@ -4822,6 +4848,45 @@ sink = "http"
     }
 
     #[test]
+    fn github_webhook_config_preserves_old_configs_and_round_trips() {
+        let legacy: AppConfig = toml::from_str("[daemon]\nport = 25294\n").unwrap();
+        assert!(legacy.providers.github.webhook_secret_env.is_none());
+        assert!(
+            !toml::to_string(&legacy)
+                .unwrap()
+                .contains("[providers.github]")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[providers.github]\nwebhook_secret_env = \"CLAWHIP_GITHUB_WEBHOOK_SECRET\"\n\n[[routes]]\nevent = \"*\"\nsink = \"localfile\"\nlocal_path = \"events.jsonl\"\n").unwrap();
+        let config = AppConfig::load_or_default(&path).unwrap();
+        assert_eq!(
+            config.providers.github.webhook_secret_env.as_deref(),
+            Some("CLAWHIP_GITHUB_WEBHOOK_SECRET")
+        );
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
+        let round_trip: AppConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.providers.github.webhook_secret_env,
+            config.providers.github.webhook_secret_env
+        );
+    }
+
+    #[test]
+    fn github_webhook_config_rejects_invalid_secret_env_names() {
+        for name in ["", " ", "NOT VALID", "1SECRET", "SECRET-NAME"] {
+            let mut config = AppConfig::default();
+            config.providers.github.webhook_secret_env = Some(name.into());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("providers.github.webhook_secret_env"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn http_endpoint_policy_allows_loopback_http_and_https() {
         for endpoint in [
             "http://127.0.0.1:8644/webhooks/clawhip-controller",
@@ -4988,6 +5053,7 @@ sink = "http"
                 },
                 slack: SlackConfig::default(),
                 http: HttpConfig::default(),
+                github: GitHubConfig::default(),
             },
             routes: vec![RouteRule {
                 event: "tmux.keyword".into(),
@@ -5065,6 +5131,7 @@ sink = "http"
                 },
                 slack: SlackConfig::default(),
                 http: HttpConfig::default(),
+                github: GitHubConfig::default(),
             },
             daemon: DaemonConfig {
                 base_url: "http://127.0.0.1:25294".into(),
@@ -5425,6 +5492,7 @@ message = " ping "
                 },
                 slack: SlackConfig::default(),
                 http: HttpConfig::default(),
+                github: GitHubConfig::default(),
             },
             cron: CronConfig {
                 poll_interval_secs: 30,
