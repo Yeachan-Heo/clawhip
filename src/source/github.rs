@@ -673,7 +673,6 @@ const MAX_EMITTED_COMMENT_IDS: usize = 1000;
 const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
 const MAX_BASELINE_RUNS_PER_REPO: usize = CI_PAGE_SIZE * MAX_CI_PAGES;
-const MAX_EMITTED_COMMENT_IDS: usize = 1000;
 const MAX_EMITTED_OPENED_CLOSED: usize = 500;
 /// Hard bound on protected current-window identities per repo. The fetched
 /// window is normally at most [`MAX_BASELINE_RUNS_PER_REPO`] runs, but each
@@ -2490,13 +2489,13 @@ async fn poll_github(
         // K1 fix: issue_cursor is based only on issue timestamps, never on comment timestamps.
         // When issues are empty, use pre_fetch_cutoff (captured before the request) to avoid
         // permanently skipping issues created after the empty response.
-        // L2 fix: When page cap is hit, use oldest_fetched_timestamp to never advance past unread items.
+        // L2 fix: When page cap is hit, keep cursor unchanged and resume from saved continuation on next poll.
         let last_poll_time = if fetch_succeeded {
             if issues.is_empty() {
                 Some(pre_fetch_cutoff)
             } else if !issues_complete {
-                // Page cap hit: use oldest actually-read timestamp, not newest
-                oldest_fetched_timestamp
+                // Page cap hit: keep previous cursor unchanged to resume from same point on next poll
+                previous.and_then(|p| p.issue_cursor.clone())
             } else {
                 issues
                     .values()
@@ -3666,14 +3665,18 @@ fn collect_issue_events_with_comments(
         if has_unseen_comments {
             // L4 fix: Ensure comment count is not lower than reality.
             // If a comment arrived between snapshot and API fetch, the snapshot count is stale.
-            // Use max(snapshot_count, snapshot_count + unseen_comments) to ensure accuracy.
+            // Use max(snapshot_count, previous_count + unseen_comments) to ensure accuracy.
             let snapshot_count = current
+                .get(issue_num)
+                .map(|issue| issue.comments)
+                .unwrap_or(0);
+            let previous_count = previous
                 .get(issue_num)
                 .map(|issue| issue.comments)
                 .unwrap_or(0);
             let unseen_count = comments.len() as u64;
             let reported_count =
-                std::cmp::max(snapshot_count, snapshot_count.saturating_add(unseen_count));
+                std::cmp::max(snapshot_count, previous_count.saturating_add(unseen_count));
 
             events.push(
                 IncomingEvent::github_issue_commented(
@@ -9292,12 +9295,12 @@ mod tests {
         api_comments.insert(
             10,
             vec![GitHubComment {
+                user: None,
                 id: 1,
                 issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
                 html_url: "https://github.com/org/repo/issues/10#issuecomment-1".into(),
                 created_at: "2026-10-15T10:00:00Z".into(),
                 updated_at: "2026-10-15T10:00:00Z".into(),
-                body: "Comment at boundary".into(),
             }],
         );
 
@@ -9412,12 +9415,12 @@ mod tests {
         api_comments.insert(
             10,
             vec![GitHubComment {
+                user: None,
                 id: 1,
                 issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
                 html_url: "https://github.com/org/repo/issues/10#issuecomment-1".into(),
                 created_at: "2026-10-15T09:30:00Z".into(),
                 updated_at: "2026-10-15T09:30:00Z".into(),
-                body: "Comment".into(),
             }],
         );
 
@@ -9474,12 +9477,12 @@ mod tests {
         api_comments.insert(
             1,
             vec![GitHubComment {
+                user: None,
                 id: 1,
                 issue_url: "https://api.github.com/repos/org/repo/issues/1".into(),
                 html_url: "https://github.com/org/repo/issues/1#issuecomment-1".into(),
                 created_at: "2026-10-15T10:00:30Z".into(),
                 updated_at: "2026-10-15T10:00:30Z".into(),
-                body: "Comment on new issue".into(),
             }],
         );
 
@@ -9522,6 +9525,7 @@ mod tests {
 
         // Create a previous state with both issue and comment cursors set
         let previous_state = GitHubRepoState {
+            activity: PRActivityState::default(),
             issues: HashMap::new(),
             prs: HashMap::new(),
             ci: HashMap::new(),
@@ -9571,6 +9575,7 @@ mod tests {
         // cursor progression in all code paths.
 
         let previous_state = GitHubRepoState {
+            activity: PRActivityState::default(),
             issues: HashMap::new(),
             prs: HashMap::new(),
             ci: HashMap::new(),
@@ -9682,6 +9687,7 @@ mod tests {
 
         let comment_id = 12345u64;
         let previous_state = GitHubRepoState {
+            activity: PRActivityState::default(),
             issues: HashMap::from([(
                 1u64,
                 IssueSnapshot {
@@ -9704,12 +9710,12 @@ mod tests {
         };
 
         let comment = GitHubComment {
+            user: None,
             id: comment_id,
             issue_url: "https://api.github.com/repos/org/repo/issues/1".into(),
             html_url: "https://github.com/org/repo/issues/1#issuecomment-12345".into(),
             created_at: "2026-10-15T10:00:00Z".into(),
             updated_at: "2026-10-15T10:00:00Z".into(),
-            body: "Same comment".into(),
         };
 
         let current = HashMap::from([(
@@ -9755,6 +9761,7 @@ mod tests {
         // Cursor independence test: comment_cursor should advance independently
         // from issue_cursor. This regression would occur if cursors are coupled.
         let previous_state = GitHubRepoState {
+            activity: PRActivityState::default(),
             issues: HashMap::new(),
             prs: HashMap::new(),
             ci: HashMap::new(),
@@ -9799,6 +9806,7 @@ mod tests {
         };
 
         let previous_state = GitHubRepoState {
+            activity: PRActivityState::default(),
             issues: HashMap::new(),
             prs: HashMap::new(),
             ci: HashMap::new(),
@@ -9852,6 +9860,7 @@ mod tests {
         let comment_id_1 = 100u64;
         let comment_id_2 = 101u64;
         let previous_state = GitHubRepoState {
+            activity: PRActivityState::default(),
             issues: HashMap::from([(
                 1u64,
                 IssueSnapshot {
@@ -9888,20 +9897,20 @@ mod tests {
         // Two comments, both created after the watermark (should be unseen)
         let comments = vec![
             GitHubComment {
+                user: None,
                 id: comment_id_1,
                 issue_url: "https://api.github.com/repos/org/repo/issues/1".into(),
                 html_url: "https://github.com/org/repo/issues/1#issuecomment-100".into(),
                 created_at: "2026-10-15T10:15:00Z".into(),
                 updated_at: "2026-10-15T10:15:00Z".into(),
-                body: "First comment".into(),
             },
             GitHubComment {
+                user: None,
                 id: comment_id_2,
                 issue_url: "https://api.github.com/repos/org/repo/issues/1".into(),
                 html_url: "https://github.com/org/repo/issues/1#issuecomment-101".into(),
                 created_at: "2026-10-15T10:20:00Z".into(),
                 updated_at: "2026-10-15T10:20:00Z".into(),
-                body: "Second comment".into(),
             },
         ];
 
@@ -9956,6 +9965,7 @@ mod tests {
 
         // First poll: two fresh comments
         let first_poll_state = GitHubRepoState {
+            activity: PRActivityState::default(),
             issues: HashMap::from([(
                 2u64,
                 IssueSnapshot {
@@ -9991,20 +10001,20 @@ mod tests {
 
         let first_poll_comments = vec![
             GitHubComment {
+                user: None,
                 id: comment_id_1,
                 issue_url: "https://api.github.com/repos/org/repo/issues/2".into(),
                 html_url: "https://github.com/org/repo/issues/2#issuecomment-200".into(),
                 created_at: "2026-10-15T10:15:00Z".into(),
                 updated_at: "2026-10-15T10:15:00Z".into(),
-                body: "First comment".into(),
             },
             GitHubComment {
+                user: None,
                 id: comment_id_2,
                 issue_url: "https://api.github.com/repos/org/repo/issues/2".into(),
                 html_url: "https://github.com/org/repo/issues/2#issuecomment-201".into(),
                 created_at: "2026-10-15T10:20:00Z".into(),
                 updated_at: "2026-10-15T10:20:00Z".into(),
-                body: "Second comment".into(),
             },
         ];
 
@@ -10028,12 +10038,12 @@ mod tests {
         // Second poll: comment_id_2 is edited (updated_at moves)
         // but created_at equals the prior comment_cursor (10:20:00 becomes old at 10:20:00)
         let second_poll_comments = vec![GitHubComment {
+            user: None,
             id: comment_id_2,
             issue_url: "https://api.github.com/repos/org/repo/issues/2".into(),
             html_url: "https://github.com/org/repo/issues/2#issuecomment-201".into(),
             created_at: "2026-10-15T10:20:00Z".into(), // Same as before (at cursor)
             updated_at: "2026-10-15T10:45:00Z".into(), // Updated!
-            body: "Second comment (edited)".into(),
         }];
 
         let api_comments_2 = HashMap::from([(2u64, second_poll_comments)]);
@@ -10066,21 +10076,21 @@ mod tests {
         // G2: is_pr_comment should parse the authority correctly.
         // Test with github.corp.net host (not .com)
         let pr_comment_corp = GitHubComment {
+            user: None,
             id: 300u64,
             issue_url: "https://api.github.corp.net/repos/org/repo/issues/1".into(),
             html_url: "https://github.corp.net/org/repo/pull/42#issuecomment-300".into(),
             created_at: "2026-10-15T10:00:00Z".into(),
             updated_at: "2026-10-15T10:00:00Z".into(),
-            body: "PR comment on corporate GitHub".into(),
         };
 
         let issue_comment_corp = GitHubComment {
+            user: None,
             id: 301u64,
             issue_url: "https://api.github.corp.net/repos/org/repo/issues/1".into(),
             html_url: "https://github.corp.net/org/repo/issues/1#issuecomment-301".into(),
             created_at: "2026-10-15T10:00:00Z".into(),
             updated_at: "2026-10-15T10:00:00Z".into(),
-            body: "Issue comment on corporate GitHub".into(),
         };
 
         assert!(
@@ -10098,12 +10108,12 @@ mod tests {
         // G2: is_pr_comment should not confuse a repo named 'pull' with pull requests.
         // For example: https://github.com/org/pull/issues/42 should NOT be a PR.
         let repo_pull = GitHubComment {
+            user: None,
             id: 302u64,
             issue_url: "https://api.github.com/repos/org/pull/issues/42".into(),
             html_url: "https://github.com/org/pull/issues/42#issuecomment-302".into(),
             created_at: "2026-10-15T10:00:00Z".into(),
             updated_at: "2026-10-15T10:00:00Z".into(),
-            body: "Comment on an issue in a repo named 'pull'".into(),
         };
 
         assert!(
@@ -10113,12 +10123,12 @@ mod tests {
 
         // But a true PR comment in that repo SHOULD be classified
         let repo_pull_pr = GitHubComment {
+            user: None,
             id: 303u64,
             issue_url: "https://api.github.com/repos/org/pull/pulls/42".into(),
             html_url: "https://github.com/org/pull/pull/42#issuecomment-303".into(),
             created_at: "2026-10-15T10:00:00Z".into(),
             updated_at: "2026-10-15T10:00:00Z".into(),
-            body: "Comment on PR in 'pull' repo".into(),
         };
 
         assert!(
@@ -10171,20 +10181,20 @@ mod tests {
             10,
             vec![
                 GitHubComment {
+                    user: None,
                     id: 1,
                     issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
                     html_url: "https://github.com/org/repo/issues/10#issuecomment-1".into(),
                     created_at: "2026-10-15T10:00:00Z".into(),
                     updated_at: "2026-10-15T10:00:00Z".into(),
-                    body: "Comment 1".into(),
                 },
                 GitHubComment {
+                    user: None,
                     id: 2,
                     issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
                     html_url: "https://github.com/org/repo/issues/10#issuecomment-2".into(),
                     created_at: "2026-10-15T10:00:01Z".into(),
                     updated_at: "2026-10-15T10:00:01Z".into(),
-                    body: "Comment 2".into(),
                 },
             ],
         );
