@@ -26,6 +26,8 @@ use crate::telemetry;
 const MAX_PAGES: usize = 5;
 const MAX_THREADS: usize = 1000;
 const RECONCILE: time::Duration = time::Duration::minutes(5);
+const HTTP_DATE_FORMAT: &str =
+    "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT";
 
 pub struct GitHubNotificationsSource {
     config: Arc<AppConfig>,
@@ -132,6 +134,8 @@ struct CatchUp {
     // Offsets enumerate oversized ties, but never prove coverage across polls.
     tied: bool,
     page: u64,
+    // Delivery-only timestamp scan above a pinned boundary second.
+    newer_before: Option<OffsetDateTime>,
 }
 
 #[derive(Deserialize)]
@@ -244,10 +248,15 @@ async fn fetch_threads(
         "{}/notifications",
         config.monitors.github_api_base.trim_end_matches('/')
     ))?;
-    let catch_up = state.catch_up.clone();
+    let mut catch_up = state.catch_up.clone();
     let mut page = catch_up.as_ref().map_or(1, |cursor| cursor.page);
     let mut oldest = None;
     let mut newest = catch_up.as_ref().map(|cursor| cursor.covered_max);
+    let pinned = catch_up.as_ref().is_some_and(|cursor| cursor.tied);
+    let newer_before = catch_up.as_ref().and_then(|cursor| cursor.newer_before);
+    let mut newer_page = 1;
+    let mut newer_oldest = None;
+    let mut newer_done = false;
     let mut result = PollResult {
         threads: Vec::new(),
         date: None,
@@ -256,9 +265,23 @@ async fn fetch_threads(
         catch_up: None,
     };
     for index in 0..MAX_PAGES {
-        // A fresh head costs one request; the remaining budget drains the saved window.
-        // The head overlaps the entire saved window; Date cannot prove coverage.
+        // Pinned ties get a fresh head, at most three newer continuation pages,
+        // and at least one tie page. A restarting newer scan reuses the head;
+        // when it ends early, the tie receives the unused request budget.
         let fresh_head = catch_up.is_some() && index == 0;
+        let newer_range = pinned
+            && if fresh_head {
+                newer_before.is_none()
+            } else {
+                index < MAX_PAGES - 1 && !newer_done
+            };
+        let request_page = if fresh_head {
+            1
+        } else if newer_range {
+            newer_page
+        } else {
+            page
+        };
         let since = catch_up
             .as_ref()
             .map_or(state.watermark, |cursor| cursor.since);
@@ -267,9 +290,14 @@ async fn fetch_threads(
             ("all", "false".to_string()),
             ("participating", participating.to_string()),
             ("per_page", "50".to_string()),
-            ("page", if fresh_head { 1 } else { page }.to_string()),
+            ("page", request_page.to_string()),
         ]);
-        let lower = if !fresh_head && catch_up.as_ref().is_some_and(|cursor| cursor.tied) {
+        let lower = if pinned && (fresh_head || newer_range) {
+            // GitHub's exclusive since excludes the pinned second itself.
+            catch_up
+                .as_ref()
+                .map(|cursor| cursor.before - time::Duration::seconds(1))
+        } else if pinned {
             // Enumerate only the boundary second, never offsets into older data.
             catch_up
                 .as_ref()
@@ -280,8 +308,15 @@ async fn fetch_threads(
         if let Some(lower) = lower {
             request = request.query(&[("since", lower.format(&Rfc3339)?)]);
         }
-        if !fresh_head && let Some(cursor) = &catch_up {
-            request = request.query(&[("before", cursor.before.format(&Rfc3339)?)]);
+        let before = if newer_range {
+            newer_before
+        } else if !fresh_head {
+            catch_up.as_ref().map(|cursor| cursor.before)
+        } else {
+            None
+        };
+        if let Some(before) = before {
+            request = request.query(&[("before", before.format(&Rfc3339)?)]);
         }
         if index == 0
             && catch_up.is_none()
@@ -293,7 +328,10 @@ async fn fetch_threads(
             // the reconciliation window, even when its Date has not changed.
             request = request.header(
                 IF_MODIFIED_SINCE,
-                modified.min(covered - RECONCILE).format(&Rfc2822)?,
+                modified
+                    .min(covered - RECONCILE)
+                    .to_offset(time::UtcOffset::UTC)
+                    .format(&time::format_description::parse(HTTP_DATE_FORMAT)?)?,
             );
         }
         let response = github_request(client, request, "notifications").await?;
@@ -338,12 +376,38 @@ async fn fetch_threads(
         for thread in threads {
             let updated = OffsetDateTime::parse(&thread.updated_at, &Rfc3339)
                 .context("invalid GitHub notification updated_at")?;
-            if !fresh_head {
+            if newer_range {
+                newer_oldest = Some(
+                    newer_oldest.map_or(updated, |previous: OffsetDateTime| previous.min(updated)),
+                );
+            } else if !fresh_head {
                 oldest =
                     Some(oldest.map_or(updated, |previous: OffsetDateTime| previous.min(updated)));
                 newest = Some(newest.map_or(updated, |previous| previous.max(updated)));
             }
             result.threads.push((thread, updated));
+        }
+        if newer_range {
+            if let Some(next) = next {
+                if next <= request_page {
+                    return Err("non-advancing GitHub notifications pagination link".into());
+                }
+                newer_page = next;
+            } else {
+                newer_done = true;
+            }
+            if newer_done || index == MAX_PAGES - 2 {
+                catch_up.as_mut().unwrap().newer_before = if newer_done {
+                    None // Restart fresh next poll; this scan never proves W.
+                } else {
+                    Some(
+                        newer_oldest
+                            .ok_or("GitHub notifications newer pagination without threads")?
+                            + time::Duration::seconds(1),
+                    )
+                };
+            }
+            continue;
         }
         if fresh_head {
             continue;
@@ -355,6 +419,7 @@ async fn fetch_threads(
                     // now be scanned by timestamp, without a persisted offset.
                     cursor.before -= time::Duration::seconds(1);
                     cursor.tied = false;
+                    cursor.newer_before = None;
                 }
                 // Otherwise contraction may have skipped unseen IDs. Reconcile
                 // from page one; an offset scan must never commit a watermark.
@@ -397,6 +462,7 @@ async fn fetch_threads(
             covered_max: newest.ok_or("GitHub notifications pagination cap without threads")?,
             tied: false,
             page: 1,
+            newer_before: None,
         },
     });
     Ok(Some(result))
@@ -509,7 +575,7 @@ mod tests {
 
     const DATE_VALUE: &str = "Thu, 15 Oct 2026 00:00:00 GMT";
     const OLD: &str = "2026-10-14T23:59:00Z";
-    const OLD_CONDITIONAL: &str = "if-modified-since: Wed, 14 Oct 2026 23:54:00 +0000";
+    const OLD_CONDITIONAL: &str = "if-modified-since: Wed, 14 Oct 2026 23:54:00 GMT";
     const NEW: &str = "2026-10-15T00:00:01Z";
     const NEWER: &str = "2026-10-15T00:00:02Z";
 
@@ -634,8 +700,25 @@ mod tests {
         threads: Vec<Value>,
         after_response: Vec<Value>,
         date: OffsetDateTime,
+        last_modified: Option<OffsetDateTime>,
+        not_modified: usize,
         requests: usize,
         fail_at: Option<usize>,
+    }
+
+    fn modified_since(request: &str) -> Option<OffsetDateTime> {
+        let value = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("if-modified-since")
+                .then(|| value.trim())
+        })?;
+        let format = time::format_description::parse(HTTP_DATE_FORMAT).unwrap();
+        let date = time::PrimitiveDateTime::parse(value, &format)
+            .ok()?
+            .assume_utc();
+        // Ignore non-IMF-fixdate values, including numeric offsets and a
+        // mismatched weekday, rather than rewarding malformed conditionals.
+        (date.format(&format).ok()? == value).then_some(date)
     }
 
     async fn inbox_server() -> (Server, Arc<Mutex<Inbox>>) {
@@ -643,6 +726,8 @@ mod tests {
             threads: Vec::new(),
             after_response: Vec::new(),
             date: OffsetDateTime::parse(DATE_VALUE, &Rfc2822).unwrap(),
+            last_modified: None,
+            not_modified: 0,
             requests: 0,
             fail_at: None,
         }));
@@ -654,7 +739,9 @@ mod tests {
                 return Some(Reply::status(500));
             }
             let date = inbox.date.format(&Rfc2822).unwrap();
-            if request.contains(&format!("if-modified-since: {date}\r\n")) {
+            let last_modified = inbox.last_modified.unwrap_or(inbox.date);
+            if modified_since(request).is_some_and(|modified| last_modified <= modified) {
+                inbox.not_modified += 1;
                 return Some(Reply::status(304));
             }
             let path = request.split_whitespace().nth(1).unwrap();
@@ -694,7 +781,10 @@ mod tests {
             ));
             reply.headers = vec![
                 ("Date".into(), date.clone()),
-                ("Last-Modified".into(), date),
+                (
+                    "Last-Modified".into(),
+                    last_modified.format(&Rfc2822).unwrap(),
+                ),
             ];
             if threads.len() > page * per_page {
                 reply.headers.push((
@@ -744,13 +834,24 @@ mod tests {
         poll_once(config, client, tx, state).await.unwrap();
         let requests = server.requests.lock().unwrap();
         assert!(requests.len() - start <= MAX_PAGES);
+        let mut newer_pages = 0;
+        let mut tie_pages = 0;
         for (index, request) in requests[start..].iter().enumerate() {
             let path = request.split_whitespace().nth(1).unwrap();
             let url = reqwest::Url::parse(&format!("{}{path}", server.base)).unwrap();
             let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
             let since = if let Some(cursor) = &catch_up {
-                if index > 0 && cursor.tied {
-                    Some(cursor.before - time::Duration::seconds(2))
+                if cursor.tied {
+                    let tie = cursor.before - time::Duration::seconds(1);
+                    if index == 0 || query["since"] == tie.format(&Rfc3339).unwrap() {
+                        if index > 0 {
+                            newer_pages += 1;
+                        }
+                        Some(tie)
+                    } else {
+                        tie_pages += 1;
+                        Some(tie - time::Duration::seconds(1))
+                    }
                 } else {
                     cursor.since.map(|since| since - RECONCILE)
                 }
@@ -766,12 +867,24 @@ mod tests {
                 if index == 0 {
                     assert!(!query.contains_key("before"));
                     assert_eq!(query["page"], "1");
+                } else if cursor.tied && since == Some(cursor.before - time::Duration::seconds(1)) {
+                    assert_eq!(
+                        query.get("before"),
+                        cursor
+                            .newer_before
+                            .map(|before| before.format(&Rfc3339).unwrap())
+                            .as_ref()
+                    );
                 } else {
                     assert_eq!(query["before"], cursor.before.format(&Rfc3339).unwrap());
                 }
             } else {
                 assert!(!query.contains_key("before"));
             }
+        }
+        if catch_up.is_some_and(|cursor| cursor.tied) {
+            assert!(newer_pages <= 3);
+            assert!(tie_pages >= 1);
         }
     }
 
@@ -883,6 +996,48 @@ mod tests {
         assert_eq!(state.interval(60), Duration::from_secs(180));
         assert_eq!(state.interval(300), Duration::from_secs(300));
         assert!(server.requests.lock().unwrap()[1].contains(OLD_CONDITIONAL));
+    }
+
+    #[tokio::test]
+    async fn notifications_conditional_http_date_controls_304() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = MonitorState::default();
+        inbox.lock().unwrap().last_modified = Some(
+            // An older server modification permits 304; its non-UTC offset
+            // must not leak into the outbound HTTP-date.
+            OffsetDateTime::parse("2026-10-15T01:50:00+02:00", &Rfc3339).unwrap(),
+        );
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let baseline = (state.cutoff, state.watermark, state.last_modified.clone());
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(inbox.lock().unwrap().not_modified, 1);
+        assert_eq!(
+            (state.cutoff, state.watermark, state.last_modified.clone()),
+            baseline
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(
+            server.requests.lock().unwrap()[1]
+                .contains("if-modified-since: Wed, 14 Oct 2026 23:50:00 GMT")
+        );
+        for invalid in [
+            "Wed, 14 Oct 2026 23:50:00 +0000",
+            "Thu, 14 Oct 2026 23:50:00 GMT",
+        ] {
+            let response = client
+                .http
+                .get(format!("{}/notifications", server.base))
+                .query(&[("all", "false"), ("per_page", "50"), ("page", "1")])
+                .header(IF_MODIFIED_SINCE, invalid)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(inbox.lock().unwrap().not_modified, 1);
+        }
     }
 
     #[tokio::test]
@@ -1266,6 +1421,167 @@ mod tests {
         );
     }
 
+    async fn pinned_tie_delivers_newer(count: usize, fail_continuation: bool) {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut state = MonitorState::default();
+        inbox.lock().unwrap().threads = vec![thread("baseline", OLD)];
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let watermark = state.watermark;
+        fill_inbox(&inbox, 600, true);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            ids.extend(received_ids(&mut rx));
+        }
+        assert!(state.catch_up.as_ref().unwrap().tied);
+        let tie = OffsetDateTime::parse(NEW, &Rfc3339).unwrap();
+        inbox.lock().unwrap().threads.extend((1..=count).map(|id| {
+            let updated = tie + time::Duration::seconds(id as i64);
+            thread(&format!("newer-{id}"), &updated.format(&Rfc3339).unwrap())
+        }));
+        for poll in 0..12 {
+            if poll == 1 && fail_continuation {
+                assert!(state.catch_up.as_ref().unwrap().newer_before.is_some());
+                let baseline = (
+                    state.watermark,
+                    state.catch_up.clone(),
+                    state.threads.clone(),
+                    state.last_modified.clone(),
+                );
+                {
+                    let mut inbox = inbox.lock().unwrap();
+                    inbox.fail_at = Some(inbox.requests + 3);
+                }
+                let start = server.requests.lock().unwrap().len();
+                assert!(poll_once(&config, &client, &tx, &mut state).await.is_err());
+                assert_eq!(server.requests.lock().unwrap().len() - start, 3);
+                assert_eq!(
+                    (
+                        state.watermark,
+                        state.catch_up.clone(),
+                        state.threads.clone(),
+                        state.last_modified.clone()
+                    ),
+                    baseline
+                );
+                assert!(rx.try_recv().is_err());
+            }
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            ids.extend(received_ids(&mut rx));
+            assert_eq!(state.watermark, watermark);
+            assert!(state.catch_up.as_ref().unwrap().tied);
+            if poll == 0 {
+                assert_eq!(
+                    ids.iter().filter(|id| id.starts_with("newer-")).count(),
+                    count.min(200)
+                );
+                assert_eq!(
+                    state.catch_up.as_ref().unwrap().newer_before.is_some(),
+                    count > 200
+                );
+            }
+            if poll == 1 {
+                assert_eq!(
+                    ids.iter().filter(|id| id.starts_with("newer-")).count(),
+                    count
+                );
+                assert!(state.catch_up.as_ref().unwrap().newer_before.is_none());
+            }
+        }
+        assert_eq!(ids.len(), 600 + count);
+        for id in (0..600)
+            .map(|id| id.to_string())
+            .chain((1..=count).map(|id| format!("newer-{id}")))
+        {
+            assert_eq!(ids.iter().filter(|seen| **seen == id).count(), 1, "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn notifications_pinned_tie_delivers_51_newer_once() {
+        pinned_tie_delivers_newer(51, false).await;
+    }
+
+    #[tokio::test]
+    async fn notifications_pinned_tie_delivers_260_newer_across_polls_once() {
+        pinned_tie_delivers_newer(260, false).await;
+    }
+
+    #[tokio::test]
+    async fn notifications_pinned_newer_failure_preserves_delivery_cursor() {
+        pinned_tie_delivers_newer(260, true).await;
+    }
+
+    #[tokio::test]
+    async fn notifications_nested_newer_tie_still_reserves_original_tie_budget() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut state = MonitorState::default();
+        inbox.lock().unwrap().threads = vec![thread("baseline", OLD)];
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let watermark = state.watermark;
+        fill_inbox(&inbox, 600, true);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            ids.extend(received_ids(&mut rx));
+        }
+        let newer = OffsetDateTime::parse(NEWER, &Rfc3339).unwrap();
+        inbox
+            .lock()
+            .unwrap()
+            .threads
+            .extend((0..260).map(|id| thread(&format!("newer-{id}"), NEWER)));
+        for _ in 0..12 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            ids.extend(received_ids(&mut rx));
+            assert_eq!(state.watermark, watermark);
+            assert_eq!(
+                state.catch_up.as_ref().unwrap().newer_before,
+                Some(newer + time::Duration::seconds(1))
+            );
+        }
+        assert_eq!(
+            ids.iter().filter(|id| !id.starts_with("newer-")).count(),
+            600
+        );
+        // This is the documented nonrecursive limitation, not coverage proof:
+        // only the first 200 IDs of the newer second can be delivered.
+        assert_eq!(
+            ids.iter().filter(|id| id.starts_with("newer-")).count(),
+            200
+        );
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 800);
+    }
+
+    #[tokio::test]
+    async fn notifications_pinned_empty_newer_range_leaves_four_tie_pages() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut state = MonitorState::default();
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        fill_inbox(&inbox, 600, true);
+        for _ in 0..2 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            received_ids(&mut rx);
+        }
+        assert_eq!(state.catch_up.as_ref().unwrap().page, 5);
+        let start = server.requests.lock().unwrap().len();
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(server.requests.lock().unwrap().len() - start, 5);
+        assert_eq!(state.catch_up.as_ref().unwrap().page, 9);
+        assert!(state.catch_up.as_ref().unwrap().newer_before.is_none());
+    }
+
     async fn contraction_reconciles_600(update_head: bool) {
         let (server, inbox) = inbox_server().await;
         let config = config(&server.base);
@@ -1392,7 +1708,7 @@ mod tests {
         assert_eq!(received_ids(&mut rx), ["X"]);
         assert!(
             server.requests.lock().unwrap()[2]
-                .contains("if-modified-since: Thu, 15 Oct 2026 00:05:00 +0000")
+                .contains("if-modified-since: Thu, 15 Oct 2026 00:05:00 GMT")
         );
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
         assert!(rx.try_recv().is_err());

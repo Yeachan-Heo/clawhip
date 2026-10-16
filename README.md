@@ -904,15 +904,21 @@ updates are deduplicated by thread ID and `updated_at`. Conditional requests use
 `Last-Modified` or W minus five minutes (the cold-start cutoff minus five minutes
 when W is unset), so a later response header cannot hide the overlap.
 An authenticated `304 Not Modified` emits nothing and does not consume the
-primary rate limit. The effective interval is
+primary rate limit. In steady state these conditional savings are mostly
+unavailable: the conditional time is clamped to W minus five minutes, usually
+earlier than the inbox's last modification, so GitHub returns `200`. A `200`
+consumes the primary rate limit; at the default 60-second interval, one to five
+requests per poll is roughly 60–300 requests/hour of the authenticated
+5,000/hour budget. Conditional times use the UTC IMF-fixdate HTTP-date format.
+The effective interval is
 the maximum of the configured interval and the **latest valid** `X-Poll-Interval`,
 including headers on failures and 304 responses; a later lower value reduces the
 delay again. Missing/invalid interval headers retain the latest valid value.
 Shared GitHub 403/429 backoff also applies.
 
 A five-page cap reports throttled source degradation and saves a catch-up window
-without advancing W. While catching up, every poll first fetches one fresh head
-page with `since=<W at catch-up start>-5m`, so its newest 50 updates are not delayed
+without advancing W. Outside a pinned tie, every catch-up poll first fetches one
+fresh head page with `since=<W at catch-up start>-5m`, so its newest 50 updates are not delayed
 by the backlog. The remaining four requests drain that same lower bound with
 `before=<oldest received updated_at + 1s>`. The head and backlog windows overlap,
 with no timestamp gap. Normal continuation uses only timestamps, restarting
@@ -932,11 +938,35 @@ at page one when they reach its end. Such cross-poll offsets never prove
 completion: contractions can skip an ID during one pass, but subsequent passes
 revisit it once the inbox stabilizes. W remains pinned and older backlog waits
 until a page-one scan proves the entire boundary second fits in one poll. The
-fresh head remains live throughout. This can persist indefinitely and costs up
-to five constructed requests per poll (one head plus up to four backlog), with
-throttled degradation reporting rather than unbounded requests. Even without
-oversized ties, more than 250 threads in the five-minute overlap can repeatedly
-trigger catch-up, at the same per-poll request bound.
+available tie budget determines how many pages that proof can cover.
+
+While pinned at second T, newer delivery has its own timestamp-only scan of
+`(T, now]`, using exclusive `since=T`. Every poll first fetches page one of this
+fresh head, even with a saved newer cursor. Up to three following requests go
+to newer-range pagination, leaving **at least one request for enumerating T**;
+unused newer requests go to T (an empty newer head leaves four tie pages). A
+newer scan starting afresh reuses the head as its first page. If it does not
+finish, it saves `before=<oldest received updated_at + 1s>` and restarts at page
+one of that timestamp window next poll, deduplicating the overlap by thread ID
+and `updated_at`. On completion it restarts fresh next poll. This delivery scan
+never advances W or proves tie coverage. Thus, once the inbox stabilizes, a
+newer range with distinct timestamps drains across polls while T also receives
+enumeration requests; fresh head overflow cannot wait forever behind T.
+
+**Nested newer-tie limitation:** this newer-range delivery scan does not
+recursively enumerate oversized same-second groups. A group of more than 200
+newer threads at one second cannot fit its restarting budget (head plus three
+pages); a saved continuation has only three pages, so even a group of more than
+150 threads at its boundary can pin it. Unseen threads in that group and newer
+updates below it may then wait indefinitely until the group shrinks. The fresh
+head and the original T enumeration still run, with W conservatively pinned.
+Avoiding recursive cursor trees keeps state and request allocation bounded;
+this is a delivery limitation, not a claim of complete coverage.
+
+Pinned ties can persist indefinitely and cost up to five constructed requests
+per poll, with throttled degradation reporting rather than unbounded requests.
+Even without oversized ties, more than 250 threads in the five-minute overlap
+can repeatedly trigger catch-up, at the same per-poll request bound.
 
 **Unread only; never marks read.** No PATCH/PUT requests are made. Reading a
 notification on github.com removes it from the unread feed; further activity
