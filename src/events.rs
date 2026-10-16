@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::discord_watch::DiscordMessageCreateEvent;
+use crate::event::{GitHubPRCommentEvent, GitHubPRReviewCommentEvent, GitHubPRReviewEvent};
 use crate::render::{DefaultRenderer, Renderer};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
@@ -326,6 +327,46 @@ impl IncomingEvent {
             format: None,
             template: None,
             payload: json!({ "repo": repo, "number": number, "title": title }),
+        }
+    }
+
+    pub fn github_pr_commented(comment: GitHubPRCommentEvent, channel: Option<String>) -> Self {
+        Self {
+            kind: "github.pr-commented".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "repo": comment.repo, "number": comment.number, "title": comment.title,
+                "author": comment.author, "pr_author": comment.pr_author,
+                "url": comment.url, "comment_id": comment.comment_id,
+            }),
+        }
+    }
+
+    pub fn github_pr_review_commented(
+        comment: GitHubPRReviewCommentEvent,
+        channel: Option<String>,
+    ) -> Self {
+        let mut event = Self::github_pr_commented(comment.comment, channel);
+        event.kind = "github.pr-review-commented".to_string();
+        event.payload["path"] = json!(comment.path);
+        event
+    }
+
+    pub fn github_pr_reviewed(review: GitHubPRReviewEvent, channel: Option<String>) -> Self {
+        Self {
+            kind: "github.pr-reviewed".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "repo": review.repo, "number": review.number, "title": review.title,
+                "author": review.author, "pr_author": review.pr_author,
+                "url": review.url, "review_id": review.review_id, "state": review.state,
+            }),
         }
     }
 
@@ -1018,6 +1059,9 @@ pub fn normalize_event(mut event: IncomingEvent) -> IncomingEvent {
 
 fn canonical_event_kind(kind: &str, payload: &Value) -> String {
     match kind {
+        "github.pr-commented" | "github.pr-review-commented" | "github.pr-reviewed" => {
+            kind.to_string()
+        }
         "issue-opened" => "github.issue-opened".to_string(),
         "git.pr-status-changed" => "github.pr-status-changed".to_string(),
         other => native_contract_kind(other, payload).unwrap_or_else(|| other.to_string()),

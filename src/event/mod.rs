@@ -3,7 +3,8 @@ pub mod compat;
 
 pub use body::{
     AgentEvent, CustomEvent, DiscordNudgeIntentEvent, GitBranchChangedEvent,
-    GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent, GitHubIssueEvent, GitHubPREvent,
+    GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent, GitHubIssueEvent,
+    GitHubPRCommentEvent, GitHubPREvent, GitHubPRReviewCommentEvent, GitHubPRReviewEvent,
     GitHubPRStatusEvent, GitHubReleaseEvent, TmuxKeywordAggregatedEvent, TmuxKeywordEvent,
     TmuxStaleEvent, WorkspaceEvent,
 };
@@ -31,6 +32,9 @@ pub enum EventBody {
     GitHubIssueOpened(GitHubIssueEvent),
     GitHubIssueCommented(GitHubIssueEvent),
     GitHubIssueClosed(GitHubIssueEvent),
+    GitHubPRCommented(GitHubPRCommentEvent),
+    GitHubPRReviewCommented(GitHubPRReviewCommentEvent),
+    GitHubPRReviewed(GitHubPRReviewEvent),
     GitHubPROpened(GitHubPREvent),
     GitHubPRMerged(GitHubPREvent),
     GitHubPRStatusChanged(GitHubPRStatusEvent),

@@ -642,6 +642,8 @@ pub struct GitRepoMonitor {
     pub emit_issue_opened: bool,
     #[serde(default)]
     pub emit_pr_status: bool,
+    #[serde(default)]
+    pub emit_pr_activity: bool,
     pub channel: Option<String>,
     /// Human-readable channel name hint for binding verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -666,6 +668,7 @@ impl Default for GitRepoMonitor {
             emit_branch_changes: true,
             emit_issue_opened: true,
             emit_pr_status: false,
+            emit_pr_activity: false,
             channel: None,
             channel_name: None,
             setup_owned: false,
@@ -4206,6 +4209,17 @@ fn normalize_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pr_activity_config_is_backward_compatible_and_opt_in() {
+        let old: AppConfig = toml::from_str("[[monitors.git.repos]]\npath = '/repo'\n").unwrap();
+        assert!(!old.monitors.git.repos[0].emit_pr_activity);
+        let enabled: AppConfig =
+            toml::from_str("[[monitors.git.repos]]\npath = '/repo'\nemit_pr_activity = true\n")
+                .unwrap();
+        assert!(enabled.monitors.git.repos[0].emit_pr_activity);
+        assert!(!GitRepoMonitor::default().emit_pr_activity);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_bounded_test_child(
         test_name: &str,
@@ -5711,6 +5725,7 @@ name = "general"
                         emit_branch_changes: false,
                         emit_issue_opened: false,
                         emit_pr_status: true,
+                        emit_pr_activity: true,
                         channel: Some("old".into()),
                         channel_name: Some("#DEV".into()),
                         setup_owned: true,
@@ -5735,6 +5750,7 @@ name = "general"
         assert!(!monitor.emit_branch_changes);
         assert!(!monitor.emit_issue_opened);
         assert!(monitor.emit_pr_status);
+        assert!(monitor.emit_pr_activity);
         assert_eq!(monitor.mention.as_deref(), Some("<@1>"));
         assert_eq!(monitor.format, Some(MessageFormat::Raw));
         assert_eq!(monitor.channel.as_deref(), Some("new"));

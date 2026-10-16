@@ -15,6 +15,7 @@ use tokio::time::sleep;
 
 use crate::Result;
 use crate::config::{AppConfig, GitRepoMonitor};
+use crate::event::{GitHubPRCommentEvent, GitHubPRReviewCommentEvent, GitHubPRReviewEvent};
 use crate::events::IncomingEvent;
 use crate::source::Source;
 use crate::source::git::{GitSnapshot, repo_display_name, snapshot_git_repo};
@@ -22,6 +23,37 @@ use crate::telemetry;
 
 const GH_AUTH_TIMEOUT: Duration = Duration::from_secs(2);
 const GITHUB_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
+/// Format the current UTC time as ISO 8601 with 'Z' suffix (e.g., "2026-10-15T10:00:00Z")
+fn current_utc_iso8601() -> String {
+    use time::format_description::well_known::Iso8601;
+    time::OffsetDateTime::now_utc()
+        .format(&Iso8601::DEFAULT)
+        .unwrap_or_else(|_| "2000-01-01T00:00:00Z".to_string())
+}
+
+/// J1 fix: Subtract 1 second from an ISO 8601 timestamp.
+/// GitHub's `since` parameter is strictly-after (exclusive), so we query with
+/// `since = cursor - 1s` and rely on dedup to handle boundary-second comments.
+/// Returns the input if parsing fails.
+fn subtract_one_second(timestamp: &str) -> String {
+    use time::Duration as TimeDuration;
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Iso8601;
+
+    match OffsetDateTime::parse(timestamp, &Iso8601::DEFAULT) {
+        Ok(dt) => {
+            if let Some(earlier) = dt.checked_sub(TimeDuration::seconds(1)) {
+                earlier
+                    .format(&Iso8601::DEFAULT)
+                    .unwrap_or_else(|_| timestamp.to_string())
+            } else {
+                timestamp.to_string()
+            }
+        }
+        Err(_) => timestamp.to_string(),
+    }
+}
+
 // MoveFileExW with write-through and the following file flush can exceed the
 // old 200 ms retry window on loaded Windows runners.
 const BASELINE_LOCK_MAX_WAIT: Duration = Duration::from_secs(5);
@@ -637,6 +669,7 @@ where
         .collect())
 }
 
+const MAX_EMITTED_COMMENT_IDS: usize = 1000;
 const CI_PAGE_SIZE: usize = 100;
 const MAX_CI_PAGES: usize = 5;
 const MAX_BASELINE_RUNS_PER_REPO: usize = CI_PAGE_SIZE * MAX_CI_PAGES;
@@ -1955,6 +1988,7 @@ fn snapshots_same_run(left: &GitHubCISnapshot, right: &GitHubCISnapshot) -> bool
 }
 
 struct GitHubRepoState {
+    activity: PRActivityState,
     issues: HashMap<u64, IssueSnapshot>,
     prs: HashMap<u64, PullRequestSnapshot>,
     ci: HashMap<String, GitHubCISnapshot>,
@@ -1970,12 +2004,40 @@ struct IssueSnapshot {
 
 #[derive(Clone)]
 struct PullRequestSnapshot {
+    updated_at: String,
+    author: String,
     title: String,
     status: String,
     url: String,
     head_branch: String,
     head_sha: String,
 }
+
+#[derive(Clone, Default)]
+struct PRActivityState {
+    pr_comment_cursor: Option<String>,
+    pr_comment_lower: Option<String>,
+    review_comment_cursor: Option<String>,
+    // Creation eligibility stays fixed while the updated-at cursor drains a capped feed.
+    review_comment_lower: Option<String>,
+    emitted_review_comment_ids: VecDeque<u64>,
+    emitted_pr_comment_ids: VecDeque<u64>,
+    review_watermark: Option<String>,
+    review_scan: Option<ReviewScan>,
+    emitted_review_ids: VecDeque<u64>,
+}
+
+#[derive(Clone)]
+struct ReviewScan {
+    lower: String,
+    upper: String,
+    pending: VecDeque<u64>,
+    // Retain payload metadata while the per-poll budget drains the scan.
+    prs: HashMap<u64, PullRequestSnapshot>,
+}
+
+const MAX_REVIEW_FETCH_PRS: usize = 20;
+const MAX_COMMENT_PAGES: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GitHubCISnapshot {
@@ -2115,7 +2177,7 @@ async fn poll_github(
     }
 
     for repo in &config.monitors.git.repos {
-        if !repo.emit_issue_opened && !repo.emit_pr_status {
+        if !repo.emit_issue_opened && !repo.emit_pr_status && !repo.emit_pr_activity {
             continue;
         }
 
@@ -2137,6 +2199,34 @@ async fn poll_github(
         };
 
         let previous = state.get(&repo.path);
+        let activity = previous.map(|p| p.activity.clone()).unwrap_or_default();
+        let (activity_prs, activity_window_complete, activity_baseline_cutoff) = if repo
+            .emit_pr_activity
+            && activity.review_scan.is_none()
+            && let Some(client) = github_client
+        {
+            match fetch_updated_pull_requests(
+                client,
+                &config.monitors.github_api_base,
+                repo,
+                &snapshot,
+                previous.map(|p| &p.activity),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    emit_source_degraded(Some(&repo.path), &error.to_string());
+                    eprintln!(
+                        "clawhip source GitHub activity PR fetch failed for {}: {error}",
+                        repo.path
+                    );
+                    (HashMap::new(), false, None)
+                }
+            }
+        } else {
+            (HashMap::new(), true, None)
+        };
         let issues = match poll_issues(config, github_client, repo, &snapshot, previous, tx).await {
             Ok(issues) => issues,
             Err(error) => {
@@ -2163,6 +2253,18 @@ async fn poll_github(
                     )
                 }
             };
+        let activity = poll_pr_activity(
+            config,
+            github_client,
+            repo,
+            &snapshot,
+            activity,
+            &activity_prs,
+            activity_window_complete,
+            activity_baseline_cutoff.as_deref(),
+            tx,
+        )
+        .await?;
         let repo_key = ci_baseline_repo_key(&snapshot, repo);
         let fetch_generation =
             ci_baseline.reserve_window_generation(&repo_key, &repo.path, &repo.path);
@@ -2276,6 +2378,7 @@ async fn poll_github(
                 state.insert(
                     repo.path.clone(),
                     GitHubRepoState {
+                        activity,
                         issues,
                         prs,
                         ci: previous.map(|entry| entry.ci.clone()).unwrap_or_default(),
@@ -2304,6 +2407,7 @@ async fn poll_github(
         state.insert(
             repo.path.clone(),
             GitHubRepoState {
+                activity,
                 issues,
                 prs,
                 ci,
@@ -2358,6 +2462,411 @@ async fn poll_issues(
                 .unwrap_or_default())
         }
     }
+}
+
+fn remember_activity_id(ids: &mut VecDeque<u64>, id: u64) {
+    if !ids.contains(&id) {
+        ids.push_back(id);
+        if ids.len() > MAX_EMITTED_COMMENT_IDS {
+            ids.pop_front();
+        }
+    }
+}
+
+fn pr_comment_payload(
+    repo: &str,
+    number: u64,
+    pr: Option<&PullRequestSnapshot>,
+    comment_id: u64,
+    user: Option<&GitHubUser>,
+    url: &str,
+) -> GitHubPRCommentEvent {
+    GitHubPRCommentEvent {
+        repo: repo.to_string(),
+        number,
+        title: pr.map(|pr| pr.title.clone()).unwrap_or_default(),
+        author: user.map(|user| user.login.clone()).unwrap_or_default(),
+        pr_author: pr.map(|pr| pr.author.clone()).unwrap_or_default(),
+        url: url.to_string(),
+        comment_id,
+    }
+}
+
+fn github_response_date(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    use time::format_description::well_known::{Rfc2822, Rfc3339};
+
+    let date = headers.get(reqwest::header::DATE)?.to_str().ok()?;
+    time::OffsetDateTime::parse(date, &Rfc2822)
+        .ok()?
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .ok()
+}
+
+/// Fetch a bounded window; cold comment baselines only need the newest page.
+async fn fetch_pr_activity_pages<T: serde::de::DeserializeOwned>(
+    client: &GitHubClient,
+    api_base: &str,
+    endpoint: &str,
+    is_comment_feed: bool,
+    cursor: Option<&str>,
+) -> Result<(Vec<T>, bool, Option<String>)> {
+    let since = cursor.map(subtract_one_second).unwrap_or_default();
+    let mut entries = Vec::new();
+    let mut fetched_at = None;
+    let mut seen_next_urls = HashSet::new();
+    for page in 1..=MAX_COMMENT_PAGES {
+        let page_str = page.to_string();
+        seen_next_urls.insert(pagination_page_key(&format!(
+            "{}/{endpoint}?page={page_str}",
+            api_base.trim_end_matches('/')
+        )));
+        let page_query = [("per_page", "100"), ("page", page_str.as_str())];
+        let comment_query = [
+            ("sort", "updated"),
+            ("direction", if cursor.is_none() { "desc" } else { "asc" }),
+            ("since", since.as_str()),
+            ("per_page", "100"),
+            ("page", page_str.as_str()),
+        ];
+        let response = github_get(
+            client,
+            api_base,
+            endpoint,
+            if is_comment_feed {
+                &comment_query
+            } else {
+                &page_query
+            },
+            endpoint,
+        )
+        .await?;
+        let next_url = github_link_next(response.headers());
+        if page == 1 {
+            fetched_at = github_response_date(response.headers());
+        }
+        entries.extend(response.json::<Vec<T>>().await?);
+        if is_comment_feed && cursor.is_none() {
+            return Ok((entries, true, fetched_at));
+        }
+        let Some(next_url) = next_url else {
+            return Ok((entries, true, fetched_at));
+        };
+        if !seen_next_urls.insert(pagination_page_key(&next_url)) {
+            return Ok((entries, false, fetched_at));
+        }
+    }
+    Ok((entries, false, fetched_at))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_pr_activity(
+    config: &AppConfig,
+    github_client: Option<&GitHubClient>,
+    repo: &GitRepoMonitor,
+    snapshot: &GitSnapshot,
+    mut state: PRActivityState,
+    prs: &HashMap<u64, PullRequestSnapshot>,
+    prs_complete: bool,
+    baseline_cutoff: Option<&str>,
+    tx: &mpsc::Sender<IncomingEvent>,
+) -> Result<PRActivityState> {
+    if !repo.emit_pr_activity {
+        return Ok(state);
+    }
+    let Some(client) = github_client else {
+        return Ok(state);
+    };
+    let Some(github_repo) = snapshot.github_repo.as_deref() else {
+        return Ok(state);
+    };
+    let api_base = &config.monitors.github_api_base;
+    let cutoff = current_utc_iso8601();
+    let pr_comment_cursor = state.pr_comment_cursor.clone();
+    match fetch_pr_activity_pages::<GitHubComment>(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/issues/comments"),
+        true,
+        pr_comment_cursor.as_deref(),
+    )
+    .await
+    {
+        Ok((comments, complete, fetched_at)) => {
+            // Issue comments also advance the feed position, but never enter PR dedup.
+            let max_updated = comments
+                .iter()
+                .map(|comment| comment.updated_at.clone())
+                .chain(pr_comment_cursor.clone())
+                .max()
+                .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
+            let lower = state.pr_comment_lower.clone();
+            for comment in comments {
+                let Some(number) = comment.pr_number() else {
+                    continue;
+                };
+                if state.emitted_pr_comment_ids.contains(&comment.id) {
+                    continue;
+                }
+                if let Some(lower) = lower.as_deref() {
+                    if comment.created_at.as_str() < lower {
+                        continue;
+                    }
+                    send_event(
+                        tx,
+                        IncomingEvent::github_pr_commented(
+                            pr_comment_payload(
+                                &snapshot.repo_name,
+                                number,
+                                prs.get(&number).or_else(|| {
+                                    state
+                                        .review_scan
+                                        .as_ref()
+                                        .and_then(|scan| scan.prs.get(&number))
+                                }),
+                                comment.id,
+                                comment.user.as_ref(),
+                                &comment.html_url,
+                            ),
+                            repo.channel.clone(),
+                        )
+                        .with_mention(repo.mention.clone())
+                        .with_format(repo.format.clone()),
+                    )
+                    .await?;
+                }
+                remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
+            }
+            state.pr_comment_cursor = Some(max_updated.clone());
+            if pr_comment_cursor.is_none() {
+                state.pr_comment_lower = Some(fetched_at.unwrap_or(max_updated));
+            } else if complete {
+                state.pr_comment_lower = Some(lower.unwrap().max(max_updated));
+            }
+            if !complete {
+                emit_source_degraded(
+                    Some(&repo.path),
+                    "GitHub PR conversation comment pagination cap reached",
+                );
+            }
+        }
+        Err(error) => {
+            emit_source_degraded(
+                Some(&repo.path),
+                &format!("GitHub PR conversation comments fetch failed: {error}"),
+            );
+        }
+    }
+    let comment_cursor = state.review_comment_cursor.clone();
+    match fetch_pr_activity_pages::<GitHubReviewComment>(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/pulls/comments"),
+        true,
+        comment_cursor.as_deref(),
+    )
+    .await
+    {
+        Ok((comments, complete, fetched_at)) => {
+            let max_updated = comments
+                .iter()
+                .map(|comment| comment.updated_at.clone())
+                .chain(comment_cursor.clone())
+                .max()
+                .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
+            let lower = state.review_comment_lower.clone();
+            for comment in comments {
+                if state.emitted_review_comment_ids.contains(&comment.id) {
+                    continue;
+                }
+                if let Some(lower) = lower.as_deref() {
+                    if comment.created_at.as_str() < lower {
+                        continue;
+                    }
+                    let Some(number) = comment
+                        .pull_request_url
+                        .rsplit('/')
+                        .next()
+                        .and_then(|n| n.parse().ok())
+                    else {
+                        continue;
+                    };
+                    send_event(
+                        tx,
+                        IncomingEvent::github_pr_review_commented(
+                            GitHubPRReviewCommentEvent {
+                                comment: pr_comment_payload(
+                                    &snapshot.repo_name,
+                                    number,
+                                    prs.get(&number).or_else(|| {
+                                        state
+                                            .review_scan
+                                            .as_ref()
+                                            .and_then(|scan| scan.prs.get(&number))
+                                    }),
+                                    comment.id,
+                                    comment.user.as_ref(),
+                                    &comment.html_url,
+                                ),
+                                path: comment.path,
+                            },
+                            repo.channel.clone(),
+                        )
+                        .with_mention(repo.mention.clone())
+                        .with_format(repo.format.clone()),
+                    )
+                    .await?;
+                }
+                remember_activity_id(&mut state.emitted_review_comment_ids, comment.id);
+            }
+            // Ascending pages are resumable even when the page budget is exhausted.
+            state.review_comment_cursor = Some(max_updated.clone());
+            if comment_cursor.is_none() {
+                state.review_comment_lower = Some(fetched_at.unwrap_or(max_updated));
+            } else if complete {
+                // All updates through max_updated have been consumed, including edits
+                // of unseen comments created behind P. Never use Date here: it may
+                // be newer than updates arriving during the paginated fetch.
+                state.review_comment_lower = Some(lower.unwrap().max(max_updated));
+            }
+            if !complete {
+                emit_source_degraded(
+                    Some(&repo.path),
+                    "GitHub inline review comment pagination cap reached",
+                );
+            }
+        }
+        Err(error) => {
+            emit_source_degraded(
+                Some(&repo.path),
+                &format!("GitHub inline review comments fetch failed: {error}"),
+            );
+        }
+    }
+
+    if state.review_scan.is_none() {
+        // An empty failed list must not establish or advance the baseline.
+        if !prs_complete && prs.is_empty() {
+            return Ok(state);
+        }
+        let newest_update = prs
+            .values()
+            .map(|pr| pr.updated_at.clone())
+            .chain(state.review_watermark.clone())
+            .max()
+            .unwrap_or(cutoff);
+        let upper = if state.review_watermark.is_none() {
+            baseline_cutoff.unwrap_or(&newest_update).to_string()
+        } else {
+            newest_update.clone()
+        };
+        let lower = state
+            .review_watermark
+            .clone()
+            .unwrap_or_else(|| upper.clone());
+        let mut candidates: Vec<_> = prs
+            .iter()
+            .filter(|(_, pr)| {
+                if state.review_watermark.is_none() {
+                    pr.updated_at == newest_update
+                } else {
+                    pr.updated_at >= lower
+                }
+            })
+            .collect();
+        candidates.sort_unstable_by(|(a_number, a), (b_number, b)| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a_number.cmp(b_number))
+        });
+        state.review_scan = Some(ReviewScan {
+            lower,
+            upper,
+            pending: candidates.into_iter().map(|(number, _)| *number).collect(),
+            prs: prs.clone(),
+        });
+    }
+    let mut scan = state.review_scan.take().expect("review scan was built");
+    for _ in 0..MAX_REVIEW_FETCH_PRS {
+        let Some(number) = scan.pending.pop_front() else {
+            break;
+        };
+        let pr = &scan.prs[&number];
+        match fetch_pr_activity_pages::<GitHubReview>(
+            client,
+            api_base,
+            &format!("repos/{github_repo}/pulls/{number}/reviews"),
+            false,
+            None,
+        )
+        .await
+        {
+            Ok((reviews, fetched_all, _)) => {
+                for review in reviews {
+                    let review_state = match review.state.as_str() {
+                        "APPROVED" => "approved",
+                        "CHANGES_REQUESTED" => "changes_requested",
+                        "COMMENTED" => "commented",
+                        _ => continue,
+                    };
+                    let Some(submitted_at) = review.submitted_at.as_deref() else {
+                        continue;
+                    };
+                    if state.emitted_review_ids.contains(&review.id) {
+                        continue;
+                    }
+                    let seeding = state.review_watermark.is_none();
+                    if !seeding && submitted_at < scan.lower.as_str() {
+                        continue;
+                    }
+                    if !seeding {
+                        send_event(
+                            tx,
+                            IncomingEvent::github_pr_reviewed(
+                                GitHubPRReviewEvent {
+                                    repo: snapshot.repo_name.clone(),
+                                    number,
+                                    title: pr.title.clone(),
+                                    author: review.user.map(|user| user.login).unwrap_or_default(),
+                                    pr_author: pr.author.clone(),
+                                    url: review.html_url,
+                                    review_id: review.id,
+                                    state: review_state.to_string(),
+                                },
+                                repo.channel.clone(),
+                            )
+                            .with_mention(repo.mention.clone())
+                            .with_format(repo.format.clone()),
+                        )
+                        .await?;
+                    }
+                    remember_activity_id(&mut state.emitted_review_ids, review.id);
+                }
+                if !fetched_all {
+                    emit_source_degraded(
+                        Some(&repo.path),
+                        "GitHub per-PR review pagination cap reached",
+                    );
+                    scan.pending.push_front(number);
+                    break;
+                }
+            }
+            Err(error) => {
+                emit_source_degraded(
+                    Some(&repo.path),
+                    &format!("GitHub reviews fetch failed for #{number}: {error}"),
+                );
+                scan.pending.push_front(number);
+                break;
+            }
+        }
+    }
+    if scan.pending.is_empty() {
+        state.review_watermark = Some(scan.upper);
+    } else {
+        state.review_scan = Some(scan);
+    }
+    Ok(state)
 }
 
 async fn poll_pull_requests(
@@ -2551,6 +3060,9 @@ fn emit_source_degraded(repo_path: Option<&str>, error: &str) -> bool {
     static LAST_REPORTS: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
     let reports = LAST_REPORTS.get_or_init(|| Mutex::new(HashMap::new()));
     let key = error.to_string();
+    // Current-thread async tests must not throttle one another's telemetry.
+    #[cfg(test)]
+    let key = format!("{:?}:{key}", std::thread::current().id());
     let should_report = reports
         .lock()
         .map(|mut entries| {
@@ -2892,28 +3404,96 @@ async fn fetch_pull_requests(
         page += 1;
     }
     Ok((
-        pulls
-            .into_iter()
-            .map(|pull| {
-                let status = if pull.merged_at.is_some() {
-                    "merged".to_string()
-                } else {
-                    pull.state
-                };
-                (
-                    pull.number,
-                    PullRequestSnapshot {
-                        title: pull.title,
-                        status,
-                        url: pull.html_url,
-                        head_branch: pull.head.reference,
-                        head_sha: pull.head.sha,
-                    },
-                )
-            })
-            .collect(),
+        pulls.into_iter().map(pull_request_snapshot).collect(),
         complete,
     ))
+}
+
+fn pull_request_snapshot(pull: GitHubPullRequest) -> (u64, PullRequestSnapshot) {
+    let status = if pull.merged_at.is_some() {
+        "merged".to_string()
+    } else {
+        pull.state
+    };
+    (
+        pull.number,
+        PullRequestSnapshot {
+            updated_at: pull.updated_at,
+            author: pull.user.map(|user| user.login).unwrap_or_default(),
+            title: pull.title,
+            status,
+            url: pull.html_url,
+            head_branch: pull.head.reference,
+            head_sha: pull.head.sha,
+        },
+    )
+}
+
+/// Separate updated-desc window: do not change the PR-status poller's membership/order.
+async fn fetch_updated_pull_requests(
+    client: &GitHubClient,
+    api_base: &str,
+    repo: &GitRepoMonitor,
+    snapshot: &GitSnapshot,
+    previous: Option<&PRActivityState>,
+) -> Result<(HashMap<u64, PullRequestSnapshot>, bool, Option<String>)> {
+    let github_repo = snapshot
+        .github_repo
+        .as_deref()
+        .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
+    let cursor = previous.and_then(|state| state.review_watermark.as_deref());
+    let mut prs = HashMap::new();
+    let mut baseline_cutoff = None;
+    let mut seen_next_urls = HashSet::new();
+    for page in 1..=MAX_CI_PAGES {
+        let page_str = page.to_string();
+        seen_next_urls.insert(pagination_page_key(&format!(
+            "{}/repos/{github_repo}/pulls?page={page_str}",
+            api_base.trim_end_matches('/')
+        )));
+        let response = github_get(
+            client,
+            api_base,
+            &format!("repos/{github_repo}/pulls"),
+            &[
+                ("state", "all"),
+                ("sort", "updated"),
+                ("direction", "desc"),
+                ("per_page", "100"),
+                ("page", page_str.as_str()),
+            ],
+            &format!("updated pull requests for {github_repo}"),
+        )
+        .await?;
+        let next_url = github_link_next(response.headers());
+        if cursor.is_none() {
+            baseline_cutoff = github_response_date(response.headers());
+        }
+        let pulls: Vec<GitHubPullRequest> = response.json().await?;
+        if pulls.iter().any(|pull| pull.updated_at.is_empty()) {
+            return Err("GitHub updated PR response is missing updated_at".into());
+        }
+        // Always recheck the boundary second; a PR may receive another review
+        // without its second-resolution updated_at changing.
+        let reached_cursor =
+            cursor.is_some_and(|cursor| pulls.iter().any(|pull| pull.updated_at.as_str() < cursor));
+        prs.extend(pulls.into_iter().map(pull_request_snapshot));
+        // Cold start never traverses historical pages.
+        if cursor.is_none() {
+            return Ok((prs, true, baseline_cutoff));
+        }
+        let Some(next_url) = next_url.filter(|_| !reached_cursor) else {
+            return Ok((prs, true, baseline_cutoff));
+        };
+        if !seen_next_urls.insert(pagination_page_key(&next_url)) {
+            break;
+        }
+    }
+    emit_source_degraded(
+        Some(&repo.path),
+        "GitHub updated PR pagination cap reached: reviews on PRs older than the newest 500-PR window may be lost",
+    );
+    Ok((prs, false, baseline_cutoff))
 }
 
 async fn fetch_ci_statuses(
@@ -3356,7 +3936,70 @@ impl GitHubIssue {
 }
 
 #[derive(Deserialize)]
+struct GitHubUser {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubReviewComment {
+    id: u64,
+    pull_request_url: String,
+    html_url: String,
+    created_at: String,
+    updated_at: String,
+    path: String,
+    user: Option<GitHubUser>,
+}
+
+#[derive(Deserialize)]
+struct GitHubReview {
+    id: u64,
+    html_url: String,
+    submitted_at: Option<String>,
+    state: String,
+    user: Option<GitHubUser>,
+}
+
+#[derive(Deserialize)]
+struct GitHubComment {
+    #[serde(default)]
+    user: Option<GitHubUser>,
+    id: u64,
+    issue_url: String,
+    html_url: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl GitHubComment {
+    /// Inspect the type segment AFTER owner/repo, never a host or repository name.
+    /// GitHub Enterprise uses the same web path and may prefix API paths with /api/v3.
+    fn pr_number(&self) -> Option<u64> {
+        if let Ok(url) = reqwest::Url::parse(&self.html_url)
+            && let Some(segments) = url.path_segments()
+        {
+            let mut segments = segments.skip(2);
+            if segments.next() == Some("pull") {
+                return segments.next()?.parse().ok();
+            }
+        }
+        let url = reqwest::Url::parse(&self.issue_url).ok()?;
+        let path = url.path().strip_prefix("/api/v3").unwrap_or(url.path());
+        let mut segments = path.strip_prefix("/repos/")?.split('/').skip(2);
+        if segments.next() == Some("pulls") {
+            segments.next()?.parse().ok()
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct GitHubPullRequest {
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    user: Option<GitHubUser>,
     number: u64,
     title: String,
     state: String,
@@ -4122,6 +4765,7 @@ mod tests {
         state.insert(
             "/tmp/persist-boundary".into(),
             GitHubRepoState {
+                activity: PRActivityState::default(),
                 issues: HashMap::new(),
                 prs: HashMap::new(),
                 ci: HashMap::new(),
@@ -6520,6 +7164,8 @@ mod tests {
             url: "https://github.com/org/repo/pull/42".into(),
             head_branch: "feat/pr".into(),
             head_sha: "prsha".into(),
+            author: String::new(),
+            updated_at: String::new(),
         };
         let client = build_github_client(None).unwrap();
         let (runs, complete) =
@@ -7063,6 +7709,8 @@ mod tests {
             url: "https://github.com/org/repo/pull/42".into(),
             head_branch: "feat/pr".into(),
             head_sha: "prsha".into(),
+            author: String::new(),
+            updated_at: String::new(),
         };
         let open_prs = vec![(42_u64, &pr)];
 
@@ -7380,5 +8028,1883 @@ mod tests {
 
         source_task.abort();
         let _ = source_task.await;
+    }
+    type ActivityResponse = (
+        String,
+        serde_json::Value,
+        u16,
+        Option<String>,
+        Option<String>,
+    );
+
+    fn activity_response(path: &str, body: serde_json::Value) -> ActivityResponse {
+        (path.to_string(), body, 200, None, None)
+    }
+
+    async fn activity_server(
+        responses: Vec<ActivityResponse>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            for (path, body, status, next, date) in responses {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("expected request was not made")
+                        .unwrap();
+                let mut buffer = vec![0; 8192];
+                let n = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..n]).to_string();
+                let target = request.split_whitespace().nth(1).unwrap();
+                assert_eq!(target.split('?').next().unwrap(), path, "{request}");
+                captured.lock().unwrap().push(target.to_string());
+                let body = body.to_string();
+                let link = next
+                    .map(|next| format!("link: <{server_base}{next}>; rel=\"next\"\r\n"))
+                    .unwrap_or_default();
+                let date = date
+                    .map(|date| format!("date: {date}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {status} Mock\r\ncontent-type: application/json\r\nconnection: close\r\n{link}{date}content-length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "unexpected extra GitHub API request"
+            );
+        });
+        (base, requests, server)
+    }
+
+    fn activity_pr(number: u64, updated_at: &str) -> serde_json::Value {
+        json!({"number": number, "title": "A PR", "state": "open", "html_url": "https://github.com/org/repo/pull/1",
+            "merged_at": null, "head": {"ref": "feature", "sha": "abc"}, "updated_at": updated_at,
+            "user": {"login": "pr-owner"}})
+    }
+
+    fn activity_comment(
+        id: u64,
+        number: u64,
+        created_at: &str,
+        updated_at: &str,
+    ) -> serde_json::Value {
+        json!({"id": id, "issue_url": format!("https://api.github.com/repos/org/repo/issues/{number}"),
+            "pull_request_url": format!("https://api.github.com/repos/org/repo/pulls/{number}"),
+            "html_url": format!("https://github.com/org/repo/pull/{number}#comment-{id}"),
+            "created_at": created_at, "updated_at": updated_at, "user": {"login": "commenter"},
+            "path": "src/main.rs", "body": "private comment text"})
+    }
+
+    fn activity_review(id: u64, state: &str, submitted_at: &str) -> serde_json::Value {
+        json!({"id": id, "state": state, "submitted_at": submitted_at,
+            "user": {"login": "reviewer"}, "html_url": format!("https://github.com/org/repo/pull/1#review-{id}"),
+            "body": "private review text"})
+    }
+
+    fn activity_poll_responses(
+        conversations: serde_json::Value,
+        prs: serde_json::Value,
+        inline: serde_json::Value,
+    ) -> Vec<ActivityResponse> {
+        vec![
+            activity_response("/repos/org/repo/pulls", prs),
+            activity_response("/repos/org/repo/issues", json!([])),
+            activity_response("/repos/org/repo/issues/comments", conversations),
+            activity_response("/repos/org/repo/pulls/comments", inline),
+        ]
+    }
+
+    struct ActivityHarness {
+        config: AppConfig,
+        client: GitHubClient,
+        state: HashMap<String, GitHubRepoState>,
+        baseline: CIBaseline,
+        baseline_path: Option<PathBuf>,
+        tx: mpsc::Sender<IncomingEvent>,
+        rx: mpsc::Receiver<IncomingEvent>,
+    }
+
+    impl ActivityHarness {
+        fn new(base: String) -> Self {
+            telemetry::take_test_records();
+            let mut config = AppConfig::default();
+            config.monitors.github_api_base = base;
+            config.monitors.git.repos = vec![GitRepoMonitor {
+                path: concat!(env!("CARGO_MANIFEST_DIR"), "/missing-pr-activity-repo").into(),
+                name: Some("repo".into()),
+                github_repo: Some("org/repo".into()),
+                emit_pr_activity: true,
+                emit_commits: false,
+                emit_branch_changes: false,
+                ..GitRepoMonitor::default()
+            }];
+            let (tx, rx) = mpsc::channel(3000);
+            Self {
+                config,
+                client: build_github_client(None).unwrap(),
+                state: HashMap::new(),
+                baseline: CIBaseline::default(),
+                baseline_path: None,
+                tx,
+                rx,
+            }
+        }
+
+        async fn poll(&mut self) -> Vec<IncomingEvent> {
+            poll_github(
+                &self.config,
+                Some(&self.client),
+                &self.tx,
+                &mut self.state,
+                &mut self.baseline,
+                self.baseline_path.as_deref(),
+            )
+            .await
+            .unwrap();
+            let mut events = Vec::new();
+            while let Ok(event) = self.rx.try_recv() {
+                events.push(event);
+            }
+            events
+        }
+
+        fn repo_state(&self) -> &GitHubRepoState {
+            &self.state[&self.config.monitors.git.repos[0].path]
+        }
+
+        fn assert_degraded(&self, error_fragment: &str) {
+            let records = telemetry::take_test_records();
+            assert!(
+                records.iter().any(|record| {
+                    record["telemetry_event"] == "source_degraded"
+                        && record["reason_code"] == "source_poll_failed"
+                        && record["repo_path"] == self.config.monitors.git.repos[0].path
+                        && record["error"]
+                            .as_str()
+                            .is_some_and(|error| error.contains(error_fragment))
+                }),
+                "missing degradation {error_fragment}: {records:?}"
+            );
+        }
+    }
+
+    const ACTIVITY_T0: &str = "2030-01-01T00:00:00Z";
+    const ACTIVITY_T1: &str = "2030-01-01T00:01:00Z";
+    const ACTIVITY_T2: &str = "2030-01-01T00:02:00Z";
+
+    fn activity_scan_responses() -> Vec<ActivityResponse> {
+        vec![
+            activity_response("/repos/org/repo/issues", json!([])),
+            activity_response("/repos/org/repo/issues/comments", json!([])),
+            activity_response("/repos/org/repo/pulls/comments", json!([])),
+        ]
+    }
+
+    fn activity_review_baseline_responses() -> Vec<ActivityResponse> {
+        let mut responses = activity_poll_responses(
+            json!([]),
+            json!([activity_pr(1, ACTIVITY_T0)]),
+            json!([activity_comment(0, 1, ACTIVITY_T0, ACTIVITY_T0)]),
+        );
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        responses
+    }
+
+    fn activity_second(offset: u64) -> String {
+        format!("2030-01-01T00:{:02}:{:02}Z", offset / 60, offset % 60)
+    }
+
+    #[tokio::test]
+    async fn pr_activity_flag_off_keeps_requests_and_drops_pr_conversations() {
+        let mut responses = Vec::new();
+        for comments in [1, 2] {
+            responses.push(activity_response(
+                "/repos/org/repo/issues",
+                json!([
+                    {"number": 10, "title": "An issue", "state": "open", "comments": comments},
+                    {"number": 1, "title": "A PR", "state": "open", "comments": comments,
+                     "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"}}
+                ]),
+            ));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        harness.config.monitors.git.repos[0].emit_pr_activity = false;
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.issue-commented");
+        assert_eq!(events[0].payload["number"], 10);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            ["/repos/org/repo/issues?state=all&per_page=100"; 2],
+            "flag-off must preserve dev's exact request paths and count"
+        );
+        assert!(harness.repo_state().activity.review_watermark.is_none());
+        assert!(harness.repo_state().activity.pr_comment_cursor.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_conversation_emitted_once_with_pr_author() {
+        let prs = json!([activity_pr(1, ACTIVITY_T0)]);
+        let mut responses = activity_poll_responses(
+            json!([activity_comment(1, 1, ACTIVITY_T0, ACTIVITY_T0)]),
+            prs.clone(),
+            json!([]),
+        );
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([activity_comment(2, 2, ACTIVITY_T1, ACTIVITY_T1)]),
+                json!([activity_pr(2, ACTIVITY_T1)]),
+                json!([]),
+            ));
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/2/reviews",
+                json!([]),
+            ));
+        }
+        responses.retain(|response| response.0 != "/repos/org/repo/issues");
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        harness.config.monitors.git.repos[0].emit_issue_opened = false;
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.pr-commented");
+        assert_eq!(
+            events[0].payload,
+            json!({"repo": "repo", "number": 2, "title": "A PR",
+            "author": "commenter", "pr_author": "pr-owner", "comment_id": 2,
+            "url": "https://github.com/org/repo/pull/2#comment-2"})
+        );
+        let router = Router::new(Arc::new(AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("fallback".into()),
+                ..DefaultsConfig::default()
+            },
+            routes: vec![RouteRule {
+                event: "github.*".into(),
+                channel: Some("my-prs".into()),
+                filter: [("pr_author".to_string(), "pr-owner".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        }));
+        assert_eq!(router.preview(&events[0]).await.unwrap().0, "my-prs");
+        let mut other_pr = events[0].clone();
+        other_pr.payload["pr_author"] = json!("another-owner");
+        assert_eq!(router.preview(&other_pr).await.unwrap().0, "fallback");
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_inline_baseline_new_dedup_and_old_edit_outside_pr_window() {
+        let mut responses = activity_poll_responses(
+            json!([]),
+            json!([]),
+            json!([activity_comment(1, 9999, ACTIVITY_T0, ACTIVITY_T0)]),
+        );
+        let comments = json!([
+            activity_comment(2, 9999, ACTIVITY_T1, ACTIVITY_T1),
+            activity_comment(3, 9999, "2029-01-01T00:00:00Z", ACTIVITY_T2)
+        ]);
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([]),
+                json!([]),
+                comments.clone(),
+            ));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.pr-review-commented");
+        assert_eq!(events[0].payload["number"], 9999);
+        assert_eq!(events[0].payload["comment_id"], 2);
+        assert_eq!(events[0].payload["path"], "src/main.rs");
+        assert_eq!(events[0].payload["title"], "");
+        assert_eq!(events[0].payload["pr_author"], "");
+        assert!(events[0].payload.get("body").is_none());
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(ACTIVITY_T2)
+        );
+        let requests = requests.lock().unwrap().clone();
+        let feed = &requests[7];
+        assert!(
+            feed.contains("sort=updated")
+                && feed.contains("direction=asc")
+                && feed.contains("per_page=100")
+        );
+        assert!(feed.contains("since=2029-12-31T23%3A59%3A59"), "{feed}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_conversation_failure_and_page_cap_preserve_lower_bound() {
+        let mut responses = activity_poll_responses(
+            json!([activity_comment(1, 1, ACTIVITY_T0, ACTIVITY_T0)]),
+            json!([]),
+            json!([]),
+        );
+        let mut failed =
+            activity_poll_responses(json!({"message": "failed"}), json!([]), json!([]));
+        failed[2].2 = 500;
+        responses.extend(failed);
+        responses.push(activity_response("/repos/org/repo/pulls", json!([])));
+        responses.push(activity_response("/repos/org/repo/issues", json!([])));
+        for page in 1..=MAX_COMMENT_PAGES {
+            let mut response = activity_response(
+                "/repos/org/repo/issues/comments",
+                json!([activity_comment(2, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+            );
+            response.3 = Some(format!("/repos/org/repo/issues/comments?page={}", page + 1));
+            responses.push(response);
+        }
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/comments",
+            json!([]),
+        ));
+        responses.extend(activity_poll_responses(
+            json!([activity_comment(2, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+            json!([]),
+            json!([]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_cursor.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_lower.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        harness.assert_degraded("GitHub PR conversation comments fetch failed:");
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.pr-commented");
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_cursor.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_lower.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        harness.assert_degraded("GitHub PR conversation comment pagination cap reached");
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_lower.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_inline_failure_preserves_cursor_and_page_cap_advances() {
+        let mut responses = activity_poll_responses(
+            json!([]),
+            json!([]),
+            json!([activity_comment(1, 1, ACTIVITY_T0, ACTIVITY_T0)]),
+        );
+        let mut failed =
+            activity_poll_responses(json!([]), json!([]), json!({"message": "failure"}));
+        failed.last_mut().unwrap().2 = 500;
+        responses.extend(failed);
+        let mut capped = activity_poll_responses(
+            json!([]),
+            json!([]),
+            json!([activity_comment(2, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+        );
+        capped.last_mut().unwrap().3 = Some("/repos/org/repo/pulls/comments?page=2".into());
+        responses.extend(capped);
+        for page in 2..=MAX_COMMENT_PAGES {
+            let mut response = activity_response("/repos/org/repo/pulls/comments", json!([]));
+            response.3 = Some(format!("/repos/org/repo/pulls/comments?page={}", page + 1));
+            responses.push(response);
+        }
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!([]),
+            json!([activity_comment(2, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(harness.poll().await.len(), 1);
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_reviews_updated_only_states_and_dedup() {
+        let mut responses =
+            activity_poll_responses(json!([]), json!([activity_pr(1, ACTIVITY_T0)]), json!([]));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([activity_review(1, "APPROVED", ACTIVITY_T0)]),
+        ));
+        let reviews = json!([
+            activity_review(2, "APPROVED", ACTIVITY_T1), activity_review(3, "CHANGES_REQUESTED", ACTIVITY_T1),
+            activity_review(4, "COMMENTED", ACTIVITY_T1), activity_review(5, "PENDING", ACTIVITY_T1),
+            activity_review(6, "DISMISSED", ACTIVITY_T1), activity_review(7, "APPROVED", "2029-01-01T00:00:00Z"),
+            {"id": 8, "state": "COMMENTED", "submitted_at": null, "user": null, "html_url": ""}
+        ]);
+        for updated in [ACTIVITY_T1, ACTIVITY_T2] {
+            responses.extend(activity_poll_responses(
+                json!([]),
+                json!([activity_pr(2, updated)]),
+                json!([]),
+            ));
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/2/reviews",
+                reviews.clone(),
+            ));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 3);
+        for (event, state) in events
+            .iter()
+            .zip(["approved", "changes_requested", "commented"])
+        {
+            assert_eq!(event.canonical_kind(), "github.pr-reviewed");
+            assert_eq!(event.payload["state"], state);
+            assert_eq!(event.payload["pr_author"], "pr-owner");
+            assert_eq!(event.payload["author"], "reviewer");
+            assert!(event.payload.get("body").is_none());
+        }
+        assert!(harness.poll().await.is_empty());
+        let review_paths: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.contains("/reviews?"))
+            .cloned()
+            .collect();
+        assert_eq!(review_paths.len(), 3);
+        assert!(review_paths[0].starts_with("/repos/org/repo/pulls/1/reviews?"));
+        assert!(
+            review_paths[1..]
+                .iter()
+                .all(|path| path.starts_with("/repos/org/repo/pulls/2/reviews?"))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_review_failure_preserves_cursor_and_retries_without_duplicates() {
+        let mut responses =
+            activity_poll_responses(json!([]), json!([activity_pr(1, ACTIVITY_T0)]), json!([]));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        let prs = json!([activity_pr(2, ACTIVITY_T1), activity_pr(3, ACTIVITY_T2)]);
+        for fail in [true, false] {
+            if fail {
+                responses.extend(activity_poll_responses(json!([]), prs.clone(), json!([])));
+                responses.push(activity_response(
+                    "/repos/org/repo/pulls/2/reviews",
+                    json!([activity_review(2, "APPROVED", ACTIVITY_T1)]),
+                ));
+            } else {
+                responses.extend(activity_scan_responses());
+            }
+            let mut response = activity_response(
+                "/repos/org/repo/pulls/3/reviews",
+                if fail {
+                    json!({"message":"failed"})
+                } else {
+                    json!([activity_review(3, "COMMENTED", ACTIVITY_T2)])
+                },
+            );
+            if fail {
+                response.2 = 500;
+            }
+            responses.push(response);
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["review_id"], 2);
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_scan
+                .as_ref()
+                .unwrap()
+                .pending,
+            [3]
+        );
+        harness.assert_degraded("GitHub reviews fetch failed for #3:");
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["review_id"], 3);
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T2)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_updated_pr_page_cap_commits_bounded_window() {
+        let mut responses =
+            activity_poll_responses(json!([]), json!([activity_pr(1, ACTIVITY_T0)]), json!([]));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        for page in 1..=MAX_CI_PAGES {
+            let mut response = activity_response(
+                "/repos/org/repo/pulls",
+                json!([activity_pr(page as u64 + 1, ACTIVITY_T1)]),
+            );
+            response.3 = Some(format!("/repos/org/repo/pulls?page={}", page + 1));
+            responses.push(response);
+        }
+        responses.push(activity_response("/repos/org/repo/issues", json!([])));
+        responses.push(activity_response(
+            "/repos/org/repo/issues/comments",
+            json!([]),
+        ));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/comments",
+            json!([]),
+        ));
+        for number in 2..=6 {
+            responses.push(activity_response(
+                &format!("/repos/org/repo/pulls/{number}/reviews"),
+                json!([activity_review(number, "APPROVED", ACTIVITY_T1)]),
+            ));
+        }
+        let recovered: Vec<_> = (2..=6)
+            .map(|number| activity_pr(number, ACTIVITY_T1))
+            .collect();
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!(recovered),
+            json!([]),
+        ));
+        for number in 2..=6 {
+            responses.push(activity_response(
+                &format!("/repos/org/repo/pulls/{number}/reviews"),
+                json!([activity_review(number, "APPROVED", ACTIVITY_T1)]),
+            ));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(harness.poll().await.len(), MAX_CI_PAGES);
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        let requests = requests.lock().unwrap().clone();
+        assert!(requests[5].contains("sort=updated") && requests[5].contains("direction=desc"));
+        assert!(requests[9].contains("page=5"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_updated_pr_pagination_stops_at_cursor() {
+        let mut responses =
+            activity_poll_responses(json!([]), json!([activity_pr(1, ACTIVITY_T0)]), json!([]));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        let mut first = activity_response(
+            "/repos/org/repo/pulls",
+            json!([activity_pr(2, ACTIVITY_T1)]),
+        );
+        first.3 = Some("/repos/org/repo/pulls?page=2".into());
+        responses.push(first);
+        let mut second = activity_response(
+            "/repos/org/repo/pulls",
+            json!([
+                activity_pr(1, ACTIVITY_T0),
+                activity_pr(3, "2029-01-01T00:00:00Z")
+            ]),
+        );
+        second.3 = Some("/repos/org/repo/pulls?page=3".into());
+        responses.push(second);
+        responses.push(activity_response("/repos/org/repo/issues", json!([])));
+        responses.push(activity_response(
+            "/repos/org/repo/issues/comments",
+            json!([]),
+        ));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/comments",
+            json!([]),
+        ));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/2/reviews",
+            json!([activity_review(2, "APPROVED", ACTIVITY_T1)]),
+        ));
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(harness.poll().await.len(), 1);
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        let requests = requests.lock().unwrap().clone();
+        assert!(requests[5].contains("page=1") && requests[6].contains("page=2"));
+        assert_eq!(requests.len(), 12);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_missing_updated_timestamp_preserves_review_cursor() {
+        let mut responses =
+            activity_poll_responses(json!([]), json!([activity_pr(1, ACTIVITY_T0)]), json!([]));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        let mut partial = activity_pr(2, ACTIVITY_T1);
+        partial.as_object_mut().unwrap().remove("updated_at");
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!([partial]),
+            json!([]),
+        ));
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!([activity_pr(2, ACTIVITY_T1)]),
+            json!([]),
+        ));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/2/reviews",
+            json!([activity_review(2, "COMMENTED", ACTIVITY_T1)]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["review_id"], 2);
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_review_baseline_spans_cap_without_historical_notifications() {
+        let prs: Vec<_> = (1..=21)
+            .map(|number| activity_pr(number, ACTIVITY_T0))
+            .collect();
+        let mut responses = activity_poll_responses(json!([]), json!(prs), json!([]));
+        for number in 1..=20 {
+            responses.push(activity_response(
+                &format!("/repos/org/repo/pulls/{number}/reviews"),
+                json!([activity_review(number, "APPROVED", ACTIVITY_T0)]),
+            ));
+        }
+        responses.extend(activity_scan_responses());
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/21/reviews",
+            json!([activity_review(21, "APPROVED", ACTIVITY_T0)]),
+        ));
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!([activity_pr(21, ACTIVITY_T1)]),
+            json!([]),
+        ));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/21/reviews",
+            json!([
+                activity_review(21, "APPROVED", ACTIVITY_T0),
+                activity_review(22, "COMMENTED", ACTIVITY_T1)
+            ]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert!(harness.repo_state().activity.review_watermark.is_none());
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["review_id"], 22);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f2_review_scan_keeps_submission_lower_bound_across_21_prs() {
+        let mut responses =
+            activity_poll_responses(json!([]), json!([activity_pr(1, ACTIVITY_T0)]), json!([]));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        let prs: Vec<_> = (2..=22)
+            .rev()
+            .map(|number| activity_pr(number, ACTIVITY_T2))
+            .collect();
+        responses.extend(activity_poll_responses(json!([]), json!(prs), json!([])));
+        for number in 2..=21 {
+            responses.push(activity_response(
+                &format!("/repos/org/repo/pulls/{number}/reviews"),
+                json!([activity_review(number, "APPROVED", ACTIVITY_T1)]),
+            ));
+        }
+        responses.extend(activity_scan_responses());
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/22/reviews",
+            json!([activity_review(22, "APPROVED", ACTIVITY_T1)]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let mut events = harness.poll().await;
+        assert_eq!(events.len(), 20);
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_scan
+                .as_ref()
+                .unwrap()
+                .pending,
+            [22]
+        );
+        events.extend(harness.poll().await);
+        let ids: HashSet<_> = events
+            .iter()
+            .map(|event| event.payload["review_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(events.len(), 21);
+        assert_eq!(ids, (2..=22).collect());
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T2)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f1_same_second_second_review_is_emitted_once() {
+        let mut responses = activity_review_baseline_responses();
+        for ids in [vec![42], vec![42, 43], vec![42, 43]] {
+            responses.extend(activity_poll_responses(
+                json!([]),
+                json!([activity_pr(42, ACTIVITY_T1)]),
+                json!([]),
+            ));
+            let reviews: Vec<_> = ids
+                .into_iter()
+                .map(|id| activity_review(id, "APPROVED", ACTIVITY_T1))
+                .collect();
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/42/reviews",
+                json!(reviews),
+            ));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let first = harness.poll().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].payload["review_id"], 42);
+        let second = harness.poll().await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].payload["review_id"], 43);
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f3a_inline_cold_start_skips_1101_comment_history() {
+        let history: Vec<_> = (1..=1101)
+            .rev()
+            .map(|id| {
+                let timestamp = activity_second(id);
+                activity_comment(id, 1, &timestamp, &timestamp)
+            })
+            .collect();
+        let mut responses = activity_poll_responses(json!([]), json!([]), json!(&history[..100]));
+        responses.last_mut().unwrap().3 = Some("/repos/org/repo/pulls/comments?page=2".into());
+        let new_time = activity_second(1102);
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!([]),
+            json!([
+                history[0].clone(),
+                activity_comment(1102, 1, &new_time, &new_time)
+            ]),
+        ));
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(activity_second(1101).as_str())
+        );
+        assert_eq!(
+            harness.repo_state().activity.emitted_review_comment_ids,
+            (1002..=1101).rev().collect::<VecDeque<_>>()
+        );
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        assert!(requests.lock().unwrap()[3].contains("direction=desc"));
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["comment_id"], 1102);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f3b_review_cold_start_skips_501_pr_history() {
+        let history: Vec<_> = (1..=501)
+            .map(|number| {
+                activity_pr(
+                    number,
+                    if number == 1 {
+                        ACTIVITY_T1
+                    } else {
+                        ACTIVITY_T0
+                    },
+                )
+            })
+            .collect();
+        let mut responses = activity_poll_responses(json!([]), json!(&history[..100]), json!([]));
+        responses[0].3 = Some("/repos/org/repo/pulls?page=2".into());
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([activity_review(1, "APPROVED", ACTIVITY_T1)]),
+        ));
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!([activity_pr(501, ACTIVITY_T2)]),
+            json!([]),
+        ));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/501/reviews",
+            json!([
+                activity_review(501, "APPROVED", ACTIVITY_T0),
+                activity_review(502, "APPROVED", ACTIVITY_T2)
+            ]),
+        ));
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        assert!(harness.repo_state().activity.review_scan.is_none());
+        assert_eq!(harness.repo_state().activity.emitted_review_ids, [1]);
+        assert_eq!(requests.lock().unwrap().len(), 5);
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["review_id"], 502);
+        assert!(
+            !harness
+                .repo_state()
+                .activity
+                .emitted_review_ids
+                .contains(&501),
+            "reviews below W are not remembered"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f4_capped_501_pr_scan_drains_500_without_starvation() {
+        let mut responses = activity_review_baseline_responses();
+        let prs: Vec<_> = (2..=502)
+            .map(|number| activity_pr(number, ACTIVITY_T2))
+            .collect();
+        for (page, chunk) in prs[..500].chunks(100).enumerate() {
+            let mut response = activity_response("/repos/org/repo/pulls", json!(chunk));
+            response.3 = Some(format!("/repos/org/repo/pulls?page={}", page + 2));
+            responses.push(response);
+        }
+        for batch in 0..25 {
+            responses.extend(activity_scan_responses());
+            for number in (2 + batch * 20)..(22 + batch * 20) {
+                responses.push(activity_response(
+                    &format!("/repos/org/repo/pulls/{number}/reviews"),
+                    json!([activity_review(number, "APPROVED", ACTIVITY_T1)]),
+                ));
+            }
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let mut events = Vec::new();
+        for batch in 0..25 {
+            let next = harness.poll().await;
+            assert_eq!(next.len(), 20);
+            events.extend(next);
+            if batch < 24 {
+                assert_eq!(
+                    harness.repo_state().activity.review_watermark.as_deref(),
+                    Some(ACTIVITY_T0)
+                );
+                assert_eq!(
+                    harness
+                        .repo_state()
+                        .activity
+                        .review_scan
+                        .as_ref()
+                        .unwrap()
+                        .pending
+                        .len(),
+                    480 - batch * 20
+                );
+            }
+        }
+        let ids: HashSet<_> = events
+            .iter()
+            .map(|event| event.payload["review_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(events.len(), 500);
+        assert_eq!(ids, (2..=501).collect());
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T2)
+        );
+        assert!(harness.repo_state().activity.review_scan.is_none());
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("/repos/org/repo/pulls?"))
+                .count(),
+            6
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f5_issue_comments_never_affect_pr_dedup_or_emission() {
+        let mut comments = vec![activity_comment(2, 1, ACTIVITY_T1, ACTIVITY_T1)];
+        for id in 3..=1001 {
+            let mut comment = activity_comment(id, 2, ACTIVITY_T1, ACTIVITY_T1);
+            comment["html_url"] = json!(format!(
+                "https://github.com/org/repo/issues/2#issuecomment-{id}"
+            ));
+            comments.push(comment);
+        }
+        let mut responses = activity_poll_responses(
+            json!([activity_comment(1, 1, ACTIVITY_T0, ACTIVITY_T0)]),
+            json!([]),
+            json!([]),
+        );
+        for _ in 0..3 {
+            let mut poll = activity_poll_responses(json!([]), json!([]), json!([]));
+            poll[2].1 = json!(&comments[..100]);
+            poll[2].3 = Some("/repos/org/repo/issues/comments?page=2".into());
+            let inline = poll.pop().unwrap();
+            responses.extend(poll);
+            for (page, chunk) in comments[100..].chunks(100).enumerate() {
+                let mut response =
+                    activity_response("/repos/org/repo/issues/comments", json!(chunk));
+                if page < 8 {
+                    response.3 = Some(format!("/repos/org/repo/issues/comments?page={}", page + 3));
+                }
+                responses.push(response);
+            }
+            responses.push(inline);
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.pr-commented");
+        assert_eq!(events[0].payload["comment_id"], 2);
+        for _ in 0..2 {
+            assert!(harness.poll().await.is_empty());
+        }
+        assert_eq!(harness.repo_state().activity.emitted_pr_comment_ids, [1, 2]);
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_cursor.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f6_ci_persist_failure_never_replays_delivered_conversation() {
+        let mut responses = activity_poll_responses(
+            json!([activity_comment(1, 1, ACTIVITY_T0, ACTIVITY_T0)]),
+            json!([]),
+            json!([]),
+        );
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([activity_comment(2, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+                json!([]),
+                json!([]),
+            ));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        harness.baseline_path = Some(blocker.join("baseline.json"));
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.pr-commented");
+        assert_eq!(events[0].payload["comment_id"], 2);
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_cursor.as_deref(),
+            Some(ACTIVITY_T1),
+            "real CI persist failure must retain delivered activity state"
+        );
+        assert!(
+            telemetry::take_test_records()
+                .iter()
+                .any(|record| { record["reason_code"] == "ci_baseline_persist_failed" }),
+            "must exercise the real CI persist failure branch"
+        );
+        assert!(
+            harness
+                .repo_state()
+                .activity
+                .emitted_pr_comment_ids
+                .contains(&2)
+        );
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_inline_cap_resumes_1101_new_comments_without_duplicates() {
+        let mut responses = activity_review_baseline_responses();
+        responses.extend(activity_poll_responses(json!([]), json!([]), json!([])));
+        responses.pop();
+        for page in 0..10 {
+            let comments: Vec<_> = ((page * 100 + 1)..=(page * 100 + 100))
+                .map(|id| {
+                    let timestamp = activity_second(id);
+                    activity_comment(id, 1, &timestamp, &timestamp)
+                })
+                .collect();
+            let mut response = activity_response("/repos/org/repo/pulls/comments", json!(comments));
+            response.3 = Some(format!("/repos/org/repo/pulls/comments?page={}", page + 2));
+            responses.push(response);
+        }
+        let tail: Vec<_> = (1000..=1101)
+            .map(|id| {
+                let timestamp = activity_second(id);
+                activity_comment(id, 1, &timestamp, &timestamp)
+            })
+            .collect();
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(json!([]), json!([]), json!(tail)));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let mut events = harness.poll().await;
+        assert_eq!(events.len(), 1000);
+        harness.assert_degraded("GitHub inline review comment pagination cap reached");
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(activity_second(1000).as_str())
+        );
+        events.extend(harness.poll().await);
+        assert_eq!(events.len(), 1101);
+        let ids: HashSet<_> = events
+            .iter()
+            .map(|event| event.payload["comment_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, (1..=1101).collect());
+        assert!(harness.poll().await.is_empty());
+        let requests = requests.lock().unwrap();
+        let resumed = requests
+            .iter()
+            .filter(|request| request.starts_with("/repos/org/repo/pulls/comments?"))
+            .nth(11)
+            .unwrap();
+        assert!(
+            resumed.contains("since=2030-01-01T00%3A16%3A39"),
+            "{resumed}"
+        );
+        drop(requests);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_inline_partial_fetch_failure_preserves_cursor_and_retries() {
+        let mut responses = activity_review_baseline_responses();
+        let mut failed = activity_poll_responses(
+            json!([]),
+            json!([]),
+            json!([activity_comment(1, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+        );
+        failed.last_mut().unwrap().3 = Some("/repos/org/repo/pulls/comments?page=2".into());
+        responses.extend(failed);
+        let mut failure = activity_response(
+            "/repos/org/repo/pulls/comments",
+            json!({"message": "second page failed"}),
+        );
+        failure.2 = 500;
+        responses.push(failure);
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!([]),
+            json!([
+                activity_comment(1, 1, ACTIVITY_T1, ACTIVITY_T1),
+                activity_comment(2, 1, ACTIVITY_T2, ACTIVITY_T2)
+            ]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert!(harness.poll().await.is_empty());
+        harness.assert_degraded("GitHub inline review comments fetch failed:");
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_lower
+                .as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert!(
+            !harness
+                .repo_state()
+                .activity
+                .emitted_review_comment_ids
+                .contains(&1)
+        );
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(ACTIVITY_T2)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_review_page_cap_requeues_without_replaying_sent_reviews() {
+        let mut responses = activity_review_baseline_responses();
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!([activity_pr(2, ACTIVITY_T1)]),
+            json!([]),
+        ));
+        for page in 1..=MAX_COMMENT_PAGES {
+            let mut response = activity_response(
+                "/repos/org/repo/pulls/2/reviews",
+                if page == 1 {
+                    json!([activity_review(2, "APPROVED", ACTIVITY_T1)])
+                } else {
+                    json!([])
+                },
+            );
+            response.3 = Some(format!("/repos/org/repo/pulls/2/reviews?page={}", page + 1));
+            responses.push(response);
+        }
+        responses.extend(activity_scan_responses());
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/2/reviews",
+            json!([
+                activity_review(2, "APPROVED", ACTIVITY_T1),
+                activity_review(3, "APPROVED", ACTIVITY_T1)
+            ]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["review_id"], 2);
+        harness.assert_degraded("GitHub per-PR review pagination cap reached");
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_scan
+                .as_ref()
+                .unwrap()
+                .pending,
+            [2]
+        );
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["review_id"], 3);
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_cold_empty_feed_uses_server_date_not_local_clock() {
+        let mut responses = activity_poll_responses(json!([]), json!([]), json!([]));
+        responses[0].4 = Some("Tue, 01 Jan 2030 00:00:00 GMT".into());
+        responses[3].4 = Some("Tue, 01 Jan 2030 00:00:00 GMT".into());
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([]),
+                json!([activity_pr(1, ACTIVITY_T1)]),
+                json!([activity_comment(1, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+            ));
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/1/reviews",
+                json!([activity_review(1, "APPROVED", ACTIVITY_T1)]),
+            ));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_lower
+                .as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(harness.poll().await.len(), 2);
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_cold_invalid_date_falls_back_to_observed_timestamps() {
+        let mut responses = activity_poll_responses(
+            json!([]),
+            json!([activity_pr(1, ACTIVITY_T1)]),
+            json!([activity_comment(1, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+        );
+        responses[0].4 = Some("not a server date".into());
+        responses[3].4 = Some("not a server date".into());
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([activity_review(1, "APPROVED", ACTIVITY_T1)]),
+        ));
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([]),
+                json!([activity_pr(1, ACTIVITY_T2)]),
+                json!([
+                    activity_comment(2, 1, ACTIVITY_T0, ACTIVITY_T2),
+                    activity_comment(3, 1, ACTIVITY_T2, ACTIVITY_T2)
+                ]),
+            ));
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/1/reviews",
+                json!([
+                    activity_review(1, "APPROVED", ACTIVITY_T1),
+                    activity_review(2, "COMMENTED", ACTIVITY_T2)
+                ]),
+            ));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_lower
+                .as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some(ACTIVITY_T1)
+        );
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload["comment_id"], 3);
+        assert_eq!(events[1].payload["review_id"], 2);
+        assert!(
+            !harness
+                .repo_state()
+                .activity
+                .emitted_review_comment_ids
+                .contains(&2),
+            "ineligible old edits must not enter the FIFO"
+        );
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f8_inline_cold_partial_boundary_no_replay() {
+        let history: Vec<_> = (1..=101)
+            .map(|id| activity_comment(id, 1, ACTIVITY_T0, ACTIVITY_T0))
+            .collect();
+        let mut responses = activity_poll_responses(json!([]), json!([]), json!(&history[..100]));
+        let cold = responses.last_mut().unwrap();
+        cold.3 = Some("/repos/org/repo/pulls/comments?page=2".into());
+        cold.4 = Some("Tue, 01 Jan 2030 00:00:01 GMT".into());
+        let mut overlap = activity_poll_responses(json!([]), json!([]), json!(&history[..100]));
+        overlap.last_mut().unwrap().3 = Some("/repos/org/repo/pulls/comments?page=2".into());
+        responses.extend(overlap);
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/comments",
+            json!([history[100]]),
+        ));
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([]),
+                json!([]),
+                json!([
+                    history[100],
+                    activity_comment(102, 1, ACTIVITY_T1, ACTIVITY_T1)
+                ]),
+            ));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_lower
+                .as_deref(),
+            Some("2030-01-01T00:00:01Z")
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            4,
+            "cold fetch must stay bounded to one page"
+        );
+        assert!(
+            harness.poll().await.is_empty(),
+            "unseen historical id 101 must not replay"
+        );
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["comment_id"], 102);
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f8_review_cold_partial_boundary_no_replay() {
+        let history: Vec<_> = (1..=101)
+            .map(|number| activity_pr(number, ACTIVITY_T0))
+            .collect();
+        let mut responses = activity_poll_responses(json!([]), json!(&history[..100]), json!([]));
+        responses[0].3 = Some("/repos/org/repo/pulls?page=2".into());
+        responses[0].4 = Some("Tue, 01 Jan 2030 00:00:01 GMT".into());
+        for batch in 0..5 {
+            if batch > 0 {
+                responses.extend(activity_scan_responses());
+            }
+            for number in (batch * 20 + 1)..=(batch * 20 + 20) {
+                responses.push(activity_response(
+                    &format!("/repos/org/repo/pulls/{number}/reviews"),
+                    json!([activity_review(number, "APPROVED", ACTIVITY_T0)]),
+                ));
+            }
+        }
+        // The next list includes the previously unseen PR at the old boundary.
+        // Its update is below the Date-based baseline, so no historical reviews are fetched.
+        let mut overlap = vec![history[100].clone()];
+        overlap.extend_from_slice(&history[..99]);
+        responses.extend(activity_poll_responses(
+            json!([]),
+            json!(overlap),
+            json!([]),
+        ));
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([]),
+                json!([activity_pr(101, ACTIVITY_T2)]),
+                json!([]),
+            ));
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/101/reviews",
+                json!([
+                    activity_review(101, "APPROVED", ACTIVITY_T0),
+                    activity_review(102, "COMMENTED", ACTIVITY_T1)
+                ]),
+            ));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        for _ in 0..5 {
+            assert!(harness.poll().await.is_empty());
+        }
+        assert_eq!(
+            harness.repo_state().activity.review_watermark.as_deref(),
+            Some("2030-01-01T00:00:01Z")
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.starts_with("/repos/org/repo/pulls?"))
+                .count(),
+            1
+        );
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["review_id"], 102);
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_conversation_cold_partial_boundary_no_replay() {
+        let history: Vec<_> = (1..=101)
+            .map(|id| activity_comment(id, 1, ACTIVITY_T0, ACTIVITY_T0))
+            .collect();
+        let mut responses = activity_poll_responses(json!(&history[..100]), json!([]), json!([]));
+        responses[2].3 = Some("/repos/org/repo/issues/comments?page=2".into());
+        responses[2].4 = Some("Tue, 01 Jan 2030 00:00:01 GMT".into());
+        let mut overlap = activity_poll_responses(json!(&history[..100]), json!([]), json!([]));
+        overlap[2].3 = Some("/repos/org/repo/issues/comments?page=2".into());
+        let inline = overlap.pop().unwrap();
+        responses.extend(overlap);
+        responses.push(activity_response(
+            "/repos/org/repo/issues/comments",
+            json!([history[100]]),
+        ));
+        responses.push(inline);
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([
+                    history[100],
+                    activity_comment(102, 1, ACTIVITY_T1, ACTIVITY_T1)
+                ]),
+                json!([]),
+                json!([]),
+            ));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_cursor.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_lower.as_deref(),
+            Some("2030-01-01T00:00:01Z")
+        );
+        assert_eq!(
+            harness.repo_state().activity.emitted_pr_comment_ids.len(),
+            100
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            4,
+            "cold start must read only one conversation page"
+        );
+        assert!(requests.lock().unwrap()[2].contains("direction=desc"));
+        assert!(
+            harness.poll().await.is_empty(),
+            "unseen historical id 101 must not replay"
+        );
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.pr-commented");
+        assert_eq!(events[0].payload["comment_id"], 102);
+        assert!(harness.poll().await.is_empty());
+        let requests = requests.lock().unwrap().clone();
+        let resumed = &requests[6];
+        assert!(
+            resumed.contains("sort=updated")
+                && resumed.contains("direction=asc")
+                && resumed.contains("per_page=100")
+        );
+        assert!(
+            resumed.contains("since=2029-12-31T23%3A59%3A59"),
+            "{resumed}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_conversation_capped_resume_keeps_edited_unseen_comment() {
+        let mut responses = activity_poll_responses(
+            json!([activity_comment(0, 1, ACTIVITY_T0, ACTIVITY_T0)]),
+            json!([]),
+            json!([]),
+        );
+        let mut capped = activity_poll_responses(json!([]), json!([]), json!([]));
+        let inline = capped.pop().unwrap();
+        capped.pop();
+        responses.extend(capped);
+        for page in 0..MAX_COMMENT_PAGES {
+            let comments: Vec<_> = ((page * 100 + 1)..=(page * 100 + 100))
+                .map(|id| {
+                    let timestamp = activity_second(id as u64);
+                    activity_comment(id as u64, 1, &timestamp, &timestamp)
+                })
+                .collect();
+            let mut response =
+                activity_response("/repos/org/repo/issues/comments", json!(comments));
+            response.3 = Some(format!("/repos/org/repo/issues/comments?page={}", page + 2));
+            responses.push(response);
+        }
+        responses.push(inline);
+        let tail = json!([
+            activity_comment(1000, 1, &activity_second(1000), &activity_second(1000)),
+            activity_comment(1001, 1, &activity_second(1), &activity_second(1001))
+        ]);
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(tail.clone(), json!([]), json!([])));
+        }
+        let (base, requests, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let mut events = harness.poll().await;
+        assert_eq!(events.len(), 1000);
+        harness.assert_degraded("GitHub PR conversation comment pagination cap reached");
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_cursor.as_deref(),
+            Some(activity_second(1000).as_str())
+        );
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_lower.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        let resumed = harness.poll().await;
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].payload["comment_id"], 1001);
+        events.extend(resumed);
+        let ids: HashSet<_> = events
+            .iter()
+            .map(|event| event.payload["comment_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(events.len(), 1001);
+        assert_eq!(ids, (1..=1001).collect());
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_lower.as_deref(),
+            Some(activity_second(1001).as_str())
+        );
+        assert!(harness.poll().await.is_empty());
+        let requests = requests.lock().unwrap().clone();
+        let resumed = requests
+            .iter()
+            .filter(|path| path.starts_with("/repos/org/repo/issues/comments?"))
+            .nth(11)
+            .unwrap();
+        assert!(
+            resumed.contains("since=2030-01-01T00%3A16%3A39"),
+            "{resumed}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_conversation_partial_failure_preserves_position_lower_and_ids() {
+        let mut responses = activity_poll_responses(
+            json!([activity_comment(0, 1, ACTIVITY_T0, ACTIVITY_T0)]),
+            json!([]),
+            json!([]),
+        );
+        let mut failed = activity_poll_responses(
+            json!([activity_comment(1, 1, ACTIVITY_T1, ACTIVITY_T1)]),
+            json!([]),
+            json!([]),
+        );
+        failed[2].3 = Some("/repos/org/repo/issues/comments?page=2".into());
+        let inline = failed.pop().unwrap();
+        responses.extend(failed);
+        let mut failure = activity_response(
+            "/repos/org/repo/issues/comments",
+            json!({"message": "second page failed"}),
+        );
+        failure.2 = 500;
+        responses.push(failure);
+        responses.push(inline);
+        responses.extend(activity_poll_responses(
+            json!([
+                activity_comment(1, 1, ACTIVITY_T1, ACTIVITY_T1),
+                activity_comment(2, 1, ACTIVITY_T2, ACTIVITY_T2)
+            ]),
+            json!([]),
+            json!([]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        assert!(harness.poll().await.is_empty());
+        harness.assert_degraded("GitHub PR conversation comments fetch failed:");
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_cursor.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_lower.as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        assert_eq!(harness.repo_state().activity.emitted_pr_comment_ids, [0]);
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_cursor.as_deref(),
+            Some(ACTIVITY_T2)
+        );
+        assert_eq!(
+            harness.repo_state().activity.pr_comment_lower.as_deref(),
+            Some(ACTIVITY_T2)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_classifier_github_corp_host() {
+        let mut pr = activity_comment(1, 42, ACTIVITY_T1, ACTIVITY_T1);
+        pr["html_url"] = json!("https://github.corp.net/org/repo/pull/42#issuecomment-1");
+        let mut issue = activity_comment(2, 1, ACTIVITY_T1, ACTIVITY_T1);
+        issue["html_url"] = json!("https://github.corp.net/org/repo/issues/1#issuecomment-2");
+        issue["issue_url"] = json!("https://github.corp.net/api/v3/repos/org/repo/issues/1");
+        let mut api_pr = activity_comment(3, 43, ACTIVITY_T1, ACTIVITY_T1);
+        api_pr["html_url"] = json!("not a URL");
+        api_pr["issue_url"] = json!("https://github.corp.net/api/v3/repos/org/repo/pulls/43");
+        let mut responses = activity_poll_responses(json!([]), json!([]), json!([]));
+        responses[2].4 = Some("Tue, 01 Jan 2030 00:00:00 GMT".into());
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([pr, issue, api_pr]),
+                json!([]),
+                json!([]),
+            ));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload["number"], 42);
+        assert_eq!(events[1].payload["number"], 43);
+        assert_eq!(harness.repo_state().activity.emitted_pr_comment_ids, [1, 3]);
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_classifier_repo_named_pull() {
+        let mut issue = activity_comment(1, 42, ACTIVITY_T1, ACTIVITY_T1);
+        issue["html_url"] = json!("https://github.com/org/pull/issues/42#issuecomment-1");
+        issue["issue_url"] = json!("https://api.github.com/repos/org/pull/issues/42");
+        let mut pr = activity_comment(2, 42, ACTIVITY_T1, ACTIVITY_T1);
+        pr["html_url"] = json!("https://github.com/org/pull/pull/42#issuecomment-2");
+        pr["issue_url"] = json!("https://api.github.com/repos/org/pull/pulls/42");
+        let mut invalid = activity_comment(3, 42, ACTIVITY_T1, ACTIVITY_T1);
+        invalid["html_url"] = json!("https://github.com/pull/pull/issues/42");
+        invalid["issue_url"] = json!("not a URL");
+        let mut responses = activity_poll_responses(json!([]), json!([]), json!([]));
+        responses[2].4 = Some("Tue, 01 Jan 2030 00:00:00 GMT".into());
+        responses.extend(activity_poll_responses(
+            json!([issue, pr, invalid]),
+            json!([]),
+            json!([]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["comment_id"], 2);
+        assert_eq!(events[0].payload["number"], 42);
+        assert_eq!(harness.repo_state().activity.emitted_pr_comment_ids, [2]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_activity_f9_capped_inline_resume_keeps_edited_unseen_comment() {
+        let mut responses = activity_review_baseline_responses();
+        responses.extend(activity_poll_responses(json!([]), json!([]), json!([])));
+        responses.pop();
+        for page in 0..10 {
+            let comments: Vec<_> = ((page * 100 + 1)..=(page * 100 + 100))
+                .map(|id| {
+                    let timestamp = activity_second(id);
+                    activity_comment(id, 1, &timestamp, &timestamp)
+                })
+                .collect();
+            let mut response = activity_response("/repos/org/repo/pulls/comments", json!(comments));
+            response.3 = Some(format!("/repos/org/repo/pulls/comments?page={}", page + 2));
+            responses.push(response);
+        }
+        let tail = json!([
+            activity_comment(1000, 1, &activity_second(1000), &activity_second(1000)),
+            activity_comment(1001, 1, &activity_second(1), &activity_second(1001))
+        ]);
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(json!([]), json!([]), tail.clone()));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        assert!(harness.poll().await.is_empty());
+        let mut events = harness.poll().await;
+        assert_eq!(events.len(), 1000);
+        harness.assert_degraded("GitHub inline review comment pagination cap reached");
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_cursor
+                .as_deref(),
+            Some(activity_second(1000).as_str())
+        );
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_lower
+                .as_deref(),
+            Some(ACTIVITY_T0)
+        );
+        let resumed = harness.poll().await;
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].payload["comment_id"], 1001);
+        events.extend(resumed);
+        let ids: HashSet<_> = events
+            .iter()
+            .map(|event| event.payload["comment_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(events.len(), 1001);
+        assert_eq!(ids, (1..=1001).collect());
+        assert_eq!(
+            harness
+                .repo_state()
+                .activity
+                .review_comment_lower
+                .as_deref(),
+            Some(activity_second(1001).as_str())
+        );
+        assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
     }
 }

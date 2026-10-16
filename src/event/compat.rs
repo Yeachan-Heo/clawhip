@@ -6,8 +6,9 @@ use crate::Result;
 use crate::event::{
     AgentEvent, CustomEvent, DiscordNudgeIntentEvent, EventBody, EventEnvelope, EventMetadata,
     EventPriority, GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent,
-    GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent, GitHubReleaseEvent,
-    TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
+    GitHubIssueEvent, GitHubPRCommentEvent, GitHubPREvent, GitHubPRReviewCommentEvent,
+    GitHubPRReviewEvent, GitHubPRStatusEvent, GitHubReleaseEvent, TmuxKeywordAggregatedEvent,
+    TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
 use crate::events::{IncomingEvent, normalize_event};
 
@@ -55,6 +56,25 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
             payload,
         )?)),
         "github.issue-closed" => Ok(EventBody::GitHubIssueClosed(github_issue_event(payload)?)),
+        "github.pr-commented" => Ok(EventBody::GitHubPRCommented(github_pr_comment_event(
+            payload,
+        )?)),
+        "github.pr-review-commented" => Ok(EventBody::GitHubPRReviewCommented(
+            GitHubPRReviewCommentEvent {
+                comment: github_pr_comment_event(payload)?,
+                path: string_field(payload, "path")?,
+            },
+        )),
+        "github.pr-reviewed" => Ok(EventBody::GitHubPRReviewed(GitHubPRReviewEvent {
+            repo: string_field(payload, "repo")?,
+            number: u64_field(payload, "number")?,
+            title: string_field(payload, "title")?,
+            author: string_field(payload, "author")?,
+            pr_author: string_field(payload, "pr_author")?,
+            url: string_field(payload, "url")?,
+            review_id: u64_field(payload, "review_id")?,
+            state: string_field(payload, "state")?,
+        })),
         "github.pr-status-changed" => github_pr_body(payload),
         "github.release-published" => Ok(EventBody::GitHubReleasePublished(github_release_event(
             payload,
@@ -222,6 +242,18 @@ fn github_issue_event(payload: &Value) -> Result<GitHubIssueEvent> {
         number: u64_field(payload, "number")?,
         title: string_field(payload, "title")?,
         comments: payload.get("comments").and_then(Value::as_u64),
+    })
+}
+
+fn github_pr_comment_event(payload: &Value) -> Result<GitHubPRCommentEvent> {
+    Ok(GitHubPRCommentEvent {
+        repo: string_field(payload, "repo")?,
+        number: u64_field(payload, "number")?,
+        title: string_field(payload, "title")?,
+        author: string_field(payload, "author")?,
+        pr_author: string_field(payload, "pr_author")?,
+        url: string_field(payload, "url")?,
+        comment_id: u64_field(payload, "comment_id")?,
     })
 }
 
@@ -476,6 +508,74 @@ mod tests {
     use super::*;
     use crate::events::IncomingEvent;
     use serde_json::json;
+
+    #[test]
+    fn pr_activity_events_have_typed_bodies_and_render_all_formats() {
+        let comment = GitHubPRCommentEvent {
+            repo: "org/repo".into(),
+            number: 42,
+            title: "A PR".into(),
+            author: "reviewer".into(),
+            pr_author: "owner".into(),
+            url: "https://github.com/org/repo/pull/42#comment-7".into(),
+            comment_id: 7,
+        };
+        let events = [
+            IncomingEvent::github_pr_commented(comment.clone(), None),
+            IncomingEvent::github_pr_review_commented(
+                GitHubPRReviewCommentEvent {
+                    comment: comment.clone(),
+                    path: "src/main.rs".into(),
+                },
+                None,
+            ),
+            IncomingEvent::github_pr_reviewed(
+                GitHubPRReviewEvent {
+                    repo: comment.repo.clone(),
+                    number: comment.number,
+                    title: comment.title.clone(),
+                    author: comment.author.clone(),
+                    pr_author: comment.pr_author.clone(),
+                    url: comment.url.clone(),
+                    review_id: 8,
+                    state: "approved".into(),
+                },
+                None,
+            ),
+        ];
+        for event in &events {
+            let envelope = from_incoming_event(event).unwrap();
+            match &envelope.body {
+                EventBody::GitHubPRCommented(body) => assert_eq!(body, &comment),
+                EventBody::GitHubPRReviewCommented(body) => {
+                    assert_eq!(body.comment, comment);
+                    assert_eq!(body.path, "src/main.rs");
+                }
+                EventBody::GitHubPRReviewed(body) => {
+                    assert_eq!(body.review_id, 8);
+                    assert_eq!(body.state, "approved");
+                }
+                other => panic!("unexpected event body: {other:?}"),
+            }
+            for format in [
+                crate::events::MessageFormat::Compact,
+                crate::events::MessageFormat::Alert,
+                crate::events::MessageFormat::Inline,
+                crate::events::MessageFormat::Raw,
+            ] {
+                let rendered = event.render_default(&format).unwrap();
+                assert!(
+                    rendered.contains("org/repo")
+                        && rendered.contains("reviewer")
+                        && rendered.contains(&comment.url)
+                );
+            }
+            assert!(event.payload.get("body").is_none());
+            let mut partial = event.clone();
+            partial.payload.as_object_mut().unwrap().remove("url");
+            assert!(from_incoming_event(&partial).is_err());
+        }
+    }
 
     #[test]
     fn converts_aggregated_git_commits() {
