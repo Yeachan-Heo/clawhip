@@ -41,6 +41,35 @@ pub struct GitHubPREvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPRCommentEvent {
+    pub repo: String,
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub pr_author: String,
+    pub url: String,
+    pub comment_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPRReviewCommentEvent {
+    pub comment: GitHubPRCommentEvent,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPRReviewEvent {
+    pub repo: String,
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub pr_author: String,
+    pub url: String,
+    pub review_id: u64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHubPRStatusEvent {
     pub repo: String,
     pub number: u64,

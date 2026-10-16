@@ -173,7 +173,21 @@ pub fn render_line(mut object: Map<String, Value>) -> String {
 }
 
 pub fn emit(object: Map<String, Value>) {
+    #[cfg(test)]
+    TEST_RECORDS.with_borrow_mut(|records| records.push(object.clone()));
     eprintln!("{}", render_line(object));
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RECORDS: std::cell::RefCell<Vec<Map<String, Value>>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+pub fn take_test_records() -> Vec<Map<String, Value>> {
+    TEST_RECORDS.with_borrow_mut(std::mem::take)
 }
 
 fn fingerprint(value: &str) -> u64 {

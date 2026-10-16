@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.6.14 - 2026-10-16
+
+### Highlights
+
+- add opt-in GitHub pull request review and comment activity notifications as a complement to existing PR lifecycle events
+
+### Upgrade notes
+
+- crate version is now `0.6.14`
+- to enable PR review and comment notifications on a git repository, set `emit_pr_activity = true` on `[[monitors.git.repos]]`
+- when opt-in is enabled, three new event types are emitted: `github.pr-commented`, `github.pr-review-commented`, and `github.pr-reviewed`
+- feature is opt-out by default; existing config remains compatible; no migration required
+
+### Added
+
+- add `emit_pr_activity` opt-in flag on `[[monitors.git.repos]]` config to enable pull request activity notifications
+- emit `github.pr-commented` event when a pull request receives a new comment
+- emit `github.pr-review-commented` event when a pull request review receives a reply comment
+- emit `github.pr-reviewed` event when a pull request receives a review submission
+
 ## 0.6.13 - 2026-10-13
 
 ### Highlights
