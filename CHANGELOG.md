@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.6.15 - 2026-10-16
+
+### Highlights
+
+- add webhook signature verification for authenticated GitHub events (issue/PR comments and reviews)
+
+### Upgrade notes
+
+- crate version is now `0.6.15`
+- existing webhook configuration and behavior remain fully compatible; no migration required
+- to enable signature verification for comment and review events, set `[providers.github].webhook_secret_env` to an environment variable containing the GitHub webhook secret
+- without a configured secret, existing unsigned webhook behavior for `issues.opened`, `pull_request.opened`/`closed`, and `release` events continues unchanged
+- comment and review event types require an authenticated webhook with configured secret to be processed; without a secret they are ignored with `202` to prevent unauthorized injection
+- when a secret is configured, webhook requests with invalid or missing `X-Hub-Signature-256` header receive `401` before event processing
+
 ## 0.6.14 - 2026-10-16
 
 ### Highlights
