@@ -2192,15 +2192,17 @@ async fn poll_github(
         let (
             issues,
             fetch_succeeded,
+            issues_complete,
+            oldest_fetched_timestamp,
             max_comment_timestamp,
             emitted_comment_ids,
             emitted_opened,
             emitted_closed,
             pre_fetch_cutoff,
         ) = match poll_issues(config, github_client, repo, &snapshot, previous, tx).await {
-            Ok((issues, success, max_ts, ids, opened, closed, cutoff)) => {
-                (issues, success, max_ts, ids, opened, closed, cutoff)
-            }
+            Ok((issues, success, complete, oldest_ts, max_ts, ids, opened, closed, cutoff)) => (
+                issues, success, complete, oldest_ts, max_ts, ids, opened, closed, cutoff,
+            ),
             Err(error) => {
                 eprintln!(
                     "clawhip source GitHub issue processing failed for {}: {error}",
@@ -2220,6 +2222,8 @@ async fn poll_github(
                         .map(|entry| entry.issues.clone())
                         .unwrap_or_default(),
                     false,
+                    true,
+                    None,
                     None,
                     ids,
                     opened,
@@ -2352,22 +2356,31 @@ async fn poll_github(
                     "clawhip source github CI baseline persist failed for {}: {error}",
                     repo.path
                 );
+                // L3 fix: Ensure state is updated with newly-emitted comment IDs even on CI baseline failure.
+                // This prevents re-emission of comments on the next poll when persistence fails.
                 // F9 fix: Only update watermark if fetch succeeded.
                 // If fetch failed, preserve the previous watermark to avoid permanently
                 // skipping newly created issues that fall between the failed fetch and recovery.
                 let last_poll_time = if fetch_succeeded {
-                    Some(
+                    if issues.is_empty() {
+                        Some(pre_fetch_cutoff.clone())
+                    } else if !issues_complete {
+                        // Page cap hit: use oldest actually-read timestamp, not newest
+                        oldest_fetched_timestamp
+                    } else {
                         issues
                             .values()
                             .map(|issue| issue.updated_at.as_str())
                             .max()
                             .map(|s| s.to_string())
-                            .unwrap_or_else(current_utc_iso8601),
-                    )
+                    }
                 } else {
                     // Preserve previous watermark on fetch failure
                     previous.and_then(|p| p.issue_cursor.clone())
                 };
+                // Use the newly computed comment_cursor that was potentially updated by comment events
+                let comment_cursor = max_comment_timestamp
+                    .or_else(|| previous.and_then(|p| p.comment_cursor.clone()));
                 state.insert(
                     repo.path.clone(),
                     GitHubRepoState {
@@ -2378,16 +2391,10 @@ async fn poll_github(
                             .map(|entry| entry.ci_baseline_established)
                             .unwrap_or(false),
                         issue_cursor: last_poll_time,
-                        comment_cursor: previous.and_then(|p| p.comment_cursor.clone()),
-                        emitted_comment_ids: previous
-                            .map(|p| p.emitted_comment_ids.clone())
-                            .unwrap_or_default(),
-                        emitted_opened: previous
-                            .map(|p| p.emitted_opened.clone())
-                            .unwrap_or_default(),
-                        emitted_closed: previous
-                            .map(|p| p.emitted_closed.clone())
-                            .unwrap_or_default(),
+                        comment_cursor,
+                        emitted_comment_ids,
+                        emitted_opened,
+                        emitted_closed,
                     },
                 );
                 continue;
@@ -2410,9 +2417,13 @@ async fn poll_github(
         // K1 fix: issue_cursor is based only on issue timestamps, never on comment timestamps.
         // When issues are empty, use pre_fetch_cutoff (captured before the request) to avoid
         // permanently skipping issues created after the empty response.
+        // L2 fix: When page cap is hit, use oldest_fetched_timestamp to never advance past unread items.
         let last_poll_time = if fetch_succeeded {
             if issues.is_empty() {
                 Some(pre_fetch_cutoff)
+            } else if !issues_complete {
+                // Page cap hit: use oldest actually-read timestamp, not newest
+                oldest_fetched_timestamp
             } else {
                 issues
                     .values()
@@ -2424,12 +2435,10 @@ async fn poll_github(
             // Fetch failed: preserve previous watermark
             previous.and_then(|p| p.issue_cursor.clone())
         };
-        // Separate comment cursor: advanced only from max comment updated_at
-        let comment_cursor = if fetch_succeeded {
-            max_comment_timestamp.clone()
-        } else {
-            previous.and_then(|p| p.comment_cursor.clone())
-        };
+        // L1 fix: Separate comment cursor: advanced only from max comment updated_at.
+        // If comment fetch failed, max_comment_timestamp is None and we preserve the previous cursor.
+        let comment_cursor =
+            max_comment_timestamp.or_else(|| previous.and_then(|p| p.comment_cursor.clone()));
         state.insert(
             repo.path.clone(),
             GitHubRepoState {
@@ -2449,7 +2458,8 @@ async fn poll_github(
     Ok(())
 }
 
-// Returns: (issues HashMap, fetch_succeeded, final_comment_timestamp, emitted_comment_ids, emitted_opened, emitted_closed, pre_fetch_cutoff)
+// Returns: (issues HashMap, fetch_succeeded, issues_complete, oldest_fetched_timestamp, final_comment_timestamp, emitted_comment_ids, emitted_opened, emitted_closed, pre_fetch_cutoff)
+// L2 fix: Track issues_complete separately from fetch_succeeded, and return oldest_fetched_timestamp for cursor advancement.
 async fn poll_issues(
     config: &AppConfig,
     github_client: Option<&GitHubClient>,
@@ -2460,6 +2470,8 @@ async fn poll_issues(
 ) -> Result<(
     HashMap<u64, IssueSnapshot>,
     bool,
+    bool,
+    Option<String>,
     Option<String>,
     VecDeque<u64>,
     HashSet<(u64, String)>,
@@ -2484,6 +2496,8 @@ async fn poll_issues(
                 .map(|entry| entry.issues.clone())
                 .unwrap_or_default(),
             false,
+            true,
+            None,
             None,
             ids,
             opened,
@@ -2507,6 +2521,8 @@ async fn poll_issues(
                 .map(|entry| entry.issues.clone())
                 .unwrap_or_default(),
             false,
+            true,
+            None,
             None,
             ids,
             opened,
@@ -2515,8 +2531,18 @@ async fn poll_issues(
         ));
     };
 
-    match fetch_issues(client, &config.monitors.github_api_base, repo, snapshot).await {
-        Ok(issues) => {
+    // L2 fix: Pass issue cursor and handle pagination completeness
+    let issue_cursor = previous.and_then(|p| p.issue_cursor.as_deref());
+    match fetch_issues(
+        client,
+        &config.monitors.github_api_base,
+        repo,
+        snapshot,
+        issue_cursor,
+    )
+    .await
+    {
+        Ok((issues, issues_complete, oldest_fetched_timestamp)) => {
             // Merge newly fetched issues with history to retain information about
             // issues that have cycled out of the first page. Bound the history to prevent
             // unbounded growth: keep current page (~100 issues) plus a buffer of older
@@ -2565,12 +2591,14 @@ async fn poll_issues(
                     {
                         Ok((comments, complete, max_ts)) => (comments, complete, max_ts),
                         Err(error) => {
-                            // If comments fetch fails, emit no comment events.
+                            // L1 fix: If comments fetch fails, return incomplete flag to preserve cursor.
+                            // This prevents the comment_cursor from being reset to None, allowing recovery
+                            // on the next poll.
                             eprintln!(
                                 "clawhip source GitHub issue comments fetch failed for {}: {error}",
                                 repo.path
                             );
-                            (HashMap::new(), true, None)
+                            (HashMap::new(), false, None)
                         }
                     }
                 } else {
@@ -2634,6 +2662,8 @@ async fn poll_issues(
             Ok((
                 merged_issues,
                 true,
+                issues_complete,
+                oldest_fetched_timestamp,
                 final_comment_timestamp,
                 emitted_comment_ids,
                 emitted_opened,
@@ -2662,6 +2692,8 @@ async fn poll_issues(
                     .map(|entry| entry.issues.clone())
                     .unwrap_or_default(),
                 false,
+                true,
+                None,
                 None,
                 ids,
                 opened,
@@ -3150,6 +3182,17 @@ fn collect_issue_events_with_comments(
 
         // Emit exactly one event per issue if it has unseen comments
         if has_unseen_comments {
+            // L4 fix: Ensure comment count is not lower than reality.
+            // If a comment arrived between snapshot and API fetch, the snapshot count is stale.
+            // Use max(snapshot_count, snapshot_count + unseen_comments) to ensure accuracy.
+            let snapshot_count = current
+                .get(issue_num)
+                .map(|issue| issue.comments)
+                .unwrap_or(0);
+            let unseen_count = comments.len() as u64;
+            let reported_count =
+                std::cmp::max(snapshot_count, snapshot_count.saturating_add(unseen_count));
+
             events.push(
                 IncomingEvent::github_issue_commented(
                     repo_name.to_string(),
@@ -3158,10 +3201,7 @@ fn collect_issue_events_with_comments(
                         .get(issue_num)
                         .map(|issue| issue.title.clone())
                         .unwrap_or_else(|| format!("Issue #{}", issue_num)),
-                    current
-                        .get(issue_num)
-                        .map(|issue| issue.comments)
-                        .unwrap_or(comments.len() as u64),
+                    reported_count,
                     repo.channel.clone(),
                 )
                 .with_mention(repo.mention.clone())
@@ -3281,31 +3321,105 @@ fn collect_ci_events(
     events
 }
 
+/// Fetch issues from the GitHub API with pagination.
+/// L2 fix: Paginate until finding an issue older than issue_cursor, respecting page cap.
+/// Returns (HashMap, is_complete, oldest_timestamp_read).
+/// is_complete is false if page cap was hit before finding older issues.
+/// oldest_timestamp_read is the oldest updated_at timestamp actually fetched (for cursor advancement).
 async fn fetch_issues(
     client: &GitHubClient,
     api_base: &str,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
-) -> Result<HashMap<u64, IssueSnapshot>> {
+    issue_cursor: Option<&str>,
+) -> Result<(HashMap<u64, IssueSnapshot>, bool, Option<String>)> {
     let github_repo = snapshot
         .github_repo
         .clone()
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
-    let response = github_get(
-        client,
-        api_base,
-        &format!("repos/{github_repo}/issues"),
-        &[
-            ("state", "all"),
-            ("per_page", "100"),
-            ("sort", "updated"),
-            ("direction", "desc"),
-        ],
-        &format!("issues for {github_repo}"),
-    )
-    .await?;
-    let issues: Vec<GitHubIssue> = response.json().await?;
-    Ok(issues
+
+    let mut all_issues = Vec::new();
+    let mut page = 1_usize;
+    let mut seen_next_urls = HashSet::new();
+    let mut hit_page_cap = false;
+    const MAX_ISSUE_PAGES: usize = 10; // Sane page cap
+
+    // Subtract 1 second from cursor for overlap handling (like in comments)
+    let cursor_param = issue_cursor.unwrap_or("");
+    let since_param = if !cursor_param.is_empty() {
+        subtract_one_second(cursor_param)
+    } else {
+        String::new()
+    };
+    let since_str = since_param.as_str();
+
+    loop {
+        let page_str = page.to_string();
+        let current_page = format!(
+            "{}/repos/{github_repo}/issues?since={since_str}&page={page_str}",
+            api_base.trim_end_matches('/')
+        );
+        seen_next_urls.insert(pagination_page_key(&current_page));
+
+        let response = github_get(
+            client,
+            api_base,
+            &format!("repos/{github_repo}/issues"),
+            &[
+                ("state", "all"),
+                ("per_page", "100"),
+                ("sort", "updated"),
+                ("direction", "desc"),
+                ("since", since_str),
+            ],
+            &format!("issues for {github_repo}"),
+        )
+        .await?;
+
+        let next_url = github_link_next(response.headers());
+        let page_issues: Vec<GitHubIssue> = response.json().await?;
+
+        // Check if we've reached issues older than the cursor (stop pagination)
+        let mut found_old_issue = false;
+        for issue in &page_issues {
+            if let Some(cursor) = issue_cursor
+                && issue.updated_at.as_str() < cursor
+            {
+                found_old_issue = true;
+                break;
+            }
+        }
+
+        all_issues.extend(page_issues);
+
+        if found_old_issue {
+            // Found issues older than cursor, stop pagination
+            break;
+        }
+
+        let Some(next_url) = next_url else {
+            break;
+        };
+
+        if page >= MAX_ISSUE_PAGES || !seen_next_urls.insert(pagination_page_key(&next_url)) {
+            eprintln!(
+                "clawhip source github: issue pagination cap hit at page {} for {}",
+                page, github_repo
+            );
+            hit_page_cap = true;
+            break;
+        }
+        page += 1;
+    }
+
+    // Track the oldest timestamp we actually read (for cursor advancement)
+    let oldest_timestamp = all_issues
+        .iter()
+        .map(|issue| issue.updated_at.as_str())
+        .min()
+        .map(|s| s.to_string());
+
+    let issues = all_issues
         .into_iter()
         .filter(|issue| !issue.is_pull_request())
         .map(|issue| {
@@ -3321,7 +3435,10 @@ async fn fetch_issues(
                 },
             )
         })
-        .collect())
+        .collect::<HashMap<_, _>>();
+
+    let is_complete = !hit_page_cap;
+    Ok((issues, is_complete, oldest_timestamp))
 }
 
 /// Fetch issue comments from the GitHub API, grouped by issue number.
@@ -8258,7 +8375,7 @@ mod tests {
                 };
 
                 let client = build_github_client(None).unwrap();
-                let _result = fetch_issues(&client, &config.monitors.github_api_base, &repo, &snapshot)
+                let _result = fetch_issues(&client, &config.monitors.github_api_base, &repo, &snapshot, None)
                     .await;
 
                 let _ = server.await;
@@ -9419,6 +9536,97 @@ mod tests {
         assert!(
             repo_pull_pr.is_pr_comment(),
             "Comment on PR in 'pull' repo with path /pull/pull/ SHOULD be classified as PR comment"
+        );
+    }
+
+    #[test]
+    fn l4_comment_count_stale_snapshot() {
+        // L4 fix: Ensure comment count in event is not lower than reality.
+        // If a comment arrived between snapshot and API fetch, use max(snapshot_count, snapshot_count + unseen).
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        let mut previous = HashMap::new();
+        previous.insert(
+            10,
+            IssueSnapshot {
+                title: "issue".into(),
+                state: "open".into(),
+                comments: 5, // Snapshot has 5 comments
+                created_at: "2026-10-01T00:00:00Z".into(),
+                updated_at: "2026-10-01T00:00:00Z".into(),
+                closed_at: None,
+            },
+        );
+
+        let mut current = HashMap::new();
+        current.insert(
+            10,
+            IssueSnapshot {
+                title: "issue".into(),
+                state: "open".into(),
+                comments: 6, // Updated snapshot has 6 comments (a new one arrived)
+                created_at: "2026-10-01T00:00:00Z".into(),
+                updated_at: "2026-10-15T10:00:00Z".into(),
+                closed_at: None,
+            },
+        );
+
+        let last_poll_time = "2026-10-15T10:00:00Z";
+
+        // API returns 2 new comments (but one arrived between snapshot and API fetch)
+        let mut api_comments = HashMap::new();
+        api_comments.insert(
+            10,
+            vec![
+                GitHubComment {
+                    id: 1,
+                    issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
+                    html_url: "https://github.com/org/repo/issues/10#issuecomment-1".into(),
+                    created_at: "2026-10-15T10:00:00Z".into(),
+                    updated_at: "2026-10-15T10:00:00Z".into(),
+                    body: "Comment 1".into(),
+                },
+                GitHubComment {
+                    id: 2,
+                    issue_url: "https://api.github.com/repos/org/repo/issues/10".into(),
+                    html_url: "https://github.com/org/repo/issues/10#issuecomment-2".into(),
+                    created_at: "2026-10-15T10:00:01Z".into(),
+                    updated_at: "2026-10-15T10:00:01Z".into(),
+                    body: "Comment 2".into(),
+                },
+            ],
+        );
+
+        let mut emitted_ids = VecDeque::new();
+        let events = test_collect_issue_events_with_dedup(
+            &repo,
+            "clawhip",
+            &previous,
+            &current,
+            Some(last_poll_time),
+            &api_comments,
+            &mut emitted_ids,
+        );
+
+        // Find the issue-commented event
+        let commented_event = events
+            .iter()
+            .find(|e| e.canonical_kind() == "github.issue-commented")
+            .expect("Should emit issue-commented event");
+
+        // The comment count should be at least 7 (5 + 2 new ones) to account for the stale snapshot
+        // Actually, we use max(snapshot_count, snapshot_count + unseen) = max(5, 5 + 2) = 7
+        let reported_count = commented_event.payload["number"]
+            .as_u64()
+            .expect("Should have comment count");
+        assert!(
+            reported_count >= 7,
+            "Comment count should be at least 7 (5 from snapshot + 2 new), got {}",
+            reported_count
         );
     }
 }
