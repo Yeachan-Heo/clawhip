@@ -2990,6 +2990,9 @@ async fn post_github(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    if !github_json_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
     let verified = if let Some(env_name) = &state.config.providers.github.webhook_secret_env {
         let secret = std::env::var(env_name)
             .ok()
@@ -3013,9 +3016,10 @@ async fn post_github(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    // Serialize verified deliveries through enqueue, and remember only successful
-    // requests: a queue failure must remain retryable. Unsigned legacy requests
-    // cannot poison the authenticated delivery cache.
+    // Serialize verified deliveries through enqueue, and remember only deliveries
+    // that enqueued an event: a queue failure must remain retryable, and ignored
+    // deliveries (ping, unsupported actions) must not evict accepted ones. Unsigned
+    // legacy requests cannot poison the authenticated delivery cache.
     let mut deliveries = if verified {
         Some(state.github_webhook.deliveries.lock().await)
     } else {
@@ -3037,11 +3041,40 @@ async fn post_github(
 
     let response = github_webhook_event(&state, &headers, payload, verified).await;
     if response.status().is_success()
+        && response
+            .extensions()
+            .get::<GitHubWebhookIgnored>()
+            .is_none()
         && let (Some(deliveries), Some(delivery)) = (&mut deliveries, delivery)
     {
         deliveries.record(delivery);
     }
     response
+}
+
+/// Marks a successful `/github` response that enqueued nothing.
+#[derive(Clone, Copy)]
+struct GitHubWebhookIgnored;
+
+/// Mirrors axum's `Json` extractor media-type check, which this handler replaced
+/// with raw `Bytes` so the signature covers the exact body.
+fn github_json_content_type(headers: &HeaderMap) -> bool {
+    let Some(content_type) = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || essence
+            .strip_prefix("application/")
+            .is_some_and(|subtype| subtype.ends_with("+json"))
 }
 
 fn github_signature_valid(headers: &HeaderMap, body: &[u8], secret: &[u8]) -> bool {
@@ -3308,11 +3341,13 @@ async fn github_webhook_event(
         } else {
             "unsupported event"
         };
-        return (
+        let mut response = (
             StatusCode::ACCEPTED,
             Json(json!({"ok": true, "ignored": true, "reason": reason})),
         )
             .into_response();
+        response.extensions_mut().insert(GitHubWebhookIgnored);
+        return response;
     };
 
     if let Err(error) = from_incoming_event(&event) {
@@ -3825,6 +3860,7 @@ mod tests {
         let (state, mut rx) = app_state_with_config(hold_config());
         let mut headers = HeaderMap::new();
         headers.insert("x-github-event", "release".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
         let payload = json!({
             "action": "edited",
             "repository": {"full_name": "Yeachan-Heo/clawhip"},
@@ -3880,6 +3916,7 @@ mod tests {
         let (state, mut rx) = app_state_with_config(hold_config());
         let mut headers = HeaderMap::new();
         headers.insert("x-github-event", "pull_request".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
         let payload = json!({
             "action": "closed",
             "repository": {"full_name": "Yeachan-Heo/clawhip"},
@@ -4373,11 +4410,17 @@ mod tests {
         for index in 0..GITHUB_DELIVERY_CAPACITY {
             assert_eq!(
                 fixture
-                    .post("ping", &json!({}), true, Some(&format!("ping-{index}")))
+                    .post(
+                        "issue_comment",
+                        &payload,
+                        true,
+                        Some(&format!("accepted-{index}"))
+                    )
                     .await
                     .status(),
                 StatusCode::ACCEPTED
             );
+            fixture.rx.try_recv().unwrap();
         }
         {
             let deliveries = fixture.state.github_webhook.deliveries.lock().await;
@@ -4394,6 +4437,121 @@ mod tests {
         );
         fixture.rx.try_recv().unwrap();
         fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_ignored_deliveries_neither_consume_nor_evict_cache() {
+        let mut fixture = GitHubWebhookTest::new(Some(GITHUB_TEST_SECRET_ENV)).await;
+        let payload = github_activity_payload();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("accepted"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.rx.try_recv().unwrap();
+        let mut edited = payload.clone();
+        edited["action"] = json!("edited");
+        for index in 0..GITHUB_DELIVERY_CAPACITY {
+            let delivery = format!("ignored-{index}");
+            let (event, body) = if index % 2 == 0 {
+                ("ping", json!({}))
+            } else {
+                ("issue_comment", edited.clone())
+            };
+            assert_eq!(
+                fixture
+                    .post(event, &body, true, Some(&delivery))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            fixture.assert_empty();
+        }
+        {
+            let deliveries = fixture.state.github_webhook.deliveries.lock().await;
+            assert_eq!(deliveries.seen.len(), 1);
+            assert!(deliveries.seen.contains("accepted"));
+        }
+        // Still deduplicated after 1,000 ignored deliveries.
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("accepted"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.assert_empty();
+        // A delivery ID first seen on an ignored event still enqueues its real event.
+        assert_eq!(
+            fixture
+                .post("ping", &payload, true, Some("reused"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        fixture.assert_empty();
+        assert_eq!(
+            fixture
+                .post("issue_comment", &payload, true, Some("reused"))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            fixture.rx.try_recv().unwrap().kind,
+            "github.issue-commented"
+        );
+        fixture.assert_empty();
+    }
+
+    #[tokio::test]
+    async fn github_webhook_requires_json_media_type_like_the_json_extractor() {
+        for secret in [None, Some(GITHUB_TEST_SECRET_ENV)] {
+            let mut fixture = GitHubWebhookTest::new(secret).await;
+            let mut payload = github_activity_payload();
+            payload["action"] = json!("opened");
+            let body = serde_json::to_vec(&payload).unwrap();
+            let signature = github_test_signature(&body);
+            for content_type in [
+                None,
+                Some("text/plain"),
+                Some("application/x-www-form-urlencoded"),
+            ] {
+                let mut request = fixture
+                    .client
+                    .post(&fixture.url)
+                    .header("x-github-event", "issues")
+                    .header("x-hub-signature-256", &signature)
+                    .body(body.clone());
+                if let Some(content_type) = content_type {
+                    request = request.header("content-type", content_type);
+                }
+                assert_eq!(
+                    request.send().await.unwrap().status(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                );
+                fixture.assert_empty();
+            }
+            for content_type in [
+                "application/json; charset=utf-8",
+                "application/vnd.github+json",
+            ] {
+                let response = fixture
+                    .client
+                    .post(&fixture.url)
+                    .header("x-github-event", "issues")
+                    .header("x-hub-signature-256", &signature)
+                    .header("content-type", content_type)
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                assert_eq!(fixture.rx.try_recv().unwrap().kind, "github.issue-opened");
+            }
+        }
     }
 
     #[tokio::test]
