@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.6.17 - 2026-10-16
+
+### Highlights
+
+- fix GitHub issue comment notifications to emit for comments on existing older issues in busy repositories
+
+### Upgrade notes
+
+- crate version is now `0.6.17`
+- existing GitHub notification configuration and behavior remain fully compatible; no migration required
+- fixes #380 where comments on older existing issues failed to emit `github.issue-commented` events
+
 ## 0.6.16 - 2026-10-16
 
 ### Highlights
