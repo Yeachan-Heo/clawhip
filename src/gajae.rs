@@ -40,6 +40,7 @@ const REQUIRED_RECEIPT_FAMILIES: &[&str] = &[
 ];
 
 const SUPPORTED_EVENTS: &[&str] = &[
+    "github.notification",
     "github.issue-opened",
     "github.issue-commented",
     "github.pr-commented",
@@ -2888,6 +2889,8 @@ routes:
         let current = parse_profile(
             r#"
 routes:
+  github.notification:
+    command: gajae handle github.notification
   github.issue-opened:
     command: gajae handle github.issue-opened
   github.issue-commented:

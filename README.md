@@ -857,9 +857,76 @@ can stall them as above.
 A PR with over 1,000 reviews can keep its
 scan waiting at the per-PR page cap. Restarting establishes fresh baselines.
 
+## GitHub notifications (opt-in, across all repositories)
+
+Poll the authenticated user's notification inbox without configuring repositories
+or fetching PR metadata. This complements, rather than replaces, `emit_pr_activity`.
+Only activity GitHub places in your notification inbox is observed (including
+your PRs/issues, mentions and review requests); it is not a repository-wide audit log.
+
+```toml
+[monitors.github_notifications]
+enabled = true                  # default false: zero requests when disabled
+poll_interval_secs = 60          # min 1; server X-Poll-Interval takes precedence
+participating = false            # true sends participating=true
+reasons = []                     # empty = all; e.g. ["author", "mention", "review_requested"]
+repos = []                       # empty = all; e.g. ["owner/repo"]
+# channel = "CHANNEL_ID"         # optional direct destination
+# channel_name = "development"
+# mention = "<@USER_ID>"
+format = "compact"
+
+[[routes]]
+event = "github.notification"
+filter = { reason = "review_requested", subject_type = "PullRequest" }
+channel = "REVIEW_CHANNEL_ID"
+```
+
+Credentials use `CLAWHIP_GITHUB_TOKEN`, then `monitors.github_token`, then
+`gh auth token`. GitHub's [notifications REST documentation](https://docs.github.com/en/rest/activity/notifications)
+currently documents personal access tokens **(classic)** with `notifications` or
+`repo` scope; this endpoint does **not** support fine-grained personal access tokens.
+Authenticate `gh` with a credential that can read notifications.
+
+Each poll normally costs one `GET /notifications?all=false&participating=false&per_page=50`
+(up to five pages when needed). Requests send the previous successful response's
+`Last-Modified` as `If-Modified-Since`; an authenticated `304 Not Modified` emits
+nothing and does not consume the primary rate limit. The poller never runs faster
+than the configured interval or the largest observed `X-Poll-Interval`. Shared
+GitHub 403/429 backoff also applies. Failures preserve the thread baseline and
+conditional cursor. Pagination caps report source degradation, retain received
+threads, and clear the conditional cursor to avoid hiding omitted pages.
+
+**Unread only; never marks read.** No PATCH/PUT requests are made. Reading a
+notification on github.com removes it from the unread feed; further activity
+re-surfaces it with a newer `updated_at`. The first successful poll seeds a
+baseline without replaying history. Its server `Date` is the eligibility cutoff
+(missing/invalid Date defers initialization). Subsequent polls emit one
+`github.notification` per thread whose `updated_at` advances, not per comment.
+An unseen thread older than that cutoff never replays unless it changes.
+The in-memory dedupe FIFO holds 1,000 threads; an evicted post-cutoff thread can
+emit again, and restarting establishes a fresh, silent baseline. Same-second
+changes with the same `updated_at` cannot be distinguished.
+
+Payloads contain no comment/review bodies, token, or private credential metadata.
+Repository names and titles can still identify private repositories: route only
+to destinations authorized to see the authenticated user's inbox.
+
+| Field | Meaning |
+| --- | --- |
+| `repo` | `owner/repo` |
+| `thread_id` | GitHub notification thread ID (string) |
+| `reason` | GitHub reason, e.g. `author`, `comment`, `mention`, `review_requested`, `assign`, `state_change`, `team_mention`, `ci_activity` |
+| `subject_type` | GitHub type, e.g. `PullRequest`, `Issue`, `Discussion`, `Release`, `CheckSuite`, `Commit` |
+| `title` | Subject title, never its body |
+| `number` | Optional issue/PR/discussion number derived without another request |
+| `url` | Derived HTML URL, with a comment anchor when determinable; otherwise repository URL |
+| `updated_at` | GitHub thread update timestamp |
+
 ## Preset event families
 
 ### GitHub family
+- `github.notification`
 - `github.issue-opened`
 - `github.issue-commented`
 - `github.issue-closed`

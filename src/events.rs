@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::discord_watch::DiscordMessageCreateEvent;
-use crate::event::{GitHubPRCommentEvent, GitHubPRReviewCommentEvent, GitHubPRReviewEvent};
+use crate::event::{
+    GitHubNotificationEvent, GitHubPRCommentEvent, GitHubPRReviewCommentEvent, GitHubPRReviewEvent,
+};
 use crate::render::{DefaultRenderer, Renderer};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
@@ -564,6 +566,29 @@ impl IncomingEvent {
         }
     }
 
+    pub fn github_notification(event: GitHubNotificationEvent, channel: Option<String>) -> Self {
+        let mut payload = json!({
+            "repo": event.repo,
+            "thread_id": event.thread_id,
+            "reason": event.reason,
+            "subject_type": event.subject_type,
+            "title": event.title,
+            "url": event.url,
+            "updated_at": event.updated_at,
+        });
+        if let Some(number) = event.number {
+            payload["number"] = json!(number);
+        }
+        Self {
+            kind: "github.notification".to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload,
+        }
+    }
+
     /// GitHub Actions (or other watched Statuspage component) status transition.
     pub fn github_actions_status(
         component: String,
@@ -1059,9 +1084,10 @@ pub fn normalize_event(mut event: IncomingEvent) -> IncomingEvent {
 
 fn canonical_event_kind(kind: &str, payload: &Value) -> String {
     match kind {
-        "github.pr-commented" | "github.pr-review-commented" | "github.pr-reviewed" => {
-            kind.to_string()
-        }
+        "github.notification"
+        | "github.pr-commented"
+        | "github.pr-review-commented"
+        | "github.pr-reviewed" => kind.to_string(),
         "issue-opened" => "github.issue-opened".to_string(),
         "git.pr-status-changed" => "github.pr-status-changed".to_string(),
         other => native_contract_kind(other, payload).unwrap_or_else(|| other.to_string()),

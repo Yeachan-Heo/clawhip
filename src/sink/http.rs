@@ -369,6 +369,7 @@ fn is_public_text_field(key: &str) -> bool {
             | "project"
             | "provider"
             | "question_summary"
+            | "reason"
             | "repo"
             | "repo_name"
             | "route_key"
@@ -382,8 +383,11 @@ fn is_public_text_field(key: &str) -> bool {
             | "status"
             | "summary"
             | "summary_text"
+            | "subject_type"
             | "tag"
             | "title"
+            | "thread_id"
+            | "updated_at"
             | "tool_name"
             | "workflow"
     )
@@ -1167,6 +1171,26 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret), "body leaked {secret}");
         }
+    }
+
+    #[test]
+    fn notifications_event_body_preserves_public_fields_and_redacts_secrets() {
+        let target = SinkTarget::HttpEndpoint("https://controller.example/events".into());
+        let mut message = message();
+        message.event_kind = "github.notification".into();
+        let expected = json!({"repo": "owner/repo", "thread_id": "12345678901234567890",
+            "reason": "review_requested", "subject_type": "PullRequest", "title": "A PR",
+            "number": 12, "url": "https://github.com/owner/repo/pull/12",
+            "updated_at": "2026-10-15T00:00:01Z"});
+        message.payload = expected.clone();
+        message.payload["api_token"] = json!("secret-token");
+        message.payload["body"] = json!("private comment");
+        let parsed: Value =
+            serde_json::from_slice(&event_body(&message, &target, "request-123").unwrap()).unwrap();
+        assert_eq!(parsed["type"], "github.notification");
+        assert_eq!(parsed["source"], "github");
+        assert_eq!(parsed["payload"], expected);
+        assert_eq!(parsed["redacted"], true);
     }
 
     #[test]

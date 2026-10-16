@@ -115,7 +115,7 @@ fn explicit_monitor_github_token_from(
         })
 }
 
-async fn resolve_monitor_github_token(
+pub(crate) async fn resolve_monitor_github_token(
     config: &AppConfig,
 ) -> (Option<String>, GitHubMonitorAuthStatus) {
     if let Some((token, source)) = explicit_monitor_github_token(config) {
@@ -169,8 +169,8 @@ struct GitHubRequestBackoff {
     reported: bool,
 }
 
-struct GitHubClient {
-    http: reqwest::Client,
+pub(crate) struct GitHubClient {
+    pub(crate) http: reqwest::Client,
     backoff: Mutex<GitHubRequestBackoff>,
 }
 
@@ -3120,6 +3120,25 @@ async fn github_get(
     query: &[(&str, &str)],
     context: &str,
 ) -> Result<reqwest::Response> {
+    let url = format!(
+        "{}/{}",
+        api_base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let response = github_request(client, client.http.get(&url).query(query), context).await?;
+    if !response.status().is_success() {
+        return Err(github_api_error(response.status()).into());
+    }
+    Ok(response)
+}
+
+/// Shared transport/backoff. Callers inspect status so conditional pollers can read
+/// polling headers on failures and accept 304 without changing legacy GET behavior.
+pub(crate) async fn github_request(
+    client: &GitHubClient,
+    request: reqwest::RequestBuilder,
+    context: &str,
+) -> Result<reqwest::Response> {
     if let Ok(backoff) = client.backoff.lock()
         && backoff
             .until
@@ -3127,14 +3146,9 @@ async fn github_get(
     {
         return Err("GitHub API rate limit backoff is active; retrying later".into());
     }
-    let url = format!(
-        "{}/{}",
-        api_base.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    );
     eprintln!("clawhip source github: GET ({context})");
 
-    let response = client.http.get(&url).query(query).send().await?;
+    let response = request.send().await?;
     let status = response.status();
 
     if !status.is_success() {
@@ -3149,7 +3163,7 @@ async fn github_get(
                 backoff.reported = true;
             }
         }
-        return Err(github_api_error(status).into());
+        return Ok(response);
     }
 
     if let Ok(mut backoff) = client.backoff.lock() {
@@ -3898,7 +3912,7 @@ fn apply_workflow_run_attempts(
     }
 }
 
-fn build_github_client(token: Option<String>) -> Result<GitHubClient> {
+pub(crate) fn build_github_client(token: Option<String>) -> Result<GitHubClient> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("clawhip/0.1"));
     headers.insert(
