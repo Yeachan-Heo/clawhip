@@ -798,7 +798,24 @@ Route these events with `github.*` or their individual kinds:
 | `github.pr-reviewed` | Submitted review | `review_id`, `state` (`approved`, `changes_requested`, `commented`) |
 
 All three payloads include `repo`, `number`, `title`, `author`, `pr_author`, and
-`url` (the comment/review permalink). Unknown PR titles/authors are empty strings;
+`url` (the comment/review permalink). For comments outside the current PR window
+or review scan, the poller resolves the title and PR author with
+`GET /repos/{owner}/{repo}/pulls/{number}`. A 256-entry in-memory FIFO cache avoids
+repeated lookups; window data takes precedence and refreshes cached titles.
+Unknown metadata goes into a shared in-memory FIFO of at most 500 pending
+comments (identifiers, author login, URL, timestamps and inline path, never body
+text). Pending IDs immediately enter their feed's deduplication FIFO. Each poll
+retries pending work oldest-first before reading new comments; remaining lookup
+budget can resolve newly queued work after both feeds are read. A 404 or 410 is
+cached as unavailable and emits with empty `title`/`pr_author` (until cache
+eviction or restart). Other failures, including missing PR authors, retry for at
+most 10 attempts before emitting empty metadata and reporting degraded operation.
+403/429 use shared rate-limit backoff without consuming an attempt. Queue overflow
+emits the oldest unresolved comment rather than dropping it. Overflow and
+attempt-cap emissions carry empty `title`/`pr_author`, so routes filtering on
+`pr_author` do not match them; routing falls back according to route configuration.
+Overflow, give-up and budget deferral report throttled source degradation.
+The pending queue is in-memory: a restart drops unresolved queued comments.
 `pr_author` can be used in route payload filters to select your PRs. Comment and
 review **body text is never included** in these public-safe event payloads.
 Pending and dismissed reviews are not emitted, nor are edits to old comments.
@@ -807,7 +824,11 @@ API cost per poll: conversation comments use an activity-owned repository
 `/issues/comments` feed; inline comments use the repository `/pulls/comments` feed
 (each up to 10 pages, 100 items/page), independent of the PR list so older PRs are
 still detected. The conversation feed adds one request per poll when unpaginated;
-it ignores issue comments and does not change the existing issue-comment count-delta
+pending metadata cache misses add at most 20 PR-detail requests per poll, one per
+distinct PR, shared by both comment feeds. Cold baselines never enqueue or look
+up seeded comments. The queue and cache survive CI-baseline persistence failures
+in the running process, but are not persisted across restarts.
+The conversation feed ignores issue comments and does not change the existing issue-comment count-delta
 poller or enable issue polling when disabled. PR conversation IDs have their own bounded deduplication FIFO;
 issue-comment churn or a CI-baseline persistence failure does not replay them.
 
@@ -829,7 +850,12 @@ until the backlog drains. Thus a newly created comment edited before its first
 delivery is still eligible even when its creation precedes P. A completed fetch
 advances L to the maximum consumed update (never backwards); all updates through
 that position have been consumed. A failed fetch preserves both P and L. Only
-delivered IDs or deliberately seeded cold IDs enter the deduplication FIFO.
+delivered, queued or deliberately seeded cold IDs enter the deduplication FIFO.
+Metadata availability never stops a feed or freezes P/L: pending comments retain
+their original eligibility independently of later feed positions. Both comment
+kinds share one pending FIFO, so new conversation comments cannot starve older
+inline comments of lookup budget. All requests remain subject to the shared
+GitHub rate-limit backoff.
 
 Reviews build a separate updated-desc PR window (up to 5 pages, 500 PRs), stopping
 only below the committed submission watermark. Boundary-second PRs are always
