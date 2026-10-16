@@ -2027,6 +2027,19 @@ struct PRActivityState {
     emitted_review_ids: VecDeque<u64>,
     metadata: HashMap<u64, Option<PRActivityMetadata>>,
     metadata_order: VecDeque<u64>,
+    pending_comments: VecDeque<PendingPRComment>,
+}
+
+#[derive(Clone)]
+struct PendingPRComment {
+    id: u64,
+    number: u64,
+    author: String,
+    url: String,
+    // Some(path) identifies an inline comment; conversation comments have no path.
+    path: Option<String>,
+    created_at: String,
+    attempts: usize,
 }
 
 #[derive(Clone)]
@@ -2048,6 +2061,8 @@ const MAX_REVIEW_FETCH_PRS: usize = 20;
 const MAX_COMMENT_PAGES: usize = 10;
 const MAX_PR_METADATA_LOOKUPS: usize = 20;
 const MAX_PR_METADATA_CACHE: usize = 256;
+const MAX_PENDING_PR_COMMENTS: usize = 500;
+const MAX_METADATA_ATTEMPTS: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GitHubCISnapshot {
@@ -2488,14 +2503,14 @@ fn pr_comment_payload(
     number: u64,
     pr: Option<&PRActivityMetadata>,
     comment_id: u64,
-    user: Option<&GitHubUser>,
+    author: &str,
     url: &str,
 ) -> GitHubPRCommentEvent {
     GitHubPRCommentEvent {
         repo: repo.to_string(),
         number,
         title: pr.map(|pr| pr.title.clone()).unwrap_or_default(),
-        author: user.map(|user| user.login.clone()).unwrap_or_default(),
+        author: author.to_string(),
         pr_author: pr.map(|pr| pr.author.clone()).unwrap_or_default(),
         url: url.to_string(),
         comment_id,
@@ -2518,18 +2533,11 @@ fn cache_pr_metadata(
     state.metadata.insert(number, metadata);
 }
 
-// Outer None means retry: never mark that comment delivered or advance its feed.
-// Inner None is a permanent 404, which may emit with empty PR metadata.
-#[allow(clippy::too_many_arguments)]
-async fn resolve_pr_metadata(
-    client: &GitHubClient,
-    api_base: &str,
-    github_repo: &str,
-    repo_path: &str,
+// Outer None is unknown; inner None is a cached tombstone.
+fn known_pr_metadata(
     number: u64,
     state: &mut PRActivityState,
     prs: &HashMap<u64, PullRequestSnapshot>,
-    attempted: &mut HashSet<u64>,
 ) -> Option<Option<PRActivityMetadata>> {
     if let Some(pr) = prs.get(&number).or_else(|| {
         state
@@ -2545,14 +2553,25 @@ async fn resolve_pr_metadata(
         cache_pr_metadata(state, number, Some(metadata.clone()));
         return Some(Some(metadata));
     }
-    if let Some(metadata) = state.metadata.get(&number) {
-        return Some(metadata.clone());
-    }
-    if attempted.len() >= MAX_PR_METADATA_LOOKUPS || !attempted.insert(number) {
-        return None;
-    }
+    state.metadata.get(&number).cloned()
+}
+
+enum MetadataLookup {
+    Resolved,
+    Failed,
+    Backoff,
+}
+
+async fn resolve_pr_metadata(
+    client: &GitHubClient,
+    api_base: &str,
+    github_repo: &str,
+    repo_path: &str,
+    number: u64,
+    state: &mut PRActivityState,
+) -> MetadataLookup {
     let result: Result<Option<PRActivityMetadata>> = async {
-        let response = github_get_allow_not_found(
+        let response = github_get_allow_unavailable(
             client,
             api_base,
             &format!("repos/{github_repo}/pulls/{number}"),
@@ -2560,7 +2579,10 @@ async fn resolve_pr_metadata(
             "PR activity metadata",
         )
         .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+        ) {
             return Ok(None);
         }
         let (_, pr) = pull_request_snapshot(response.json::<GitHubPullRequest>().await?);
@@ -2576,16 +2598,149 @@ async fn resolve_pr_metadata(
     match result {
         Ok(metadata) => {
             cache_pr_metadata(state, number, metadata.clone());
-            Some(metadata)
+            MetadataLookup::Resolved
         }
         Err(error) => {
             emit_source_degraded(
                 Some(repo_path),
                 &format!("GitHub PR metadata lookup failed for #{number}: {error}"),
             );
-            None
+            if client.backoff.lock().is_ok_and(|backoff| {
+                backoff
+                    .until
+                    .is_some_and(|until| until > std::time::Instant::now())
+            }) {
+                MetadataLookup::Backoff
+            } else {
+                MetadataLookup::Failed
+            }
         }
     }
+}
+
+async fn emit_pending_comment(
+    comment: &PendingPRComment,
+    metadata: Option<&PRActivityMetadata>,
+    repo: &GitRepoMonitor,
+    repo_name: &str,
+    tx: &mpsc::Sender<IncomingEvent>,
+) -> Result<()> {
+    let payload = pr_comment_payload(
+        repo_name,
+        comment.number,
+        metadata,
+        comment.id,
+        &comment.author,
+        &comment.url,
+    );
+    let event = if let Some(path) = &comment.path {
+        IncomingEvent::github_pr_review_commented(
+            GitHubPRReviewCommentEvent {
+                comment: payload,
+                path: path.clone(),
+            },
+            repo.channel.clone(),
+        )
+    } else {
+        IncomingEvent::github_pr_commented(payload, repo.channel.clone())
+    };
+    send_event(
+        tx,
+        event
+            .with_mention(repo.mention.clone())
+            .with_format(repo.format.clone()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_pending_comments(
+    state: &mut PRActivityState,
+    client: &GitHubClient,
+    api_base: &str,
+    github_repo: &str,
+    repo: &GitRepoMonitor,
+    repo_name: &str,
+    prs: &HashMap<u64, PullRequestSnapshot>,
+    tx: &mpsc::Sender<IncomingEvent>,
+    attempted: &mut HashMap<u64, MetadataLookup>,
+    counted: &mut HashSet<(bool, u64)>,
+) -> Result<()> {
+    let mut retained = VecDeque::new();
+    let mut deferred = false;
+    while let Some(mut comment) = state.pending_comments.pop_front() {
+        // Eligibility was established at enqueue time, not against a later feed lower bound.
+        debug_assert!(!comment.created_at.is_empty());
+        if known_pr_metadata(comment.number, state, prs).is_none()
+            && !attempted.contains_key(&comment.number)
+        {
+            if attempted.len() < MAX_PR_METADATA_LOOKUPS {
+                let outcome = resolve_pr_metadata(
+                    client,
+                    api_base,
+                    github_repo,
+                    &repo.path,
+                    comment.number,
+                    state,
+                )
+                .await;
+                attempted.insert(comment.number, outcome);
+            } else {
+                deferred = true;
+            }
+        }
+        if let Some(metadata) = known_pr_metadata(comment.number, state, prs) {
+            emit_pending_comment(&comment, metadata.as_ref(), repo, repo_name, tx).await?;
+        } else {
+            if matches!(attempted.get(&comment.number), Some(MetadataLookup::Failed))
+                && counted.insert((comment.path.is_some(), comment.id))
+            {
+                comment.attempts += 1;
+            }
+            if comment.attempts >= MAX_METADATA_ATTEMPTS {
+                emit_source_degraded(
+                    Some(&repo.path),
+                    "GitHub PR metadata attempt cap reached; emitting empty metadata",
+                );
+                emit_pending_comment(&comment, None, repo, repo_name, tx).await?;
+            } else {
+                retained.push_back(comment);
+            }
+        }
+    }
+    state.pending_comments = retained;
+    if deferred {
+        emit_source_degraded(
+            Some(&repo.path),
+            "GitHub PR metadata lookup budget exhausted; pending comments deferred",
+        );
+    }
+    Ok(())
+}
+
+async fn accept_activity_comment(
+    comment: PendingPRComment,
+    state: &mut PRActivityState,
+    prs: &HashMap<u64, PullRequestSnapshot>,
+    repo: &GitRepoMonitor,
+    repo_name: &str,
+    tx: &mpsc::Sender<IncomingEvent>,
+) -> Result<()> {
+    if let Some(metadata) = known_pr_metadata(comment.number, state, prs) {
+        emit_pending_comment(&comment, metadata.as_ref(), repo, repo_name, tx).await?;
+    } else {
+        if state.pending_comments.len() == MAX_PENDING_PR_COMMENTS {
+            let oldest = state.pending_comments.pop_front().expect("queue is full");
+            let metadata = known_pr_metadata(oldest.number, state, prs).flatten();
+            emit_source_degraded(
+                Some(&repo.path),
+                "GitHub PR metadata pending queue overflow; emitting oldest comment",
+            );
+            emit_pending_comment(&oldest, metadata.as_ref(), repo, repo_name, tx).await?;
+        }
+        state.pending_comments.push_back(comment);
+    }
+    Ok(())
 }
 
 fn github_response_date(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -2678,7 +2833,6 @@ async fn poll_pr_activity(
     };
     let api_base = &config.monitors.github_api_base;
     let cutoff = current_utc_iso8601();
-    let mut metadata_attempted = HashSet::new();
     // Refresh cached titles when a later PR window includes them, even without comments.
     for (number, pr) in prs {
         if state.metadata.contains_key(number) && !pr.author.is_empty() {
@@ -2692,6 +2846,21 @@ async fn poll_pr_activity(
             );
         }
     }
+    let mut metadata_attempted = HashMap::new();
+    let mut metadata_counted = HashSet::new();
+    drain_pending_comments(
+        &mut state,
+        client,
+        api_base,
+        github_repo,
+        repo,
+        &snapshot.repo_name,
+        prs,
+        tx,
+        &mut metadata_attempted,
+        &mut metadata_counted,
+    )
+    .await?;
     let pr_comment_cursor = state.pr_comment_cursor.clone();
     match fetch_pr_activity_pages::<GitHubComment>(
         client,
@@ -2711,62 +2880,47 @@ async fn poll_pr_activity(
                 .max()
                 .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
             let lower = state.pr_comment_lower.clone();
-            let mut metadata_complete = true;
             for comment in comments {
                 let Some(number) = comment.pr_number() else {
                     continue;
                 };
-                if state.emitted_pr_comment_ids.contains(&comment.id) {
+                if state.emitted_pr_comment_ids.contains(&comment.id)
+                    || state
+                        .pending_comments
+                        .iter()
+                        .any(|pending| pending.path.is_none() && pending.id == comment.id)
+                {
                     continue;
                 }
                 if let Some(lower) = lower.as_deref() {
                     if comment.created_at.as_str() < lower {
                         continue;
                     }
-                    let Some(metadata) = resolve_pr_metadata(
-                        client,
-                        api_base,
-                        github_repo,
-                        &repo.path,
-                        number,
+                    accept_activity_comment(
+                        PendingPRComment {
+                            id: comment.id,
+                            number,
+                            author: comment.user.map(|user| user.login).unwrap_or_default(),
+                            url: comment.html_url,
+                            path: None,
+                            created_at: comment.created_at,
+                            attempts: 0,
+                        },
                         &mut state,
                         prs,
-                        &mut metadata_attempted,
-                    )
-                    .await
-                    else {
-                        metadata_complete = false;
-                        break;
-                    };
-                    send_event(
+                        repo,
+                        &snapshot.repo_name,
                         tx,
-                        IncomingEvent::github_pr_commented(
-                            pr_comment_payload(
-                                &snapshot.repo_name,
-                                number,
-                                metadata.as_ref(),
-                                comment.id,
-                                comment.user.as_ref(),
-                                &comment.html_url,
-                            ),
-                            repo.channel.clone(),
-                        )
-                        .with_mention(repo.mention.clone())
-                        .with_format(repo.format.clone()),
                     )
                     .await?;
                 }
                 remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
             }
-            // Stop at the first unresolved comment; retain P and L so the feed
-            // retries it before later comments. Only successful sends enter FIFO.
-            if metadata_complete {
-                state.pr_comment_cursor = Some(max_updated.clone());
-                if pr_comment_cursor.is_none() {
-                    state.pr_comment_lower = Some(fetched_at.unwrap_or(max_updated));
-                } else if complete {
-                    state.pr_comment_lower = Some(lower.unwrap().max(max_updated));
-                }
+            state.pr_comment_cursor = Some(max_updated.clone());
+            if pr_comment_cursor.is_none() {
+                state.pr_comment_lower = Some(fetched_at.unwrap_or(max_updated));
+            } else if complete {
+                state.pr_comment_lower = Some(lower.unwrap().max(max_updated));
             }
             if !complete {
                 emit_source_degraded(
@@ -2800,9 +2954,13 @@ async fn poll_pr_activity(
                 .max()
                 .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
             let lower = state.review_comment_lower.clone();
-            let mut metadata_complete = true;
             for comment in comments {
-                if state.emitted_review_comment_ids.contains(&comment.id) {
+                if state.emitted_review_comment_ids.contains(&comment.id)
+                    || state
+                        .pending_comments
+                        .iter()
+                        .any(|pending| pending.path.is_some() && pending.id == comment.id)
+                {
                     continue;
                 }
                 if let Some(lower) = lower.as_deref() {
@@ -2817,53 +2975,31 @@ async fn poll_pr_activity(
                     else {
                         continue;
                     };
-                    let Some(metadata) = resolve_pr_metadata(
-                        client,
-                        api_base,
-                        github_repo,
-                        &repo.path,
-                        number,
+                    accept_activity_comment(
+                        PendingPRComment {
+                            id: comment.id,
+                            number,
+                            author: comment.user.map(|user| user.login).unwrap_or_default(),
+                            url: comment.html_url,
+                            path: Some(comment.path),
+                            created_at: comment.created_at,
+                            attempts: 0,
+                        },
                         &mut state,
                         prs,
-                        &mut metadata_attempted,
-                    )
-                    .await
-                    else {
-                        metadata_complete = false;
-                        break;
-                    };
-                    send_event(
+                        repo,
+                        &snapshot.repo_name,
                         tx,
-                        IncomingEvent::github_pr_review_commented(
-                            GitHubPRReviewCommentEvent {
-                                comment: pr_comment_payload(
-                                    &snapshot.repo_name,
-                                    number,
-                                    metadata.as_ref(),
-                                    comment.id,
-                                    comment.user.as_ref(),
-                                    &comment.html_url,
-                                ),
-                                path: comment.path,
-                            },
-                            repo.channel.clone(),
-                        )
-                        .with_mention(repo.mention.clone())
-                        .with_format(repo.format.clone()),
                     )
                     .await?;
                 }
                 remember_activity_id(&mut state.emitted_review_comment_ids, comment.id);
             }
-            if metadata_complete {
-                // Ascending pages are resumable even at the page cap, but not
-                // while an unresolved comment still needs this feed position.
-                state.review_comment_cursor = Some(max_updated.clone());
-                if comment_cursor.is_none() {
-                    state.review_comment_lower = Some(fetched_at.unwrap_or(max_updated));
-                } else if complete {
-                    state.review_comment_lower = Some(lower.unwrap().max(max_updated));
-                }
+            state.review_comment_cursor = Some(max_updated.clone());
+            if comment_cursor.is_none() {
+                state.review_comment_lower = Some(fetched_at.unwrap_or(max_updated));
+            } else if complete {
+                state.review_comment_lower = Some(lower.unwrap().max(max_updated));
             }
             if !complete {
                 emit_source_degraded(
@@ -2880,6 +3016,21 @@ async fn poll_pr_activity(
         }
     }
 
+    // Newly queued comments may use the remaining budget, after both feeds have
+    // joined the same FIFO. Existing pending work always gets first access.
+    drain_pending_comments(
+        &mut state,
+        client,
+        api_base,
+        github_repo,
+        repo,
+        &snapshot.repo_name,
+        prs,
+        tx,
+        &mut metadata_attempted,
+        &mut metadata_counted,
+    )
+    .await?;
     if state.review_scan.is_none() {
         // An empty failed list must not establish or advance the baseline.
         if !prs_complete && prs.is_empty() {
@@ -3256,14 +3407,17 @@ async fn github_get(
     query: &[(&str, &str)],
     context: &str,
 ) -> Result<reqwest::Response> {
-    let response = github_get_allow_not_found(client, api_base, path, query, context).await?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    let response = github_get_allow_unavailable(client, api_base, path, query, context).await?;
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+    ) {
         return Err(github_api_error(response.status()).into());
     }
     Ok(response)
 }
 
-async fn github_get_allow_not_found(
+async fn github_get_allow_unavailable(
     client: &GitHubClient,
     api_base: &str,
     path: &str,
@@ -3287,7 +3441,10 @@ async fn github_get_allow_not_found(
     let response = client.http.get(&url).query(query).send().await?;
     let status = response.status();
 
-    if status == reqwest::StatusCode::NOT_FOUND {
+    if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+    ) {
         return Ok(response);
     }
     if !status.is_success() {
@@ -8182,6 +8339,8 @@ mod tests {
         source_task.abort();
         let _ = source_task.await;
     }
+    include!("github_pr_activity_metadata_tests.rs");
+
     type ActivityResponse = (
         String,
         serde_json::Value,
@@ -8277,7 +8436,7 @@ mod tests {
         ]
     }
 
-    // Insert the lookup after a selected feed fetch (including its remaining pages).
+    // Fresh comments resolve only after both feeds have joined the pending FIFO.
     fn activity_lookup_after_feed(
         responses: &mut Vec<ActivityResponse>,
         feed: &str,
@@ -8292,10 +8451,18 @@ mod tests {
             .unwrap()
             .0
             + 1;
-        while responses
-            .get(index)
-            .is_some_and(|response| response.0 == feed)
-        {
+        if feed == "/repos/org/repo/issues/comments" {
+            index += responses[index..]
+                .iter()
+                .position(|response| response.0 == "/repos/org/repo/pulls/comments")
+                .expect("inline feed follows conversation feed");
+            index += 1;
+        }
+        while responses.get(index).is_some_and(|response| {
+            response.0 == "/repos/org/repo/pulls/comments"
+                || (response.0.starts_with("/repos/org/repo/pulls/")
+                    && !response.0.ends_with("/reviews"))
+        }) {
             index += 1;
         }
         for number in numbers {
@@ -8307,6 +8474,30 @@ mod tests {
                 ),
             );
             index += 1;
+        }
+    }
+
+    // Existing pending work resolves before the comment feed requests.
+    fn activity_lookup_before_feeds(
+        responses: &mut Vec<ActivityResponse>,
+        occurrence: usize,
+        numbers: &[u64],
+    ) {
+        let index = responses
+            .iter()
+            .enumerate()
+            .filter(|(_, response)| response.0 == "/repos/org/repo/issues/comments")
+            .nth(occurrence)
+            .unwrap()
+            .0;
+        for number in numbers.iter().rev() {
+            responses.insert(
+                index,
+                activity_response(
+                    &format!("/repos/org/repo/pulls/{number}"),
+                    activity_pr(*number, ACTIVITY_T0),
+                ),
+            );
         }
     }
 
@@ -8625,12 +8816,7 @@ mod tests {
                         json!([activity_comment(2, number, ACTIVITY_T1, ACTIVITY_T1)]),
                     ));
                 }
-                activity_lookup_after_feed(
-                    &mut responses,
-                    activity_comment_feed(inline),
-                    2,
-                    &[number],
-                );
+                activity_lookup_before_feeds(&mut responses, 2, &[number]);
                 activity_lookup_after_feed(
                     &mut responses,
                     activity_comment_feed(inline),
@@ -8667,9 +8853,11 @@ mod tests {
                         &activity.emitted_pr_comment_ids,
                     )
                 };
-                assert_eq!(cursor.as_deref(), Some(ACTIVITY_T0));
-                assert_eq!(lower.as_deref(), Some(ACTIVITY_T0));
-                assert!(!ids.contains(&2));
+                assert_eq!(cursor.as_deref(), Some(ACTIVITY_T1));
+                assert_eq!(lower.as_deref(), Some(ACTIVITY_T1));
+                assert!(ids.contains(&2));
+                assert_eq!(activity.pending_comments.len(), 1);
+                assert_eq!(activity.pending_comments[0].attempts, 1);
                 let events = harness.poll().await;
                 assert_eq!(events.len(), 1);
                 assert_eq!(events[0].payload["comment_id"], 2);
@@ -8697,17 +8885,26 @@ mod tests {
                 false,
                 json!([activity_comment(1, 99, ACTIVITY_T0, ACTIVITY_T0)]),
             );
-            let mut limited = activity_comment_poll(
+            let limited = activity_comment_poll(
                 false,
                 json!([activity_comment(2, 99, ACTIVITY_T1, ACTIVITY_T1)]),
             );
-            // The inline request and the next poll must be blocked by shared backoff.
-            limited.pop();
+            // Both feeds advance before the lookup; subsequent polls back off.
             responses.extend(limited);
             let mut lookup =
                 activity_response("/repos/org/repo/pulls/99", json!({"message": "limited"}));
             lookup.2 = status;
             responses.push(lookup);
+            let mut recovered = activity_comment_poll(
+                false,
+                json!([activity_comment(2, 99, ACTIVITY_T1, ACTIVITY_T1)]),
+            );
+            activity_lookup_before_feeds(&mut recovered, 0, &[99]);
+            responses.extend(recovered);
+            responses.extend(activity_comment_poll(
+                false,
+                json!([activity_comment(2, 99, ACTIVITY_T1, ACTIVITY_T1)]),
+            ));
             let (base, requests, server) = activity_server(responses).await;
             let mut harness = ActivityHarness::new(base);
             assert!(harness.poll().await.is_empty());
@@ -8715,11 +8912,21 @@ mod tests {
             harness.assert_degraded("GitHub PR metadata lookup failed for #99:");
             assert!(harness.client.backoff.lock().unwrap().until.is_some());
             assert!(harness.poll().await.is_empty());
-            assert_eq!(requests.lock().unwrap().len(), 8);
+            assert_eq!(requests.lock().unwrap().len(), 9);
             let activity = &harness.repo_state().activity;
-            assert_eq!(activity.pr_comment_cursor.as_deref(), Some(ACTIVITY_T0));
-            assert_eq!(activity.pr_comment_lower.as_deref(), Some(ACTIVITY_T0));
-            assert!(!activity.emitted_pr_comment_ids.contains(&2));
+            assert_eq!(activity.pr_comment_cursor.as_deref(), Some(ACTIVITY_T1));
+            assert_eq!(activity.pr_comment_lower.as_deref(), Some(ACTIVITY_T1));
+            assert!(activity.emitted_pr_comment_ids.contains(&2));
+            assert_eq!(activity.pending_comments.len(), 1);
+            assert_eq!(activity.pending_comments[0].attempts, 0);
+            // Advance only the backoff clock; recovery must use the real HTTP/poll path.
+            harness.client.backoff.lock().unwrap().until = Some(std::time::Instant::now());
+            let recovered = harness.poll().await;
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].payload["comment_id"], 2);
+            assert_eq!(recovered[0].payload["pr_author"], "pr-owner");
+            assert!(harness.repo_state().activity.pending_comments.is_empty());
+            assert!(harness.poll().await.is_empty());
             server.await.unwrap();
         }
     }
@@ -8757,9 +8964,8 @@ mod tests {
             1,
             &(16..=MAX_PR_METADATA_LOOKUPS as u64).collect::<Vec<_>>(),
         );
-        activity_lookup_after_feed(
+        activity_lookup_before_feeds(
             &mut responses,
-            "/repos/org/repo/pulls/comments",
             2,
             &((MAX_PR_METADATA_LOOKUPS + 1) as u64..=count as u64).collect::<Vec<_>>(),
         );
@@ -8768,13 +8974,14 @@ mod tests {
         assert!(harness.poll().await.is_empty());
         let mut events = harness.poll().await;
         assert_eq!(events.len(), MAX_PR_METADATA_LOOKUPS);
+        harness.assert_degraded("GitHub PR metadata lookup budget exhausted");
         assert_eq!(
             harness
                 .repo_state()
                 .activity
                 .review_comment_cursor
                 .as_deref(),
-            Some(ACTIVITY_T0)
+            Some(ACTIVITY_T1)
         );
         let first_poll_requests = requests.lock().unwrap().len();
         assert_eq!(first_poll_requests, 8 + MAX_PR_METADATA_LOOKUPS);
