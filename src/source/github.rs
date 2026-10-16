@@ -2022,8 +2022,6 @@ struct PRActivityState {
     review_comment_lower: Option<String>,
     emitted_review_comment_ids: VecDeque<u64>,
     emitted_pr_comment_ids: VecDeque<u64>,
-    // Track which issue numbers have had issue-commented events emitted (one per issue per poll)
-    emitted_issue_numbers: VecDeque<u64>,
     review_watermark: Option<String>,
     review_scan: Option<ReviewScan>,
     emitted_review_ids: VecDeque<u64>,
@@ -2573,7 +2571,8 @@ async fn poll_pr_activity(
     baseline_cutoff: Option<&str>,
     tx: &mpsc::Sender<IncomingEvent>,
 ) -> Result<PRActivityState> {
-    if !repo.emit_pr_activity {
+    // If neither PR activity nor issue comments are enabled, skip
+    if !repo.emit_pr_activity && !repo.emit_issue_opened {
         return Ok(state);
     }
     let Some(client) = github_client else {
@@ -2603,75 +2602,81 @@ async fn poll_pr_activity(
                 .max()
                 .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
             let lower = state.pr_comment_lower.clone();
-            for comment in &comments {
-                let Some(number) = comment.pr_number() else {
-                    continue;
-                };
-                if state.emitted_pr_comment_ids.contains(&comment.id) {
-                    continue;
-                }
-                if let Some(lower) = lower.as_deref() {
-                    if comment.created_at.as_str() < lower {
+            // Process PR comments only if emit_pr_activity is enabled
+            if repo.emit_pr_activity {
+                for comment in &comments {
+                    let Some(number) = comment.pr_number() else {
+                        continue;
+                    };
+                    if state.emitted_pr_comment_ids.contains(&comment.id) {
                         continue;
                     }
-                    send_event(
-                        tx,
-                        IncomingEvent::github_pr_commented(
-                            pr_comment_payload(
-                                &snapshot.repo_name,
-                                number,
-                                prs.get(&number).or_else(|| {
-                                    state
-                                        .review_scan
-                                        .as_ref()
-                                        .and_then(|scan| scan.prs.get(&number))
-                                }),
-                                comment.id,
-                                comment.user.as_ref(),
-                                &comment.html_url,
-                            ),
-                            repo.channel.clone(),
+                    if let Some(lower) = lower.as_deref() {
+                        if comment.created_at.as_str() < lower {
+                            continue;
+                        }
+                        send_event(
+                            tx,
+                            IncomingEvent::github_pr_commented(
+                                pr_comment_payload(
+                                    &snapshot.repo_name,
+                                    number,
+                                    prs.get(&number).or_else(|| {
+                                        state
+                                            .review_scan
+                                            .as_ref()
+                                            .and_then(|scan| scan.prs.get(&number))
+                                    }),
+                                    comment.id,
+                                    comment.user.as_ref(),
+                                    &comment.html_url,
+                                ),
+                                repo.channel.clone(),
+                            )
+                            .with_mention(repo.mention.clone())
+                            .with_format(repo.format.clone()),
                         )
-                        .with_mention(repo.mention.clone())
-                        .with_format(repo.format.clone()),
-                    )
-                    .await?;
+                        .await?;
+                    }
+                    remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
                 }
-                remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
             }
             // Process issue comments separately: emit one event per issue per poll.
-            let mut emitted_issue_numbers = std::collections::HashSet::new();
-            for comment in &comments {
-                let Some(issue_number) = comment.issue_number() else {
-                    continue;
-                };
-                // Skip if already emitted in this poll
-                if emitted_issue_numbers.contains(&issue_number) {
-                    continue;
-                }
-                // Skip if already emitted in a previous poll
-                if state.emitted_issue_numbers.contains(&issue_number) {
-                    continue;
-                }
-                if let Some(lower) = lower.as_deref() {
-                    if comment.created_at.as_str() < lower {
+            // Issue comments are gated by emit_issue_opened, independent of emit_pr_activity.
+            if repo.emit_issue_opened {
+                let mut emitted_issue_numbers = std::collections::HashSet::new();
+                for comment in &comments {
+                    let Some(issue_number) = comment.issue_number() else {
+                        continue;
+                    };
+                    // Skip if already emitted in this poll
+                    if emitted_issue_numbers.contains(&issue_number) {
                         continue;
                     }
-                    send_event(
-                        tx,
-                        IncomingEvent::github_issue_commented(
-                            snapshot.repo_name.clone(),
-                            issue_number,
-                            String::new(), // Title will be fetched from issue if needed
-                            0,             // Comment count - not used for activity feed events
-                            repo.channel.clone(),
+                    // Skip if this comment was already emitted in a previous poll (cross-poll dedup by comment ID)
+                    if state.emitted_pr_comment_ids.contains(&comment.id) {
+                        continue;
+                    }
+                    if let Some(lower) = lower.as_deref() {
+                        if comment.created_at.as_str() < lower {
+                            continue;
+                        }
+                        send_event(
+                            tx,
+                            IncomingEvent::github_issue_commented(
+                                snapshot.repo_name.clone(),
+                                issue_number,
+                                String::new(), // Title will be fetched from issue if needed
+                                0,             // Comment count - not used for activity feed events
+                                repo.channel.clone(),
+                            )
+                            .with_mention(repo.mention.clone())
+                            .with_format(repo.format.clone()),
                         )
-                        .with_mention(repo.mention.clone())
-                        .with_format(repo.format.clone()),
-                    )
-                    .await?;
-                    emitted_issue_numbers.insert(issue_number);
-                    remember_activity_id(&mut state.emitted_issue_numbers, issue_number);
+                        .await?;
+                        emitted_issue_numbers.insert(issue_number);
+                        remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
+                    }
                 }
             }
             state.pr_comment_cursor = Some(max_updated.clone());
@@ -2694,90 +2699,93 @@ async fn poll_pr_activity(
             );
         }
     }
-    let comment_cursor = state.review_comment_cursor.clone();
-    match fetch_pr_activity_pages::<GitHubReviewComment>(
-        client,
-        api_base,
-        &format!("repos/{github_repo}/pulls/comments"),
-        true,
-        comment_cursor.as_deref(),
-    )
-    .await
-    {
-        Ok((comments, complete, fetched_at)) => {
-            let max_updated = comments
-                .iter()
-                .map(|comment| comment.updated_at.clone())
-                .chain(comment_cursor.clone())
-                .max()
-                .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
-            let lower = state.review_comment_lower.clone();
-            for comment in comments {
-                if state.emitted_review_comment_ids.contains(&comment.id) {
-                    continue;
-                }
-                if let Some(lower) = lower.as_deref() {
-                    if comment.created_at.as_str() < lower {
+    // Process PR review comments only if emit_pr_activity is enabled
+    if repo.emit_pr_activity {
+        let comment_cursor = state.review_comment_cursor.clone();
+        match fetch_pr_activity_pages::<GitHubReviewComment>(
+            client,
+            api_base,
+            &format!("repos/{github_repo}/pulls/comments"),
+            true,
+            comment_cursor.as_deref(),
+        )
+        .await
+        {
+            Ok((comments, complete, fetched_at)) => {
+                let max_updated = comments
+                    .iter()
+                    .map(|comment| comment.updated_at.clone())
+                    .chain(comment_cursor.clone())
+                    .max()
+                    .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
+                let lower = state.review_comment_lower.clone();
+                for comment in comments {
+                    if state.emitted_review_comment_ids.contains(&comment.id) {
                         continue;
                     }
-                    let Some(number) = comment
-                        .pull_request_url
-                        .rsplit('/')
-                        .next()
-                        .and_then(|n| n.parse().ok())
-                    else {
-                        continue;
-                    };
-                    send_event(
-                        tx,
-                        IncomingEvent::github_pr_review_commented(
-                            GitHubPRReviewCommentEvent {
-                                comment: pr_comment_payload(
-                                    &snapshot.repo_name,
-                                    number,
-                                    prs.get(&number).or_else(|| {
-                                        state
-                                            .review_scan
-                                            .as_ref()
-                                            .and_then(|scan| scan.prs.get(&number))
-                                    }),
-                                    comment.id,
-                                    comment.user.as_ref(),
-                                    &comment.html_url,
-                                ),
-                                path: comment.path,
-                            },
-                            repo.channel.clone(),
+                    if let Some(lower) = lower.as_deref() {
+                        if comment.created_at.as_str() < lower {
+                            continue;
+                        }
+                        let Some(number) = comment
+                            .pull_request_url
+                            .rsplit('/')
+                            .next()
+                            .and_then(|n| n.parse().ok())
+                        else {
+                            continue;
+                        };
+                        send_event(
+                            tx,
+                            IncomingEvent::github_pr_review_commented(
+                                GitHubPRReviewCommentEvent {
+                                    comment: pr_comment_payload(
+                                        &snapshot.repo_name,
+                                        number,
+                                        prs.get(&number).or_else(|| {
+                                            state
+                                                .review_scan
+                                                .as_ref()
+                                                .and_then(|scan| scan.prs.get(&number))
+                                        }),
+                                        comment.id,
+                                        comment.user.as_ref(),
+                                        &comment.html_url,
+                                    ),
+                                    path: comment.path,
+                                },
+                                repo.channel.clone(),
+                            )
+                            .with_mention(repo.mention.clone())
+                            .with_format(repo.format.clone()),
                         )
-                        .with_mention(repo.mention.clone())
-                        .with_format(repo.format.clone()),
-                    )
-                    .await?;
+                        .await?;
+                    }
+                    remember_activity_id(&mut state.emitted_review_comment_ids, comment.id);
                 }
-                remember_activity_id(&mut state.emitted_review_comment_ids, comment.id);
+                // Ascending pages are resumable even when the page budget is exhausted.
+                state.review_comment_cursor = Some(max_updated.clone());
+                if comment_cursor.is_none() {
+                    state.review_comment_lower = Some(fetched_at.unwrap_or(max_updated));
+                } else if complete {
+                    // All updates through max_updated have been consumed, including edits
+                    // of unseen comments created behind P. Never use Date here: it may
+                    // be newer than updates arriving during the paginated fetch.
+                    state.review_comment_lower = Some(lower.unwrap().max(max_updated));
+                }
+                if !complete {
+                    emit_source_degraded(
+                        Some(&repo.path),
+                        "GitHub inline review comment pagination cap reached",
+                    );
+                }
             }
-            // Ascending pages are resumable even when the page budget is exhausted.
-            state.review_comment_cursor = Some(max_updated.clone());
-            if comment_cursor.is_none() {
-                state.review_comment_lower = Some(fetched_at.unwrap_or(max_updated));
-            } else if complete {
-                // All updates through max_updated have been consumed, including edits
-                // of unseen comments created behind P. Never use Date here: it may
-                // be newer than updates arriving during the paginated fetch.
-                state.review_comment_lower = Some(lower.unwrap().max(max_updated));
-            }
-            if !complete {
+            Err(error) => {
                 emit_source_degraded(
                     Some(&repo.path),
-                    "GitHub inline review comment pagination cap reached",
+                    &format!("GitHub inline review comments fetch failed: {error}"),
                 );
             }
-        }
-        Err(error) => {
-            emit_source_degraded(
-                Some(&repo.path),
-                &format!("GitHub inline review comments fetch failed: {error}"),
-            );
         }
     }
 
@@ -8159,6 +8167,19 @@ mod tests {
             "path": "src/main.rs", "body": "private comment text"})
     }
 
+    fn activity_issue_comment(
+        id: u64,
+        issue_number: u64,
+        created_at: &str,
+        updated_at: &str,
+    ) -> serde_json::Value {
+        json!({"id": id, "issue_url": format!("https://api.github.com/repos/org/repo/issues/{issue_number}"),
+            "pull_request_url": format!("https://api.github.com/repos/org/repo/pulls/{issue_number}"),
+            "html_url": format!("https://github.com/org/repo/issues/{issue_number}#issuecomment-{id}"),
+            "created_at": created_at, "updated_at": updated_at, "user": {"login": "commenter"},
+            "path": "src/main.rs", "body": "private comment text"})
+    }
+
     fn activity_review(id: u64, state: &str, submitted_at: &str) -> serde_json::Value {
         json!({"id": id, "state": state, "submitted_at": submitted_at,
             "user": {"login": "reviewer"}, "html_url": format!("https://github.com/org/repo/pull/1#review-{id}"),
@@ -9993,6 +10014,159 @@ mod tests {
             Some(activity_second(1001).as_str())
         );
         assert!(harness.poll().await.is_empty());
+        server.await.unwrap();
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn issue_380_default_config_emits_issue_commented() {
+        // Test defect 1: issue comments should be detected when emit_issue_opened=true,
+        // independent of emit_pr_activity=false (the default).
+        let prs = json!([activity_pr(1, ACTIVITY_T0)]);
+        let mut responses = activity_poll_responses(
+            json!([activity_issue_comment(1, 42, ACTIVITY_T0, ACTIVITY_T0)]),
+            prs.clone(),
+            json!([]),
+        );
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(json!([]), prs.clone(), json!([])));
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/1/reviews",
+                json!([]),
+            ));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        // Default config: emit_pr_activity=false, emit_issue_opened=true
+        harness.config.monitors.git.repos[0].emit_pr_activity = false;
+        // emit_issue_opened is true by default
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.issue-commented");
+        assert_eq!(events[0].payload["number"], 42);
+        server.await.unwrap();
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn issue_380_second_comment_on_same_issue_in_later_poll_emits() {
+        // Test defect 2: cross-poll dedup by comment ID, not issue number.
+        // Second comment on the same issue should emit in a later poll.
+        let prs = json!([activity_pr(1, ACTIVITY_T0)]);
+        let mut responses = activity_poll_responses(
+            json!([activity_issue_comment(1, 42, ACTIVITY_T0, ACTIVITY_T0)]),
+            prs.clone(),
+            json!([]),
+        );
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        // Second poll: same issue, different comment
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([activity_issue_comment(2, 42, ACTIVITY_T1, ACTIVITY_T1)]),
+                prs.clone(),
+                json!([]),
+            ));
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/1/reviews",
+                json!([]),
+            ));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        harness.config.monitors.git.repos[0].emit_pr_activity = false;
+        assert!(harness.poll().await.is_empty());
+        let events1 = harness.poll().await;
+        assert_eq!(events1.len(), 1);
+        assert_eq!(events1[0].payload["number"], 42);
+        let events2 = harness.poll().await;
+        // Should emit again because it's a different comment (comment_id=2 vs 1)
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0].canonical_kind(), "github.issue-commented");
+        assert_eq!(events2[0].payload["number"], 42);
+        server.await.unwrap();
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn issue_380_two_comments_same_issue_same_poll_emit_once() {
+        // Test defect 2b: within-poll dedup by issue number.
+        // Two comments on one issue in one poll should emit only once.
+        let prs = json!([activity_pr(1, ACTIVITY_T0)]);
+        let mut responses = activity_poll_responses(
+            json!([
+                activity_issue_comment(1, 42, ACTIVITY_T0, ACTIVITY_T0),
+                activity_issue_comment(2, 42, ACTIVITY_T0, ACTIVITY_T0),
+            ]),
+            prs.clone(),
+            json!([]),
+        );
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        // Second poll with empty responses
+        responses.extend(activity_poll_responses(json!([]), prs.clone(), json!([])));
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        harness.config.monitors.git.repos[0].emit_pr_activity = false;
+        assert!(harness.poll().await.is_empty());
+        let events = harness.poll().await;
+        // Should emit once per issue per poll, not once per comment
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.issue-commented");
+        assert_eq!(events[0].payload["number"], 42);
+        server.await.unwrap();
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn issue_380_edited_old_comment_does_not_emit() {
+        // Test defect 2c: edited old comment (same comment ID, just updated_at changed)
+        // should not emit because the comment ID was already seen.
+        let prs = json!([activity_pr(1, ACTIVITY_T0)]);
+        let mut responses = activity_poll_responses(
+            json!([activity_issue_comment(1, 42, ACTIVITY_T0, ACTIVITY_T0)]),
+            prs.clone(),
+            json!([]),
+        );
+        responses.push(activity_response(
+            "/repos/org/repo/pulls/1/reviews",
+            json!([]),
+        ));
+        // Second poll: same comment (same ID), but updated_at changed
+        for _ in 0..2 {
+            responses.extend(activity_poll_responses(
+                json!([activity_issue_comment(1, 42, ACTIVITY_T0, ACTIVITY_T1)]),
+                prs.clone(),
+                json!([]),
+            ));
+            responses.push(activity_response(
+                "/repos/org/repo/pulls/1/reviews",
+                json!([]),
+            ));
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        harness.config.monitors.git.repos[0].emit_pr_activity = false;
+        assert!(harness.poll().await.is_empty());
+        let events1 = harness.poll().await;
+        assert_eq!(events1.len(), 1);
+        assert_eq!(events1[0].payload["number"], 42);
+        let events2 = harness.poll().await;
+        // Should not emit because it's the same comment_id
+        assert_eq!(events2.len(), 0);
         server.await.unwrap();
     }
 }
