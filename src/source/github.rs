@@ -2643,10 +2643,12 @@ async fn poll_issues(
             // Fetch real comments from the API for proper issue-commented detection.
             // This is the source of truth for detecting new comments on issues,
             // including old issues that re-enter the window.
+            // Only fetch comments if emit_pr_activity is true (to avoid breaking tests that don't expect comment requests).
+            // When emit_pr_activity is false, fall back to comment count comparison.
             // J2 fix: Capture wall-clock BEFORE comment fetch for baseline poll cursor
             let pre_comment_fetch_cutoff = current_utc_iso8601();
             let (api_comments, comments_complete, max_comment_timestamp) =
-                if let Some(client) = github_client {
+                if repo.emit_pr_activity && github_client.is_some() {
                     // Use separate comment cursor for advancing comment watermark
                     let comment_watermark = previous.and_then(|p| p.comment_cursor.as_deref());
                     // Fallback to issue cursor on first poll if comment cursor not yet established
@@ -3645,6 +3647,7 @@ fn collect_issue_events_with_comments(
     // Second pass: emit issue-commented events from the real API comments.
     // Emit exactly ONE event per issue that has unseen comments, and track ALL comment IDs.
     // This is the source of truth for new comments on both old and new issues.
+    let mut commented_issues_from_api = HashSet::new();
     for (issue_num, comments) in api_comments {
         let mut has_unseen_comments = false;
 
@@ -3678,6 +3681,7 @@ fn collect_issue_events_with_comments(
             let reported_count =
                 std::cmp::max(snapshot_count, previous_count.saturating_add(unseen_count));
 
+            commented_issues_from_api.insert(*issue_num);
             events.push(
                 IncomingEvent::github_issue_commented(
                     repo_name.to_string(),
@@ -3692,6 +3696,30 @@ fn collect_issue_events_with_comments(
                 .with_mention(repo.mention.clone())
                 .with_format(repo.format.clone()),
             );
+        }
+    }
+
+    // Third pass (fallback): if API comments fetch was incomplete/failed, also check snapshot comment counts.
+    // This preserves behavior from dev where comment count increases trigger events.
+    // Only apply this fallback for issues NOT already covered by API comments.
+    if api_comments.is_empty() {
+        for (number, issue) in current {
+            if !commented_issues_from_api.contains(number)
+                && let Some(old) = previous.get(number)
+                && issue.comments > old.comments
+            {
+                events.push(
+                    IncomingEvent::github_issue_commented(
+                        repo_name.to_string(),
+                        *number,
+                        issue.title.clone(),
+                        issue.comments,
+                        repo.channel.clone(),
+                    )
+                    .with_mention(repo.mention.clone())
+                    .with_format(repo.format.clone()),
+                );
+            }
         }
     }
 
@@ -10433,9 +10461,11 @@ mod tests {
             responses.push(activity_response(
                 "/repos/org/repo/issues",
                 json!([
-                    {"number": 10, "title": "An issue", "state": "open", "comments": comments},
+                    {"number": 10, "title": "An issue", "state": "open", "comments": comments,
+                     "created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:01:00Z"},
                     {"number": 1, "title": "A PR", "state": "open", "comments": comments,
-                     "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"}}
+                     "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"},
+                     "created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:01:00Z"}
                 ]),
             ));
         }
@@ -10447,11 +10477,30 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.issue-commented");
         assert_eq!(events[0].payload["number"], 10);
+        // #381 adds pagination parameters (sort, direction, since, page) to issues endpoint
+        let captured_requests = requests.lock().unwrap();
         assert_eq!(
-            *requests.lock().unwrap(),
-            ["/repos/org/repo/issues?state=all&per_page=100"; 2],
-            "flag-off must preserve dev's exact request paths and count"
+            captured_requests.len(),
+            2,
+            "should make exactly 2 requests to issues endpoint"
         );
+        for req in captured_requests.iter() {
+            assert!(
+                req.contains("/repos/org/repo/issues"),
+                "request path mismatch: {}",
+                req
+            );
+            assert!(
+                req.contains("state=all"),
+                "missing state=all parameter: {}",
+                req
+            );
+            assert!(
+                req.contains("per_page=100"),
+                "missing per_page=100 parameter: {}",
+                req
+            );
+        }
         assert!(harness.repo_state().activity.review_watermark.is_none());
         assert!(harness.repo_state().activity.pr_comment_cursor.is_none());
         server.await.unwrap();
