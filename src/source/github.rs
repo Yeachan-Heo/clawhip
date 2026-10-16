@@ -9216,17 +9216,18 @@ mod tests {
             .collect();
         assert_eq!(ids, (1..=1101).collect());
         assert!(harness.poll().await.is_empty());
-        let requests = requests.lock().unwrap();
-        let resumed = requests
-            .iter()
-            .filter(|request| request.starts_with("/repos/org/repo/pulls/comments?"))
-            .nth(11)
-            .unwrap();
-        assert!(
-            resumed.contains("since=2030-01-01T00%3A16%3A39"),
-            "{resumed}"
-        );
-        drop(requests);
+        {
+            let requests = requests.lock().unwrap();
+            let resumed = requests
+                .iter()
+                .filter(|request| request.starts_with("/repos/org/repo/pulls/comments?"))
+                .nth(11)
+                .unwrap();
+            assert!(
+                resumed.contains("since=2030-01-01T00%3A16%3A39"),
+                "{resumed}"
+            );
+        }
         server.await.unwrap();
     }
 
