@@ -16,7 +16,7 @@ owner; Clawhip observes and controls only through the SDK contract.
 </p>
 
 > **⭐ Optional support:** the interactive repo-local install paths (`./install.sh` and `clawhip install` from a clone) can offer to star this repo after a successful install when `gh` is installed and authenticated. Skip it with `--skip-star-prompt` or `CLAWHIP_SKIP_STAR_PROMPT=1`.
-> **Community:** Join the clawhip Discord at https://discord.gg/jq6jnSGABY.
+> **Community:** Join the clawhip Discord at https://discord.gg/wSyUQYfhAw.
 
 **gajae-claw (clawhip) is the control plane for agents:** route events from GitHub, Discord, tmux, and other tools to the right human or agent, record what happened, and separate automatic actions from approval-required actions.
 
@@ -451,6 +451,55 @@ Input sources in v0.3.0:
 - tmux monitor source
 - `clawhip tmux new` / `clawhip tmux watch` registration path
 
+### GitHub webhook authentication
+
+Configure a GitHub webhook to POST JSON to the daemon's `/github` endpoint.
+Set the same secret in GitHub's webhook settings and in the daemon's environment:
+
+```toml
+[providers.github]
+webhook_secret_env = "CLAWHIP_GITHUB_WEBHOOK_SECRET"
+
+[daemon]
+bind_host = "127.0.0.1"
+```
+
+The config stores only the environment variable name, not the secret. When
+configured, **all** `/github` events require a valid `X-Hub-Signature-256`
+HMAC-SHA256 signature over the exact raw request body. Missing/invalid signatures
+or a missing/empty secret environment variable return `401` without emitting an
+event. JSON parsing and event handling happen only after verification.
+
+With no secret configured, existing `issues.opened`, release
+(`published`/`released`/`prereleased`/`edited`), and `pull_request.opened`/`closed`
+webhooks retain their unauthenticated behavior. The following activity events
+require a configured secret and valid signature. With no secret configured they
+are ignored with `202` to avoid introducing a new unauthenticated notification
+injection surface (with a configured secret, invalid/missing signatures get `401`):
+
+| GitHub event/action | Emitted kind |
+| --- | --- |
+| `issue_comment.created` on an issue | `github.issue-commented` |
+| `issue_comment.created` on a PR | `github.pr-commented` |
+| `pull_request_review.submitted` | `github.pr-reviewed` (approved, changes_requested, commented only) |
+| `pull_request_review_comment.created` | `github.pr-review-commented` |
+
+Edited/deleted comments and other review states/actions are ignored. Activity
+payloads contain identifiers and metadata, never comment/review bodies. Webhooks
+are independent of polling monitor flags, including `emit_pr_activity`.
+
+For authenticated requests with `X-GitHub-Delivery`, the daemon remembers the last
+1,000 successful delivery IDs in memory (FIFO). Redeliveries return `202` without
+emitting again. IDs are not persisted across restarts; requests without a delivery
+ID are not deduplicated. Failed requests remain retryable. Enabling both webhook
+activity and `emit_pr_activity` polling for the same repo can produce duplicate
+notifications across those sources; consumers can dedupe PR activity using
+`comment_id`/`review_id`.
+
+The default bind address is `0.0.0.0`. Prefer `bind_host = "127.0.0.1"` with a
+reverse proxy exposing only `/github` over HTTPS. The webhook secret protects
+`/github`, not other daemon endpoints; do not expose the whole daemon publicly.
+
 ## Input -> behavior -> verification
 
 ### 1. Custom client event
@@ -494,9 +543,8 @@ Verification:
 ### 3. GitHub issue commented preset
 
 Input:
+- authenticated GitHub webhook `issue_comment.created` on an issue (see webhook authentication above)
 - built-in GitHub issue monitor comment delta
-  (polls issues sorted by `updated` desc to detect comment changes)
-- GitHub webhook `issue_comment.created` (not yet implemented; requires signature verification)
 
 Behavior:
 - emit `github.issue-commented`
@@ -511,7 +559,6 @@ Verification:
 ### 4. GitHub issue closed preset
 
 Input:
-- GitHub webhook `issues.closed`
 - built-in GitHub issue monitor state transition
 
 Behavior:
@@ -527,7 +574,7 @@ Verification:
 ### 5. GitHub PR preset family
 
 Input:
-- GitHub webhook `pull_request.*`
+- GitHub webhook `pull_request.opened` / `pull_request.closed`
 - built-in PR monitor state changes
 - CLI thin client `clawhip github pr-status-changed ...`
 
