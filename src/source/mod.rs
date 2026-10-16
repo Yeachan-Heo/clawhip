@@ -5,6 +5,7 @@ use crate::events::IncomingEvent;
 
 pub mod git;
 pub mod github;
+pub mod github_notifications;
 pub mod github_status;
 pub mod subscription;
 pub mod tmux;
@@ -18,6 +19,7 @@ pub use github::{
     GitHubSource, default_github_ci_baseline_path, new_shared_github_monitor_auth_status,
     snapshot_github_monitor_auth_status,
 };
+pub use github_notifications::GitHubNotificationsSource;
 pub use github_status::GitHubStatusSource;
 pub use subscription::{SubscriptionSnapshot, SubscriptionState, SubscriptionWorker};
 pub use tmux::{

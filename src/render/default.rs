@@ -133,6 +133,27 @@ impl Renderer for DefaultRenderer {
             ),
             ("github.issue-closed", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
+            ("github.notification", format) => {
+                if matches!(format, MessageFormat::Raw) {
+                    serde_json::to_string_pretty(payload)?
+                } else {
+                    let label = match format {
+                        MessageFormat::Alert => "GitHub notification",
+                        MessageFormat::Inline => "[GitHub notification]",
+                        _ => "GitHub",
+                    };
+                    format!(
+                        "{} {} {} ({}): {} {}",
+                        label,
+                        string_field(payload, "repo")?,
+                        string_field(payload, "subject_type")?,
+                        string_field(payload, "reason")?,
+                        string_field(payload, "title")?,
+                        string_field(payload, "url")?
+                    )
+                }
+            }
+
             (
                 kind
                 @ ("github.pr-commented" | "github.pr-review-commented" | "github.pr-reviewed"),

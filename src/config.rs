@@ -616,6 +616,11 @@ pub struct MonitorConfig {
     /// Independent from websocket `[[subscriptions]]` and per-repo GitHub API monitors.
     #[serde(default, skip_serializing_if = "GitHubStatusMonitorConfig::is_default")]
     pub github_status: GitHubStatusMonitorConfig,
+    #[serde(
+        default,
+        skip_serializing_if = "GitHubNotificationsMonitorConfig::is_default"
+    )]
+    pub github_notifications: GitHubNotificationsMonitorConfig,
 }
 
 impl Default for MonitorConfig {
@@ -628,6 +633,7 @@ impl Default for MonitorConfig {
             tmux: TmuxMonitorConfig::default(),
             workspace: Vec::new(),
             github_status: GitHubStatusMonitorConfig::default(),
+            github_notifications: GitHubNotificationsMonitorConfig::default(),
         }
     }
 }
@@ -810,6 +816,44 @@ impl GitHubStatusMonitorConfig {
             && self.channel_name.is_none()
             && self.mention.is_none()
             && self.format.is_none()
+    }
+}
+
+/// Authenticated user's unread GitHub notification threads, across repositories.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GitHubNotificationsMonitorConfig {
+    pub enabled: bool,
+    pub poll_interval_secs: u64,
+    pub reasons: Vec<String>,
+    pub participating: bool,
+    pub repos: Vec<String>,
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_name: Option<String>,
+    pub mention: Option<String>,
+    pub format: Option<MessageFormat>,
+}
+
+impl Default for GitHubNotificationsMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_secs: 60,
+            reasons: Vec::new(),
+            participating: false,
+            repos: Vec::new(),
+            channel: None,
+            channel_name: None,
+            mention: None,
+            format: None,
+        }
+    }
+}
+
+impl GitHubNotificationsMonitorConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -1569,7 +1613,14 @@ impl AppConfig {
     }
 
     fn has_discord_delivery_requiring_bot_token(&self) -> bool {
-        self.default_channel_can_fallback_to_discord()
+        (self.monitors.github_notifications.enabled
+            && self
+                .monitors
+                .github_notifications
+                .channel
+                .as_ref()
+                .is_some_and(|channel| !channel.trim().is_empty()))
+            || self.default_channel_can_fallback_to_discord()
             || self.routes.iter().any(|route| {
                 route.effective_sink() == "discord" && route.discord_webhook_target().is_none()
             })
@@ -1931,6 +1982,37 @@ impl AppConfig {
                 return Err(
                     "monitors.github_status.components must list at least one component name"
                         .into(),
+                );
+            }
+        }
+
+        let notifications = &self.monitors.github_notifications;
+        if notifications.poll_interval_secs == 0 {
+            return Err(
+                "monitors.github_notifications.poll_interval_secs must be at least 1".into(),
+            );
+        }
+        if notifications
+            .reasons
+            .iter()
+            .any(|reason| reason.trim().is_empty())
+        {
+            return Err(
+                "monitors.github_notifications.reasons must not contain empty reasons".into(),
+            );
+        }
+        for repo in &notifications.repos {
+            let parts: Vec<_> = repo.split('/').collect();
+            if parts.len() != 2
+                || parts.iter().any(|part| {
+                    part.is_empty()
+                        || !part
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                })
+            {
+                return Err(
+                    "monitors.github_notifications.repos entries must be owner/repo".into(),
                 );
             }
         }
@@ -4234,6 +4316,57 @@ fn normalize_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notifications_config_backward_compatible_and_roundtrips() {
+        let old = "[[routes]]\nevent = '*'\nsink = 'localfile'\nlocal_path = '/tmp/events.jsonl'\n";
+        let config: AppConfig = toml::from_str(old).unwrap();
+        config.validate().unwrap();
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("github_notifications")
+        );
+        let configured = format!(
+            "{old}\n[monitors.github_notifications]\nenabled = true\npoll_interval_secs = 90\nparticipating = true\nreasons = ['author', 'review_requested']\nrepos = ['owner/repo']\nmention = '<@123>'\nformat = 'alert'\n"
+        );
+        let enabled: AppConfig = toml::from_str(&configured).unwrap();
+        enabled.validate().unwrap();
+        let notifications = &enabled.monitors.github_notifications;
+        assert!(notifications.enabled && notifications.participating);
+        assert_eq!(notifications.poll_interval_secs, 90);
+        assert_eq!(notifications.reasons, ["author", "review_requested"]);
+        assert_eq!(notifications.repos, ["owner/repo"]);
+        assert_eq!(notifications.mention.as_deref(), Some("<@123>"));
+        assert_eq!(notifications.format, Some(MessageFormat::Alert));
+        let roundtrip: AppConfig = toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
+        assert_eq!(&roundtrip.monitors.github_notifications, notifications);
+    }
+
+    #[test]
+    fn notifications_config_validation_rejects_bad_interval_repos_and_reasons() {
+        let base = "[[routes]]\nevent = '*'\nsink = 'localfile'\nlocal_path = '/tmp/events.jsonl'\n[monitors.github_notifications]\nenabled = true\n";
+        for (setting, field) in [
+            ("poll_interval_secs = 0", "poll_interval_secs"),
+            ("reasons = ['  ']", "reasons"),
+            ("repos = ['owner']", "repos"),
+            ("repos = ['owner/']", "repos"),
+            ("repos = ['owner/repo/extra']", "repos"),
+            ("repos = ['owner/space repo']", "repos"),
+        ] {
+            let config: AppConfig = toml::from_str(&format!("{base}{setting}\n")).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("monitors.github_notifications.{field}")),
+                "{error}"
+            );
+        }
+        let config: AppConfig = toml::from_str(&format!(
+            "{base}poll_interval_secs = 1\nreasons = ['future_reason']\n"
+        ))
+        .unwrap();
+        config.validate().unwrap(); // GitHub can add reasons without requiring a clawhip upgrade.
+    }
 
     #[test]
     fn pr_activity_config_is_backward_compatible_and_opt_in() {

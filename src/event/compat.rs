@@ -6,9 +6,9 @@ use crate::Result;
 use crate::event::{
     AgentEvent, CustomEvent, DiscordNudgeIntentEvent, EventBody, EventEnvelope, EventMetadata,
     EventPriority, GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent,
-    GitHubIssueEvent, GitHubPRCommentEvent, GitHubPREvent, GitHubPRReviewCommentEvent,
-    GitHubPRReviewEvent, GitHubPRStatusEvent, GitHubReleaseEvent, TmuxKeywordAggregatedEvent,
-    TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
+    GitHubIssueEvent, GitHubNotificationEvent, GitHubPRCommentEvent, GitHubPREvent,
+    GitHubPRReviewCommentEvent, GitHubPRReviewEvent, GitHubPRStatusEvent, GitHubReleaseEvent,
+    TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
 use crate::events::{IncomingEvent, normalize_event};
 
@@ -52,6 +52,16 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
             new_branch: string_field(payload, "new_branch")?,
         })),
         "github.issue-opened" => Ok(EventBody::GitHubIssueOpened(github_issue_event(payload)?)),
+        "github.notification" => Ok(EventBody::GitHubNotification(GitHubNotificationEvent {
+            repo: string_field(payload, "repo")?,
+            thread_id: string_field(payload, "thread_id")?,
+            reason: string_field(payload, "reason")?,
+            subject_type: string_field(payload, "subject_type")?,
+            title: string_field(payload, "title")?,
+            number: payload.get("number").and_then(Value::as_u64),
+            url: string_field(payload, "url")?,
+            updated_at: string_field(payload, "updated_at")?,
+        })),
         "github.issue-commented" => Ok(EventBody::GitHubIssueCommented(github_issue_event(
             payload,
         )?)),
