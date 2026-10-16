@@ -25,6 +25,7 @@ use crate::telemetry;
 // Bounds constructed requests; HTTP redirects retain the shared client's policy.
 const MAX_PAGES: usize = 5;
 const MAX_THREADS: usize = 1000;
+const RECONCILE: time::Duration = time::Duration::minutes(5);
 
 pub struct GitHubNotificationsSource {
     config: Arc<AppConfig>,
@@ -125,10 +126,11 @@ impl MonitorState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CatchUp {
-    since: OffsetDateTime,
+    since: Option<OffsetDateTime>,
     before: OffsetDateTime,
-    poll_date: OffsetDateTime,
-    // Resume within an unchanged boundary second when it fills a whole budget.
+    covered_max: OffsetDateTime,
+    // Offsets enumerate oversized ties, but never prove coverage across polls.
+    tied: bool,
     page: u64,
 }
 
@@ -245,6 +247,7 @@ async fn fetch_threads(
     let catch_up = state.catch_up.clone();
     let mut page = catch_up.as_ref().map_or(1, |cursor| cursor.page);
     let mut oldest = None;
+    let mut newest = catch_up.as_ref().map(|cursor| cursor.covered_max);
     let mut result = PollResult {
         threads: Vec::new(),
         date: None,
@@ -254,16 +257,11 @@ async fn fetch_threads(
     };
     for index in 0..MAX_PAGES {
         // A fresh head costs one request; the remaining budget drains the saved window.
-        // Using its original poll Date avoids repeatedly scanning the whole backlog here.
+        // The head overlaps the entire saved window; Date cannot prove coverage.
         let fresh_head = catch_up.is_some() && index == 0;
-        let since = if fresh_head {
-            catch_up.as_ref().map(|cursor| cursor.poll_date)
-        } else {
-            catch_up
-                .as_ref()
-                .map(|cursor| cursor.since)
-                .or(state.watermark)
-        };
+        let since = catch_up
+            .as_ref()
+            .map_or(state.watermark, |cursor| cursor.since);
         let participating = config.monitors.github_notifications.participating;
         let mut request = client.http.get(endpoint.clone()).query(&[
             ("all", "false".to_string()),
@@ -271,11 +269,16 @@ async fn fetch_threads(
             ("per_page", "50".to_string()),
             ("page", if fresh_head { 1 } else { page }.to_string()),
         ]);
-        if let Some(since) = since {
-            request = request.query(&[(
-                "since",
-                (since - time::Duration::seconds(1)).format(&Rfc3339)?,
-            )]);
+        let lower = if !fresh_head && catch_up.as_ref().is_some_and(|cursor| cursor.tied) {
+            // Enumerate only the boundary second, never offsets into older data.
+            catch_up
+                .as_ref()
+                .map(|cursor| cursor.before - time::Duration::seconds(2))
+        } else {
+            since.map(|since| since - RECONCILE)
+        };
+        if let Some(lower) = lower {
+            request = request.query(&[("since", lower.format(&Rfc3339)?)]);
         }
         if !fresh_head && let Some(cursor) = &catch_up {
             request = request.query(&[("before", cursor.before.format(&Rfc3339)?)]);
@@ -283,8 +286,15 @@ async fn fetch_threads(
         if index == 0
             && catch_up.is_none()
             && let Some(modified) = &state.last_modified
+            && let Ok(modified) = OffsetDateTime::parse(modified, &Rfc2822)
+            && let Some(covered) = state.watermark.or(state.cutoff)
         {
-            request = request.header(IF_MODIFIED_SINCE, modified);
+            // A later Last-Modified must not hide a late-visible update inside
+            // the reconciliation window, even when its Date has not changed.
+            request = request.header(
+                IF_MODIFIED_SINCE,
+                modified.min(covered - RECONCILE).format(&Rfc2822)?,
+            );
         }
         let response = github_request(client, request, "notifications").await?;
         if let Some(interval) = response
@@ -331,6 +341,7 @@ async fn fetch_threads(
             if !fresh_head {
                 oldest =
                     Some(oldest.map_or(updated, |previous: OffsetDateTime| previous.min(updated)));
+                newest = Some(newest.map_or(updated, |previous| previous.max(updated)));
             }
             result.threads.push((thread, updated));
         }
@@ -338,12 +349,23 @@ async fn fetch_threads(
             continue;
         }
         let Some(next) = next else {
-            result.watermark = catch_up
-                .as_ref()
-                .map(|cursor| cursor.poll_date)
-                .or(result.date);
-            // The head may have more pages newer than poll_date. Do not let its
-            // Last-Modified hide them after the saved backlog has drained.
+            if let Some(mut cursor) = catch_up.clone().filter(|cursor| cursor.tied) {
+                if cursor.page == 1 {
+                    // A whole boundary second fit in this poll: older data can
+                    // now be scanned by timestamp, without a persisted offset.
+                    cursor.before -= time::Duration::seconds(1);
+                    cursor.tied = false;
+                }
+                // Otherwise contraction may have skipped unseen IDs. Reconcile
+                // from page one; an offset scan must never commit a watermark.
+                cursor.page = 1;
+                result.catch_up = Some(cursor);
+                result.last_modified = None;
+                return Ok(Some(result));
+            }
+            result.watermark = state.watermark.into_iter().chain(newest).max();
+            // The one-page head is not a complete scan. Never commit its maximum
+            // or let its conditional cursor hide overflow on the next poll.
             if catch_up.is_some() {
                 result.last_modified = None;
             }
@@ -354,31 +376,29 @@ async fn fetch_threads(
         }
         page = next;
     }
-    let date = result
-        .date
-        .ok_or("GitHub notifications response missing a valid Date header")?;
     let before = oldest.ok_or("GitHub notifications pagination cap without threads")?
         + time::Duration::seconds(1);
     result.catch_up = Some(match catch_up {
         Some(mut cursor) => {
-            if before < cursor.before {
+            if cursor.tied {
+                cursor.page = page;
+            } else if before < cursor.before {
                 cursor.before = before;
                 cursor.page = 1;
             } else {
-                // All pages can share the boundary second. Keep that inclusive
-                // boundary and resume its next page instead of skipping the tie.
+                cursor.tied = true;
                 cursor.page = page;
             }
             cursor
         }
         None => CatchUp {
-            since: state.watermark.unwrap_or(date),
+            since: state.watermark,
             before,
-            poll_date: date,
+            covered_max: newest.ok_or("GitHub notifications pagination cap without threads")?,
+            tied: false,
             page: 1,
         },
     });
-    result.watermark = Some(state.watermark.unwrap_or(date));
     Ok(Some(result))
 }
 
@@ -489,6 +509,7 @@ mod tests {
 
     const DATE_VALUE: &str = "Thu, 15 Oct 2026 00:00:00 GMT";
     const OLD: &str = "2026-10-14T23:59:00Z";
+    const OLD_CONDITIONAL: &str = "if-modified-since: Wed, 14 Oct 2026 23:54:00 +0000";
     const NEW: &str = "2026-10-15T00:00:01Z";
     const NEWER: &str = "2026-10-15T00:00:02Z";
 
@@ -611,6 +632,7 @@ mod tests {
 
     struct Inbox {
         threads: Vec<Value>,
+        after_response: Vec<Value>,
         date: OffsetDateTime,
         requests: usize,
         fail_at: Option<usize>,
@@ -619,6 +641,7 @@ mod tests {
     async fn inbox_server() -> (Server, Arc<Mutex<Inbox>>) {
         let inbox = Arc::new(Mutex::new(Inbox {
             threads: Vec::new(),
+            after_response: Vec::new(),
             date: OffsetDateTime::parse(DATE_VALUE, &Rfc2822).unwrap(),
             requests: 0,
             fail_at: None,
@@ -679,6 +702,9 @@ mod tests {
                     format!("<BASE/notifications?page={}>; rel=\"next\"", page + 1),
                 ));
             }
+            // Visibility can change after body selection but before its Date.
+            let newly_visible = std::mem::take(&mut inbox.after_response);
+            inbox.threads.extend(newly_visible);
             Some(reply)
         })
         .await;
@@ -722,25 +748,18 @@ mod tests {
             let path = request.split_whitespace().nth(1).unwrap();
             let url = reqwest::Url::parse(&format!("{}{path}", server.base)).unwrap();
             let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-            let since = catch_up
-                .as_ref()
-                .map(|cursor| {
-                    if index == 0 {
-                        cursor.poll_date
-                    } else {
-                        cursor.since
-                    }
-                })
-                .or(watermark);
+            let since = if let Some(cursor) = &catch_up {
+                if index > 0 && cursor.tied {
+                    Some(cursor.before - time::Duration::seconds(2))
+                } else {
+                    cursor.since.map(|since| since - RECONCILE)
+                }
+            } else {
+                watermark.map(|since| since - RECONCILE)
+            };
             assert_eq!(
                 query.get("since"),
-                since
-                    .map(|since| {
-                        (since - time::Duration::seconds(1))
-                            .format(&Rfc3339)
-                            .unwrap()
-                    })
-                    .as_ref()
+                since.map(|since| since.format(&Rfc3339).unwrap()).as_ref()
             );
             if let Some(cursor) = &catch_up {
                 assert!(!request.contains("if-modified-since:"));
@@ -827,7 +846,7 @@ mod tests {
         let requests = server.requests.lock().unwrap();
         assert!(requests[0].contains("authorization: Bearer test-token"));
         assert!(!requests[0].to_lowercase().contains("if-modified-since:"));
-        assert!(requests[1].contains(&format!("if-modified-since: {DATE_VALUE}")));
+        assert!(requests[1].contains(OLD_CONDITIONAL));
     }
 
     #[tokio::test]
@@ -863,10 +882,7 @@ mod tests {
         assert!(state.last_degraded.is_none());
         assert_eq!(state.interval(60), Duration::from_secs(180));
         assert_eq!(state.interval(300), Duration::from_secs(300));
-        assert!(
-            server.requests.lock().unwrap()[1]
-                .contains(&format!("if-modified-since: {DATE_VALUE}"))
-        );
+        assert!(server.requests.lock().unwrap()[1].contains(OLD_CONDITIONAL));
     }
 
     #[tokio::test]
@@ -993,10 +1009,7 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().payload["updated_at"], NEW);
         poll_once(&config, &client, &tx, &mut state).await.unwrap();
         assert!(rx.try_recv().is_err());
-        assert!(
-            server.requests.lock().unwrap()[3]
-                .contains(&format!("if-modified-since: {DATE_VALUE}"))
-        );
+        assert!(server.requests.lock().unwrap()[3].contains(OLD_CONDITIONAL));
     }
 
     #[tokio::test]
@@ -1029,20 +1042,25 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), 251);
         assert!(state.catch_up.is_none());
-        assert_eq!(state.watermark, Some(inbox.lock().unwrap().date));
+        assert_eq!(
+            state.watermark,
+            Some(OffsetDateTime::parse(NEW, &Rfc3339).unwrap() + time::Duration::seconds(250))
+        );
         assert!(state.last_modified.is_none());
+        // A 251-thread, 250-second burst also fills the five-minute overlap.
+        // One thread read elsewhere leaves a complete 250-thread normal scan.
+        inbox.lock().unwrap().threads.remove(0);
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
         assert!(state.last_modified.is_some());
         let baseline = state.watermark;
+        let conditional_start = server.requests.lock().unwrap().len();
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
         assert_eq!(state.watermark, baseline);
         assert!(rx.try_recv().is_err());
         let requests = server.requests.lock().unwrap();
         assert!(!requests[0].contains("since="));
-        for request in &requests[1..] {
-            assert!(request.contains("since="));
-        }
-        assert!(requests.last().unwrap().contains("if-modified-since:"));
+        assert!(requests.last().unwrap().contains("since="));
+        assert!(requests[conditional_start].contains("if-modified-since:"));
     }
 
     #[tokio::test]
@@ -1068,7 +1086,10 @@ mod tests {
             }
         }
         assert!(state.catch_up.is_none());
-        assert_eq!(state.watermark, Some(inbox.lock().unwrap().date));
+        assert_eq!(
+            state.watermark,
+            Some(OffsetDateTime::parse(NEW, &Rfc3339).unwrap() + time::Duration::seconds(699))
+        );
         assert_eq!(ids.len(), 700);
         ids.sort();
         ids.dedup();
@@ -1160,15 +1181,20 @@ mod tests {
         let cursor = state.catch_up.as_ref().unwrap();
         assert_eq!(cursor.before, original.before);
         assert_eq!(cursor.page, 5, "a full boundary second resumes, not skips");
-        assert_eq!(state.watermark, Some(original.since));
+        assert_eq!(state.watermark, original.since);
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
         ids.extend(received_ids(&mut rx));
-        assert!(state.catch_up.is_none());
-        assert_eq!(state.watermark, Some(original.poll_date));
-        // The catch-up head's Last-Modified must not suppress the next window.
+        assert!(state.catch_up.as_ref().unwrap().tied);
+        assert_eq!(state.catch_up.as_ref().unwrap().page, 1);
+        assert_eq!(state.watermark, original.since);
+        // Oversized ties cannot prove completion from saved offsets. Repeated
+        // reconciliation still emits nothing twice, while the head stays live.
         assert!(state.last_modified.is_none());
-        bounded_poll(&server, &config, &client, &tx, &mut state).await;
-        assert!(rx.try_recv().is_err());
+        for _ in 0..4 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            assert!(rx.try_recv().is_err());
+            assert_eq!(state.watermark, original.since);
+        }
         assert_eq!(ids.len(), 252);
         ids.sort();
         ids.dedup();
@@ -1224,7 +1250,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
         ids.extend(received_ids(&mut rx));
-        assert!(state.catch_up.is_none());
+        assert!(state.catch_up.as_ref().unwrap().tied);
         assert_eq!(ids.len(), 252);
         ids.sort();
         ids.dedup();
@@ -1238,6 +1264,281 @@ mod tests {
             requests[start + 1].lines().next(),
             requests[start + 3].lines().next()
         );
+    }
+
+    async fn contraction_reconciles_600(update_head: bool) {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut state = MonitorState::default();
+        let watermark = OffsetDateTime::parse("2026-10-15T09:00:00Z", &Rfc3339).unwrap();
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = watermark;
+            inbox.threads = vec![thread("baseline", &watermark.format(&Rfc3339).unwrap())];
+        }
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let updated = (watermark + time::Duration::seconds(1))
+            .format(&Rfc3339)
+            .unwrap();
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = watermark + time::Duration::seconds(1001);
+            inbox.threads = (0..600)
+                .map(|id| thread(&id.to_string(), &updated))
+                .collect();
+        }
+        let mut updates = Vec::new();
+        for _ in 0..3 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            while let Ok(event) = rx.try_recv() {
+                updates.push((
+                    event.payload["thread_id"].as_str().unwrap().to_string(),
+                    event.payload["updated_at"].as_str().unwrap().to_string(),
+                ));
+            }
+        }
+        assert_eq!(state.catch_up.as_ref().unwrap().page, 9);
+        let head_update = (watermark + time::Duration::seconds(1002))
+            .format(&Rfc3339)
+            .unwrap();
+        {
+            let mut inbox = inbox.lock().unwrap();
+            if update_head {
+                inbox.threads[0]["updated_at"] = json!(head_update);
+            } else {
+                inbox.threads.remove(0);
+            }
+            inbox.date += time::Duration::seconds(2);
+        }
+        for poll in 0..8 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            let mut fresh = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                fresh.push((
+                    event.payload["thread_id"].as_str().unwrap().to_string(),
+                    event.payload["updated_at"].as_str().unwrap().to_string(),
+                ));
+            }
+            if update_head && poll == 0 {
+                assert!(
+                    fresh.contains(&("0".into(), head_update.clone())),
+                    "head stays live"
+                );
+            }
+            if poll >= 3 {
+                assert!(
+                    fresh.is_empty(),
+                    "reconciliation must not replay remembered updates"
+                );
+            }
+            updates.extend(fresh);
+            assert_eq!(
+                state.watermark,
+                Some(watermark),
+                "an offset is not coverage proof"
+            );
+        }
+        for id in 0..600 {
+            assert_eq!(
+                updates
+                    .iter()
+                    .filter(|(seen, time)| seen == &id.to_string() && time == &updated)
+                    .count(),
+                1,
+                "missing or repeated original update for thread {id}"
+            );
+        }
+        assert_eq!(updates.len(), 600 + usize::from(update_head));
+        assert!(updates.contains(&("400".into(), updated)));
+        assert!(state.catch_up.as_ref().unwrap().tied);
+    }
+
+    #[tokio::test]
+    async fn notifications_catch_up_read_contraction_reconciles_600_once() {
+        contraction_reconciles_600(false).await;
+    }
+
+    #[tokio::test]
+    async fn notifications_catch_up_updated_contraction_reconciles_600_once() {
+        contraction_reconciles_600(true).await;
+    }
+
+    #[tokio::test]
+    async fn notifications_warm_body_selection_before_late_update_reconciles_once() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = MonitorState::default();
+        inbox.lock().unwrap().threads = vec![thread("baseline", OLD)];
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let selected = "2026-10-15T00:10:00Z";
+        let late = "2026-10-15T00:10:01Z";
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = OffsetDateTime::parse("2026-10-15T00:10:03Z", &Rfc3339).unwrap();
+            inbox.threads = vec![thread("selected", selected)];
+            inbox.after_response = vec![thread("X", late)];
+        }
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(received_ids(&mut rx), ["selected"]);
+        assert_eq!(
+            state.watermark,
+            Some(OffsetDateTime::parse(selected, &Rfc3339).unwrap())
+        );
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(received_ids(&mut rx), ["X"]);
+        assert!(
+            server.requests.lock().unwrap()[2]
+                .contains("if-modified-since: Thu, 15 Oct 2026 00:05:00 +0000")
+        );
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn notifications_catch_up_late_visibility_between_windows_reconciles_once() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut state = MonitorState::default();
+        let watermark = OffsetDateTime::parse("2026-10-15T09:00:00Z", &Rfc3339).unwrap();
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = watermark;
+            inbox.threads = vec![thread("baseline", &watermark.format(&Rfc3339).unwrap())];
+        }
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = watermark + time::Duration::seconds(603);
+            inbox.threads = (0..251)
+                .map(|id| {
+                    let updated = watermark + time::Duration::seconds(300 + id);
+                    thread(&id.to_string(), &updated.format(&Rfc3339).unwrap())
+                })
+                .collect();
+        }
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let mut ids = received_ids(&mut rx);
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox
+                .threads
+                .push(thread("late-head", "2026-10-15T09:09:59Z"));
+            inbox.after_response = vec![thread("late-body", "2026-10-15T09:09:58Z")];
+            inbox.date += time::Duration::seconds(1);
+        }
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let head = received_ids(&mut rx);
+        assert!(head.iter().any(|id| id == "late-head"));
+        assert!(!head.iter().any(|id| id == "late-body"));
+        ids.extend(head);
+        assert!(state.catch_up.is_none());
+        assert_eq!(
+            state.watermark,
+            Some(watermark + time::Duration::seconds(550))
+        );
+        for _ in 0..4 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            ids.extend(received_ids(&mut rx));
+        }
+        assert_eq!(ids.len(), 253);
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 253);
+    }
+
+    #[tokio::test]
+    async fn notifications_oversized_tie_shrinks_then_timestamp_backlog_completes() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut state = MonitorState::default();
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        fill_inbox(&inbox, 251, true);
+        // Use an eligible, older second, distinct from the oversized tie.
+        inbox
+            .lock()
+            .unwrap()
+            .threads
+            .push(thread("older", "2026-10-15T00:00:00Z"));
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            ids.extend(received_ids(&mut rx));
+        }
+        assert_eq!(ids.len(), 251);
+        assert!(!ids.iter().any(|id| id == "older"));
+        assert!(state.catch_up.as_ref().unwrap().tied);
+        assert_eq!(state.catch_up.as_ref().unwrap().page, 1);
+        inbox.lock().unwrap().threads.drain(0..60);
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert!(!state.catch_up.as_ref().unwrap().tied);
+        assert_eq!(state.catch_up.as_ref().unwrap().page, 1);
+        assert!(rx.try_recv().is_err());
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(received_ids(&mut rx), ["older"]);
+        assert!(state.catch_up.is_none());
+        assert_eq!(
+            state.watermark,
+            Some(OffsetDateTime::parse(NEW, &Rfc3339).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_reconciliation_recovers_late_update_behind_received_maximum() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = MonitorState::default();
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let newest = "2026-10-15T00:10:00Z";
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = OffsetDateTime::parse("2026-10-15T00:10:03Z", &Rfc3339).unwrap();
+            inbox.threads = vec![thread("newest", newest)];
+            inbox.after_response = vec![thread("late", "2026-10-15T00:05:01Z")];
+        }
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(received_ids(&mut rx), ["newest"]);
+        for expected in [vec!["late"], vec![], vec![]] {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            assert_eq!(received_ids(&mut rx), expected);
+            assert_eq!(
+                state.watermark,
+                Some(OffsetDateTime::parse(newest, &Rfc3339).unwrap())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn notifications_empty_and_older_responses_do_not_advance_watermark_to_date() {
+        let server = server(vec![
+            Reply::ok(json!([])),
+            Reply::ok(json!([thread("old", OLD)])),
+            Reply::ok(json!([])),
+            Reply::ok(json!([thread("older", "2026-10-14T23:58:00Z")])),
+        ])
+        .await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = MonitorState::default();
+        poll_once(&config, &client, &tx, &mut state).await.unwrap();
+        assert!(state.watermark.is_none());
+        assert!(state.cutoff.is_some());
+        let old = OffsetDateTime::parse(OLD, &Rfc3339).unwrap();
+        for _ in 0..3 {
+            poll_once(&config, &client, &tx, &mut state).await.unwrap();
+            assert_eq!(state.watermark, Some(old));
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

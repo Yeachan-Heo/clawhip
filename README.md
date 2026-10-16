@@ -892,30 +892,51 @@ Each poll constructs at most five `GET /notifications` requests, with `all=false
 `participating` as configured, and `per_page=50`. Constructed polling/pagination
 requests stay on the configured API origin; HTTP 3xx redirects retain the shared
 GitHub client's default behavior and can add transport requests or change origin.
-The committed watermark W is the
-first-page server `Date` of the last complete scan (initialized from the cold-start
-cutoff). Normal polls request `since=W-1s`; the one-second overlap is deduplicated
-by thread ID and `updated_at`. They send the previous complete response's
-`Last-Modified` as `If-Modified-Since`; an authenticated `304 Not Modified` emits
-nothing and does not consume the primary rate limit. The effective interval is
+The committed watermark W advances only to the greatest `updated_at` actually
+received in a completed scan, never from the response `Date` or an incomplete
+fresh head page. Empty/older responses leave W unchanged; before any update has
+been covered, W is unset and requests omit `since`. Normal polls request
+`since=W-5m`. This fixed reconciliation overlap tolerates response generation
+latency, visibility lag and clock disagreement totaling less than five minutes;
+updates arriving behind that window are not guaranteed to be observed. Repeated
+updates are deduplicated by thread ID and `updated_at`. Conditional requests use
+`If-Modified-Since` no later than either the previous complete response's
+`Last-Modified` or W minus five minutes (the cold-start cutoff minus five minutes
+when W is unset), so a later response header cannot hide the overlap.
+An authenticated `304 Not Modified` emits nothing and does not consume the
+primary rate limit. The effective interval is
 the maximum of the configured interval and the **latest valid** `X-Poll-Interval`,
 including headers on failures and 304 responses; a later lower value reduces the
 delay again. Missing/invalid interval headers retain the latest valid value.
 Shared GitHub 403/429 backoff also applies.
 
-A five-page cap reports source degradation and saves a catch-up window without
-advancing W. While catching up, each poll first fetches one fresh head page with
-`since=<original capped poll Date>-1s`, so its newest 50 updates are not delayed by
-the backlog. The remaining four requests drain `since=W-1s&before=<oldest received
-updated_at + 1s>`. Overlapping the boundary second avoids skipping tied threads;
-if that second fills the budget, the next poll resumes its next page rather than
-skipping the second. Local reason/repo filters never advance or truncate the
-scan. When the catch-up window has no next page, W advances to the original capped
-poll's Date and the continuation clears. The next normal scan includes updates
-since that Date, including any beyond the fresh head's first page. Conditional
-requests are disabled throughout catch-up and on that first normal scan.
+A five-page cap reports throttled source degradation and saves a catch-up window
+without advancing W. While catching up, every poll first fetches one fresh head
+page with `since=<W at catch-up start>-5m`, so its newest 50 updates are not delayed
+by the backlog. The remaining four requests drain that same lower bound with
+`before=<oldest received updated_at + 1s>`. The head and backlog windows overlap,
+with no timestamp gap. Normal continuation uses only timestamps, restarting
+pagination at page one each poll; reading/updating earlier threads cannot shift
+a saved page offset past unseen older threads. Local reason/repo filters never
+advance or truncate the scan. Once the backlog is proven complete, W advances
+to the greatest update covered by that scan, excluding the incomplete head.
+The next normal scan therefore includes head overflow. Conditional requests are
+disabled throughout catch-up and on that first normal scan.
 HTTP/decoding failures and missing/invalid first-page Date headers preserve the
 watermark, continuation, thread baseline, and conditional cursor.
+
+**Oversized boundary-second limitation:** if more than 200 unread threads share
+the boundary `updated_at` second, they cannot all be reconciled in the four
+backlog requests. Bounded page offsets enumerate only that second, then restart
+at page one when they reach its end. Such cross-poll offsets never prove
+completion: contractions can skip an ID during one pass, but subsequent passes
+revisit it once the inbox stabilizes. W remains pinned and older backlog waits
+until a page-one scan proves the entire boundary second fits in one poll. The
+fresh head remains live throughout. This can persist indefinitely and costs up
+to five constructed requests per poll (one head plus up to four backlog), with
+throttled degradation reporting rather than unbounded requests. Even without
+oversized ties, more than 250 threads in the five-minute overlap can repeatedly
+trigger catch-up, at the same per-poll request bound.
 
 **Unread only; never marks read.** No PATCH/PUT requests are made. Reading a
 notification on github.com removes it from the unread feed; further activity
@@ -924,11 +945,12 @@ baseline without replaying history. Its server `Date` is the eligibility cutoff
 (missing/invalid Date defers initialization). Subsequent polls emit one
 `github.notification` per thread whose `updated_at` advances, not per comment.
 An unseen thread older than that cutoff never replays unless it changes.
-The in-memory dedupe FIFO holds 1,000 threads; overlapping windows can replay an
-evicted post-cutoff thread, and restarting establishes a fresh, silent baseline.
-GitHub's inbox is not a snapshot: reading/updating threads while paging can shift
-page offsets, including within large same-second ties. Separate changes to one
-thread with the same second-resolution `updated_at` cannot be distinguished.
+The in-memory dedupe FIFO holds 1,000 threads; eviction can replay a post-cutoff
+thread within the reconciliation overlap or a repeatedly scanned oversized tie.
+Restarting establishes a fresh, silent baseline. GitHub's inbox is not a snapshot:
+continuous mutation during requests can delay observation, and updates must
+remain unread/visible to be fetched. Separate changes to one thread with the same
+second-resolution `updated_at` cannot be distinguished.
 
 Payloads contain no comment/review bodies, token, or private credential metadata.
 Repository names and titles can still identify private repositories: route only
