@@ -798,7 +798,24 @@ Route these events with `github.*` or their individual kinds:
 | `github.pr-reviewed` | Submitted review | `review_id`, `state` (`approved`, `changes_requested`, `commented`) |
 
 All three payloads include `repo`, `number`, `title`, `author`, `pr_author`, and
-`url` (the comment/review permalink). Unknown PR titles/authors are empty strings;
+`url` (the comment/review permalink). For comments outside the current PR window
+or review scan, the poller resolves the title and PR author with
+`GET /repos/{owner}/{repo}/pulls/{number}`. A 256-entry in-memory FIFO cache avoids
+repeated lookups; window data takes precedence and refreshes cached titles.
+Unknown metadata goes into a shared in-memory FIFO of at most 500 pending
+comments (identifiers, author login, URL, timestamps and inline path, never body
+text). Pending IDs immediately enter their feed's deduplication FIFO. Each poll
+retries pending work oldest-first before reading new comments; remaining lookup
+budget can resolve newly queued work after both feeds are read. A 404 or 410 is
+cached as unavailable and emits with empty `title`/`pr_author` (until cache
+eviction or restart). Other failures, including missing PR authors, retry for at
+most 10 attempts before emitting empty metadata and reporting degraded operation.
+403/429 use shared rate-limit backoff without consuming an attempt. Queue overflow
+emits the oldest unresolved comment rather than dropping it. Overflow and
+attempt-cap emissions carry empty `title`/`pr_author`, so routes filtering on
+`pr_author` do not match them; routing falls back according to route configuration.
+Overflow, give-up and budget deferral report throttled source degradation.
+The pending queue is in-memory: a restart drops unresolved queued comments.
 `pr_author` can be used in route payload filters to select your PRs. Comment and
 review **body text is never included** in these public-safe event payloads.
 Pending and dismissed reviews are not emitted, nor are edits to old comments.
@@ -807,7 +824,11 @@ API cost per poll: conversation comments use an activity-owned repository
 `/issues/comments` feed; inline comments use the repository `/pulls/comments` feed
 (each up to 10 pages, 100 items/page), independent of the PR list so older PRs are
 still detected. The conversation feed adds one request per poll when unpaginated;
-it ignores issue comments and does not change the existing issue-comment count-delta
+pending metadata cache misses add at most 20 PR-detail requests per poll, one per
+distinct PR, shared by both comment feeds. Cold baselines never enqueue or look
+up seeded comments. The queue and cache survive CI-baseline persistence failures
+in the running process, but are not persisted across restarts.
+The conversation feed ignores issue comments and does not change the existing issue-comment count-delta
 poller or enable issue polling when disabled. PR conversation IDs have their own bounded deduplication FIFO;
 issue-comment churn or a CI-baseline persistence failure does not replay them.
 
@@ -829,7 +850,12 @@ until the backlog drains. Thus a newly created comment edited before its first
 delivery is still eligible even when its creation precedes P. A completed fetch
 advances L to the maximum consumed update (never backwards); all updates through
 that position have been consumed. A failed fetch preserves both P and L. Only
-delivered IDs or deliberately seeded cold IDs enter the deduplication FIFO.
+delivered, queued or deliberately seeded cold IDs enter the deduplication FIFO.
+Metadata availability never stops a feed or freezes P/L: pending comments retain
+their original eligibility independently of later feed positions. Both comment
+kinds share one pending FIFO, so new conversation comments cannot starve older
+inline comments of lookup budget. All requests remain subject to the shared
+GitHub rate-limit backoff.
 
 Reviews build a separate updated-desc PR window (up to 5 pages, 500 PRs), stopping
 only below the committed submission watermark. Boundary-second PRs are always
@@ -857,9 +883,162 @@ can stall them as above.
 A PR with over 1,000 reviews can keep its
 scan waiting at the per-PR page cap. Restarting establishes fresh baselines.
 
+## GitHub notifications (opt-in, across all repositories)
+
+Poll the authenticated user's notification inbox without configuring repositories
+or fetching PR metadata. This complements, rather than replaces, `emit_pr_activity`.
+Only activity GitHub places in your notification inbox is observed (including
+your PRs/issues, mentions and review requests); it is not a repository-wide audit log.
+
+```toml
+[monitors.github_notifications]
+enabled = true                  # default false: zero requests when disabled
+poll_interval_secs = 60          # min 1; max(configured, latest valid X-Poll-Interval)
+participating = false            # true sends participating=true
+reasons = []                     # empty = all; e.g. ["author", "mention", "review_requested"]
+repos = []                       # empty = all; e.g. ["owner/repo"]
+# channel = "CHANNEL_ID"         # optional direct destination
+# channel_name = "development"
+# mention = "<@USER_ID>"
+format = "compact"
+
+[[routes]]
+event = "github.notification"
+filter = { reason = "review_requested", subject_type = "PullRequest" }
+channel = "REVIEW_CHANNEL_ID"
+```
+
+Credentials use `CLAWHIP_GITHUB_TOKEN`, then `monitors.github_token`, then
+`gh auth token`. GitHub's [notifications REST documentation](https://docs.github.com/en/rest/activity/notifications)
+currently documents personal access tokens **(classic)** with `notifications` or
+`repo` scope; this endpoint does **not** support fine-grained personal access tokens.
+Authenticate `gh` with a credential that can read notifications.
+
+Each poll constructs at most five `GET /notifications` requests, with `all=false`,
+`participating` as configured, and `per_page=50`. Constructed polling/pagination
+requests stay on the configured API origin; HTTP 3xx redirects retain the shared
+GitHub client's default behavior and can add transport requests or change origin.
+The committed watermark W advances only to the greatest `updated_at` actually
+received in a completed scan, never from the response `Date` or an incomplete
+fresh head page. Empty/older responses leave W unchanged; before any update has
+been covered, W is unset and requests omit `since`. Normal polls request
+`since=W-5m`. This fixed reconciliation overlap tolerates response generation
+latency, visibility lag and clock disagreement totaling less than five minutes;
+updates arriving behind that window are not guaranteed to be observed. Repeated
+updates are deduplicated by thread ID and `updated_at`. Conditional requests use
+`If-Modified-Since` no later than either the previous complete response's
+`Last-Modified` or W minus five minutes (the cold-start cutoff minus five minutes
+when W is unset), so a later response header cannot hide the overlap.
+An authenticated `304 Not Modified` emits nothing and does not consume the
+primary rate limit. In steady state these conditional savings are mostly
+unavailable: the conditional time is clamped to W minus five minutes, usually
+earlier than the inbox's last modification, so GitHub returns `200`. A `200`
+consumes the primary rate limit; at the default 60-second interval, one to five
+requests per poll is roughly 60–300 requests/hour of the authenticated
+5,000/hour budget. Conditional times use the UTC IMF-fixdate HTTP-date format.
+The effective interval is
+the maximum of the configured interval and the **latest valid** `X-Poll-Interval`,
+including headers on failures and 304 responses; a later lower value reduces the
+delay again. Missing/invalid interval headers retain the latest valid value.
+Shared GitHub 403/429 backoff also applies.
+
+A five-page cap reports throttled source degradation and saves a catch-up window
+without advancing W. Outside a pinned tie, every catch-up poll first fetches one
+fresh head page with `since=<W at catch-up start>-5m`, so its newest 50 updates are not delayed
+by the backlog. The remaining four requests drain that same lower bound with
+`before=<oldest received updated_at + 1s>`. The head and backlog windows overlap,
+with no timestamp gap. Normal continuation uses only timestamps, restarting
+pagination at page one each poll; reading/updating earlier threads cannot shift
+a saved page offset past unseen older threads. Local reason/repo filters never
+advance or truncate the scan. Once the backlog is proven complete, W advances
+to the greatest update covered by that scan, excluding the incomplete head.
+The next normal scan therefore includes head overflow. Conditional requests are
+disabled throughout catch-up and on that first normal scan.
+HTTP/decoding failures and missing/invalid first-page Date headers preserve the
+watermark, continuation, thread baseline, and conditional cursor.
+
+**Oversized boundary-second limitation:** if more than 200 unread threads share
+the boundary `updated_at` second, they cannot all be reconciled in the four
+backlog requests. Bounded page offsets enumerate only that second, then restart
+at page one when they reach its end. Such cross-poll offsets never prove
+completion: contractions can skip an ID during one pass, but subsequent passes
+revisit it once the inbox stabilizes. W remains pinned and older backlog waits
+until a page-one scan proves the entire boundary second fits in one poll. The
+available tie budget determines how many pages that proof can cover.
+
+While pinned at second T, newer delivery has its own timestamp-only scan of
+`(T, now]`, using exclusive `since=T`. Every poll first fetches page one of this
+fresh head, even with a saved newer cursor. Up to three following requests go
+to newer-range pagination, leaving **at least one request for enumerating T**;
+unused newer requests go to T. An empty newer head leaves four tie pages only
+when no newer continuation is saved; an empty stale continuation costs one
+request, is then cleared, and leaves three tie pages. A
+newer scan starting afresh reuses the head as its first page. If it does not
+finish, it saves `before=<oldest received updated_at + 1s>` and restarts at page
+one of that timestamp window next poll, deduplicating the overlap by thread ID
+and `updated_at`. If a continuation exhausts its budget without moving `before`
+strictly older than its starting value, that stalled cursor is cleared so the
+next poll restarts from the fresh head. On completion it also restarts fresh
+next poll. This delivery scan
+never advances W or proves tie coverage. Thus, once the inbox stabilizes, a
+newer range with distinct timestamps drains across polls while T also receives
+enumeration requests; fresh head overflow cannot wait forever behind T.
+
+**Nested newer-tie limitation:** this newer-range delivery scan does not
+recursively enumerate oversized same-second groups. A group of more than 200
+newer threads at one second cannot fit its restarting budget (head plus three
+pages); a saved continuation has only three pages, so even a group of more than
+150 threads at its boundary can stall it. Restarting a stalled cursor prevents
+distinct-timestamp arrivals above that group from being stranded between the
+head and the saved boundary: once the inbox freezes, each continuation either
+moves older or restarts a head-based scan. In the 201-thread nested-group case,
+51 distinct arrivals above it all arrive within two successful polls (one to
+clear the stalled cursor, then one head-based scan to reach the 51st arrival).
+Unseen threads inside or below the oversized nested second can still wait
+indefinitely until the group shrinks; restarting does not enumerate that group
+recursively or prove its coverage. The fresh head and the original T enumeration
+still run, with W conservatively pinned.
+Avoiding recursive cursor trees keeps state and request allocation bounded;
+this is a delivery limitation, not a claim of complete coverage.
+
+Pinned ties can persist indefinitely and cost up to five constructed requests
+per poll, with throttled degradation reporting rather than unbounded requests.
+Even without oversized ties, more than 250 threads in the five-minute overlap
+can repeatedly trigger catch-up, at the same per-poll request bound.
+
+**Unread only; never marks read.** No PATCH/PUT requests are made. Reading a
+notification on github.com removes it from the unread feed; further activity
+re-surfaces it with a newer `updated_at`. The first successful poll seeds a
+baseline without replaying history. Its server `Date` is the eligibility cutoff
+(missing/invalid Date defers initialization). Subsequent polls emit one
+`github.notification` per thread whose `updated_at` advances, not per comment.
+An unseen thread older than that cutoff never replays unless it changes.
+The in-memory dedupe FIFO holds 1,000 threads; eviction can replay a post-cutoff
+thread within the reconciliation overlap or a repeatedly scanned oversized tie.
+Restarting establishes a fresh, silent baseline. GitHub's inbox is not a snapshot:
+continuous mutation during requests can delay observation, and updates must
+remain unread/visible to be fetched. Separate changes to one thread with the same
+second-resolution `updated_at` cannot be distinguished.
+
+Payloads contain no comment/review bodies, token, or private credential metadata.
+Repository names and titles can still identify private repositories: route only
+to destinations authorized to see the authenticated user's inbox.
+
+| Field | Meaning |
+| --- | --- |
+| `repo` | `owner/repo` |
+| `thread_id` | GitHub notification thread ID (string) |
+| `reason` | GitHub reason, e.g. `author`, `comment`, `mention`, `review_requested`, `assign`, `state_change`, `team_mention`, `ci_activity` |
+| `subject_type` | GitHub type, e.g. `PullRequest`, `Issue`, `Discussion`, `Release`, `CheckSuite`, `Commit` |
+| `title` | Subject title, never its body |
+| `number` | Optional issue/PR/discussion number derived without another request |
+| `url` | Derived HTML URL, with a comment anchor when determinable; otherwise repository URL |
+| `updated_at` | GitHub thread update timestamp |
+
 ## Preset event families
 
 ### GitHub family
+- `github.notification`
 - `github.issue-opened`
 - `github.issue-commented`
 - `github.issue-closed`
