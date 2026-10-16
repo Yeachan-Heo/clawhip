@@ -115,7 +115,7 @@ fn explicit_monitor_github_token_from(
         })
 }
 
-async fn resolve_monitor_github_token(
+pub(crate) async fn resolve_monitor_github_token(
     config: &AppConfig,
 ) -> (Option<String>, GitHubMonitorAuthStatus) {
     if let Some((token, source)) = explicit_monitor_github_token(config) {
@@ -169,8 +169,8 @@ struct GitHubRequestBackoff {
     reported: bool,
 }
 
-struct GitHubClient {
-    http: reqwest::Client,
+pub(crate) struct GitHubClient {
+    pub(crate) http: reqwest::Client,
     backoff: Mutex<GitHubRequestBackoff>,
 }
 
@@ -3425,13 +3425,66 @@ async fn github_get(
     query: &[(&str, &str)],
     context: &str,
 ) -> Result<reqwest::Response> {
-    let response = github_get_allow_unavailable(client, api_base, path, query, context).await?;
+    let url = format!(
+        "{}/{}",
+        api_base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let response = github_request(client, client.http.get(&url).query(query), context).await?;
     if matches!(
         response.status(),
         reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
     ) {
         return Err(github_api_error(response.status()).into());
     }
+    Ok(response)
+}
+
+/// Shared transport/backoff. Callers inspect status so conditional pollers can read
+/// polling headers on failures and accept 304 without changing legacy GET behavior.
+pub(crate) async fn github_request(
+    client: &GitHubClient,
+    request: reqwest::RequestBuilder,
+    context: &str,
+) -> Result<reqwest::Response> {
+    if let Ok(backoff) = client.backoff.lock()
+        && backoff
+            .until
+            .is_some_and(|until| until > std::time::Instant::now())
+    {
+        return Err("GitHub API rate limit backoff is active; retrying later".into());
+    }
+    eprintln!("clawhip source github: GET ({context})");
+
+    let response = request.send().await?;
+    let status = response.status();
+
+    if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+    ) {
+        return Ok(response);
+    }
+    if !status.is_success() {
+        let rate_limited = status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        if rate_limited && let Ok(mut backoff) = client.backoff.lock() {
+            backoff.until = Some(std::time::Instant::now() + GITHUB_RATE_LIMIT_BACKOFF);
+            if !backoff.reported {
+                eprintln!(
+                    "clawhip source github: API rate limit reached; backing off for 60 seconds"
+                );
+                backoff.reported = true;
+            }
+        }
+        return Ok(response);
+    }
+
+    if let Ok(mut backoff) = client.backoff.lock() {
+        backoff.until = None;
+        backoff.reported = false;
+    }
+    eprintln!("clawhip source github: GET ({context}) -> {status}");
     Ok(response)
 }
 
@@ -3442,21 +3495,12 @@ async fn github_get_allow_unavailable(
     query: &[(&str, &str)],
     context: &str,
 ) -> Result<reqwest::Response> {
-    if let Ok(backoff) = client.backoff.lock()
-        && backoff
-            .until
-            .is_some_and(|until| until > std::time::Instant::now())
-    {
-        return Err("GitHub API rate limit backoff is active; retrying later".into());
-    }
     let url = format!(
         "{}/{}",
         api_base.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    eprintln!("clawhip source github: GET ({context})");
-
-    let response = client.http.get(&url).query(query).send().await?;
+    let response = github_request(client, client.http.get(&url).query(query), context).await?;
     let status = response.status();
 
     if matches!(
@@ -3484,7 +3528,6 @@ async fn github_get_allow_unavailable(
         backoff.until = None;
         backoff.reported = false;
     }
-    eprintln!("clawhip source github: GET ({context}) -> {status}");
     Ok(response)
 }
 
@@ -4226,7 +4269,7 @@ fn apply_workflow_run_attempts(
     }
 }
 
-fn build_github_client(token: Option<String>) -> Result<GitHubClient> {
+pub(crate) fn build_github_client(token: Option<String>) -> Result<GitHubClient> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("clawhip/0.1"));
     headers.insert(

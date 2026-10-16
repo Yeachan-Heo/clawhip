@@ -4,9 +4,9 @@ pub mod compat;
 pub use body::{
     AgentEvent, CustomEvent, DiscordNudgeIntentEvent, GitBranchChangedEvent,
     GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent, GitHubIssueEvent,
-    GitHubPRCommentEvent, GitHubPREvent, GitHubPRReviewCommentEvent, GitHubPRReviewEvent,
-    GitHubPRStatusEvent, GitHubReleaseEvent, TmuxKeywordAggregatedEvent, TmuxKeywordEvent,
-    TmuxStaleEvent, WorkspaceEvent,
+    GitHubNotificationEvent, GitHubPRCommentEvent, GitHubPREvent, GitHubPRReviewCommentEvent,
+    GitHubPRReviewEvent, GitHubPRStatusEvent, GitHubReleaseEvent, TmuxKeywordAggregatedEvent,
+    TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
 
 use crate::discord_watch::DiscordMessageCreateEvent;
@@ -32,6 +32,7 @@ pub enum EventBody {
     GitHubIssueOpened(GitHubIssueEvent),
     GitHubIssueCommented(GitHubIssueEvent),
     GitHubIssueClosed(GitHubIssueEvent),
+    GitHubNotification(GitHubNotificationEvent),
     GitHubPRCommented(GitHubPRCommentEvent),
     GitHubPRReviewCommented(GitHubPRReviewCommentEvent),
     GitHubPRReviewed(GitHubPRReviewEvent),
