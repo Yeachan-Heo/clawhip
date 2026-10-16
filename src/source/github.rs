@@ -3853,6 +3853,7 @@ async fn fetch_issues(
                 ("sort", "updated"),
                 ("direction", "desc"),
                 ("since", since_str),
+                ("page", page_str.as_str()),
             ],
             &format!("issues for {github_repo}"),
         )
