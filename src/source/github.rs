@@ -10215,7 +10215,8 @@ mod tests {
             "Comment count should be at least 7 (5 from snapshot + 2 new), got {}",
             reported_count
         );
-=======
+    }
+
     type ActivityResponse = (
         String,
         serde_json::Value,
@@ -12094,6 +12095,5 @@ mod tests {
         );
         assert!(harness.poll().await.is_empty());
         server.await.unwrap();
->>>>>>> origin/dev
     }
 }
