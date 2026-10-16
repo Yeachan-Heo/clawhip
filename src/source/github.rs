@@ -3500,20 +3500,7 @@ async fn github_get_allow_unavailable(
         api_base.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    github_request(client, client.http.get(&url).query(query), context).await
-}
-    context: &str,
-) -> Result<reqwest::Response> {
-    if let Ok(backoff) = client.backoff.lock()
-        && backoff
-            .until
-            .is_some_and(|until| until > std::time::Instant::now())
-    {
-        return Err("GitHub API rate limit backoff is active; retrying later".into());
-    }
-    eprintln!("clawhip source github: GET ({context})");
-
-    let response = request.send().await?;
+    let response = github_request(client, client.http.get(&url).query(query), context).await?;
     let status = response.status();
 
     if matches!(
@@ -3534,14 +3521,13 @@ async fn github_get_allow_unavailable(
                 backoff.reported = true;
             }
         }
-        return Ok(response);
+        return Err(github_api_error(status).into());
     }
 
     if let Ok(mut backoff) = client.backoff.lock() {
         backoff.until = None;
         backoff.reported = false;
     }
-    eprintln!("clawhip source github: GET ({context}) -> {status}");
     Ok(response)
 }
 
