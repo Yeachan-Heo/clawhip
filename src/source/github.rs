@@ -2015,6 +2015,9 @@ struct PullRequestSnapshot {
 
 #[derive(Clone, Default)]
 struct PRActivityState {
+    issue_comment_cursor: Option<String>,
+    issue_comment_lower: Option<String>,
+    emitted_issue_comment_ids: VecDeque<u64>,
     pr_comment_cursor: Option<String>,
     pr_comment_lower: Option<String>,
     review_comment_cursor: Option<String>,
@@ -2285,6 +2288,7 @@ async fn poll_github(
             &snapshot,
             activity,
             &activity_prs,
+            &issues,
             activity_window_complete,
             activity_baseline_cutoff.as_deref(),
             tx,
@@ -2470,6 +2474,10 @@ async fn poll_issues(
                 for event in
                     collect_issue_events(repo, &snapshot.repo_name, &previous.issues, &issues)
                 {
+                    // The comment feed owns comment identity and deduplication.
+                    if event.canonical_kind() == "github.issue-commented" {
+                        continue;
+                    }
                     send_event(tx, event).await?;
                 }
             }
@@ -2829,6 +2837,81 @@ async fn fetch_pr_activity_pages<T: serde::de::DeserializeOwned>(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn emit_issue_feed_comment(
+    client: &GitHubClient,
+    api_base: &str,
+    github_repo: &str,
+    repo: &GitRepoMonitor,
+    snapshot: &GitSnapshot,
+    issues: &HashMap<u64, IssueSnapshot>,
+    comment: &GitHubComment,
+    lower: Option<&str>,
+    state: &mut PRActivityState,
+    commented_issues: &mut HashSet<u64>,
+    tx: &mpsc::Sender<IncomingEvent>,
+) -> Result<()> {
+    if state.emitted_issue_comment_ids.contains(&comment.id) {
+        return Ok(());
+    }
+    let Some(number) = reqwest::Url::parse(&comment.html_url).ok().and_then(|url| {
+        let mut segments = url.path_segments()?.skip(2);
+        (segments.next()? == "issues").then_some(())?;
+        segments.next()?.parse::<u64>().ok()
+    }) else {
+        return Ok(());
+    };
+    let api_number = reqwest::Url::parse(&comment.issue_url)
+        .ok()
+        .and_then(|url| {
+            let path = url.path().strip_prefix("/api/v3").unwrap_or(url.path());
+            let mut segments = path.strip_prefix("/repos/")?.split('/').skip(2);
+            (segments.next()? == "issues").then_some(())?;
+            segments.next()?.parse::<u64>().ok()
+        });
+    if api_number != Some(number) {
+        return Ok(());
+    }
+    if lower.is_some_and(|lower| comment.created_at.as_str() >= lower)
+        && !commented_issues.contains(&number)
+    {
+        let (title, count) = if let Some(issue) = issues.get(&number) {
+            (issue.title.clone(), issue.comments)
+        } else {
+            let issue: GitHubIssue = github_get(
+                client,
+                api_base,
+                &format!("repos/{github_repo}/issues/{number}"),
+                &[],
+                "issue comment metadata",
+            )
+            .await?
+            .json()
+            .await?;
+            if issue.is_pull_request() {
+                return Ok(());
+            }
+            (issue.title, issue.comments)
+        };
+        send_event(
+            tx,
+            IncomingEvent::github_issue_commented(
+                snapshot.repo_name.clone(),
+                number,
+                title,
+                count,
+                repo.channel.clone(),
+            )
+            .with_mention(repo.mention.clone())
+            .with_format(repo.format.clone()),
+        )
+        .await?;
+        commented_issues.insert(number);
+    }
+    remember_activity_id(&mut state.emitted_issue_comment_ids, comment.id);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn poll_pr_activity(
     config: &AppConfig,
     github_client: Option<&GitHubClient>,
@@ -2836,11 +2919,12 @@ async fn poll_pr_activity(
     snapshot: &GitSnapshot,
     mut state: PRActivityState,
     prs: &HashMap<u64, PullRequestSnapshot>,
+    issues: &HashMap<u64, IssueSnapshot>,
     prs_complete: bool,
     baseline_cutoff: Option<&str>,
     tx: &mpsc::Sender<IncomingEvent>,
 ) -> Result<PRActivityState> {
-    if !repo.emit_pr_activity {
+    if !repo.emit_pr_activity && !repo.emit_issue_opened {
         return Ok(state);
     }
     let Some(client) = github_client else {
@@ -2879,7 +2963,11 @@ async fn poll_pr_activity(
         &mut metadata_counted,
     )
     .await?;
-    let pr_comment_cursor = state.pr_comment_cursor.clone();
+    let pr_comment_cursor = if repo.emit_pr_activity {
+        state.pr_comment_cursor.clone()
+    } else {
+        state.issue_comment_cursor.clone()
+    };
     match fetch_pr_activity_pages::<GitHubComment>(
         client,
         api_base,
@@ -2897,11 +2985,35 @@ async fn poll_pr_activity(
                 .chain(pr_comment_cursor.clone())
                 .max()
                 .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
-            let lower = state.pr_comment_lower.clone();
+            let lower = if repo.emit_pr_activity {
+                state.pr_comment_lower.clone()
+            } else {
+                state.issue_comment_lower.clone()
+            };
+            let mut commented_issues = HashSet::new();
             for comment in comments {
                 let Some(number) = comment.pr_number() else {
+                    if repo.emit_issue_opened {
+                        emit_issue_feed_comment(
+                            client,
+                            api_base,
+                            github_repo,
+                            repo,
+                            snapshot,
+                            issues,
+                            &comment,
+                            lower.as_deref(),
+                            &mut state,
+                            &mut commented_issues,
+                            tx,
+                        )
+                        .await?;
+                    }
                     continue;
                 };
+                if !repo.emit_pr_activity {
+                    continue;
+                }
                 if state.emitted_pr_comment_ids.contains(&comment.id)
                     || state
                         .pending_comments
@@ -2934,11 +3046,19 @@ async fn poll_pr_activity(
                 }
                 remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
             }
-            state.pr_comment_cursor = Some(max_updated.clone());
-            if pr_comment_cursor.is_none() {
-                state.pr_comment_lower = Some(fetched_at.unwrap_or(max_updated));
+            let next_lower = if pr_comment_cursor.is_none() {
+                Some(fetched_at.unwrap_or_else(|| max_updated.clone()))
             } else if complete {
-                state.pr_comment_lower = Some(lower.unwrap().max(max_updated));
+                Some(lower.unwrap().max(max_updated.clone()))
+            } else {
+                lower
+            };
+            if repo.emit_pr_activity {
+                state.pr_comment_cursor = Some(max_updated);
+                state.pr_comment_lower = next_lower;
+            } else {
+                state.issue_comment_cursor = Some(max_updated);
+                state.issue_comment_lower = next_lower;
             }
             if !complete {
                 emit_source_degraded(
@@ -2953,6 +3073,9 @@ async fn poll_pr_activity(
                 &format!("GitHub PR conversation comments fetch failed: {error}"),
             );
         }
+    }
+    if !repo.emit_pr_activity {
+        return Ok(state);
     }
     let comment_cursor = state.review_comment_cursor.clone();
     match fetch_pr_activity_pages::<GitHubReviewComment>(
@@ -7917,8 +8040,8 @@ mod tests {
         assert!(persisted["repo:org/repo"].terminal_runs.len() <= MAX_BASELINE_RUNS_PER_REPO);
 
         let requests = server.await.unwrap();
-        // Four CI polls; the issues/pulls endpoints add two requests per poll.
-        assert_eq!(requests.len(), 12);
+        // Four CI polls; issues, pulls, and issue comments add three requests per poll.
+        assert_eq!(requests.len(), 16);
         assert_eq!(
             requests
                 .iter()
@@ -8341,6 +8464,8 @@ mod tests {
             let responses = [
                 "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: 4\r\n\r\nboom",
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n[]",
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n[]",
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n[]",
             ];
 
             for response in responses {
@@ -8378,7 +8503,7 @@ mod tests {
         let source_task = tokio::spawn(async move { source.run(tx).await });
 
         tokio::time::timeout(Duration::from_secs(5), async {
-            while request_count.load(Ordering::SeqCst) < 2 {
+            while request_count.load(Ordering::SeqCst) < 4 {
                 tokio::task::yield_now().await;
             }
         })
@@ -8391,11 +8516,14 @@ mod tests {
         );
 
         let requests = server.await.unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests.iter().all(|request| {
-            request.contains("GET /repos/owner/private-repo/issues?")
-                || request.contains("GET /repos/owner/private-repo/issues ")
-        }));
+        assert_eq!(requests.len(), 4);
+        for (request, endpoint) in
+            requests
+                .iter()
+                .zip(["issues", "issues/comments", "issues", "issues/comments"])
+        {
+            assert!(request.contains(&format!("GET /repos/owner/private-repo/{endpoint}?")));
+        }
 
         source_task.abort();
         let _ = source_task.await;
@@ -8640,6 +8768,107 @@ mod tests {
     const ACTIVITY_T1: &str = "2030-01-01T00:01:00Z";
     const ACTIVITY_T2: &str = "2030-01-01T00:02:00Z";
 
+    fn issue_feed_comment(id: u64, created: &str, updated: &str) -> serde_json::Value {
+        let mut comment = activity_comment(id, 10, created, updated);
+        comment["html_url"] = json!(format!(
+            "https://github.com/org/repo/issues/10#issuecomment-{id}"
+        ));
+        comment
+    }
+
+    async fn assert_default_issue_comment_polls(extra: serde_json::Value, expected: usize) {
+        let initial = issue_feed_comment(1, ACTIVITY_T0, ACTIVITY_T0);
+        let fresh = issue_feed_comment(2, ACTIVITY_T1, ACTIVITY_T1);
+        let mut responses = Vec::new();
+        for (comments, emits) in [
+            (json!([initial]), false),
+            (json!([fresh]), true),
+            (extra, expected == 1),
+        ] {
+            // The old issue is outside the repository's 100-issue window.
+            responses.push(activity_response("/repos/org/repo/issues", json!([])));
+            responses.push(activity_response(
+                "/repos/org/repo/issues/comments",
+                comments,
+            ));
+            if emits {
+                responses.push(activity_response(
+                    "/repos/org/repo/issues/10",
+                    json!({
+                        "number": 10, "title": "Old issue", "state": "open", "comments": 3
+                    }),
+                ));
+            }
+        }
+        let (base, _, server) = activity_server(responses).await;
+        let mut harness = ActivityHarness::new(base);
+        harness.config.monitors.git.repos[0].emit_pr_activity =
+            GitRepoMonitor::default().emit_pr_activity;
+        assert!(harness.config.monitors.git.repos[0].emit_issue_opened);
+        assert!(!harness.config.monitors.git.repos[0].emit_pr_activity);
+        assert!(harness.poll().await.is_empty());
+        let first = harness.poll().await;
+        assert_eq!(first.len(), 1, "default config must notify on an old issue");
+        assert_eq!(first[0].canonical_kind(), "github.issue-commented");
+        assert_eq!(first[0].payload["number"], 10);
+        assert_eq!(first[0].payload["title"], "Old issue");
+        let later = harness.poll().await;
+        assert_eq!(later.len(), expected);
+        if expected == 1 {
+            assert_eq!(later[0].canonical_kind(), "github.issue-commented");
+            assert_eq!(later[0].payload["number"], 10);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn issue_380_default_old_issue_comment() {
+        assert_default_issue_comment_polls(
+            json!([issue_feed_comment(2, ACTIVITY_T1, ACTIVITY_T1)]),
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_380_later_second_comment() {
+        assert_default_issue_comment_polls(
+            json!([issue_feed_comment(3, ACTIVITY_T2, ACTIVITY_T2)]),
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_380_two_comments_one_event() {
+        assert_default_issue_comment_polls(
+            json!([
+                issue_feed_comment(3, ACTIVITY_T2, ACTIVITY_T2),
+                issue_feed_comment(4, ACTIVITY_T2, ACTIVITY_T2)
+            ]),
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_380_edited_old_comment() {
+        assert_default_issue_comment_polls(
+            json!([issue_feed_comment(1, ACTIVITY_T0, ACTIVITY_T2)]),
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_380_pr_comment_excluded() {
+        assert_default_issue_comment_polls(
+            json!([activity_comment(3, 10, ACTIVITY_T2, ACTIVITY_T2)]),
+            0,
+        )
+        .await;
+    }
+
     fn activity_scan_responses() -> Vec<ActivityResponse> {
         vec![
             activity_response("/repos/org/repo/issues", json!([])),
@@ -8668,13 +8897,24 @@ mod tests {
     #[tokio::test]
     async fn pr_activity_flag_off_keeps_requests_and_drops_pr_conversations() {
         let mut responses = Vec::new();
-        for comments in [1, 2] {
+        for (comments, id, created, updated) in [
+            (1, 1, ACTIVITY_T0, ACTIVITY_T0),
+            (1, 2, ACTIVITY_T1, ACTIVITY_T1),
+            (2, 2, ACTIVITY_T1, ACTIVITY_T2),
+        ] {
             responses.push(activity_response(
                 "/repos/org/repo/issues",
                 json!([
                     {"number": 10, "title": "An issue", "state": "open", "comments": comments},
                     {"number": 1, "title": "A PR", "state": "open", "comments": comments,
                      "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"}}
+                ]),
+            ));
+            responses.push(activity_response(
+                "/repos/org/repo/issues/comments",
+                json!([
+                    issue_feed_comment(id, created, updated),
+                    activity_comment(id + 10, 1, created, updated)
                 ]),
             ));
         }
@@ -8686,10 +8926,25 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.issue-commented");
         assert_eq!(events[0].payload["number"], 10);
+        assert!(
+            harness.poll().await.is_empty(),
+            "an edit and count delta must not replay a comment"
+        );
+        assert_eq!(
+            harness.repo_state().activity.emitted_issue_comment_ids,
+            [1, 2]
+        );
         assert_eq!(
             *requests.lock().unwrap(),
-            ["/repos/org/repo/issues?state=all&per_page=100"; 2],
-            "flag-off must preserve dev's exact request paths and count"
+            [
+                "/repos/org/repo/issues?state=all&per_page=100",
+                "/repos/org/repo/issues/comments?sort=updated&direction=desc&since=&per_page=100&page=1",
+                "/repos/org/repo/issues?state=all&per_page=100",
+                "/repos/org/repo/issues/comments?sort=updated&direction=asc&since=2029-12-31T23%3A59%3A59.000000000Z&per_page=100&page=1",
+                "/repos/org/repo/issues?state=all&per_page=100",
+                "/repos/org/repo/issues/comments?sort=updated&direction=asc&since=2030-01-01T00%3A00%3A59.000000000Z&per_page=100&page=1",
+            ],
+            "flag-off must fetch issue comments without fetching PR activity"
         );
         assert!(harness.repo_state().activity.review_watermark.is_none());
         assert!(harness.repo_state().activity.pr_comment_cursor.is_none());
@@ -10056,7 +10311,7 @@ mod tests {
             json!([]),
             json!([]),
         );
-        for _ in 0..3 {
+        for poll_index in 0..3 {
             let mut poll = activity_poll_responses(json!([]), json!([]), json!([]));
             poll[2].1 = json!(&comments[..100]);
             poll[2].3 = Some("/repos/org/repo/issues/comments?page=2".into());
@@ -10070,6 +10325,14 @@ mod tests {
                 }
                 responses.push(response);
             }
+            if poll_index == 0 {
+                responses.push(activity_response(
+                    "/repos/org/repo/issues/2",
+                    json!({
+                        "number": 2, "title": "An issue", "state": "open", "comments": 999
+                    }),
+                ));
+            }
             responses.push(inline);
         }
         activity_lookup_after_feed(&mut responses, "/repos/org/repo/issues/comments", 1, &[1]);
@@ -10077,6 +10340,13 @@ mod tests {
         let mut harness = ActivityHarness::new(base);
         assert!(harness.poll().await.is_empty());
         let events = harness.poll().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].canonical_kind(), "github.issue-commented");
+        assert_eq!(events[0].payload["number"], 2);
+        let events: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.canonical_kind().starts_with("github.pr-"))
+            .collect();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].canonical_kind(), "github.pr-commented");
         assert_eq!(events[0].payload["comment_id"], 2);
@@ -10783,10 +11053,33 @@ mod tests {
             1,
             &[42, 43],
         );
+        let feed = responses
+            .iter()
+            .enumerate()
+            .filter(|(_, response)| response.0 == "/repos/org/repo/issues/comments")
+            .nth(1)
+            .unwrap()
+            .0;
+        responses.insert(
+            feed + 1,
+            activity_response(
+                "/repos/org/repo/issues/1",
+                json!({
+                    "number": 1, "title": "An issue", "state": "open", "comments": 1
+                }),
+            ),
+        );
         let (base, _, server) = activity_server(responses).await;
         let mut harness = ActivityHarness::new(base);
         assert!(harness.poll().await.is_empty());
         let events = harness.poll().await;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].canonical_kind(), "github.issue-commented");
+        assert_eq!(events[0].payload["number"], 1);
+        let events: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.canonical_kind().starts_with("github.pr-"))
+            .collect();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].payload["number"], 42);
         assert_eq!(events[1].payload["number"], 43);
@@ -10814,10 +11107,33 @@ mod tests {
             json!([]),
         ));
         activity_lookup_after_feed(&mut responses, "/repos/org/repo/issues/comments", 1, &[42]);
+        let feed = responses
+            .iter()
+            .enumerate()
+            .filter(|(_, response)| response.0 == "/repos/org/repo/issues/comments")
+            .nth(1)
+            .unwrap()
+            .0;
+        responses.insert(
+            feed + 1,
+            activity_response(
+                "/repos/org/repo/issues/42",
+                json!({
+                    "number": 42, "title": "An issue", "state": "open", "comments": 1
+                }),
+            ),
+        );
         let (base, _, server) = activity_server(responses).await;
         let mut harness = ActivityHarness::new(base);
         assert!(harness.poll().await.is_empty());
         let events = harness.poll().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].canonical_kind(), "github.issue-commented");
+        assert_eq!(events[0].payload["number"], 42);
+        let events: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.canonical_kind().starts_with("github.pr-"))
+            .collect();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].payload["comment_id"], 2);
         assert_eq!(events[0].payload["number"], 42);
