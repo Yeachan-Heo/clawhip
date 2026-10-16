@@ -944,11 +944,16 @@ While pinned at second T, newer delivery has its own timestamp-only scan of
 `(T, now]`, using exclusive `since=T`. Every poll first fetches page one of this
 fresh head, even with a saved newer cursor. Up to three following requests go
 to newer-range pagination, leaving **at least one request for enumerating T**;
-unused newer requests go to T (an empty newer head leaves four tie pages). A
+unused newer requests go to T. An empty newer head leaves four tie pages only
+when no newer continuation is saved; an empty stale continuation costs one
+request, is then cleared, and leaves three tie pages. A
 newer scan starting afresh reuses the head as its first page. If it does not
 finish, it saves `before=<oldest received updated_at + 1s>` and restarts at page
 one of that timestamp window next poll, deduplicating the overlap by thread ID
-and `updated_at`. On completion it restarts fresh next poll. This delivery scan
+and `updated_at`. If a continuation exhausts its budget without moving `before`
+strictly older than its starting value, that stalled cursor is cleared so the
+next poll restarts from the fresh head. On completion it also restarts fresh
+next poll. This delivery scan
 never advances W or proves tie coverage. Thus, once the inbox stabilizes, a
 newer range with distinct timestamps drains across polls while T also receives
 enumeration requests; fresh head overflow cannot wait forever behind T.
@@ -957,9 +962,16 @@ enumeration requests; fresh head overflow cannot wait forever behind T.
 recursively enumerate oversized same-second groups. A group of more than 200
 newer threads at one second cannot fit its restarting budget (head plus three
 pages); a saved continuation has only three pages, so even a group of more than
-150 threads at its boundary can pin it. Unseen threads in that group and newer
-updates below it may then wait indefinitely until the group shrinks. The fresh
-head and the original T enumeration still run, with W conservatively pinned.
+150 threads at its boundary can stall it. Restarting a stalled cursor prevents
+distinct-timestamp arrivals above that group from being stranded between the
+head and the saved boundary: once the inbox freezes, each continuation either
+moves older or restarts a head-based scan. In the 201-thread nested-group case,
+51 distinct arrivals above it all arrive within two successful polls (one to
+clear the stalled cursor, then one head-based scan to reach the 51st arrival).
+Unseen threads inside or below the oversized nested second can still wait
+indefinitely until the group shrinks; restarting does not enumerate that group
+recursively or prove its coverage. The fresh head and the original T enumeration
+still run, with W conservatively pinned.
 Avoiding recursive cursor trees keeps state and request allocation bounded;
 this is a delivery limitation, not a claim of complete coverage.
 

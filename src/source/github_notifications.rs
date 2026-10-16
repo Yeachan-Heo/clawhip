@@ -405,6 +405,10 @@ async fn fetch_threads(
                             .ok_or("GitHub notifications newer pagination without threads")?
                             + time::Duration::seconds(1),
                     )
+                    // A nested second can exhaust this budget without moving
+                    // the boundary. Restart from the head next poll so distinct
+                    // arrivals above that second cannot remain hidden behind it.
+                    .filter(|before| newer_before.is_none_or(|previous| *before < previous))
                 };
             }
             continue;
@@ -1537,13 +1541,13 @@ mod tests {
             .unwrap()
             .threads
             .extend((0..260).map(|id| thread(&format!("newer-{id}"), NEWER)));
-        for _ in 0..12 {
+        for poll in 0..12 {
             bounded_poll(&server, &config, &client, &tx, &mut state).await;
             ids.extend(received_ids(&mut rx));
             assert_eq!(state.watermark, watermark);
             assert_eq!(
                 state.catch_up.as_ref().unwrap().newer_before,
-                Some(newer + time::Duration::seconds(1))
+                (poll % 2 == 0).then_some(newer + time::Duration::seconds(1))
             );
         }
         assert_eq!(
@@ -1559,6 +1563,116 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 800);
+    }
+
+    #[tokio::test]
+    async fn notifications_stalled_newer_cursor_restarts_above_nested_tie_transactionally() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut state = MonitorState::default();
+        inbox.lock().unwrap().threads = vec![thread("baseline", OLD)];
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let watermark = state.watermark;
+        fill_inbox(&inbox, 600, true);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            ids.extend(received_ids(&mut rx));
+        }
+        assert!(state.catch_up.as_ref().unwrap().tied);
+        let nested = OffsetDateTime::parse(NEWER, &Rfc3339).unwrap();
+        inbox
+            .lock()
+            .unwrap()
+            .threads
+            .extend((0..201).map(|id| thread(&format!("nested-{id}"), NEWER)));
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let delivered = received_ids(&mut rx);
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|id| id.starts_with("nested-"))
+                .count(),
+            200
+        );
+        ids.extend(delivered);
+        assert_eq!(
+            state.catch_up.as_ref().unwrap().newer_before,
+            Some(nested + time::Duration::seconds(1))
+        );
+        inbox.lock().unwrap().threads.extend((1..=51).map(|id| {
+            let updated = nested + time::Duration::seconds(id);
+            thread(&format!("arrival-{id}"), &updated.format(&Rfc3339).unwrap())
+        }));
+        // Freeze the inbox. A failure on T happens after the local stalled
+        // cursor was cleared; none of that poll's delivery/state may commit.
+        let baseline = (
+            state.watermark,
+            state.catch_up.clone(),
+            state.threads.clone(),
+            state.order.clone(),
+            state.cutoff,
+            state.last_modified.clone(),
+        );
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.fail_at = Some(inbox.requests + MAX_PAGES);
+        }
+        let start = server.requests.lock().unwrap().len();
+        assert!(poll_once(&config, &client, &tx, &mut state).await.is_err());
+        assert_eq!(server.requests.lock().unwrap().len() - start, MAX_PAGES);
+        assert_eq!(
+            (
+                state.watermark,
+                state.catch_up.clone(),
+                state.threads.clone(),
+                state.order.clone(),
+                state.cutoff,
+                state.last_modified.clone(),
+            ),
+            baseline
+        );
+        assert!(rx.try_recv().is_err());
+        for poll in 0..12 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            let delivered = received_ids(&mut rx);
+            if poll == 0 {
+                assert_eq!(
+                    delivered
+                        .iter()
+                        .filter(|id| id.starts_with("arrival-"))
+                        .count(),
+                    50
+                );
+                assert!(!delivered.iter().any(|id| id == "arrival-1"));
+                assert!(state.catch_up.as_ref().unwrap().newer_before.is_none());
+            }
+            if poll == 1 {
+                assert_eq!(
+                    delivered
+                        .iter()
+                        .filter(|id| id.starts_with("arrival-"))
+                        .count(),
+                    1
+                );
+                assert!(delivered.iter().any(|id| id == "arrival-1"));
+            }
+            ids.extend(delivered);
+            assert_eq!(state.watermark, watermark);
+            assert!(state.catch_up.as_ref().unwrap().tied);
+        }
+        // Restarting serves arrivals above U, not recursive coverage of U.
+        assert!(!ids.iter().any(|id| id == "nested-200"));
+        assert_eq!(ids.len(), 600 + 200 + 51);
+        for id in (0..600)
+            .map(|id| id.to_string())
+            .chain((0..200).map(|id| format!("nested-{id}")))
+            .chain((1..=51).map(|id| format!("arrival-{id}")))
+        {
+            assert_eq!(ids.iter().filter(|seen| **seen == id).count(), 1, "{id}");
+        }
     }
 
     #[tokio::test]
@@ -1580,6 +1694,43 @@ mod tests {
         assert_eq!(server.requests.lock().unwrap().len() - start, 5);
         assert_eq!(state.catch_up.as_ref().unwrap().page, 9);
         assert!(state.catch_up.as_ref().unwrap().newer_before.is_none());
+    }
+
+    #[tokio::test]
+    async fn notifications_pinned_stale_newer_cursor_leaves_three_tie_pages_then_clears() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut state = MonitorState::default();
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        fill_inbox(&inbox, 600, true);
+        for _ in 0..2 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            received_ids(&mut rx);
+        }
+        inbox
+            .lock()
+            .unwrap()
+            .threads
+            .extend((0..201).map(|id| thread(&format!("newer-{id}"), NEWER)));
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        received_ids(&mut rx);
+        assert!(state.catch_up.as_ref().unwrap().newer_before.is_some());
+        let page = state.catch_up.as_ref().unwrap().page;
+        inbox
+            .lock()
+            .unwrap()
+            .threads
+            .retain(|thread| thread["updated_at"] == NEW);
+        let start = server.requests.lock().unwrap().len();
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(server.requests.lock().unwrap().len() - start, 5);
+        assert_eq!(state.catch_up.as_ref().unwrap().page, page + 3);
+        assert!(state.catch_up.as_ref().unwrap().newer_before.is_none());
+        let delivered = received_ids(&mut rx);
+        assert_eq!(delivered.len(), 150);
+        assert!(delivered.iter().all(|id| !id.starts_with("newer-")));
     }
 
     async fn contraction_reconciles_600(update_head: bool) {
