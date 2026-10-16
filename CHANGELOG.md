@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.6.16 - 2026-10-16
+
+### Highlights
+
+- add opt-in GitHub notifications source to poll authenticated user's notification inbox across all repositories
+- fix PR metadata resolution for activity comments that fall outside the PR date window
+
+### Upgrade notes
+
+- crate version is now `0.6.16`
+- new `[monitors.github_notifications]` source is optional and disabled by default
+- to enable notifications polling, set `[monitors.github_notifications]` with `enabled = true`
+- GitHub notifications API requires a classic personal access token (PAT) with `notifications` or `repo` scope; fine-grained personal access tokens are not supported
+- credentials are read from `CLAWHIP_GITHUB_TOKEN` environment variable, then `monitors.github_token` config field, then `gh auth token`
+- when enabled, the daemon polls the authenticated user's notification inbox; only activity in your inbox is observed (your PRs/issues, mentions, and review requests)
+- new event type `github.notification` is emitted for each notification thread; see README for filtering examples
+- existing PR activity and notification configuration remain fully compatible; no migration required
+
 ## 0.6.15 - 2026-10-16
 
 ### Highlights
