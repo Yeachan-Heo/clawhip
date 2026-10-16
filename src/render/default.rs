@@ -133,6 +133,48 @@ impl Renderer for DefaultRenderer {
             ),
             ("github.issue-closed", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
+            (
+                kind
+                @ ("github.pr-commented" | "github.pr-review-commented" | "github.pr-reviewed"),
+                format,
+            ) => {
+                let action = match kind {
+                    "github.pr-reviewed" => string_field(payload, "state")?,
+                    "github.pr-review-commented" => "inline comment".to_string(),
+                    _ => "commented".to_string(),
+                };
+                match format {
+                    MessageFormat::Raw => serde_json::to_string_pretty(payload)?,
+                    MessageFormat::Compact => format!(
+                        "{}#{} {} by {}: {} {}",
+                        string_field(payload, "repo")?,
+                        payload.field_u64("number")?,
+                        action,
+                        string_field(payload, "author")?,
+                        string_field(payload, "title")?,
+                        string_field(payload, "url")?
+                    ),
+                    MessageFormat::Alert => format!(
+                        "GitHub PR {} in {}: #{} {} by {} {}",
+                        action,
+                        string_field(payload, "repo")?,
+                        payload.field_u64("number")?,
+                        string_field(payload, "title")?,
+                        string_field(payload, "author")?,
+                        string_field(payload, "url")?
+                    ),
+                    MessageFormat::Inline => format!(
+                        "[GitHub PR {}] {}#{} {} by {} {}",
+                        action,
+                        string_field(payload, "repo")?,
+                        payload.field_u64("number")?,
+                        string_field(payload, "title")?,
+                        string_field(payload, "author")?,
+                        string_field(payload, "url")?
+                    ),
+                }
+            }
+
             ("git.commit", MessageFormat::Compact) => format!(
                 "git:{}@{} {} {}",
                 git_repo_label(payload)?,

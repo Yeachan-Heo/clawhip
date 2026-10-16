@@ -42,6 +42,9 @@ const REQUIRED_RECEIPT_FAMILIES: &[&str] = &[
 const SUPPORTED_EVENTS: &[&str] = &[
     "github.issue-opened",
     "github.issue-commented",
+    "github.pr-commented",
+    "github.pr-review-commented",
+    "github.pr-reviewed",
     "github.issue-closed",
     "github.pr-status-changed",
     "github.release-published",
@@ -2889,6 +2892,12 @@ routes:
     command: gajae handle github.issue-opened
   github.issue-commented:
     command: gajae handle github.issue-commented
+  github.pr-commented:
+    command: gajae handle github.pr-commented
+  github.pr-review-commented:
+    command: gajae handle github.pr-review-commented
+  github.pr-reviewed:
+    command: gajae handle github.pr-reviewed
   github.issue-closed:
     command: gajae handle github.issue-closed
   github.pr-status-changed:
