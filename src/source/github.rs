@@ -2498,6 +2498,21 @@ fn remember_activity_id(ids: &mut VecDeque<u64>, id: u64) {
     }
 }
 
+/// Ends pending ownership of a delivered comment. Its dedupe receipt may have
+/// been evicted while it waited for metadata, so move it to the newest end of
+/// the matching feed FIFO; otherwise the feed could emit an edit of it again.
+fn refresh_delivered_comment_id(state: &mut PRActivityState, comment: &PendingPRComment) {
+    let ids = if comment.path.is_some() {
+        &mut state.emitted_review_comment_ids
+    } else {
+        &mut state.emitted_pr_comment_ids
+    };
+    if let Some(index) = ids.iter().position(|id| *id == comment.id) {
+        ids.remove(index);
+    }
+    remember_activity_id(ids, comment.id);
+}
+
 fn pr_comment_payload(
     repo: &str,
     number: u64,
@@ -2691,6 +2706,7 @@ async fn drain_pending_comments(
         }
         if let Some(metadata) = known_pr_metadata(comment.number, state, prs) {
             emit_pending_comment(&comment, metadata.as_ref(), repo, repo_name, tx).await?;
+            refresh_delivered_comment_id(state, &comment);
         } else {
             if matches!(attempted.get(&comment.number), Some(MetadataLookup::Failed))
                 && counted.insert((comment.path.is_some(), comment.id))
@@ -2703,6 +2719,7 @@ async fn drain_pending_comments(
                     "GitHub PR metadata attempt cap reached; emitting empty metadata",
                 );
                 emit_pending_comment(&comment, None, repo, repo_name, tx).await?;
+                refresh_delivered_comment_id(state, &comment);
             } else {
                 retained.push_back(comment);
             }
@@ -2737,6 +2754,7 @@ async fn accept_activity_comment(
                 "GitHub PR metadata pending queue overflow; emitting oldest comment",
             );
             emit_pending_comment(&oldest, metadata.as_ref(), repo, repo_name, tx).await?;
+            refresh_delivered_comment_id(state, &oldest);
         }
         state.pending_comments.push_back(comment);
     }

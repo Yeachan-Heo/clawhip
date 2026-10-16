@@ -811,8 +811,11 @@ cached as unavailable and emits with empty `title`/`pr_author` (until cache
 eviction or restart). Other failures, including missing PR authors, retry for at
 most 10 attempts before emitting empty metadata and reporting degraded operation.
 403/429 use shared rate-limit backoff without consuming an attempt. Queue overflow
-emits the oldest pending comment with available metadata rather than dropping it;
-overflow, give-up and budget deferral report throttled source degradation.
+emits the oldest unresolved comment rather than dropping it. Overflow and
+attempt-cap emissions carry empty `title`/`pr_author`, so routes filtering on
+`pr_author` do not match them; routing falls back according to route configuration.
+Overflow, give-up and budget deferral report throttled source degradation.
+The pending queue is in-memory: a restart drops unresolved queued comments.
 `pr_author` can be used in route payload filters to select your PRs. Comment and
 review **body text is never included** in these public-safe event payloads.
 Pending and dismissed reviews are not emitted, nor are edits to old comments.

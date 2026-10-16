@@ -67,6 +67,132 @@ async fn pr_activity_metadata_queue_inline_fifo_eviction_no_replay() {
     assert_metadata_queue_fifo_eviction_no_replay(true).await;
 }
 
+// Keep L at T1 while 1000 new, known-metadata comments evict pending ID 1.
+fn activity_pending_receipt_eviction(inline: bool, attempts_before_cap: usize) -> Vec<ActivityResponse> {
+    let feed = activity_comment_feed(inline);
+    let mut responses = activity_comment_poll(inline, json!([
+        activity_comment(0, 1, ACTIVITY_T0, ACTIVITY_T0)
+    ]));
+    for attempt in 0..attempts_before_cap {
+        let comments = if attempt == 0 {
+            json!([activity_comment(1, 99, ACTIVITY_T1, ACTIVITY_T1)])
+        } else { json!([]) };
+        let mut batch = activity_comment_poll(inline, comments);
+        if attempt == 0 { activity_lookup_after_feed(&mut batch, feed, 0, &[99]); }
+        else { activity_lookup_before_feeds(&mut batch, 0, &[99]); }
+        batch.iter_mut().find(|response| response.0 == "/repos/org/repo/pulls/99").unwrap().2 = 500;
+        responses.extend(batch);
+    }
+    let mut capped = activity_poll_responses(json!([]), json!([activity_pr(1, ACTIVITY_T0)]), json!([]));
+    activity_lookup_before_feeds(&mut capped, 0, &[99]);
+    capped.iter_mut().find(|response| response.0 == "/repos/org/repo/pulls/99").unwrap().2 = 500;
+    if inline { capped.pop(); } else { capped.truncate(3); }
+    responses.extend(capped);
+    for page in 0..MAX_COMMENT_PAGES {
+        let comments: Vec<_> = (page * 100 + 2..=page * 100 + 101).map(|id| {
+            let time = activity_second(id as u64 + 60);
+            activity_comment(id as u64, 1, &time, &time)
+        }).collect();
+        let mut response = activity_response(feed, json!(comments));
+        response.3 = Some(format!("{feed}?page={}", page + 2));
+        responses.push(response);
+    }
+    if !inline { responses.push(activity_response("/repos/org/repo/pulls/comments", json!([]))); }
+    responses.push(activity_response("/repos/org/repo/pulls/1/reviews", json!([])));
+    responses
+}
+
+fn assert_pending_receipt_evicted(harness: &ActivityHarness, inline: bool) {
+    let activity = &harness.repo_state().activity;
+    let (position, lower, ids) = if inline {
+        (&activity.review_comment_cursor, &activity.review_comment_lower, &activity.emitted_review_comment_ids)
+    } else { (&activity.pr_comment_cursor, &activity.pr_comment_lower, &activity.emitted_pr_comment_ids) };
+    assert_eq!(position.as_deref(), Some(activity_second(1061).as_str()));
+    assert_eq!(lower.as_deref(), Some(ACTIVITY_T1), "the capped fetch must hold L");
+    assert!(!ids.contains(&1), "pending ID 1 must actually leave the feed FIFO");
+    assert_eq!(activity.pending_comments.len(), 1);
+    assert_eq!(activity.pending_comments[0].id, 1);
+    assert_eq!(activity.pending_comments[0].path.is_some(), inline);
+}
+
+async fn assert_pending_delivery_refreshes_evicted_receipt(inline: bool) {
+    let mut responses = activity_pending_receipt_eviction(inline, 1);
+    let mut recovery = activity_comment_poll(inline, json!([
+        activity_comment(1, 99, ACTIVITY_T1, &activity_second(1062))
+    ]));
+    activity_lookup_before_feeds(&mut recovery, 0, &[99]);
+    responses.extend(recovery);
+    let (base, _, server) = activity_server(responses).await;
+    let mut harness = ActivityHarness::new(base);
+    assert!(harness.poll().await.is_empty());
+    assert!(harness.poll().await.is_empty());
+    let mut events = harness.poll().await;
+    assert_eq!(events.len(), 1000);
+    assert_pending_receipt_evicted(&harness, inline);
+    events.extend(harness.poll().await);
+    let delivered: Vec<_> = events.iter().filter(|event| event.payload["comment_id"] == 1).collect();
+    assert_eq!(delivered.len(), 1, "pending delivery and its same-poll edit must emit once total");
+    assert_eq!(delivered[0].payload["pr_author"], "pr-owner");
+    assert_eq!(delivered[0].payload["title"], "A PR");
+    assert!(harness.repo_state().activity.pending_comments.is_empty());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn pr_activity_metadata_queue_conversation_delivery_refreshes_evicted_receipt() {
+    assert_pending_delivery_refreshes_evicted_receipt(false).await;
+}
+
+#[tokio::test]
+async fn pr_activity_metadata_queue_inline_delivery_refreshes_evicted_receipt() {
+    assert_pending_delivery_refreshes_evicted_receipt(true).await;
+}
+
+#[tokio::test]
+async fn pr_activity_metadata_queue_give_up_and_overflow_refresh_evicted_receipt() {
+    for inline in [false, true] {
+        for give_up in [true, false] {
+            let attempts = if give_up { MAX_METADATA_ATTEMPTS - 2 } else { 1 };
+            let mut responses = activity_pending_receipt_eviction(inline, attempts);
+            let mut comments: Vec<_> = if give_up { Vec::new() } else {
+                (1002..1002 + MAX_PENDING_PR_COMMENTS as u64).map(|id| {
+                    activity_comment(id, 99, &activity_second(1062), &activity_second(1062))
+                }).collect()
+            };
+            comments.push(activity_comment(1, 99, ACTIVITY_T1, &activity_second(1063)));
+            let mut delivery = activity_comment_poll(inline, json!(comments));
+            activity_lookup_before_feeds(&mut delivery, 0, &[99]);
+            delivery.iter_mut().find(|response| response.0 == "/repos/org/repo/pulls/99").unwrap().2 = 500;
+            responses.extend(delivery);
+            let mut recovery = activity_comment_poll(inline, json!([]));
+            if !give_up { activity_lookup_before_feeds(&mut recovery, 0, &[99]); }
+            responses.extend(recovery);
+            let (base, _, server) = activity_server(responses).await;
+            let mut harness = ActivityHarness::new(base);
+            assert!(harness.poll().await.is_empty());
+            for _ in 0..attempts { assert!(harness.poll().await.is_empty()); }
+            let mut events = harness.poll().await;
+            assert_eq!(events.len(), 1000);
+            assert_pending_receipt_evicted(&harness, inline);
+            let delivery = harness.poll().await;
+            assert_eq!(delivery.len(), 1, "give_up={give_up}, inline={inline}");
+            assert_eq!(delivery[0].payload["comment_id"], 1);
+            assert_eq!(delivery[0].payload["pr_author"], "");
+            assert_eq!(delivery[0].payload["title"], "");
+            let activity = &harness.repo_state().activity;
+            let ids = if inline { &activity.emitted_review_comment_ids } else { &activity.emitted_pr_comment_ids };
+            assert!(ids.contains(&1), "every pending delivery must refresh its receipt");
+            assert!(!activity.pending_comments.iter().any(|comment| comment.id == 1));
+            events.extend(delivery);
+            events.extend(harness.poll().await);
+            assert_eq!(events.iter().filter(|event| event.payload["comment_id"] == 1).count(), 1);
+            assert_eq!(events.len(), 1001 + if give_up { 0 } else { MAX_PENDING_PR_COMMENTS });
+            assert!(harness.repo_state().activity.pending_comments.is_empty());
+            server.await.unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn pr_activity_metadata_queue_saturation_is_fair_and_reports_deferral() {
     let mut responses = activity_poll_responses(
