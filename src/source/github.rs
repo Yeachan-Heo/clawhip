@@ -2022,6 +2022,7 @@ struct PRActivityState {
     review_comment_lower: Option<String>,
     emitted_review_comment_ids: VecDeque<u64>,
     emitted_pr_comment_ids: VecDeque<u64>,
+    emitted_issue_comment_ids: VecDeque<u64>,
     review_watermark: Option<String>,
     review_scan: Option<ReviewScan>,
     emitted_review_ids: VecDeque<u64>,
@@ -2287,6 +2288,7 @@ async fn poll_github(
             &activity_prs,
             activity_window_complete,
             activity_baseline_cutoff.as_deref(),
+            &issues,
             tx,
         )
         .await?;
@@ -2838,6 +2840,7 @@ async fn poll_pr_activity(
     prs: &HashMap<u64, PullRequestSnapshot>,
     prs_complete: bool,
     baseline_cutoff: Option<&str>,
+    issues: &HashMap<u64, IssueSnapshot>,
     tx: &mpsc::Sender<IncomingEvent>,
 ) -> Result<PRActivityState> {
     if !repo.emit_pr_activity {
@@ -2899,40 +2902,71 @@ async fn poll_pr_activity(
                 .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
             let lower = state.pr_comment_lower.clone();
             for comment in comments {
-                let Some(number) = comment.pr_number() else {
-                    continue;
-                };
-                if state.emitted_pr_comment_ids.contains(&comment.id)
-                    || state
-                        .pending_comments
-                        .iter()
-                        .any(|pending| pending.path.is_none() && pending.id == comment.id)
-                {
-                    continue;
-                }
-                if let Some(lower) = lower.as_deref() {
-                    if comment.created_at.as_str() < lower {
+                // Process PR comments
+                if let Some(number) = comment.pr_number() {
+                    if state.emitted_pr_comment_ids.contains(&comment.id)
+                        || state
+                            .pending_comments
+                            .iter()
+                            .any(|pending| pending.path.is_none() && pending.id == comment.id)
+                    {
                         continue;
                     }
-                    accept_activity_comment(
-                        PendingPRComment {
-                            id: comment.id,
-                            number,
-                            author: comment.user.map(|user| user.login).unwrap_or_default(),
-                            url: comment.html_url,
-                            path: None,
-                            created_at: comment.created_at,
-                            attempts: 0,
-                        },
-                        &mut state,
-                        prs,
-                        repo,
-                        &snapshot.repo_name,
-                        tx,
-                    )
-                    .await?;
+                    if let Some(lower) = lower.as_deref() {
+                        if comment.created_at.as_str() < lower {
+                            continue;
+                        }
+                        accept_activity_comment(
+                            PendingPRComment {
+                                id: comment.id,
+                                number,
+                                author: comment.user.map(|user| user.login).unwrap_or_default(),
+                                url: comment.html_url,
+                                path: None,
+                                created_at: comment.created_at,
+                                attempts: 0,
+                            },
+                            &mut state,
+                            prs,
+                            repo,
+                            &snapshot.repo_name,
+                            tx,
+                        )
+                        .await?;
+                    }
+                    remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
+                } else if repo.emit_issue_opened {
+                    // Process issue comments
+                    if let Some(number) = comment.issue_number() {
+                        if state.emitted_issue_comment_ids.contains(&comment.id) {
+                            continue;
+                        }
+                        if let Some(lower) = lower.as_deref()
+                            && comment.created_at.as_str() < lower
+                        {
+                            continue;
+                        }
+                        // Find the issue title from the issues we already fetched
+                        let issue_title = issues
+                            .get(&number)
+                            .map(|issue| issue.title.clone())
+                            .unwrap_or_default();
+                        send_event(
+                            tx,
+                            IncomingEvent::github_issue_commented(
+                                snapshot.repo_name.clone(),
+                                number,
+                                issue_title,
+                                issues.get(&number).map(|i| i.comments).unwrap_or(0),
+                                repo.channel.clone(),
+                            )
+                            .with_mention(repo.mention.clone())
+                            .with_format(repo.format.clone()),
+                        )
+                        .await?;
+                        remember_activity_id(&mut state.emitted_issue_comment_ids, comment.id);
+                    }
                 }
-                remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
             }
             state.pr_comment_cursor = Some(max_updated.clone());
             if pr_comment_cursor.is_none() {
@@ -4358,6 +4392,28 @@ impl GitHubComment {
         let path = url.path().strip_prefix("/api/v3").unwrap_or(url.path());
         let mut segments = path.strip_prefix("/repos/")?.split('/').skip(2);
         if segments.next() == Some("pulls") {
+            segments.next()?.parse().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Extract issue number from URL. Returns None for PR comments.
+    fn issue_number(&self) -> Option<u64> {
+        if let Ok(url) = reqwest::Url::parse(&self.html_url)
+            && let Some(segments) = url.path_segments()
+        {
+            let mut segments = segments.skip(2);
+            if let Some(first) = segments.next()
+                && first == "issues"
+            {
+                return segments.next()?.parse().ok();
+            }
+        }
+        let url = reqwest::Url::parse(&self.issue_url).ok()?;
+        let path = url.path().strip_prefix("/api/v3").unwrap_or(url.path());
+        let mut segments = path.strip_prefix("/repos/")?.split('/').skip(2);
+        if segments.next() == Some("issues") {
             segments.next()?.parse().ok()
         } else {
             None
@@ -8722,7 +8778,6 @@ mod tests {
         responses.retain(|response| response.0 != "/repos/org/repo/issues");
         let (base, _, server) = activity_server(responses).await;
         let mut harness = ActivityHarness::new(base);
-        harness.config.monitors.git.repos[0].emit_issue_opened = false;
         assert!(harness.poll().await.is_empty());
         let events = harness.poll().await;
         assert_eq!(events.len(), 1);
@@ -10075,6 +10130,8 @@ mod tests {
         activity_lookup_after_feed(&mut responses, "/repos/org/repo/issues/comments", 1, &[1]);
         let (base, _, server) = activity_server(responses).await;
         let mut harness = ActivityHarness::new(base);
+        // For this test, disable issue comment emission since it tests PR dedup behavior
+        harness.config.monitors.git.repos[0].emit_issue_opened = false;
         assert!(harness.poll().await.is_empty());
         let events = harness.poll().await;
         assert_eq!(events.len(), 1);
