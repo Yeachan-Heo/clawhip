@@ -727,12 +727,97 @@ Verification:
 - `clawhip status`
 - `systemctl status clawhip` when systemd-enabled
 
+## GitHub pull request activity (opt-in)
+
+Enable all three activity events on a Git repository monitor:
+
+```toml
+[[monitors.git.repos]]
+path = "/path/to/repo"
+github_repo = "owner/repo"
+emit_pr_activity = true
+```
+
+`emit_pr_activity` defaults to `false`, including for existing configurations.
+It is independent of `emit_pr_status` and `emit_issue_opened`. When disabled,
+the poller makes no additional requests and continues to ignore PR conversation comments.
+Route these events with `github.*` or their individual kinds:
+
+| Event | Activity | Extra payload fields |
+| --- | --- | --- |
+| `github.pr-commented` | PR conversation comment | `comment_id` |
+| `github.pr-review-commented` | Inline review comment | `comment_id`, `path` |
+| `github.pr-reviewed` | Submitted review | `review_id`, `state` (`approved`, `changes_requested`, `commented`) |
+
+All three payloads include `repo`, `number`, `title`, `author`, `pr_author`, and
+`url` (the comment/review permalink). Unknown PR titles/authors are empty strings;
+`pr_author` can be used in route payload filters to select your PRs. Comment and
+review **body text is never included** in these public-safe event payloads.
+Pending and dismissed reviews are not emitted, nor are edits to old comments.
+
+API cost per poll: conversation comments use an activity-owned repository
+`/issues/comments` feed; inline comments use the repository `/pulls/comments` feed
+(each up to 10 pages, 100 items/page), independent of the PR list so older PRs are
+still detected. The conversation feed adds one request per poll when unpaginated;
+it ignores issue comments and does not change the existing issue-comment count-delta
+poller or enable issue polling when disabled. PR conversation IDs have their own bounded deduplication FIFO;
+issue-comment churn or a CI-baseline persistence failure does not replay them.
+
+Cold start itself emits no activity and does not traverse full history. Conversation and inline
+comments read only the newest page (`sort=updated&direction=desc`) and seed all
+received PR-comment IDs. Reviews read only the newest PR page and seed reviews on PRs sharing
+that page's newest `updated_at`; more than 20 such PRs span polls without emission.
+Each cold fetch's server `Date` establishes its creation/submission eligibility
+lower bound L, falling back to the newest observed update when Date is missing or
+invalid. Later notifications require `created_at` / `submitted_at` >= L and an
+unseen ID, so unseen historical boundary items older than that cutoff do not replay.
+Timestamps have second precision: unseen historical items in the cutoff second
+cannot be distinguished from new same-second activity, especially with the fallback.
+
+After baseline, each comment feed uses its own updated-at pagination position P
+with ascending updates and `since=P-1s`. The 10-page cap reports source degradation
+and advances P to the last received update, but holds creation eligibility L fixed
+until the backlog drains. Thus a newly created comment edited before its first
+delivery is still eligible even when its creation precedes P. A completed fetch
+advances L to the maximum consumed update (never backwards); all updates through
+that position have been consumed. A failed fetch preserves both P and L. Only
+delivered IDs or deliberately seeded cold IDs enter the deduplication FIFO.
+
+Reviews build a separate updated-desc PR window (up to 5 pages, 500 PRs), stopping
+only below the committed submission watermark. Boundary-second PRs are always
+rechecked; review IDs prevent duplicate notifications. A scan stores its fixed
+submission lower bound and pending PRs, fetching at most 20 PRs per poll (up to
+10 pages of reviews per PR), oldest update first. No PR-list request is needed
+while that scan drains. The watermark advances to the window's newest PR update
+only when every pending PR succeeds; an individual failure or review-page cap
+reports throttled source degradation, requeues that PR, and retains the watermark.
+Thus reviews submitted before a PR's later update are not lost across scan polls.
+
+If more than 500 PRs have updated since the watermark, the PR-list cap still
+processes the newest 500-PR window and commits its upper bound on completion.
+It explicitly reports source degradation: **reviews on PRs outside that window
+may be lost**, rather than allowing a permanent backlog to starve progress.
+Pagination is not a transactional snapshot. Deduplication is in-memory and
+bounded to 1,000 IDs per activity kind; overlapping windows larger than that
+cache can replay IDs. Exactly 1,000 updates in either comment feed at the inclusive cursor second
+can fill every resumable window and block any later comment (as can larger ties).
+The conversation feed shares GitHub's `/issues/comments` endpoint with issue
+comments: filtering issue comments does not remove their pagination cost, so they
+occupy the same page slots and 10-page budget. A burst of issue comments can delay
+PR conversation notifications, and 1,000 issue comments tied at the cursor second
+can stall them as above.
+A PR with over 1,000 reviews can keep its
+scan waiting at the per-PR page cap. Restarting establishes fresh baselines.
+
 ## Preset event families
 
 ### GitHub family
 - `github.issue-opened`
 - `github.issue-commented`
 - `github.issue-closed`
+- `github.pr-commented`
+- `github.pr-review-commented`
+- `github.pr-reviewed`
 - `github.pr-status-changed`
 
 ### Git family
