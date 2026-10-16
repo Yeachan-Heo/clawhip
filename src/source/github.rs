@@ -2022,6 +2022,8 @@ struct PRActivityState {
     review_comment_lower: Option<String>,
     emitted_review_comment_ids: VecDeque<u64>,
     emitted_pr_comment_ids: VecDeque<u64>,
+    // Track which issue numbers have had issue-commented events emitted (one per issue per poll)
+    emitted_issue_numbers: VecDeque<u64>,
     review_watermark: Option<String>,
     review_scan: Option<ReviewScan>,
     emitted_review_ids: VecDeque<u64>,
@@ -2601,7 +2603,7 @@ async fn poll_pr_activity(
                 .max()
                 .unwrap_or_else(|| fetched_at.clone().unwrap_or_else(|| cutoff.clone()));
             let lower = state.pr_comment_lower.clone();
-            for comment in comments {
+            for comment in &comments {
                 let Some(number) = comment.pr_number() else {
                     continue;
                 };
@@ -2636,6 +2638,41 @@ async fn poll_pr_activity(
                     .await?;
                 }
                 remember_activity_id(&mut state.emitted_pr_comment_ids, comment.id);
+            }
+            // Process issue comments separately: emit one event per issue per poll.
+            let mut emitted_issue_numbers = std::collections::HashSet::new();
+            for comment in &comments {
+                let Some(issue_number) = comment.issue_number() else {
+                    continue;
+                };
+                // Skip if already emitted in this poll
+                if emitted_issue_numbers.contains(&issue_number) {
+                    continue;
+                }
+                // Skip if already emitted in a previous poll
+                if state.emitted_issue_numbers.contains(&issue_number) {
+                    continue;
+                }
+                if let Some(lower) = lower.as_deref() {
+                    if comment.created_at.as_str() < lower {
+                        continue;
+                    }
+                    send_event(
+                        tx,
+                        IncomingEvent::github_issue_commented(
+                            snapshot.repo_name.clone(),
+                            issue_number,
+                            String::new(), // Title will be fetched from issue if needed
+                            0,             // Comment count - not used for activity feed events
+                            repo.channel.clone(),
+                        )
+                        .with_mention(repo.mention.clone())
+                        .with_format(repo.format.clone()),
+                    )
+                    .await?;
+                    emitted_issue_numbers.insert(issue_number);
+                    remember_activity_id(&mut state.emitted_issue_numbers, issue_number);
+                }
             }
             state.pr_comment_cursor = Some(max_updated.clone());
             if pr_comment_cursor.is_none() {
@@ -3987,6 +4024,23 @@ impl GitHubComment {
         let path = url.path().strip_prefix("/api/v3").unwrap_or(url.path());
         let mut segments = path.strip_prefix("/repos/")?.split('/').skip(2);
         if segments.next() == Some("pulls") {
+            segments.next()?.parse().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Extract issue number for issue-only comments (not PR comments).
+    fn issue_number(&self) -> Option<u64> {
+        // Skip if this is a PR comment
+        if self.pr_number().is_some() {
+            return None;
+        }
+        // Extract from issue_url: /repos/owner/repo/issues/123
+        let url = reqwest::Url::parse(&self.issue_url).ok()?;
+        let path = url.path().strip_prefix("/api/v3").unwrap_or(url.path());
+        let mut segments = path.strip_prefix("/repos/")?.split('/').skip(2);
+        if segments.next() == Some("issues") {
             segments.next()?.parse().ok()
         } else {
             None
@@ -9108,9 +9162,20 @@ mod tests {
         let mut harness = ActivityHarness::new(base);
         assert!(harness.poll().await.is_empty());
         let events = harness.poll().await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].canonical_kind(), "github.pr-commented");
-        assert_eq!(events[0].payload["comment_id"], 2);
+        assert_eq!(events.len(), 2);
+        // Events include PR comment (ID 2, number 1) and issue comment (number 2)
+        let pr_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.canonical_kind() == "github.pr-commented")
+            .collect();
+        let issue_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.canonical_kind() == "github.issue-commented")
+            .collect();
+        assert_eq!(pr_events.len(), 1);
+        assert_eq!(issue_events.len(), 1);
+        assert_eq!(pr_events[0].payload["comment_id"], 2);
+        assert_eq!(issue_events[0].payload["number"], 2);
         for _ in 0..2 {
             assert!(harness.poll().await.is_empty());
         }
@@ -9805,9 +9870,19 @@ mod tests {
         let mut harness = ActivityHarness::new(base);
         assert!(harness.poll().await.is_empty());
         let events = harness.poll().await;
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].payload["number"], 42);
-        assert_eq!(events[1].payload["number"], 43);
+        assert_eq!(events.len(), 3);
+        // Events include both PR comments (42, 43) and issue comment (1)
+        let pr_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.canonical_kind() == "github.pr-commented")
+            .collect();
+        let issue_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.canonical_kind() == "github.issue-commented")
+            .collect();
+        assert_eq!(pr_events.len(), 2);
+        assert_eq!(issue_events.len(), 1);
+        assert_eq!(issue_events[0].payload["number"], 1);
         assert_eq!(harness.repo_state().activity.emitted_pr_comment_ids, [1, 3]);
         assert!(harness.poll().await.is_empty());
         server.await.unwrap();
@@ -9835,9 +9910,21 @@ mod tests {
         let mut harness = ActivityHarness::new(base);
         assert!(harness.poll().await.is_empty());
         let events = harness.poll().await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload["comment_id"], 2);
-        assert_eq!(events[0].payload["number"], 42);
+        assert_eq!(events.len(), 2);
+        // Events include both PR comment and issue comment for number 42
+        let pr_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.canonical_kind() == "github.pr-commented")
+            .collect();
+        let issue_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.canonical_kind() == "github.issue-commented")
+            .collect();
+        assert_eq!(pr_events.len(), 1);
+        assert_eq!(issue_events.len(), 1);
+        assert_eq!(pr_events[0].payload["comment_id"], 2);
+        assert_eq!(pr_events[0].payload["number"], 42);
+        assert_eq!(issue_events[0].payload["number"], 42);
         assert_eq!(harness.repo_state().activity.emitted_pr_comment_ids, [2]);
         server.await.unwrap();
     }
