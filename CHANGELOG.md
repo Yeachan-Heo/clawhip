@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.6.18 - 2026-10-22
+
+### Highlights
+
+- fix GitHub notifications missing threads that were read elsewhere before the next poll
+
+### Upgrade notes
+
+- crate version is now `0.6.18`
+- existing GitHub notification configuration and behavior remain fully compatible; no migration required
+- GitHub notifications now poll with `all=true` to include threads previously read elsewhere; the watermark and per-thread `updated_at` dedup ensure re-delivery is prevented; cold-start catch-up is bounded by the startup cutoff
+- fixes #400 where reading notification threads in the web UI would lose them from polling before the next poll cycle
+
 ## 0.6.17 - 2026-10-16
 
 ### Highlights

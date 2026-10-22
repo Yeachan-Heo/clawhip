@@ -1,4 +1,8 @@
-//! Opt-in, authenticated unread notification polling. Never mutates GitHub threads.
+//! Opt-in, authenticated notification polling. Never mutates GitHub threads.
+//!
+//! Requests use `all=true`: a thread read elsewhere before the next poll still
+//! carries its new `updated_at`, so delivery depends on the watermark and
+//! per-thread dedup rather than on GitHub's unread flag.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -287,7 +291,7 @@ async fn fetch_threads(
             .map_or(state.watermark, |cursor| cursor.since);
         let participating = config.monitors.github_notifications.participating;
         let mut request = client.http.get(endpoint.clone()).query(&[
-            ("all", "false".to_string()),
+            ("all", "true".to_string()),
             ("participating", participating.to_string()),
             ("per_page", "50".to_string()),
             ("page", request_page.to_string()),
@@ -460,8 +464,12 @@ async fn fetch_threads(
             }
             cursor
         }
+        // `all=true` exposes the whole read history. Updates older than the
+        // cold-start cutoff are never delivered, so a backlog that starts before
+        // any watermark is bounded by the cutoff (or this poll's Date when cold)
+        // instead of draining history that can only seed the dedup map.
         None => CatchUp {
-            since: state.watermark,
+            since: state.watermark.or(state.cutoff).or(result.date),
             before,
             covered_max: newest.ok_or("GitHub notifications pagination cap without threads")?,
             tied: false,
@@ -753,7 +761,8 @@ mod tests {
             let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
             assert_eq!(url.path(), "/notifications");
             assert!(request.starts_with("GET "));
-            assert_eq!(query["all"], "false");
+            // GitHub omits read threads unless `all=true`.
+            let all = query["all"] == "true";
             let since = query
                 .get("since")
                 .map(|value| OffsetDateTime::parse(value, &Rfc3339).unwrap());
@@ -770,7 +779,8 @@ mod tests {
                         OffsetDateTime::parse(thread["updated_at"].as_str().unwrap(), &Rfc3339)
                             .unwrap();
                     (since.is_none_or(|since| updated > since)
-                        && before.is_none_or(|before| updated < before))
+                        && before.is_none_or(|before| updated < before)
+                        && (all || thread["unread"] != json!(false)))
                     .then_some((updated, thread.clone()))
                 })
                 .collect();
@@ -1034,7 +1044,7 @@ mod tests {
             let response = client
                 .http
                 .get(format!("{}/notifications", server.base))
-                .query(&[("all", "false"), ("per_page", "50"), ("page", "1")])
+                .query(&[("all", "true"), ("per_page", "50"), ("page", "1")])
                 .header(IF_MODIFIED_SINCE, invalid)
                 .send()
                 .await
@@ -1112,7 +1122,7 @@ mod tests {
         assert_eq!(state.threads.len(), 4);
         for request in server.requests.lock().unwrap().iter() {
             assert!(request.starts_with("GET /notifications?"));
-            assert!(request.contains("all=false"));
+            assert!(request.contains("all=true"));
             assert!(request.contains("participating=true"));
             assert!(request.contains("per_page=50"));
         }
@@ -1207,7 +1217,7 @@ mod tests {
         );
         assert!(state.last_modified.is_none());
         // A 251-thread, 250-second burst also fills the five-minute overlap.
-        // One thread read elsewhere leaves a complete 250-thread normal scan.
+        // One thread marked done elsewhere leaves a complete 250-thread normal scan.
         inbox.lock().unwrap().threads.remove(0);
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
         assert!(state.last_modified.is_some());
@@ -1321,11 +1331,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(512);
         let mut state = MonitorState::default();
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let watermark = state.watermark;
         fill_inbox(&inbox, 251, true);
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
         let mut ids = received_ids(&mut rx);
         assert_eq!(ids.len(), 250);
         let original = state.catch_up.clone().unwrap();
+        // Started before any watermark, the backlog is bounded by the cutoff.
+        assert_eq!(original.since, state.cutoff);
         {
             let mut inbox = inbox.lock().unwrap();
             let updated = inbox.date + time::Duration::seconds(1);
@@ -1340,19 +1353,19 @@ mod tests {
         let cursor = state.catch_up.as_ref().unwrap();
         assert_eq!(cursor.before, original.before);
         assert_eq!(cursor.page, 5, "a full boundary second resumes, not skips");
-        assert_eq!(state.watermark, original.since);
+        assert_eq!(state.watermark, watermark);
         bounded_poll(&server, &config, &client, &tx, &mut state).await;
         ids.extend(received_ids(&mut rx));
         assert!(state.catch_up.as_ref().unwrap().tied);
         assert_eq!(state.catch_up.as_ref().unwrap().page, 1);
-        assert_eq!(state.watermark, original.since);
+        assert_eq!(state.watermark, watermark);
         // Oversized ties cannot prove completion from saved offsets. Repeated
         // reconciliation still emits nothing twice, while the head stays live.
         assert!(state.last_modified.is_none());
         for _ in 0..4 {
             bounded_poll(&server, &config, &client, &tx, &mut state).await;
             assert!(rx.try_recv().is_err());
-            assert_eq!(state.watermark, original.since);
+            assert_eq!(state.watermark, watermark);
         }
         assert_eq!(ids.len(), 252);
         ids.sort();
@@ -2123,6 +2136,113 @@ mod tests {
                 .iter()
                 .all(|request| request.starts_with("GET "))
         );
+    }
+
+    fn read_thread(id: &str, updated: OffsetDateTime) -> Value {
+        let mut value = thread(id, &updated.format(&Rfc3339).unwrap());
+        value["unread"] = json!(false);
+        value
+    }
+
+    #[tokio::test]
+    async fn notifications_thread_read_before_poll_is_delivered_once() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = MonitorState::default();
+        let old = OffsetDateTime::parse(OLD, &Rfc3339).unwrap();
+        inbox.lock().unwrap().threads = vec![thread("7109", OLD), read_thread("639", old)];
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.watermark, Some(old));
+
+        // Updated and then read elsewhere before the next poll: GitHub keeps the
+        // new updated_at but drops the thread from unread-only listings.
+        let updated = OffsetDateTime::parse(NEW, &Rfc3339).unwrap();
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = updated + time::Duration::seconds(12);
+            inbox.threads = vec![read_thread("7109", updated), read_thread("639", updated)];
+        }
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        let mut ids = received_ids(&mut rx);
+        ids.sort();
+        assert_eq!(ids, ["639", "7109"]);
+        assert_eq!(state.watermark, Some(updated));
+
+        // The same updated_at stays inside the reconciliation window but is
+        // already processed, so neither repeated polls nor IMS changes resend it.
+        for _ in 0..3 {
+            inbox.lock().unwrap().date += time::Duration::seconds(60);
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            assert!(rx.try_recv().is_err());
+        }
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.contains("all=true"))
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_cold_baseline_of_read_history_resends_nothing() {
+        let (server, inbox) = inbox_server().await;
+        let config = config(&server.base);
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut state = MonitorState::default();
+        let start = OffsetDateTime::parse(NEW, &Rfc3339).unwrap();
+        let spacing = time::Duration::minutes(1);
+        let history = 300;
+        let date = start + spacing * history + time::Duration::hours(1);
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = date;
+            inbox.threads = (0..history)
+                .map(|id| {
+                    let updated = start + spacing * id;
+                    if id % 2 == 0 {
+                        read_thread(&id.to_string(), updated)
+                    } else {
+                        thread(&id.to_string(), &updated.format(&Rfc3339).unwrap())
+                    }
+                })
+                .collect();
+        }
+        // Read history exceeds the five-page cap on the cold poll.
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert!(rx.try_recv().is_err());
+        let cursor = state.catch_up.clone().unwrap();
+        assert_eq!(cursor.since, Some(date));
+        assert_eq!(state.cutoff, Some(date));
+
+        // The backlog is bounded by the cutoff instead of draining history.
+        let before = server.requests.lock().unwrap().len();
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(server.requests.lock().unwrap().len() - before, 2);
+        assert!(state.catch_up.is_none());
+        assert_eq!(state.watermark, Some(start + spacing * (history - 1)));
+        for _ in 0..2 {
+            bounded_poll(&server, &config, &client, &tx, &mut state).await;
+            assert!(rx.try_recv().is_err());
+            assert!(state.catch_up.is_none());
+        }
+
+        // A historical thread updated and read after the baseline still arrives once.
+        let updated = date + time::Duration::seconds(30);
+        {
+            let mut inbox = inbox.lock().unwrap();
+            inbox.date = updated + time::Duration::seconds(30);
+            inbox.threads[0] = read_thread("0", updated);
+        }
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert_eq!(received_ids(&mut rx), ["0"]);
+        bounded_poll(&server, &config, &client, &tx, &mut state).await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
