@@ -914,8 +914,10 @@ currently documents personal access tokens **(classic)** with `notifications` or
 `repo` scope; this endpoint does **not** support fine-grained personal access tokens.
 Authenticate `gh` with a credential that can read notifications.
 
-Each poll constructs at most five `GET /notifications` requests, with `all=false`,
-`participating` as configured, and `per_page=50`. Constructed polling/pagination
+Each poll constructs at most five `GET /notifications` requests, with `all=true`,
+`participating` as configured, and `per_page=50`. Read threads are included, so
+an update read elsewhere before the next poll is still delivered once; delivery
+depends on the watermark and thread dedup, never on GitHub's unread flag. Constructed polling/pagination
 requests stay on the configured API origin; HTTP 3xx redirects retain the shared
 GitHub client's default behavior and can add transport requests or change origin.
 The committed watermark W advances only to the greatest `updated_at` actually
@@ -943,7 +945,10 @@ delay again. Missing/invalid interval headers retain the latest valid value.
 Shared GitHub 403/429 backoff also applies.
 
 A five-page cap reports throttled source degradation and saves a catch-up window
-without advancing W. Outside a pinned tie, every catch-up poll first fetches one
+without advancing W. A catch-up that starts before W is set (for example, read
+history exceeding five pages on the cold poll) uses the cold-start cutoff in
+place of W, because older updates are never delivered; the baseline does not
+drain the whole read history. Outside a pinned tie, every catch-up poll first fetches one
 fresh head page with `since=<W at catch-up start>-5m`, so its newest 50 updates are not delayed
 by the backlog. The remaining four requests drain that same lower bound with
 `before=<oldest received updated_at + 1s>`. The head and backlog windows overlap,
@@ -957,7 +962,7 @@ disabled throughout catch-up and on that first normal scan.
 HTTP/decoding failures and missing/invalid first-page Date headers preserve the
 watermark, continuation, thread baseline, and conditional cursor.
 
-**Oversized boundary-second limitation:** if more than 200 unread threads share
+**Oversized boundary-second limitation:** if more than 200 threads share
 the boundary `updated_at` second, they cannot all be reconciled in the four
 backlog requests. Bounded page offsets enumerate only that second, then restart
 at page one when they reach its end. Such cross-poll offsets never prove
