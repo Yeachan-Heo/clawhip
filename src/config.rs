@@ -819,7 +819,7 @@ impl GitHubStatusMonitorConfig {
     }
 }
 
-/// Authenticated user's unread GitHub notification threads, across repositories.
+/// Authenticated user's GitHub notification threads (read and unread), across repositories.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct GitHubNotificationsMonitorConfig {
